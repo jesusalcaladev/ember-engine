@@ -12,6 +12,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // ── ECS module (data-oriented core; tested without native dependencies) ──
+    // Declared before the engine because the engine imports it by module name,
+    // and both compile the same sources once instead of twice.
+    const ecs_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/ecs/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ecs_mod.addImport("core", core_mod);
+
     // ── Engine module (public boundary: core + platform + render) ───────────
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/root.zig"),
@@ -19,6 +30,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Separate modules: each subsystem compiles and tests on its own.
+    engine_mod.addImport("core", core_mod);
+    engine_mod.addImport("ecs", ecs_mod);
 
     // ── ember runtime ───────────────────────────────────────────────────────
     const runtime_mod = b.createModule(.{
@@ -71,6 +85,25 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(ember);
 
+    // ── M1 benchmark suite (acceptance criteria, measured) ───────────────────
+    // ReleaseSafe regardless of the build flag: budgets in spec.md are about
+    // what a shipped game does, and a Debug build measures the compiler.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    // Only `core` and `ecs`: headless by construction, so it never links Dawn
+    // nor needs a window to measure (spec §9: every feature ships a benchmark).
+    bench_mod.addImport("core", core_mod);
+    bench_mod.addImport("ecs", ecs_mod);
+    const bench = b.addExecutable(.{ .name = "ember-bench", .root_module = bench_mod });
+    const bench_cmd = b.addRunArtifact(bench);
+    if (b.args) |args| bench_cmd.addArgs(args);
+    const bench_step = b.step("bench", "Run the M1 ECS benchmark suite");
+    bench_step.dependOn(&bench_cmd.step);
+
     const run_cmd = b.addRunArtifact(ember);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args); // `zig build run -- --frames N`
@@ -78,8 +111,11 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ── Tests ───────────────────────────────────────────────────────────────
+    const test_step = b.step("test", "Run the engine core and ECS tests");
+
     const core_tests = b.addTest(.{ .root_module = core_mod });
-    const run_core_tests = b.addRunArtifact(core_tests);
-    const test_step = b.step("test", "Run the engine core tests");
-    test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
+    test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 }

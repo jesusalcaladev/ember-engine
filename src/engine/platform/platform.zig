@@ -8,7 +8,7 @@
 const std = @import("std");
 const glfw = @import("glfw_bindings.zig");
 
-pub const log = @import("../core/log.zig").scoped("platform");
+pub const log = @import("core").log.scoped("platform");
 
 pub const WindowDesc = struct {
     width: u32 = 1280,

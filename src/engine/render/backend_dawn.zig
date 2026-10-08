@@ -9,7 +9,7 @@ const std = @import("std");
 const render = @import("render.zig");
 const wgpu = @import("webgpu.zig");
 const platform = @import("../platform/platform.zig");
-const log = @import("../core/log.zig").scoped("render");
+const log = @import("core").log.scoped("render");
 
 const quad_wgsl = @embedFile("shaders/quad.wgsl");
 

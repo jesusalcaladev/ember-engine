@@ -50,6 +50,8 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 
 **Criteria**: 100k actors with updated transforms ≤ 2 ms; save→load reproduces an identical hash; 10k parent/child entities with no frame spikes.
 
+**Status: closed** (`zig build bench` measures every criterion against §2; the numbers are printed with a pass/fail per budget).
+
 ### M2 — 2D Renderer
 **Goal**: massive, cheap sprites, and the base for Play-in-editor.
 

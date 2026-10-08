@@ -1,0 +1,320 @@
+//! Component registry — the single comptime source of truth (spec §7).
+//!
+//! Every component type lives here, and from this list the whole ECS derives
+//! at comptime:
+//! - dense `ComponentId`s (registration order, stable for the build),
+//! - the archetype mask type (`Mask`),
+//! - layout metadata (`stride`, alignment) used by type-erased columns.
+//!
+//! Rules, enforced by compile error instead of runtime surprises:
+//! 1. A component is **plain data**: no pointers, no slices, no unions.
+//!    It must therefore be copyable, so moving an entity between archetypes
+//!    is a `memcpy` of a fixed number of bytes.
+//! 2. Every field (including nested ones) has a default: those defaults are
+//!    the baseline a `.zson` document starts from in "replace" mode, and the
+//!    baseline an override merges into in patch mode (see `zson`).
+//! 3. Types are identified by their **explicit registry name** ("Transform",
+//!    not a mangled path), because the text format and the profiler logs
+//!    must not depend on how the module happens to be imported.
+//!
+//! Registration is closed on purpose: the ECS is an internal detail and the
+//! public surface is Actor + Components (spec §7). Adding a component means
+//! adding one line to `entries` below.
+
+const std = @import("std");
+const core_math = @import("core").math;
+const entity = @import("entity.zig");
+
+pub const Entity = entity.Entity;
+pub const SceneId = entity.SceneId;
+pub const Vec2 = core_math.Vec2;
+
+pub const ComponentId = u16;
+
+/// Maximum number of distinct component types. Deliberate ceiling: it keeps
+/// every archetype test inside 4 machine words (`Mask`), which is what makes
+/// queries cost O(#archetypes) instead of O(#entities).
+pub const max_components = 256;
+
+/// Component set as a bitmask: fast superset/disjoint tests during queries.
+pub const Mask = std.StaticBitSet(max_components);
+
+/// Buffer size generous enough to hold any registered component while
+/// decoding a document (130 bytes covers a 60-byte Transform with slack).
+pub const max_stride = 128;
+
+// ── Components ───────────────────────────────────────────────────────────────
+
+/// Inline name: identity for humans, and the key `.zson` overrides match by.
+/// Fixed size keeps it POD (no allocation, no lifetime, byte-copyable).
+pub const Name = struct {
+    bytes: [32]u8 = [_]u8{0} ** 32,
+    len: u8 = 0,
+
+    pub const max_len = 32;
+
+    pub fn init(text: []const u8) Name {
+        var name = Name{};
+        name.set(text);
+        return name;
+    }
+
+    pub fn set(self: *Name, text: []const u8) void {
+        const len = @min(text.len, Name.max_len);
+        @memcpy(self.bytes[0..len], text[0..len]);
+        self.len = @intCast(len);
+    }
+
+    pub fn slice(self: *const Name) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn eql(self: *const Name, text: []const u8) bool {
+        return std.mem.eql(u8, self.slice(), text);
+    }
+};
+
+/// Local 2D transform plus the previous fixed-tick snapshot, so the renderer
+/// can interpolate without touching simulation state (spec §3.3).
+pub const Transform = struct {
+    position: Vec2 = Vec2{},
+    rotation: f32 = 0,
+    scale: Vec2 = unit,
+    prev_position: Vec2 = Vec2{},
+    prev_rotation: f32 = 0,
+    prev_scale: Vec2 = unit,
+
+    /// Call at the start of a fixed tick: what is about to be overwritten
+    /// must survive as "previous" for the interpolator.
+    pub fn capturePrevious(self: *Transform) void {
+        self.prev_position = self.position;
+        self.prev_rotation = self.rotation;
+        self.prev_scale = self.scale;
+    }
+
+    /// Linear interpolation between the previous and current snapshot.
+    pub fn interpolated(self: *const Transform, alpha: f32) Transform {
+        return .{
+            .position = self.prev_position.lerp(self.position, alpha),
+            .rotation = self.prev_rotation + (self.rotation - self.prev_rotation) * alpha,
+            .scale = self.prev_scale.lerp(self.scale, alpha),
+        };
+    }
+};
+
+/// Parent link. The hierarchy itself is derived by `hierarchy` (flat, no
+/// recursion); this is the only thing stored per entity.
+pub const Parent = struct {
+    /// Entity handle of the parent. `invalid` (or a dead parent) means "root".
+    parent: Entity = Entity.invalid,
+};
+
+/// Linear and angular velocity: plain data the fixed step integrates into
+/// `Transform`. Kept separate so a kinematic actor can move without a
+/// transform and a transform can move without one.
+pub const Velocity = struct {
+    linear: Vec2 = Vec2{},
+    /// Radians per second, positive clockwise (screen space y grows down).
+    angular: f32 = 0,
+};
+
+const unit = Vec2{ .x = 1, .y = 1 };
+
+// ── Registry ─────────────────────────────────────────────────────────────────
+
+/// One entry per component type. Order defines the dense ids, so it is also
+/// the canonical order `.zson` writes components in: identical files for
+/// identical worlds (spec §6).
+pub const Entry = struct {
+    name: []const u8,
+    type: type,
+    /// Layout of one element inside an archetype column.
+    stride: u32,
+    align_pow: u8,
+};
+
+pub const entries = [_]Entry{
+    .{ .name = "Name", .type = Name, .stride = @sizeOf(Name), .align_pow = 3 },
+    .{ .name = "Transform", .type = Transform, .stride = @sizeOf(Transform), .align_pow = 4 },
+    .{ .name = "Parent", .type = Parent, .stride = @sizeOf(Parent), .align_pow = 3 },
+    .{ .name = "Velocity", .type = Velocity, .stride = @sizeOf(Velocity), .align_pow = 4 },
+};
+
+comptime {
+    if (entries.len > max_components)
+        @compileError("component registry exceeds max_components (" ++ std.fmt.comptimePrint("{d}", .{max_components}) ++ ")");
+    for (entries) |entry| assertComponentRules(entry.type);
+}
+
+/// Rules 1 and 2 of this file, as compile errors next to the offending type.
+fn assertComponentRules(comptime T: type) void {
+    if (@typeInfo(T) != .@"struct")
+        @compileError("component must be a struct: " ++ @typeName(T));
+    assertPlainData(T, T);
+    assertDefaultable(T);
+}
+
+fn assertPlainData(comptime T: type, comptime origin: type) void {
+    switch (@typeInfo(T)) {
+        .bool, .int, .float => {},
+        .@"enum" => {},
+        .optional => |o| assertPlainData(o.child, origin),
+        .array => |a| assertPlainData(a.child, origin),
+        .@"struct" => |s| inline for (s.fields) |f| assertPlainData(f.type, origin),
+        else => @compileError("component " ++ @typeName(origin) ++ ": field type " ++ @typeName(T) ++ " is not plain data (no pointers, slices or unions allowed)"),
+    }
+}
+
+fn assertDefaultable(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| inline for (s.fields) |f| {
+            if (f.default_value_ptr == null)
+                @compileError("component " ++ @typeName(T) ++ ": field '" ++ f.name ++ "' has no default; defaults are the .zson baseline");
+            assertDefaultable(f.type);
+        },
+        .array => |a| assertDefaultable(a.child),
+        .optional => |o| assertDefaultable(o.child),
+        else => {},
+    }
+}
+
+/// Dense id of a component type. Unknown type = compile error at the call
+/// site, which is the point: components must be registered, not discovered.
+pub fn componentId(comptime T: type) ComponentId {
+    inline for (entries, 0..) |entry, i| {
+        if (entry.type == T) return @as(ComponentId, @intCast(i));
+    }
+    @compileError("component type not registered: " ++ @typeName(T) ++ " (add it to the entries list in components.zig)");
+}
+
+pub fn strideOf(id: ComponentId) u32 {
+    return strides[id];
+}
+
+/// Component alignment as a power of two (column buffers are allocated with it).
+pub fn alignOfPow(id: ComponentId) u8 {
+    return align_pows[id];
+}
+
+/// Comptime-only list: `Entry` holds a type, so it can never be indexed at
+/// runtime. The runtime-indexable projections below are what the storage and
+/// the serializers use.
+pub fn nameOf(id: ComponentId) []const u8 {
+    return names[id];
+}
+
+pub fn alignmentOf(id: ComponentId) std.mem.Alignment {
+    return std.mem.Alignment.fromByteUnits(@as(usize, 1) << @intCast(align_pows[id]));
+}
+
+const names: [entries.len][]const u8 = blk: {
+    var out: [entries.len][]const u8 = undefined;
+    for (entries, &out) |entry, *slot| slot.* = entry.name;
+    break :blk out;
+};
+
+const strides: [entries.len]u32 = blk: {
+    var out: [entries.len]u32 = undefined;
+    for (entries, &out) |entry, *slot| slot.* = entry.stride;
+    break :blk out;
+};
+
+const align_pows: [entries.len]u8 = blk: {
+    var out: [entries.len]u8 = undefined;
+    for (entries, &out) |entry, *slot| slot.* = entry.align_pow;
+    break :blk out;
+};
+
+/// Comptime map "registry name -> id" for `.zson` decoding.
+const name_to_id = blk: {
+    var kvs: [entries.len]struct { []const u8, ComponentId } = undefined;
+    for (entries, 0..) |entry, i| kvs[i] = .{ entry.name, @as(ComponentId, @intCast(i)) };
+    break :blk std.StaticStringMap(ComponentId).initComptime(&kvs);
+};
+
+/// Id for a registry name, or `null` if that name is not a component of this
+/// build (e.g. a document written by a newer version).
+pub fn idOfName(name: []const u8) ?ComponentId {
+    return name_to_id.get(name);
+}
+
+/// Default value of a component, as raw bytes: the "replace" baseline for
+/// `.zson` documents that omit a field (decoders pass values in as bytes, so
+/// the dispatch from a runtime id to a type has to happen here).
+pub fn writeDefault(id: ComponentId, dst: []u8) void {
+    inline for (entries, 0..) |entry, i| {
+        if (id == i) {
+            const value = entry.type{};
+            std.mem.copyForwards(u8, dst[0..entry.stride], std.mem.asBytes(&value));
+            return;
+        }
+    }
+    std.debug.panic("components: id {d} is not in the registry", .{id});
+}
+
+test "registry is dense, unique and self-consistent" {
+    inline for (entries, 0..) |entry, i| {
+        const id: ComponentId = @intCast(i);
+        try std.testing.expectEqualStrings(entry.name, nameOf(id));
+        try std.testing.expectEqual(id, componentId(entry.type));
+        try std.testing.expectEqual(id, idOfName(entry.name).?);
+        try std.testing.expectEqual(entry.stride, strideOf(id));
+    }
+}
+
+test "component ids resolved at comptime" {
+    try std.testing.expectEqual(@as(ComponentId, 0), componentId(Name));
+    try std.testing.expectEqual(@as(ComponentId, 1), componentId(Transform));
+    try std.testing.expectEqual(@as(ComponentId, 2), componentId(Parent));
+    try std.testing.expectEqual(@as(ComponentId, 3), componentId(Velocity));
+    try std.testing.expectEqual(@as(?ComponentId, null), idOfName("Nope"));
+}
+
+test "component sizes are what they must be" {
+    // Name: 33 bytes (32 inline + len).
+    try std.testing.expectEqual(@as(usize, 33), @sizeOf(Name));
+    // Transform: auto layout interleaves the prev_* snapshot with the live
+    // fields (12 bytes per position/rotation pair, 16 for the two scales).
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Transform));
+}
+
+test "Transform interpolation goes from prev to current (spec §3.3)" {
+    var now = Transform{
+        .position = .{ .x = 0, .y = 0 },
+        .rotation = 0,
+        .scale = unit,
+    };
+    now.prev_position = now.position;
+    now.prev_rotation = now.rotation;
+    now.prev_scale = now.scale;
+
+    // One fixed tick later (the simulation wrote the current fields).
+    now.position = .{ .x = 10, .y = 20 };
+    now.rotation = 2;
+
+    const mid = now.interpolated(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), mid.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), mid.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), mid.rotation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), mid.scale.x, 0.0001);
+
+    // capturePrevious is what makes "prev" mean "the last simulated tick".
+    now.capturePrevious();
+    try std.testing.expectApproxEqAbs(@as(f32, 10), now.prev_position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), now.prev_rotation, 0.0001);
+}
+
+test "Name: init, set, truncation to max_len" {
+    const short = Name.init("quad");
+    try std.testing.expectEqualStrings("quad", short.slice());
+    const long = Name.init(&[_]u8{'a'} ** 64);
+    try std.testing.expectEqual(Name.max_len, long.len);
+    try std.testing.expect(long.eql(&[_]u8{'a'} ** 32));
+}
+
+test "default baseline bytes match a default value" {
+    var buf: [@sizeOf(Transform)]u8 align(@alignOf(Transform)) = undefined;
+    writeDefault(componentId(Transform), &buf);
+    const restored: *const Transform = @ptrCast(&buf);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), restored.scale.x, 0.0001);
+}

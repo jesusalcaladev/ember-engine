@@ -11,3 +11,6 @@ libs/glfw/
 
 # Logs and development artifacts
 *.log
+
+# Bench output (the sample lives in samples/scene.zson)
+/scene.zson

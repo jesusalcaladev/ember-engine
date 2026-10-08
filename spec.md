@@ -19,13 +19,15 @@ All numbers are measured there. On superior hardware they may only improve; on i
 | Lua behaviors (10k updates) | 2.0 ms |
 | Physics (fixed 60 Hz step + interpolation) | 2.0 ms |
 | Render CPU (encoding 50k sprites) | 1.5 ms |
+| ECS: 100k transform updates over SoA queries | 2.0 ms |
+| ECS: parent-chain resolution (10k entities) | 2.0 ms |
 | Signals + framework | 0.8 ms |
 | Headroom | the rest |
 
 - **Editor**: adds ≤ 2.0 ms (overlay + composition). Its cost never appears in the exported game.
 
 ## 3. Anti-spike (hard rules against CPU spikes)
-1. **Zero allocations in the frame loop**: per-frame arena with O(1) reset; assert in debug builds.
+1. **Zero allocations in the frame loop**: per-frame arena with O(1) reset; assert in debug builds. Structural ECS growth (slots, archetypes, rows) is locked during the frame: it must be reserved at load time, and a spike is not allowed to hide behind a reallocation.
 2. **LuaJIT GC**: incremental step only, ≤ 0.4 ms/frame; full GC forbidden during play.
 3. **Physics**: max 1 catch-up step per frame (no death spirals); mandatory physics→render interpolation.
 4. **Blocking I/O in the frame: forbidden** (preload or async VFS).
@@ -64,6 +66,7 @@ Rules:
 - Same binary + same inputs → same final state (hash test in CI).
 - Stable signal order (by spawn order).
 - Play→Stop snapshot is **bit-exact** (hash test in CI) — that is what makes editing during play safe.
+- Scene serialization is canonical and **bit-exact**: same world → same bytes → same hash (`.zson`), float formatting round-trips every bit.
 
 ## 7. Invariant architecture
 - **One process, one window.** The game ALWAYS renders to an offscreen target; the editor composes. Godot-style play in a separate window is forbidden by design.
