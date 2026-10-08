@@ -146,8 +146,11 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 ### M11 — Optimization + performance CI
 - Bench suite: 3 canonical scenes (static sprites; lights + GI; physics + behaviors) running in CI on the 3 targets.
 - **Regression gate**: > 5% on any metric = red CI.
+  *(infra done: `ember-profile --baseline` compares 14 metrics and exits 1;
+  see [PROFILING.md](PROFILING.md). The 3 canonical scenes land with M2/M4/M5.)*
 - Memory report (top consumers, high-water marks per allocator) + automated 8 h soak test.
 - Spike detector: p50/p99/p99.9 reported on every run.
+  *(done: every run reports p50/p99/p99.9/max per zone and per frame, CPU+GPU.)*
 
 **Criteria**: CI fails if a PR breaks a budget; reports generated automatically.
 
@@ -155,6 +158,28 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 - Frozen Lua API + semver; online docs: static site generated from the comptime metadata (docs.godotengine.org style); 3 game samples (platformer, top-down, shmup); project template; determinism tests in CI.
 
 **Criteria**: the 3 samples run on the 3 targets within budget; stable, documented API.
+
+---
+
+### M12.1 — Integration Demo: Pin-Pon (single authoritative game sample)
+
+Instead of three small samples, v1.0 ships **one complete game** that exercises the full engine surface area:
+
+| Subsystem | What Pin-Pon proves |
+|---|---|
+| **Physics (M4)** | Ball as `RigidBody2D` with restitution/linear damping; paddles as kinematic bodies or sensor colliders; wall sensors for score zones; collision events → Signals for sound/FX. |
+| **2D Lighting + GI (M7)** | Arena lit by 2–3 `Light2D` (spot for score flash, point for ball trail, directional for ambient); automatic occluder SDFs on paddle/sprite geometry; Radiance Cascades amortized ≤ 1.5 ms/frame. |
+| **Input (M3/M5)** | Action-based mapping (keyboard + gamepad); latency from event → Lua `on_input` ≤ 1 frame; multi-device handled by the input system. |
+| **Audio by sector (M8)** | `SoundEmitter2D` on ball hit (panning + attenuation by arena side); per-bus volume (SFX / music / ambient); miniaudio RT thread, zero main-thread spikes. |
+| **Renderer (M2)** | 60 FPS @ 1080p on reference iGPU; offscreen target → editor viewport composition; batched sprites (ball, paddles, particles, UI) in ≤ 4 draw calls. |
+| **Scripting (M3)** | All gameplay in Lua (`ball.lua`, `paddle.lua`, `arena.lua`, `score.lua`); hot-reload mid-rally without losing ball velocity/position; complete `math` module used for reflection angles, clamping, lerp. |
+| **Serialization (M1)** | Save/load mid-match → identical state hash; `.zson` scene with prefabs (paddle, ball, wall) and overrides. |
+| **Editor Play-in-editor (M5)** | Pause/step/inspect entities during the rally; edit paddle speed or ball restitution live; Stop restores exact state. |
+| **Export (M10)** | Same `.pak` + binary runs on Windows/Linux/Web (WebGPU + Lua 5.4 backend). |
+
+**Deliverable**: `zig build run -- --demo pinpon` launches the game; `zig build export --demo pinpon` produces the 3 distributables.
+
+**Criteria**: Pin-Pon runs on Windows/Linux/Web at 60 FPS within every spec.md budget; save/load mid-rally is bit-exact; editing values during Play reflects instantly; CI runs it headless every PR.
 
 ---
 
