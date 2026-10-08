@@ -320,6 +320,12 @@ pub const World = struct {
     /// Typed pointer into an archetype column, or `null` when the component is
     /// absent. The whole cost of an ECS read: a slot read, a binary search
     /// over a handful of ids, a pointer.
+    ///
+    /// The pointer is valid until this entity's component set changes (adding
+    /// or removing a component moves the row, which may reallocate columns).
+    /// Systems that stale the pointer is a bug; `world.spawn` inside a query
+    /// can also reallocate the archetype list, so structural changes go after
+    /// the iteration, never inside it.
     pub fn get(self: *Self, e: Entity, comptime T: type) ?*T {
         if (!self.isAlive(e)) return null;
         const slot = self.slots.items[e.index];

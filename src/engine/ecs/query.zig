@@ -10,6 +10,11 @@
 //! Cost per iteration step: one mask test (4 word comparisons) and, once per
 //! archetype, the column indices — never per entity. Asking for a component an
 //! entity does not have is impossible by construction.
+//!
+//! The batches borrow the world's tables: spawning, despawning or adding a
+//! component (which may create an archetype) invalidates them. Do the
+//! structural work first, or buffer the handles in the frame arena and apply
+//! them after the loop.
 
 const std = @import("std");
 const components = @import("components.zig");

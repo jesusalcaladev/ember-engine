@@ -133,11 +133,27 @@ pub const Entry = struct {
     align_pow: u8,
 };
 
-pub const entries = [_]Entry{
-    .{ .name = "Name", .type = Name, .stride = @sizeOf(Name), .align_pow = 3 },
-    .{ .name = "Transform", .type = Transform, .stride = @sizeOf(Transform), .align_pow = 4 },
-    .{ .name = "Parent", .type = Parent, .stride = @sizeOf(Parent), .align_pow = 3 },
-    .{ .name = "Velocity", .type = Velocity, .stride = @sizeOf(Velocity), .align_pow = 4 },
+// Stride/alignment are derived from the type: writing them by hand is exactly
+// how a silent column misalignment bug starts.
+fn layoutOf(comptime T: type) struct { u32, u8 } {
+    return .{ @sizeOf(T), @as(u8, @ctz(@as(usize, @alignOf(T)))) };
+}
+
+pub const entries: [component_list.len]Entry = blk: {
+    var out: [component_list.len]Entry = undefined;
+    for (component_list, &out) |spec, *entry| {
+        const stride, const align_pow = layoutOf(spec.type);
+        entry.* = .{ .name = spec.name, .type = spec.type, .stride = stride, .align_pow = align_pow };
+    }
+    break :blk out;
+};
+
+/// The registry as declared: name + type. Layout metadata is derived above.
+const component_list = [_]struct { name: []const u8, type: type }{
+    .{ .name = "Name", .type = Name },
+    .{ .name = "Transform", .type = Transform },
+    .{ .name = "Parent", .type = Parent },
+    .{ .name = "Velocity", .type = Velocity },
 };
 
 comptime {

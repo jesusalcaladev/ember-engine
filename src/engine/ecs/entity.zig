@@ -33,7 +33,8 @@ pub const Entity = extern struct {
     }
 
     pub fn hash(self: Entity) u64 {
-        return std.hash.Wyhash.hash(0, std.mem.asBytes(&self.bits()));
+        const value = self.bits();
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&value));
     }
 };
 
