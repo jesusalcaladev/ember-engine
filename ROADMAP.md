@@ -58,9 +58,10 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 - WebGPU pipelines; batcher: 1 draw call per material/atlas; atlas packer.
 - Orthographic cameras + layers + sorting; simple materials.
 - **ALWAYS render to an offscreen target** (editor requirement); compose to the swapchain.
-- Minimal post-processing (blit + gamma).
+- **Anti-aliasing: SMAA 1x (Subpixel Morphological AA)** — single post-process pass on the offscreen target before compose; detects edge patterns (staircases, diagonals) and blends only there; ~0.2 ms on reference iGPU; no texture blur (unlike FXAA), no temporal ghosting (unlike TAA); MSAA 4x kept as fallback for high-DPI if needed.
+- Minimal post-processing (blit + gamma + SMAA).
 
-**Criteria**: 50k sprites in ≤ 4 draw calls @ 60 FPS; GPU frame ≤ 4 ms on the reference iGPU; assert of zero buffer/pipeline creations per frame.
+**Criteria**: 50k sprites in ≤ 4 draw calls @ 60 FPS; GPU frame ≤ 4 ms on the reference iGPU; assert of zero buffer/pipeline creations per frame; SMAA adds ≤ 0.3 ms GPU.
 
 ### M3 — LuaJIT Scripting
 **Goal**: gameplay exists and is enjoyable.
