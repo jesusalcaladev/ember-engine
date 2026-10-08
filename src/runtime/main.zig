@@ -23,6 +23,8 @@ const rotation_speed: f32 = 1.5; // rad/s
 const Args = struct {
     frames: u64 = 0, // 0 = infinite
     headless: bool = false,
+    vsync: bool = true,
+    warmup: u64 = 30,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) Args {
@@ -35,9 +37,21 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
             if (it.next()) |n| args.frames = std.fmt.parseInt(u64, n, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             args.headless = true;
+        } else if (std.mem.eql(u8, arg, "--vsync")) {
+            if (it.next()) |v| args.vsync = onOff(v, true);
+        } else if (std.mem.eql(u8, arg, "--warmup")) {
+            if (it.next()) |n| args.warmup = std.fmt.parseInt(u64, n, 10) catch 30;
         }
     }
     return args;
+}
+
+fn onOff(value: []const u8, default: bool) bool {
+    if (value.len == 0) return default;
+    if (std.mem.startsWith(u8, value, "off") or std.mem.startsWith(u8, value, "OFF")) return false;
+    if (std.mem.startsWith(u8, value, "0")) return false;
+    if (std.mem.startsWith(u8, value, "no")) return false;
+    return true;
 }
 
 const GameState = struct {
@@ -95,6 +109,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             window.nativeHandle(),
             window.fb_width,
             window.fb_height,
+            backend_dawn.Options{ .vsync = args.vsync },
         );
         renderer = dawn.renderer();
     }
@@ -113,7 +128,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var frame_count: u64 = 0;
 
     while (true) {
-        prof.beginFrame(); // marks the start of the frame for the time ring
+        const measuring = frame_count >= args.warmup;
+        prof.beginFrame(measuring); // marks the start of the frame for the time ring
         var z = prof.zone("frame_total"); // no defer: closed BEFORE endFrame
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
