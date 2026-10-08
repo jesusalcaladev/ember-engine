@@ -1,0 +1,13 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Local tools (cmake, ninja, venv)
+.tools/
+
+# Downloaded dependencies (fetched with libs/bootstrap.sh)
+libs/dawn/
+libs/glfw/
+
+# Logs and development artifacts
+*.log
