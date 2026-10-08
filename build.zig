@@ -33,6 +33,16 @@ pub fn build(b: *std.Build) void {
     // Separate modules: each subsystem compiles and tests on its own.
     engine_mod.addImport("core", core_mod);
     engine_mod.addImport("ecs", ecs_mod);
+    // The render module declares extern Dawn procs, so anything that links the
+    // engine whole (the runtime, the render tests) needs the libraries. They are
+    // declared once here instead of per-artifact.
+    engine_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn"));
+    engine_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn/native"));
+    engine_mod.linkSystemLibrary("dawn_proc", .{});
+    engine_mod.linkSystemLibrary("dawn_native", .{});
+    engine_mod.addRPath(b.path("libs/dawn/build/src/dawn"));
+    engine_mod.addRPath(b.path("libs/dawn/build/src/dawn/native"));
+    engine_mod.linkSystemLibrary("X11", .{});
 
     // ── ember runtime ───────────────────────────────────────────────────────
     const runtime_mod = b.createModule(.{
@@ -110,6 +120,25 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the ember runtime");
     run_step.dependOn(&run_cmd.step);
 
+
+    // ── ember-profile (the CI gate: reads report.json, roadmap M11) ─────────
+    const profile_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/profile/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    profile_mod.addImport("engine", engine_mod);
+    const profile_exe = b.addExecutable(.{
+        .name = "ember-profile",
+        .root_module = profile_mod,
+    });
+    b.installArtifact(profile_exe);
+    const profile_cmd = b.addRunArtifact(profile_exe);
+    if (b.args) |args| profile_cmd.addArgs(args);
+    const profile_step = b.step("profile", "Print and gate a report.json from a run");
+    profile_step.dependOn(&profile_cmd.step);
+
     // ── Tests ───────────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run the engine core and ECS tests");
 
@@ -118,4 +147,13 @@ pub fn build(b: *std.Build) void {
 
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
+
+    // Render tests (M2): the batcher, the atlas packer and the Dawn binding
+    // layouts. They need the engine module (hence `core`), but NOT a window:
+    // they run headless, so the only native dependency is Dawn itself.
+    const render_tests = b.addTest(.{
+        .root_module = engine_mod,
+        .filters = &.{"render"},
+    });
+    test_step.dependOn(&b.addRunArtifact(render_tests).step);
 }

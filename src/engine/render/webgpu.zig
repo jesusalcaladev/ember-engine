@@ -15,12 +15,15 @@ pub const WGPUTextureView = *opaque {};
 pub const WGPUBuffer = *opaque {};
 pub const WGPUShaderModule = *opaque {};
 pub const WGPURenderPipeline = *opaque {};
+pub const WGPUComputePipeline = *opaque {};
 pub const WGPUBindGroup = *opaque {};
 pub const WGPUBindGroupLayout = *opaque {};
 pub const WGPUPipelineLayout = *opaque {};
 pub const WGPUCommandEncoder = *opaque {};
 pub const WGPUCommandBuffer = *opaque {};
 pub const WGPURenderPassEncoder = *opaque {};
+pub const WGPUComputePassEncoder = *opaque {};
+pub const WGPUQuerySet = *opaque {};
 
 // ── Scalars ──────────────────────────────────────────────────────────────────
 pub const Bool = c_uint;
@@ -30,6 +33,10 @@ pub const FALSE: Bool = 0;
 pub const TRUE: Bool = 1;
 
 // ── Enums (c_uint with the header's values) ──────────────────────────────────
+// Every value below is transcribed from the pinned webgpu-headers, NOT
+// guessed. This version of the spec puts an `Undefined = 1` slot in front of
+// most binding enums (TextureSampleType_Float = 2, not 1), so a plausible
+// guess is silently wrong and only shows up as a Dawn validation error.
 pub const SType_ShaderSourceWGSL: c_uint = 0x00000002;
 pub const SType_SurfaceSourceXlibWindow: c_uint = 0x00000006;
 pub const SType_SurfaceSourceWaylandSurface: c_uint = 0x00000007;
@@ -41,12 +48,20 @@ pub const PowerPreference_HighPerformance: c_uint = 2;
 pub const BackendType_Undefined: c_uint = 0;
 pub const CallbackMode_WaitAnyOnly: c_uint = 1;
 pub const CallbackStatus_Success: c_uint = 1;
-pub const TextureUsage_RenderAttachment: Flags = 0x10;
+pub const TextureUsage_CopySrc: Flags = 0x1;
 pub const TextureUsage_CopyDst: Flags = 0x2;
+pub const TextureUsage_TextureBinding: Flags = 0x4;
+pub const TextureUsage_StorageBinding: Flags = 0x8;
+pub const TextureUsage_RenderAttachment: Flags = 0x10;
 pub const VertexFormat_Float32x2: c_uint = 0x0000001D;
 pub const VertexFormat_Float32x4: c_uint = 0x0000001F;
+pub const VertexFormat_Unorm16x4: c_uint = 0x00000015;
+pub const VertexFormat_Unorm8x4: c_uint = 0x00000009;
+pub const VertexFormat_Uint32: c_uint = 0x00000020;
 pub const VertexStepMode_Vertex: c_uint = 1;
+pub const VertexStepMode_Instance: c_uint = 2;
 pub const PrimitiveTopology_TriangleList: c_uint = 4;
+pub const PrimitiveTopology_TriangleStrip: c_uint = 5;
 pub const CullMode_None: c_uint = 1;
 pub const FrontFace_CCW: c_uint = 1;
 pub const IndexFormat_Uint16: c_uint = 1;
@@ -54,15 +69,29 @@ pub const LoadOp_Clear: c_uint = 2;
 pub const StoreOp_Store: c_uint = 1;
 pub const TextureFormat_BGRA8Unorm: c_uint = 0x0000001B;
 pub const TextureFormat_BGRA8UnormSrgb: c_uint = 0x0000001C;
+pub const TextureFormat_RGBA8Unorm: c_uint = 0x00000016;
+pub const TextureFormat_RGBA8UnormSrgb: c_uint = 0x00000017;
+pub const TextureFormat_R8Unorm: c_uint = 0x00000001;
+pub const TextureFormat_Depth24PlusStencil8: c_uint = 0x0000002F;
+pub const TextureFormat_Depth32Float: c_uint = 0x00000030;
+pub const TextureFormat_Depth24Plus: c_uint = 0x0000002E;
 pub const PresentMode_Fifo: c_uint = 1;
+pub const PresentMode_FifoRelaxed: c_uint = 2;
+/// No vsync: needed to measure unthrottled CPU cost (vsync hides the work).
+pub const PresentMode_Immediate: c_uint = 3;
+pub const PresentMode_Mailbox: c_uint = 4;
 pub const CompositeAlphaMode_Auto: c_uint = 0;
 pub const ColorWriteMask_All: Flags = 0xF;
 pub const BufferUsage_Uniform: Flags = 0x40;
 pub const BufferUsage_Vertex: Flags = 0x20;
 pub const BufferUsage_Index: Flags = 0x10;
 pub const BufferUsage_CopyDst: Flags = 0x8;
+pub const BufferUsage_MapRead: Flags = 0x1;
+pub const BufferUsage_CopySrc: Flags = 0x4;
+pub const BufferUsage_QueryResolve: Flags = 0x200;
 pub const WaitStatus_Success: c_uint = 1;
 pub const MapMode_None: Flags = 0;
+pub const MapMode_Read: Flags = 0x1;
 pub const Status_Success: c_uint = 1;
 pub const SurfaceGetCurrentTextureStatus_SuccessOptimal: c_uint = 1;
 pub const SurfaceGetCurrentTextureStatus_SuccessSuboptimal: c_uint = 2;
@@ -72,6 +101,11 @@ pub const SurfaceGetCurrentTextureStatus_Lost: c_uint = 5;
 pub const SurfaceGetCurrentTextureStatus_Error: c_uint = 6;
 pub const RequestAdapterStatus_Success: c_uint = 1;
 pub const ErrorType_NoError: c_uint = 1;
+
+/// spec §4: "GPU timestamps per pass: mandatory in debug".
+pub const FeatureName_TimestampQuery: c_uint = 0x00000009;
+pub const QueryType_Timestamp: c_uint = 0x00000002;
+pub const MapAsyncStatus_Success: c_uint = 1;
 
 // ── Structs (EXACT header field order) ───────────────────────────────────────
 pub const ChainedStruct = extern struct {
@@ -84,6 +118,12 @@ pub const StringView = extern struct {
     length: usize = std.math.maxInt(usize), // WGPU_STRLEN
 
     pub fn from(s: [:0]const u8) StringView {
+        return .{ .data = s.ptr, .length = s.len };
+    }
+
+    /// From a non-sentinel-terminated slice (@embedFile results). The C API
+    /// takes (pointer, length), so no sentinel is actually required.
+    pub fn slice(s: []const u8) StringView {
         return .{ .data = s.ptr, .length = s.len };
     }
 };
@@ -232,8 +272,8 @@ pub const SurfaceConfiguration = extern struct {
 
 pub const SurfaceTexture = extern struct {
     nextInChain: ?*ChainedStruct = null,
-    texture: ?WGPUTexture,
-    status: c_uint,
+    texture: ?WGPUTexture = null,
+    status: c_uint = 0,
 };
 
 pub const ShaderSourceWGSL = extern struct {
@@ -254,6 +294,61 @@ pub const BufferDescriptor = extern struct {
     mappedAtCreation: Bool = FALSE,
 };
 
+pub const TextureDescriptor = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    label: StringView = .{},
+    usage: Flags,
+    dimension: c_uint = 2, // TextureDimension_2D
+    size: Extent3D,
+    // ORDER MATTERS: the header declares `format` BEFORE mipLevelCount and
+    // sampleCount. Getting this wrong made Dawn read the format as a sample
+    // count ("sample count (26) is not supported") and the sample count as a
+    // format, i.e. every texture silently invalid.
+    format: c_uint,
+    mipLevelCount: u32 = 1,
+    sampleCount: u32 = 1,
+    viewFormatCount: usize = 0,
+    viewFormats: ?*const c_uint = null,
+};
+
+pub const TextureDimension_1D: c_uint = 1;
+pub const TextureDimension_2D: c_uint = 2;
+pub const TextureDimension_3D: c_uint = 3;
+
+pub const SamplerDescriptor = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    label: StringView = .{},
+    addressModeU: c_uint = AddressMode_ClampToEdge,
+    addressModeV: c_uint = AddressMode_ClampToEdge,
+    addressModeW: c_uint = AddressMode_ClampToEdge,
+    magFilter: c_uint = FilterMode_Nearest,
+    minFilter: c_uint = FilterMode_Nearest,
+    mipmapFilter: c_uint = FilterMode_Nearest,
+    lodMinClamp: f32 = 0,
+    lodMaxClamp: f32 = 32,
+    compare: c_uint = 0,
+    maxAnisotropy: u16 = 1,
+};
+
+pub const WGPUSampler = *opaque {};
+
+pub const TexelCopyTextureInfo = extern struct {
+    texture: WGPUTexture,
+    mipLevel: u32 = 0,
+    origin: Origin3D = .{},
+    aspect: c_uint = 0, // TextureAspect_All = 0
+};
+
+/// NOTE: no `nextInChain` — the header declares offset/bytesPerRow/rowsPerImage
+/// only, so a leading pointer field here shifted every value by 8 bytes.
+pub const TexelCopyBufferLayout = extern struct {
+    offset: u64 = 0,
+    bytesPerRow: u32 = 0,
+    rowsPerImage: u32 = 0,
+};
+
+pub const TextureAspect_All: c_uint = 1;
+
 pub const VertexAttribute = extern struct {
     nextInChain: ?*ChainedStruct = null,
     format: c_uint,
@@ -269,30 +364,49 @@ pub const VertexBufferLayout = extern struct {
     attributes: [*]const VertexAttribute,
 };
 
+/// Mirrors WGPUBindGroupLayoutEntry EXACTLY, sub-struct included:
+///
+///     nextInChain, binding, visibility, bindingArraySize,
+///     buffer{nextInChain, type, hasDynamicOffset, minBindingSize},
+///     sampler{nextInChain, type},
+///     texture{nextInChain, sampleType, viewDimension, multisampled},
+///     storageTexture{nextInChain, access, format, viewDimension}
+///
+/// The sub-structs are FLATTENED here, so their size is part of this struct's
+/// stride. Inventing an extra field (a `sampler_count` that does not exist in
+/// the header) shifted the stride by 8 bytes, and Dawn then read entry N-1's
+/// tail as entry N's fields — which is how a layout with `bindingArraySize: 0`
+/// was rejected as "> 1".
 pub const BindGroupLayoutEntry = extern struct {
     nextInChain: ?*ChainedStruct = null,
-    binding: u32,
-    visibility: Flags,
+    binding: u32 = 0,
+    visibility: Flags = 0, // WGPUShaderStage = WGPUFlags = uint64_t
     bindingArraySize: u32 = 0,
-    // buffer: BufferBindingLayout { nextInChain, type, minBindingSize }
+
+    // WGPUBufferBindingLayout
     buffer_nextInChain: ?*ChainedStruct = null,
-    buffer_type: c_uint, // BufferBindingType_Uniform = 2
+    /// 0 = WGPUBufferBindingType_BindingNotUsed: what a texture-only or
+    /// sampler-only entry must carry.
+    buffer_type: c_uint = 0,
+    buffer_hasDynamicOffset: Bool = FALSE,
     buffer_minBindingSize: u64 = 0,
-    // sampler / texture / storageTexture: BindingNotUsed (0) by default
+
+    // WGPUSamplerBindingLayout (two fields only)
     sampler_nextInChain: ?*ChainedStruct = null,
     sampler_type: c_uint = 0,
-    sampler_count: u64 = 0,
+
+    // WGPUTextureBindingLayout
     texture_nextInChain: ?*ChainedStruct = null,
     texture_sampleType: c_uint = 0,
     texture_viewDimension: c_uint = 0,
     texture_multisampled: Bool = FALSE,
+
+    // WGPUStorageTextureBindingLayout
     storageTexture_nextInChain: ?*ChainedStruct = null,
     storageTexture_access: c_uint = 0,
     storageTexture_format: c_uint = 0,
     storageTexture_viewDimension: c_uint = 0,
 };
-
-pub const BufferBindingType_Uniform: c_uint = 2;
 
 pub const BindGroupLayoutDescriptor = extern struct {
     nextInChain: ?*ChainedStruct = null,
@@ -312,9 +426,12 @@ pub const PipelineLayoutDescriptor = extern struct {
 pub const BindGroupEntry = extern struct {
     nextInChain: ?*ChainedStruct = null,
     binding: u32,
-    buffer: ?WGPUBuffer,
-    offset: u64,
-    size: u64,
+    // Buffer fields default to "unused" so a texture/sampler entry can be
+    // written without naming them (the C header has no defaults either, but
+    // it is C: here every entry must be explicit or defaulted).
+    buffer: ?WGPUBuffer = null,
+    offset: u64 = 0,
+    size: u64 = 0,
     sampler: ?*anyopaque = null,
     textureView: ?WGPUTextureView = null,
 };
@@ -329,6 +446,44 @@ pub const BindGroupDescriptor = extern struct {
 
 pub const ShaderStage_Vertex: Flags = 0x1;
 pub const ShaderStage_Fragment: Flags = 0x2;
+pub const ShaderStage_Compute: Flags = 0x4;
+
+pub const BufferBindingType_Uniform: c_uint = 2;
+pub const BufferBindingType_Storage: c_uint = 3;
+pub const BufferBindingType_ReadOnlyStorage: c_uint = 4;
+
+pub const SamplerBindingType_Filtering: c_uint = 2;
+pub const SamplerBindingType_NonFiltering: c_uint = 3;
+pub const SamplerBindingType_Comparison: c_uint = 4;
+
+pub const TextureSampleType_Float: c_uint = 2;
+pub const TextureSampleType_UnfilterableFloat: c_uint = 3;
+pub const TextureSampleType_Depth: c_uint = 4;
+pub const TextureSampleType_Sint: c_uint = 5;
+pub const TextureSampleType_Uint: c_uint = 6;
+
+pub const TextureViewDimension_1D: c_uint = 1;
+pub const TextureViewDimension_2D: c_uint = 2;
+pub const TextureViewDimension_2DArray: c_uint = 3;
+pub const TextureViewDimension_Cube: c_uint = 4;
+pub const TextureViewDimension_CubeArray: c_uint = 5;
+pub const TextureViewDimension_3D: c_uint = 6;
+
+pub const FilterMode_Nearest: c_uint = 1;
+pub const FilterMode_Linear: c_uint = 2;
+
+pub const AddressMode_ClampToEdge: c_uint = 1;
+pub const AddressMode_Repeat: c_uint = 2;
+pub const AddressMode_MirrorRepeat: c_uint = 3;
+
+pub const CompareFunction_Never: c_uint = 1;
+pub const CompareFunction_Less: c_uint = 2;
+pub const CompareFunction_Equal: c_uint = 3;
+pub const CompareFunction_LessEqual: c_uint = 4;
+pub const CompareFunction_Greater: c_uint = 5;
+pub const CompareFunction_NotEqual: c_uint = 6;
+pub const CompareFunction_GreaterEqual: c_uint = 7;
+pub const CompareFunction_Always: c_uint = 8;
 
 pub const RenderPipelineDescriptor = extern struct {
     nextInChain: ?*ChainedStruct = null,
@@ -377,6 +532,83 @@ pub const ColorTargetState = extern struct {
     writeMask: Flags = ColorWriteMask_All,
 };
 
+pub const DepthStencilState = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    format: c_uint,
+    depthWriteEnabled: Bool = FALSE,
+    depthCompare: c_uint = CompareFunction_Always,
+    stencilFront: StencilFaceState = .{},
+    stencilBack: StencilFaceState = .{},
+    stencilReadMask: u32 = 0xFFFFFFFF,
+    stencilWriteMask: u32 = 0xFFFFFFFF,
+    depthBias: i32 = 0,
+    depthBiasSlopeScale: f32 = 0,
+    depthBiasClamp: f32 = 0,
+};
+
+pub const StencilFaceState = extern struct {
+    compare: c_uint = CompareFunction_Always,
+    failOp: c_uint = 1, // StencilOperation_Keep
+    depthFailOp: c_uint = 1,
+    passOp: c_uint = 1,
+};
+
+pub const MultisampleState = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    count: u32 = 1,
+    mask: u32 = 0xFFFFFFFF,
+    alphaToCoverageEnabled: Bool = FALSE,
+};
+
+/// WGPUBlendState has NO nextInChain: `color` is the first field. Adding one
+/// shifted the blend components by 8 bytes and Dawn read the operation as
+/// BlendOperation::Max.
+pub const BlendState = extern struct {
+    color: BlendComponent = .{},
+    alpha: BlendComponent = .{},
+};
+
+pub const BlendComponent = extern struct {
+    operation: c_uint = 1, // BlendOperation_Add
+    srcFactor: c_uint = 1, // BlendFactor_One
+    dstFactor: c_uint = 0, // BlendFactor_Zero
+};
+
+pub const BlendFactor_Zero: c_uint = 1;
+pub const BlendFactor_One: c_uint = 2;
+pub const BlendFactor_Src: c_uint = 3;
+pub const BlendFactor_OneMinusSrc: c_uint = 4;
+pub const BlendFactor_SrcAlpha: c_uint = 5;
+pub const BlendFactor_OneMinusSrcAlpha: c_uint = 6;
+pub const BlendFactor_Dst: c_uint = 7;
+pub const BlendFactor_OneMinusDst: c_uint = 8;
+pub const BlendFactor_DstAlpha: c_uint = 9;
+pub const BlendFactor_OneMinusDstAlpha: c_uint = 10;
+pub const BlendFactor_SrcAlphaSaturated: c_uint = 11;
+pub const BlendFactor_Constant: c_uint = 12;
+pub const BlendFactor_OneMinusConstant: c_uint = 13;
+
+pub const BlendOperation_Add: c_uint = 1;
+pub const BlendOperation_Subtract: c_uint = 2;
+pub const BlendOperation_ReverseSubtract: c_uint = 3;
+pub const BlendOperation_Min: c_uint = 4;
+pub const BlendOperation_Max: c_uint = 5;
+
+pub const ComputePipelineDescriptor = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    label: StringView = .{},
+    layout: ?WGPUPipelineLayout,
+    compute: ProgrammableStage = .{},
+};
+
+pub const ProgrammableStage = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    module: WGPUShaderModule,
+    entryPoint: StringView = .{},
+    constantCount: usize = 0,
+    constants: ?*const anyopaque = null,
+};
+
 pub const RenderPassColorAttachment = extern struct {
     nextInChain: ?*ChainedStruct = null,
     view: ?WGPUTextureView,
@@ -393,13 +625,51 @@ pub const RenderPassDescriptor = extern struct {
     colorAttachmentCount: usize,
     colorAttachments: [*]const RenderPassColorAttachment,
     depthStencilAttachment: ?*const anyopaque = null,
-    occlusionQuerySet: ?*anyopaque = null,
-    timestampWrites: ?*const anyopaque = null,
+    occlusionQuerySet: ?*WGPUQuerySet = null,
+    /// WGPUPassTimestampWrites chained here: per-pass GPU timestamps (§4).
+    timestampWrites: ?*const PassTimestampWrites = null,
 };
 
 pub const CommandEncoderDescriptor = extern struct {
     nextInChain: ?*ChainedStruct = null,
     label: StringView = .{},
+};
+
+/// Chained into a RenderPass/ComputePass descriptor to write the timestamps
+/// of a pass into a timestamp query set.
+pub const PassTimestampWrites = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    querySet: WGPUQuerySet,
+    beginningOfPassWriteIndex: u32 = 0xFFFFFFFF, // WGPU_QUERY_SET_INDEX_UNDEFINED
+    endOfPassWriteIndex: u32 = 0xFFFFFFFF,
+};
+
+pub const QuerySetDescriptor = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    label: StringView = .{},
+    type: c_uint, // WGPUQueryType
+    count: u32,
+};
+
+pub const ComputePassDescriptor = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    label: StringView = .{},
+    timestampWrites: ?*const PassTimestampWrites = null,
+};
+
+pub const BufferMapCallback = ?*const fn (
+    status: c_uint,
+    message: StringView,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+) callconv(.c) void;
+
+pub const BufferMapCallbackInfo = extern struct {
+    nextInChain: ?*ChainedStruct = null,
+    mode: c_uint,
+    callback: BufferMapCallback,
+    userdata1: ?*anyopaque = null,
+    userdata2: ?*anyopaque = null,
 };
 
 // ── Functions ────────────────────────────────────────────────────────────────
@@ -416,15 +686,55 @@ pub extern fn wgpuDeviceGetQueue(device: WGPUDevice) ?WGPUQueue;
 pub extern fn wgpuDeviceCreateCommandEncoder(device: WGPUDevice, descriptor: ?*const CommandEncoderDescriptor) ?WGPUCommandEncoder;
 pub extern fn wgpuDeviceCreateShaderModule(device: WGPUDevice, descriptor: *const ShaderModuleDescriptor) ?WGPUShaderModule;
 pub extern fn wgpuDeviceCreateBuffer(device: WGPUDevice, descriptor: *const BufferDescriptor) ?WGPUBuffer;
+pub extern fn wgpuDeviceCreateTexture(device: WGPUDevice, descriptor: *const TextureDescriptor) ?WGPUTexture;
+pub extern fn wgpuDeviceCreateSampler(device: WGPUDevice, descriptor: *const SamplerDescriptor) ?WGPUSampler;
 pub extern fn wgpuDeviceCreateBindGroupLayout(device: WGPUDevice, descriptor: *const BindGroupLayoutDescriptor) ?WGPUBindGroupLayout;
 pub extern fn wgpuDeviceCreatePipelineLayout(device: WGPUDevice, descriptor: *const PipelineLayoutDescriptor) ?WGPUPipelineLayout;
 pub extern fn wgpuDeviceCreateBindGroup(device: WGPUDevice, descriptor: *const BindGroupDescriptor) ?WGPUBindGroup;
 pub extern fn wgpuDeviceCreateRenderPipeline(device: WGPUDevice, descriptor: *const RenderPipelineDescriptor) ?WGPURenderPipeline;
+pub extern fn wgpuDeviceCreateComputePipeline(device: WGPUDevice, descriptor: *const ComputePipelineDescriptor) ?WGPUComputePipeline;
 pub extern fn wgpuDeviceRelease(device: WGPUDevice) void;
 
 pub extern fn wgpuQueueWriteBuffer(queue: WGPUQueue, buffer: WGPUBuffer, bufferOffset: u64, data: *const anyopaque, size: usize) void;
+pub extern fn wgpuQueueWriteTexture(queue: WGPUQueue, destination: *const TexelCopyTextureInfo, data: *const anyopaque, dataSize: usize, dataLayout: *const TexelCopyBufferLayout, writeSize: *const Extent3D) void;
 pub extern fn wgpuQueueSubmit(queue: WGPUQueue, commandCount: usize, commands: [*]const WGPUCommandBuffer) void;
 pub extern fn wgpuQueueRelease(queue: WGPUQueue) void;
+
+// ── Timestamps, queries and readback (spec §4) ──────────────────────────────
+pub extern fn wgpuAdapterHasFeature(adapter: WGPUAdapter, feature: c_uint) Bool;
+pub extern fn wgpuDeviceHasFeature(device: WGPUDevice, feature: c_uint) Bool;
+pub extern fn wgpuDeviceCreateQuerySet(device: WGPUDevice, descriptor: *const QuerySetDescriptor) ?WGPUQuerySet;
+pub extern fn wgpuQuerySetRelease(query_set: WGPUQuerySet) void;
+pub extern fn wgpuCommandEncoderWriteTimestamp(encoder: WGPUCommandEncoder, query_set: WGPUQuerySet, query_index: u32) void;
+pub extern fn wgpuCommandEncoderResolveQuerySet(
+    encoder: WGPUCommandEncoder,
+    query_set: WGPUQuerySet,
+    first_query: u32,
+    query_count: u32,
+    destination: WGPUBuffer,
+    destination_offset: u64,
+) void;
+pub extern fn wgpuCommandEncoderCopyBufferToBuffer(
+    encoder: WGPUCommandEncoder,
+    source: WGPUBuffer,
+    source_offset: u64,
+    destination: WGPUBuffer,
+    destination_offset: u64,
+    size: u64,
+) void;
+pub extern fn wgpuBufferMapAsync(
+    buffer: WGPUBuffer,
+    mode: Flags,
+    offset: usize,
+    size: usize,
+    callback_info: BufferMapCallbackInfo,
+) Future;
+pub extern fn wgpuBufferGetMappedRange(buffer: WGPUBuffer, offset: usize, size: usize) ?*anyopaque;
+/// Read-only access to a mapping created with MapMode_Read: the WRITABLE
+/// wgpuBufferGetMappedRange returns null for read maps (and logs "Mapping is
+/// read-only"), which silently disabled every GPU measurement until now.
+pub extern fn wgpuBufferGetConstMappedRange(buffer: WGPUBuffer, offset: usize, size: usize) ?*const anyopaque;
+pub extern fn wgpuBufferUnmap(buffer: WGPUBuffer) void;
 
 pub const SurfaceCapabilities = extern struct {
     nextInChain: ?*ChainedStruct = null,
@@ -446,10 +756,10 @@ pub extern fn wgpuSurfaceUnconfigure(surface: WGPUSurface) void;
 pub extern fn wgpuSurfaceRelease(surface: WGPUSurface) void;
 
 pub extern fn wgpuTextureCreateView(texture: WGPUTexture, descriptor: ?*const anyopaque) ?WGPUTextureView;
-pub extern fn wgpuTextureRelease(texture: WGPUTexture) void;
 pub extern fn wgpuTextureGetFormat(texture: WGPUTexture) c_uint;
 
 pub extern fn wgpuCommandEncoderBeginRenderPass(encoder: WGPUCommandEncoder, descriptor: *const RenderPassDescriptor) ?WGPURenderPassEncoder;
+pub extern fn wgpuCommandEncoderBeginComputePass(encoder: WGPUCommandEncoder, descriptor: *const ComputePassDescriptor) ?WGPUComputePassEncoder;
 pub extern fn wgpuCommandEncoderFinish(encoder: WGPUCommandEncoder, descriptor: ?*const anyopaque) ?WGPUCommandBuffer;
 pub extern fn wgpuCommandEncoderRelease(encoder: WGPUCommandEncoder) void;
 
@@ -458,10 +768,18 @@ pub extern fn wgpuRenderPassEncoderSetBindGroup(encoder: WGPURenderPassEncoder, 
 pub extern fn wgpuRenderPassEncoderSetVertexBuffer(encoder: WGPURenderPassEncoder, slot: u32, buffer: ?WGPUBuffer, offset: u64, size: u64) void;
 pub extern fn wgpuRenderPassEncoderSetIndexBuffer(encoder: WGPURenderPassEncoder, buffer: ?WGPUBuffer, format: c_uint, offset: u64, size: u64) void;
 pub extern fn wgpuRenderPassEncoderDrawIndexed(encoder: WGPURenderPassEncoder, indexCount: u32, instanceCount: u32, firstIndex: u32, baseVertex: i32, firstInstance: u32) void;
+pub extern fn wgpuRenderPassEncoderDraw(encoder: WGPURenderPassEncoder, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) void;
 pub extern fn wgpuRenderPassEncoderEnd(encoder: WGPURenderPassEncoder) void;
 pub extern fn wgpuRenderPassEncoderRelease(encoder: WGPURenderPassEncoder) void;
 
+pub extern fn wgpuComputePassEncoderSetPipeline(encoder: WGPUComputePassEncoder, pipeline: WGPUComputePipeline) void;
+pub extern fn wgpuComputePassEncoderSetBindGroup(encoder: WGPUComputePassEncoder, groupIndex: u32, group: ?WGPUBindGroup, dynamicOffsetCount: usize, dynamicOffsets: ?*const u32) void;
+pub extern fn wgpuComputePassEncoderDispatchWorkgroups(encoder: WGPUComputePassEncoder, x: u32, y: u32, z: u32) void;
+pub extern fn wgpuComputePassEncoderEnd(encoder: WGPUComputePassEncoder) void;
+pub extern fn wgpuComputePassEncoderRelease(encoder: WGPUComputePassEncoder) void;
+
 pub extern fn wgpuRenderPipelineRelease(pipeline: WGPURenderPipeline) void;
+pub extern fn wgpuComputePipelineRelease(pipeline: WGPUComputePipeline) void;
 pub extern fn wgpuBindGroupRelease(group: WGPUBindGroup) void;
 pub extern fn wgpuBindGroupLayoutRelease(layout: WGPUBindGroupLayout) void;
 pub extern fn wgpuPipelineLayoutRelease(layout: WGPUPipelineLayout) void;
@@ -469,3 +787,5 @@ pub extern fn wgpuShaderModuleRelease(module: WGPUShaderModule) void;
 pub extern fn wgpuBufferRelease(buffer: WGPUBuffer) void;
 pub extern fn wgpuCommandBufferRelease(buffer: WGPUCommandBuffer) void;
 pub extern fn wgpuTextureViewRelease(view: WGPUTextureView) void;
+pub extern fn wgpuTextureRelease(texture: WGPUTexture) void;
+pub extern fn wgpuSamplerRelease(sampler: WGPUSampler) void;

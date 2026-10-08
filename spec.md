@@ -18,7 +18,7 @@ All numbers are measured there. On superior hardware they may only improve; on i
 |---|---|
 | Lua behaviors (10k updates) | 2.0 ms |
 | Physics (fixed 60 Hz step + interpolation) | 2.0 ms |
-| Render CPU (encoding 50k sprites) | 1.5 ms |
+| Render CPU (encoding 50k sprites) | 1.5 ms — **M2: 0.54 ms measured** (instanced, 32 B/sprite, no per-frame sort) |
 | ECS: 100k transform updates over SoA queries | 2.0 ms |
 | ECS: parent-chain resolution (10k entities) | 2.0 ms |
 | Signals + framework | 0.8 ms |
@@ -38,10 +38,12 @@ All numbers are measured there. On superior hardware they may only improve; on i
 
 ## 4. GPU
 - **Draw calls ≤ 32** in a typical frame (batching per material/atlas); ≤ 64 with lights + GI (compute passes count).
+  *M2 measured: 4 for the 50k-sprite canonical scene (1 sprite pass + 3 SMAA passes).*
 - **GPU frame ≤ 6 ms @ 1080p** on the reference iGPU, canonical scene (50k sprites + 20 lights + GI).
 - **Radiance Cascades (GI)**: amortized update ≤ 1.5 ms GPU/frame; full bake only at load/light editing, asynchronous.
 - Occluder SDFs: baked at import; incremental async re-bake.
 - Persistent buffers with suballocation (ring); staging uploads ≤ 2 MB/frame in steady state (outside loading screens).
+  *This is why sprites are INSTANCED at 32 B each and not 6 vertices x 36 B: the vertex form needs 10.8 MB/frame at 50k sprites, the instance form 1.6 MB. M2 measured: 1 600 096 B/frame.*
 - GPU timestamps per pass: mandatory in debug, opt-in in release.
 
 ## 5. RAM (memory)

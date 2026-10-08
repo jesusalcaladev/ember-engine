@@ -10,6 +10,9 @@ pub const core = @import("core");
 pub const ecs = @import("ecs");
 pub const platform = @import("platform/platform.zig");
 pub const render = @import("render/render.zig");
+/// M2: CPU sprite batcher (order + draw-call grouping) and the atlas packer.
+pub const batcher = @import("render/batcher.zig");
+pub const atlas = @import("render/atlas.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
