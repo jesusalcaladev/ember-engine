@@ -13,6 +13,8 @@ pub const render = @import("render/render.zig");
 /// M2: CPU sprite batcher (order + draw-call grouping) and the atlas packer.
 pub const batcher = @import("render/batcher.zig");
 pub const atlas = @import("render/atlas.zig");
+/// M2/M3: the ECS-driven render system (Actors -> GPU instances).
+pub const render2d = @import("render/2d.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

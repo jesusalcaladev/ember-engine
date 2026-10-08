@@ -481,7 +481,21 @@ pub const World = struct {
             // The archetype was derived from this very tuple: it must have it.
             const col = arch.findColumn(id).?;
             arch.cellPtr(T, col, row).* = value;
+            // A component that interpolates needs its "previous" snapshot
+            // seeded from the live value, or the very first frame renders the
+            // entity at the ORIGIN and it slides in from there (the previous
+            // snapshot of a fresh Transform is (0,0,0,1) by default).
+            if (comptime hasPreviousState(T)) {
+                arch.cellPtr(T, col, row).capturePrevious();
+            }
         }
+    }
+
+    /// True for components whose `prev_*` snapshot must be seeded on creation.
+    /// Kept as an explicit list rather than duck typing so adding a component
+    /// with a different convention is a deliberate, reviewable line.
+    fn hasPreviousState(comptime T: type) bool {
+        return T == components.Transform;
     }
 
     /// Archetype for a key, creating it if this is the first time the world

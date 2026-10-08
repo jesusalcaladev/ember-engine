@@ -118,6 +118,45 @@ pub const Velocity = struct {
     angular: f32 = 0,
 };
 
+/// How a sprite is composited. Plain enum, so the ECS stores it as 1 byte and
+/// `.zson` writes the name.
+pub const Blend = enum(u8) {
+    /// No blending: the fragment overwrites the target. Cheapest, and the only
+    /// correct choice for solid geometry (it can also use early-Z).
+    /// Named `solid`, not `opaque`: that is a Zig primitive type name.
+    solid = 0,
+    /// Standard source-over: the painter's algorithm for sprites.
+    alpha = 1,
+    /// Source + destination: lights and glows (M7).
+    additive = 2,
+};
+
+/// What to draw for an entity, and how. This is the whole render surface of an
+/// actor: position comes from `Transform`, the appearance from here.
+///
+/// Everything is plain data with defaults, which is what lets `.zson` describe
+/// a sprite prefab and lets the editor override a single field (patch mode).
+pub const Sprite = struct {
+    /// Atlas slot (index into the renderer's texture table). Slot 0 is the
+    /// fallback white texture, so a sprite with no atlas still draws.
+    atlas: u8 = 0,
+    /// Render layer. Lower draws first (painter's order); the renderer sorts by
+    /// it and the batcher groups equal values into one draw call.
+    layer: u16 = 0,
+    /// Size in world units (the Transform's scale multiplies this).
+    size: Vec2 = unit,
+    /// Atlas rect, normalized: (u0, v0, u1, v1).
+    uv: [4]f32 = .{ 0, 0, 1, 1 },
+    /// Tint, multiplied with the texel.
+    tint: [4]f32 = .{ 1, 1, 1, 1 },
+    /// Stable tie-break inside a layer, so the order is deterministic (spec §6).
+    order: i32 = 0,
+    blend: Blend = .alpha,
+    /// Draw nothing for this entity without despawning it (editor gizmos, cut
+    /// scenes). Cheaper and safer than a structural change during the frame.
+    visible: bool = true,
+};
+
 const unit = Vec2{ .x = 1, .y = 1 };
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -154,6 +193,7 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "Transform", .type = Transform },
     .{ .name = "Parent", .type = Parent },
     .{ .name = "Velocity", .type = Velocity },
+    .{ .name = "Sprite", .type = Sprite },
 };
 
 comptime {
@@ -283,7 +323,22 @@ test "component ids resolved at comptime" {
     try std.testing.expectEqual(@as(ComponentId, 1), componentId(Transform));
     try std.testing.expectEqual(@as(ComponentId, 2), componentId(Parent));
     try std.testing.expectEqual(@as(ComponentId, 3), componentId(Velocity));
+    try std.testing.expectEqual(@as(ComponentId, 4), componentId(Sprite));
     try std.testing.expectEqual(@as(?ComponentId, null), idOfName("Nope"));
+}
+
+test "Sprite is POD with sane defaults (the .zson baseline)" {
+    const s = Sprite{};
+    try std.testing.expectEqual(@as(u8, 0), s.atlas);
+    try std.testing.expectEqual(@as(u16, 0), s.layer);
+    try std.testing.expectEqual(@as(f32, 1), s.size.x);
+    try std.testing.expectEqual(@as(f32, 1), s.uv[2]);
+    try std.testing.expectEqual(Blend.alpha, s.blend);
+    try std.testing.expect(s.visible);
+    // Kept small on purpose: the 50k canonical scene multiplies this by 50000,
+    // so 52 B/sprite is 2.6 MB of column data (spec §5 allows it, but it is
+    // pure cache pressure in the render walk).
+    try std.testing.expectEqual(@as(usize, 52), @sizeOf(Sprite));
 }
 
 test "component sizes are what they must be" {
@@ -333,4 +388,26 @@ test "default baseline bytes match a default value" {
     writeDefault(componentId(Transform), &buf);
     const restored: *const Transform = @ptrCast(&buf);
     try std.testing.expectApproxEqAbs(@as(f32, 1), restored.scale.x, 0.0001);
+}
+
+test "a fresh Transform interpolates to its spawn position, not to the origin" {
+    // Without seeding prev_* from the live fields, `interpolated(0)` returns
+    // the (0,0) default and every actor visibly slides in from the top-left
+    // corner on the first frame. The world seeds it at spawn time.
+    const spawned = Transform{
+        .position = .{ .x = 120, .y = -45 },
+        .rotation = 1.5,
+        .scale = .{ .x = 3, .y = 4 },
+    };
+    var seeded = spawned;
+    seeded.capturePrevious();
+
+    const at_zero = seeded.interpolated(0);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), at_zero.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -45), at_zero.position.y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), at_zero.rotation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), at_zero.scale.x, 0.0001);
+
+    const at_one = seeded.interpolated(1);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), at_one.position.x, 0.0001);
 }

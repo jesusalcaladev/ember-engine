@@ -1,27 +1,26 @@
-//! `ember` runtime M2: window + fixed loop + batched 2D sprites.
+//! `ember` runtime M2: window + fixed loop + ECS-driven batched 2D sprites.
 //!
 //! Pipeline (ROADMAP M2, and the frame spec §7 demands):
-//!   ECS sim (60 Hz, interpolated) → batcher (sort + draw-call grouping)
-//!   → scene pass into the OFFSCREEN target → SMAA 1x → swapchain.
+//!   ECS sim (60 Hz, interpolated) → render2d system → offscreen target → SMAA 1x → swapchain.
 //!
 //! The game ALWAYS renders to an offscreen target: the editor composes it into
 //! the viewport panel in M5 (one process, one window — spec §7).
 //!
 //! Usage:
-//!   ember [--frames N] [--headless] [--vsync on|off] [--max-fps N]
-//!         [--smaa on|off] [--sprites N] [--warmup N] [--sort none|ftb|btf]
-//!
-//!   --max-fps N   Godot-style frame-rate cap (0 = uncapped). 30 halves the
-//!                 light/GI GPU cost of Pin-Pon while the sim stays at 60 Hz.
+//!   ember [--frames N] [--headless] [--vsync on|off] [--smaa on|off]
+//!         [--max-fps N] [--sprites N] [--warmup N] [--sort none|layer|ftb|btf]
 
 const std = @import("std");
 const engine = @import("engine");
 const core = engine.core;
 const platform = engine.platform;
 const render = engine.render;
+const render2d = engine.render2d;
 const batcher_mod = engine.batcher;
 const backend_null = engine.render.backend_null;
 const backend_dawn = engine.render.backend_dawn;
+const ecs = engine.ecs;
+const components = ecs.components;
 
 const fixed_dt: f32 = 1.0 / 60.0;
 const rotation_speed: f32 = 1.5; // rad/s
@@ -31,23 +30,16 @@ const Args = struct {
     headless: bool = false,
     vsync: bool = true,
     warmup: u64 = 30,
-    /// Godot-style `application/run/max_fps`: 0 = uncapped (profiler default).
     max_fps: u32 = 0,
     smaa: bool = true,
-    /// Sprite count of the canonical scene (the 50k acceptance scene).
     sprites: u32 = 50_000,
-    /// `none` (default) emits straight into the GPU instance buffer: the
-    /// minimum CPU work that can produce the frame. The batcher path (with its
-    /// counting sort and, opt-in, the O(n log n) area sorts) is exercised by
-    /// the acceptance benchmark and by `--sort layer|ftb|btf`.
     sort: batcher_mod.SortMode = .none,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) Args {
     var args = Args{};
-    // Allocator-free iterator on posix (Args.Iterator.init).
     var it = std.process.Args.Iterator.init(init.args);
-    _ = it.next(); // program name
+    _ = it.next();
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--frames")) {
             if (it.next()) |n| args.frames = std.fmt.parseInt(u64, n, 10) catch 0;
@@ -73,8 +65,8 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
 fn parseSort(v: []const u8) batcher_mod.SortMode {
     if (std.mem.eql(u8, v, "ftb")) return .front_to_back;
     if (std.mem.eql(u8, v, "btf")) return .back_to_front;
-    if (std.mem.eql(u8, v, "none")) return .none;
-    return .by_layer;
+    if (std.mem.eql(u8, v, "layer")) return .by_layer;
+    return .none;
 }
 
 fn onOff(value: []const u8, default: bool) bool {
@@ -84,99 +76,6 @@ fn onOff(value: []const u8, default: bool) bool {
     if (std.mem.startsWith(u8, value, "no")) return false;
     return true;
 }
-
-/// The canonical M2 scene: `count` sprites on a grid, rotating in sync.
-/// Replaces the M0 single quad: it is what the "50k sprites in <= 4 draw
-/// calls" acceptance criterion is measured against.
-const Scene = struct {
-    count: u32,
-    cols: u32,
-    cell: f32,
-    angle: f32,
-    prev_angle: f32,
-
-    fn init(count: u32, viewport_w: f32, viewport_h: f32) Scene {
-        const cols: u32 = @max(1, @as(u32, @intFromFloat(@sqrt(@as(f32, @floatFromInt(count))))));
-        const rows: u32 = @max(1, (count + cols - 1) / cols);
-        const cell_w = viewport_w / @as(f32, @floatFromInt(cols));
-        const cell_h = viewport_h / @as(f32, @floatFromInt(rows));
-        return .{
-            .count = count,
-            .cols = cols,
-            .cell = @min(cell_w, cell_h),
-            .angle = 0,
-            .prev_angle = 0,
-        };
-    }
-
-    fn fixedUpdate(self: *Scene, dt: f32) void {
-        self.prev_angle = self.angle;
-        self.angle += rotation_speed * dt;
-    }
-
-    /// Emits the whole scene.
-    ///
-    /// `sink` is comptime-generic so the unsorted path writes GPU instances
-    /// DIRECTLY: no 48-byte command array is built at all, which removes 2.4 MB
-    /// of writes and 2.4 MB of reads per frame at 50k sprites (measured: the
-    /// intermediate array cost ~2 ms of the batch phase). When a sort IS
-    /// requested the sink is the batcher, which owns the commands.
-    ///
-    /// The loop is a nested row/column walk, not `i / cols`: u32 division is
-    /// ~25 cycles and at 50k sprites it was ~1 ms of pure division.
-    fn emit(self: *const Scene, sink: anytype, alpha: f32) void {
-        _ = alpha; // rotation of the whole grid lands with the transform system
-        const rows: u32 = (self.count + self.cols - 1) / self.cols;
-        const half = self.cell * 0.35;
-        const origin_x = -@as(f32, @floatFromInt(self.cols)) * 0.5 * self.cell;
-        const origin_y = -@as(f32, @floatFromInt(rows)) * 0.5 * self.cell;
-        const full_uv = [4]f32{ 0, 0, 1, 1 };
-        const uv16: [4]u16 = .{ 0, 0, 65535, 65535 };
-        var out_i: usize = 0;
-
-        var row: u32 = 0;
-        while (row < rows) : (row += 1) {
-            const y = origin_y + @as(f32, @floatFromInt(row)) * self.cell;
-            // Grouped by layer the way a real scene renderer emits it (one pass
-            // per layer): rows map to layers, so the order is layer-monotonic
-            // and the batcher takes its fast path.
-            const layer: u16 = @intCast(row / 32);
-            var col: u32 = 0;
-            while (col < self.cols) : (col += 1) {
-                const idx = row * self.cols + col;
-                if (idx >= self.count) break;
-                const x = origin_x + @as(f32, @floatFromInt(col)) * self.cell;
-                // Tint cycles through the palette so SMAA has real edges to
-                // detect on both bright and dark neighbours.
-                const h = @as(f32, @floatFromInt(idx % 16)) / 16.0;
-                const tint = [4]f32{ 0.25 + 0.75 * h, 0.5, 1.0 - 0.75 * h, 1.0 };
-
-                if (@TypeOf(sink) == *batcher_mod.Batcher) {
-                    _ = sink.push(batcher_mod.SpriteCommand.make(
-                        x, y, half, half, full_uv, tint, layer, 0, .alpha,
-                    ));
-                } else {
-                    if (out_i >= sink.len) break;
-                    sink[out_i] = .{
-                        .pos = .{ x, y },
-                        .half = .{ half, half },
-                        // Full UV rect of the fallback white texture. Constant
-                        // per scene, so the packing is done once, not per sprite.
-                        .uv = uv16,
-                        .color = .{
-                            render.toUnorm8(tint[0]),
-                            render.toUnorm8(tint[1]),
-                            render.toUnorm8(tint[2]),
-                            render.toUnorm8(tint[3]),
-                        },
-                        .slot = 0,
-                    };
-                    out_i += 1;
-                }
-            }
-        }
-    }
-};
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(init);
@@ -233,24 +132,58 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const view_h: u32 = if (has_window) window.fb_height else 720;
     var target = renderer.createOffscreenTarget(view_w, view_h);
 
-    // ── M2: batcher. Reserved for the whole scene ONCE, then locked: the
-    // frame loop can never allocate (spec §3.1).
-    var batcher = batcher_mod.Batcher.init(boot_alloc);
-    defer batcher.deinit();
-    try batcher.reserve(args.sprites);
-    batcher.lock();
+    // ── ECS World: the source of truth for the scene.
+    var world = ecs.World.init(boot_alloc);
+    defer world.deinit();
+    try world.reserveEntities(args.sprites);
+    try world.reserve(.{ components.Transform, components.Sprite }, args.sprites);
+    try world.enableHierarchy();
 
-    // CPU-side vertex expansion buffer: 6 vertices per sprite, reused every
-    // frame (no per-frame allocation, spec §3.1).
-    // The GPU instance buffer is capped at 65536 sprites (2 MB, spec §4). The
-    // scene asks for the 50k acceptance number, and the batcher drops
-    // anything beyond the reservation instead of allocating in the frame.
+    // Spawn the canonical scene: a grid of sprites, one per cell.
+    // This replaces the old Scene struct: entities are Actors with Transform+Sprite.
     const capped_sprites: u32 = @min(args.sprites, 65_536);
-    const instance_cap: usize = capped_sprites;
-    const instances = try boot_alloc.alloc(render.SpriteInstance, instance_cap);
-    defer boot_alloc.free(instances);
+    const rows: u32 = @max(1, (capped_sprites + 1) / 2); // ~square grid
+    const cols: u32 = @max(1, (capped_sprites + rows - 1) / rows);
+    const cell_w: f32 = @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(cols));
+    const cell_h: f32 = @as(f32, @floatFromInt(view_h)) / @as(f32, @floatFromInt(rows));
+    const cell = @min(cell_w, cell_h);
 
-    var scene = Scene.init(args.sprites, @floatFromInt(view_w), @floatFromInt(view_h));
+    var i: u32 = 0;
+    var row: u32 = 0;
+    while (row < capped_sprites / cols + 1) : (row += 1) {
+        var col: u32 = 0;
+        while (col < cols) : (col += 1) {
+            if (i >= capped_sprites) break;
+            const x = (@as(f32, @floatFromInt(col)) - @as(f32, @floatFromInt(cols)) * 0.5) * cell;
+            const y = (@as(f32, @floatFromInt(row)) - @as(f32, @floatFromInt(capped_sprites / cols + 1)) * 0.5) * cell;
+            const half = cell * 0.35;
+            const h = @as(f32, @floatFromInt(i % 16)) / 16.0;
+            const tint = [4]f32{ 0.25 + 0.75 * h, 0.5, 1.0 - 0.75 * h, 1.0 };
+
+            _ = try world.spawn(.{
+                components.Transform{
+                    .position = .{ .x = x, .y = y },
+                    .scale = .{ .x = 1.0, .y = 1.0 },
+                },
+                components.Sprite{
+                    .size = .{ .x = half * 2.0, .y = half * 2.0 },
+                    .uv = .{ 0, 0, 1, 1 },
+                    .tint = tint,
+                    .layer = @as(u16, @intCast(row)), // grouped by row so the scene is layer-monotonic
+                    .blend = components.Blend.alpha,
+                    .visible = true,
+                },
+            });
+            i += 1;
+        }
+    }
+
+    // ── M2: render2d system (ECS → GPU instances)
+    var r2d = render2d.Renderer2D.init(boot_alloc);
+    defer r2d.deinit();
+    try r2d.reserve(args.sprites);
+    r2d.options.sort = args.sort;
+    r2d.lock();
 
     core.log.info("ember M2 — {s}, {d}x{d}, backend: {s}, sprites: {d}, smaa: {s}, max-fps: {d}", .{
         if (args.headless) "headless" else "window",
@@ -267,7 +200,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_ns = core.time.monotonicNs();
     var frame_count: u64 = 0;
     var draw_calls_max: u32 = 0;
-    var last_instances: usize = 0;
 
     while (true) {
         // ── Frame limiter (Godot-style). Runs BEFORE the frame so the pacing
@@ -283,11 +215,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (window.resized or target.width != fb.w or target.height != fb.h) {
                 window.resized = false;
                 renderer.resize(fb.w, fb.h);
-                // `createOffscreenTarget` is the single owner: it also releases
-                // the previous target, so the runtime never destroys it (doing
-                // both was a use-after-free on the GPU objects).
                 target = renderer.createOffscreenTarget(fb.w, fb.h);
-                scene = Scene.init(args.sprites, @floatFromInt(fb.w), @floatFromInt(fb.h));
             }
         }
 
@@ -295,7 +223,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var z = prof.zone("frame_total");
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
-        batcher.beginFrame();
 
         // Input
         var z_input = prof.zone("input");
@@ -313,46 +240,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var z_sim = prof.zone("fixed_update");
         const steps = loop.addTime(real_dt);
         var s: u32 = 0;
-        while (s < steps) : (s += 1) scene.fixedUpdate(fixed_dt);
+        while (s < steps) : (s += 1) {
+            // Physics integration will go here in M4. For M2/M3: nothing.
+        }
         z_sim.end();
 
-        // ── M2: emit + batch. The CPU expands each sprite into 6 world-space
-        // corners and groups the draws (spec §4: <= 32 draw calls).
+        // ── M2: ECS → GPU instances via render2d.
         var z_batch = prof.zone("batch");
-        var icount: usize = 0;
-        if (args.sort == .none) {
-            // FAST PATH: emit straight into the GPU instance buffer. No command
-            // array, no sort, no second pass — the minimum work that can
-            // possibly produce the frame (spec §2: 1.5 ms for 50k sprites).
-            var z_emit = prof.zone("batch_emit");
-            scene.emit(instances[0..], loop.alpha());
-            z_emit.end();
-            icount = @min(scene.count, instance_cap);
-        } else {
-            var z_emit = prof.zone("batch_emit");
-            scene.emit(&batcher, loop.alpha());
-            z_emit.end();
-            var z_sort = prof.zone("batch_sort");
-            batcher.buildBatches(args.sort);
-            z_sort.end();
-            var z_pack = prof.zone("batch_pack");
-            if (batcher.isAlreadyOrdered()) {
-                const n = @min(batcher.cmds.items.len, instance_cap);
-                for (batcher.cmds.items[0..n]) |cmd| {
-                    instances[icount] = packInstance(cmd);
-                    icount += 1;
-                }
-            } else {
-                for (batcher.batches.items) |batch| {
-                    for (batcher.order.items[batch.first .. batch.first + batch.count]) |idx| {
-                        if (icount >= instance_cap) break;
-                        instances[icount] = packInstance(batcher.cmds.items[idx]);
-                        icount += 1;
-                    }
-                }
-            }
-            z_pack.end();
-        }
+        r2d.collect(&world, loop.alpha());
         z_batch.end();
 
         // ── M2: render into the offscreen target, SMAA, compose to swapchain.
@@ -367,21 +262,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const fb = window.framebufferSize();
             const cam = render.makeCamera(@floatFromInt(fb.w), @floatFromInt(fb.h));
             renderer.beginScene(target, cam);
-            if (icount > 0) renderer.drawSprites(instances[0..icount], icount);
+            r2d.submit(renderer);
             renderer.endScene(args.smaa, .Medium);
         } else {
             // Headless: still exercise the whole M2 path against the null
             // backend so CI measures draw calls and batching for real.
             const cam = render.makeCamera(@floatFromInt(view_w), @floatFromInt(view_h));
             renderer.beginScene(target, cam);
-            if (icount > 0) renderer.drawSprites(instances[0..icount], icount);
+            r2d.submit(renderer);
             renderer.endScene(args.smaa, .Medium);
         }
         renderer.present();
         z_render.end();
 
         const st = renderer.stats();
-        last_instances = icount;
         if (st.draw_calls > draw_calls_max) draw_calls_max = @intCast(st.draw_calls);
 
         frame_arena.endFrame();
@@ -397,58 +291,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // ── Acceptance report (M2)
     const st = renderer.stats();
     core.log.info("frames rendered: {d}", .{frame_count});
-    core.log.info("scene: {d} instances, sort: {s}, batcher path: {s}", .{
-        last_instances,
-        @tagName(args.sort),
-        if (args.sort == .none) "bypassed (direct emit)" else "used",
-    });
-    core.log.info("renderer: {d} draw calls (max {d} in the run, budget 32), {d} passes, {d} gpu objects created in frame (budget 0)", .{
-        st.draw_calls,
+    core.log.info("batcher: {d} sprites -> {d} draw calls this frame (max {d} in the run), budget 32", .{
+        0, // TODO: expose from r2d
         draw_calls_max,
+        draw_calls_max,
+    });
+    core.log.info("renderer: {d} draw calls, {d} passes, {d} gpu objects created in frame (budget 0)", .{
+        st.draw_calls,
         st.render_passes,
         st.resources_created_frame,
     });
     core.log.info("gpu upload: {d} B/frame (budget 2097152, spec §4)", .{st.upload_bytes});
-    if (batcher.overflowed) {
-        core.log.warn("batcher OVERFLOW: {d} sprites dropped — reserve more at boot", .{batcher.dropped});
-    }
     if (st.upload_bytes > 2 * 1024 * 1024) {
         core.log.warn("staging upload {d} B/frame exceeds the spec §4 ceiling (2 MB)", .{st.upload_bytes});
-    }
-    if (limiter.effectiveFps() != 0) {
-        core.log.info("frame limiter: cap {d} fps, slept {d} frames, {d} ms total", .{
-            limiter.effectiveFps(),
-            limiter.slept_frames,
-            limiter.total_wait_ns / std.time.ns_per_ms,
-        });
     }
     prof.report("== PERF (frames) ==");
     core.log.info("mem: frame arena high-water: {d} bytes", .{frame_arena.high_water});
     core.log.info("allocs boot: {d} frees: {d} peak: {d} bytes", .{
         tracker.count_allocs, tracker.count_frees, tracker.peak_live_bytes,
     });
-}
-
-/// Packs one sprite command into its 32-byte GPU instance record. This is the
-/// only per-sprite CPU work in the frame (the corners are derived in the
-/// vertex shader), which is what keeps 50k sprites inside the 1.5 ms budget
-/// of spec §2.
-fn packInstance(cmd: batcher_mod.SpriteCommand) render.SpriteInstance {
-    return .{
-        .pos = .{ cmd.x, cmd.y },
-        .half = .{ cmd.half_w, cmd.half_h },
-        .uv = .{
-            render.toUnorm16(cmd.u0),
-            render.toUnorm16(cmd.v0),
-            render.toUnorm16(cmd.u1),
-            render.toUnorm16(cmd.v1),
-        },
-        .color = .{
-            render.toUnorm8(cmd.r),
-            render.toUnorm8(cmd.g),
-            render.toUnorm8(cmd.b),
-            render.toUnorm8(cmd.a),
-        },
-        .slot = cmd.textureSlot(),
-    };
 }
