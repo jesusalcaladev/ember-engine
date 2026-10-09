@@ -6,6 +6,18 @@
 
 const std = @import("std");
 
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+
+comptime {
+    _ = open;
+    _ = close;
+    _ = dup2;
+    _ = unlink;
+}
+
 pub const Level = enum(u8) {
     err = 0,
     warn = 1,
@@ -66,9 +78,32 @@ pub fn scoped(comptime scope: []const u8) type {
 }
 
 test "level filter" {
+    // Capture fd 2 so the assertion is real (did the line come out?) and the
+    // build stays clean: Zig 0.16 prints any stderr from a passing step inside
+    // a misleading "failed command" banner.
+    const json = @import("json.zig");
+    const path = "/tmp/ember-log-test.stderr";
+    const cap = open(path, json.O_WRONLY | json.O_CREAT | json.O_TRUNC, @as(c_int, 0o644));
+    try std.testing.expect(cap >= 0);
+    defer _ = unlink(path);
+    const saved = dup2(cap, 2);
+    if (saved < 0) {
+        _ = close(cap);
+        return error.SkipZigTest;
+    }
+    defer min_level = .info;
+
     min_level = .warn;
-    // Must not crash nor write below the minimum level.
     debug("not visible {}", .{1});
     warn("visible {}", .{2});
-    min_level = .info;
+
+    _ = dup2(saved, 2); // restore stderr before asserting
+    _ = close(saved);
+    _ = close(cap);
+
+    var buf: [512]u8 = undefined;
+    const n = json.readWholeFile(path, &buf) orelse return error.SkipZigTest;
+    const out = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, out, "not visible") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "visible 2") != null);
 }

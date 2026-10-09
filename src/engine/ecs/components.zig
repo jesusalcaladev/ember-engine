@@ -159,6 +159,23 @@ pub const Sprite = struct {
 
 const unit = Vec2{ .x = 1, .y = 1 };
 
+/// The Lua behavior bound to an actor (M3). This is the serializable link: it
+/// stores a *script id* (a stable index into the engine's script cache), never a
+/// VM reference — a Lua registry ref is meaningless across save/load, so `.zson`
+/// writes the id and the runtime re-binds it to the live script on load. That is
+/// what keeps scene serialization bit-exact (spec §6) while still letting a
+/// scene say "this actor runs player.lua".
+///
+/// The behavior's Lua state (the `self` table and its cached method refs) lives
+/// in the `script` subsystem, keyed off this component; the ECS only owns the
+/// stable id, exactly as the ECS is an internal detail and the public API is
+/// Actor + Components + Signals (spec §7).
+pub const Script = struct {
+    /// Index into the script cache. 0 means "no script" (the default), so ids
+    /// start at 1 — the same convention `SceneId` uses.
+    script: u32 = 0,
+};
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 /// One entry per component type. Order defines the dense ids, so it is also
@@ -194,6 +211,7 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "Parent", .type = Parent },
     .{ .name = "Velocity", .type = Velocity },
     .{ .name = "Sprite", .type = Sprite },
+    .{ .name = "Script", .type = Script },
 };
 
 comptime {

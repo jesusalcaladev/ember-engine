@@ -20,6 +20,7 @@ const batcher_mod = engine.batcher;
 const backend_null = engine.render.backend_null;
 const backend_dawn = engine.render.backend_dawn;
 const ecs = engine.ecs;
+const script = engine.script;
 const components = ecs.components;
 
 const fixed_dt: f32 = 1.0 / 60.0;
@@ -139,8 +140,40 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try world.reserve(.{ components.Transform, components.Sprite }, args.sprites);
     try world.enableHierarchy();
 
+    // ── M3: LuaJIT VM + the Behaviors system (Actor + Components + script).
+    // `Behaviors.init` builds its own Vm, installs the sandboxed API over the
+    // Context (world + input) and owns the script cache, so there is no
+    // separate registration step to forget.
+    var input_state = script.Input{};
+    input_state.define("move_left");
+    input_state.define("move_right");
+    input_state.define("jump");
+
+    var behaviors: script.Behaviors = undefined;
+    try behaviors.init(boot_alloc, &world, &input_state);
+    defer behaviors.deinit();
+    try behaviors.reserve(args.sprites);
+    behaviors.lock();
+
+    // A script that drives the actor's transform: this is the M3 acceptance
+    // path (Lua -> binding -> ECS), attached to the first sprite so the grid
+    // visibly moves through scripted gameplay.
+    const spin_src =
+        \\local M = {}
+        \\function M:start()
+        \\  self.total = 0
+        \\end
+        \\function M:update(dt)
+        \\  self.total = self.total + dt
+        \\  local x, y = actor.get_position(self)
+        \\  x = x + math.sin(self.total) * 40 * dt
+        \\  actor.set_position(self, x, y)
+        \\end
+        \\return M
+    ;
+    const spin_id = try behaviors.load("spin.lua", spin_src);
+
     // Spawn the canonical scene: a grid of sprites, one per cell.
-    // This replaces the old Scene struct: entities are Actors with Transform+Sprite.
     const capped_sprites: u32 = @min(args.sprites, 65_536);
     const rows: u32 = @max(1, (capped_sprites + 1) / 2); // ~square grid
     const cols: u32 = @max(1, (capped_sprites + rows - 1) / rows);
@@ -160,7 +193,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const h = @as(f32, @floatFromInt(i % 16)) / 16.0;
             const tint = [4]f32{ 0.25 + 0.75 * h, 0.5, 1.0 - 0.75 * h, 1.0 };
 
-            _ = try world.spawn(.{
+            const e = try world.spawn(.{
                 components.Transform{
                     .position = .{ .x = x, .y = y },
                     .scale = .{ .x = 1.0, .y = 1.0 },
@@ -169,14 +202,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     .size = .{ .x = half * 2.0, .y = half * 2.0 },
                     .uv = .{ 0, 0, 1, 1 },
                     .tint = tint,
-                    .layer = @as(u16, @intCast(row)), // grouped by row so the scene is layer-monotonic
+                    .layer = @as(u16, @intCast(row)),
                     .blend = components.Blend.alpha,
                     .visible = true,
                 },
             });
+            // The first actor also carries the Lua behavior: the grid renders,
+            // and one of them is gameplay-driven.
+            if (i == 0) try behaviors.attach(e, spin_id);
             i += 1;
         }
     }
+    behaviors.startAll();
 
     // ── M2: render2d system (ECS → GPU instances)
     var r2d = render2d.Renderer2D.init(boot_alloc);
@@ -185,15 +222,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     r2d.options.sort = args.sort;
     r2d.lock();
 
-    core.log.info("ember M2 — {s}, {d}x{d}, backend: {s}, sprites: {d}, smaa: {s}, max-fps: {d}", .{
-        if (args.headless) "headless" else "window",
-        view_w,
-        view_h,
-        if (args.headless) "null" else "dawn",
-        args.sprites,
-        if (args.smaa) "on" else "off",
-        args.max_fps,
-    });
 
     var loop = core.loop.FixedLoop.init(fixed_dt);
     var limiter = core.loop.FrameLimiter.init(args.max_fps, args.vsync);
@@ -241,9 +269,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const steps = loop.addTime(real_dt);
         var s: u32 = 0;
         while (s < steps) : (s += 1) {
-            // Physics integration will go here in M4. For M2/M3: nothing.
+            // M3: behaviors run at the fixed 60 Hz tick. `startAll` already ran,
+            // so this is the gameplay itself: Lua -> actor.* bindings -> ECS.
+            behaviors.fixedUpdate(fixed_dt);
         }
         z_sim.end();
+
+        // M3: the scripted per-frame update (decoupled from the fixed step, like
+        // the renderer) plus the incremental GC step. spec §3.2 budgets that GC
+        // step at ≤ 0.4 ms/frame; `vm.gcStep()` measures nothing, so the frame
+        // cost lands in `script_update` where the budget gate can see it.
+        var z_script = prof.zone("script_update");
+        behaviors.update(real_dt);
+        behaviors.sweepDestroyed();
+        behaviors.vm.gcStep();
+        z_script.end();
 
         // ── M2: ECS → GPU instances via render2d.
         var z_batch = prof.zone("batch");

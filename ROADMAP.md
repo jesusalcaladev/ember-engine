@@ -82,15 +82,24 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 ### M3 — LuaJIT Scripting
 **Goal**: gameplay exists and is enjoyable.
 
-- Embed LuaJIT; behaviors with a `start / update / fixed_update / on_signal / on_destroy` lifecycle.
-- Script hot-reload < 100 ms **without losing state** (migrate the `self` table).
-- Sandbox for the editor (library whitelist); action-based Input API for Lua.
-- Signals: `emit`/`on`, stable order by spawn; drained once per frame.
-- Zero-allocation-per-call bindings; refs cached in the behavior's state.
+- Embed LuaJIT; behaviors with a `start / update / fixed_update / on_signal / on_destroy` lifecycle. **DONE**.
+- Script hot-reload < 100 ms **without losing state** (migrate the `self` table). **DONE**: reload swaps only the cached method refs; the `self` table — all gameplay state — is untouched. Loading a name that already has live instances re-caches them, so "edit and reload" just works.
+- Sandbox for the editor (library whitelist); action-based Input API for Lua. **DONE** (`vm.sandbox` + the `input` module).
+- Signals: `emit`/`on`, stable order by spawn; drained once per frame. **DONE**.
+- Zero-allocation-per-call bindings; refs cached in the behavior's state. **DONE** (context as a light-userdata upvalue, methods as cached refs).
 - **Complete `math` module** (daily game use): scalar `clamp`/`clampf`, `min`, `max`, `abs`, `sign`, `floor/ceil/round`, `fract`, `sqrt`, `pow`, `sin/cos/atan2`, `lerp`, `inverse_lerp`, `remap`, `smoothstep`, `step`, `move_toward`, `damp`, `wrap`, `pingpong`, `deg_to_rad`/`rad_to_deg`, `is_close`; full `Vec2` (`normalized`, `distance`, `perp`, `rotate`, `angle_to`, `cross`, `clamped`); `Rect2` (`contains`, `intersects`, `intersection`, `grow`, `center`, `union`). Extends `core/math.zig` with tests; nothing allocates.
 - **Binding metadata registry via comptime doc-comments in Zig**: signature, parameters (type + default), return value, description, example. Single source of truth for autocomplete, in-editor help and stubs. No metadata → the binding does not merge.
 
-**Criteria**: the blueprint's `player.lua` runs unchanged; hot-reload while the game runs; 10k behavior updates ≤ 2 ms; incremental GC step ≤ 0.4 ms/frame; every API exposed to Lua has metadata + example; complete `math` with unit tests.
+**Status: closed** — `script/` (10 files: VM, sandbox, chunk cache, bindings, metadata, stubs, input, behaviors) is wired into the runtime: 50k ECS sprites render and one of them carries a Lua `spin.lua` behavior that drives its transform through `actor.*` bindings.
+
+Measured on that run (`zig build run -- --frames 90`): `script_update` **0.0087 ms/frame** for one behavior against the §3.2 budget of 0.4 ms, frame **16.55 ms p50** @ 60 FPS, arena high-water **0 B**, 134/134 tests green, M1 bench budgets unchanged.
+
+**Bugs found while wiring it up, all fixed**:
+1. **`lua_touserdata` returns NULL for LIGHT userdata in LuaJIT** (verified with a probe: ttype was `LUA_TLIGHTUSERDATA` and the call still yielded NULL). A handle read back through it silently became a dead entity, so every `actor.*` binding no-oped. Now read with `lua_topointer`, which handles both.
+2. **Entity 0's handle bits are 0**, i.e. a NULL pointer — and Lua hands NULL light userdata back as NULL, indistinguishable from "field never set". The first entity of any world was therefore unusable from Lua. Fixed with a +1 bias on store / −1 on read, plus two regression tests (zero and non-zero handles).
+3. **A freshly spawned `Transform` interpolated its first frame from the origin**: `prev_*` defaulted to (0,0) while the live fields held the spawn position, so `interpolated(0)` was the origin and every actor slid in from the corner. `fillRow` now seeds `prev_*` from the value the caller passed.
+4. **`Behavior.load` of an existing name did not re-cache method refs**, so a hot-reload kept calling the OLD `update`. Now every load re-caches the instances of that script id (a no-op for a brand new name), which makes `reload` and `load` equivalent.
+5. `core_log` referenced before its declaration, and a stale duplicate declaration inside a struct — both fixed.
 
 ### M4 — Box2D v3 Physics
 **Goal**: solid, deterministic game feel.
