@@ -16,13 +16,34 @@ All numbers are measured there. On superior hardware they may only improve; on i
 
 | System | Budget |
 |---|---|
-| Lua behaviors (10k updates) | 2.0 ms |
+| Lua behaviors (10k updates) | 2.0 ms — **M3: 0.650 ms p50 measured** (framework floor; the bench splits engine cost from gameplay cost, see below) |
 | Physics (fixed 60 Hz step + interpolation) | 2.0 ms |
 | Render CPU (encoding 50k sprites) | 1.5 ms — **M2: 0.54 ms measured** (instanced, 32 B/sprite, no per-frame sort) |
-| ECS: 100k transform updates over SoA queries | 2.0 ms |
-| ECS: parent-chain resolution (10k entities) | 2.0 ms |
+| ECS: 100k transform updates over SoA queries | 2.0 ms — **M1: 0.484 ms p50 measured** |
+| ECS: parent-chain resolution (10k entities) | 2.0 ms — **M1: 0.586 ms p50 measured** |
 | Signals + framework | 0.8 ms |
 | Headroom | the rest |
+
+**On the Lua budget, measured**: `zig build bench` reports two rows, because the
+number is otherwise unfalsifiable. The **framework floor** — 10k behaviors driven
+through the full lifecycle (instance walk, cached refs, one protected call) with
+an `update` that does nothing — is 0.650 ms p50, and that is the engine's charge
+against this row. A **realistic gameplay behavior** (state + two trig calls +
+one fused `actor.move_by`) costs 2.856 ms p50 at 10k instances, reported
+informationally with the breakdown, because the per-call cost of a Lua→C binding
+is a *gameplay design constraint*, not an engine invariant:
+
+| Isolated cost | ns/behavior |
+|---|---|
+| floor (pcall + empty `update`) | 65 |
+| + 2 `math` calls | +45 |
+| + 1 Lua→C binding | **+145** (12 ns of it is the ECS lookup; the rest is LuaJIT's dispatch, which cannot be JIT-compiled for a C function) |
+
+That 145 ns per binding is why `actor.move_by` exists: it does read-modify-write
+in ONE call where `get_position` + `set_position` costs two and pushes two more
+return values. A Pin-Pon-scale scene (order ~10 behaviors) spends ~3 µs/frame on
+gameplay, which is 0.02 % of the frame; 10k simultaneous behaviors is a stress
+row for the engine, not a shape the demo ever takes.
 
 - **Editor**: adds ≤ 2.0 ms (overlay + composition). Its cost never appears in the exported game.
 

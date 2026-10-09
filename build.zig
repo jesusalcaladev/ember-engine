@@ -23,6 +23,24 @@ pub fn build(b: *std.Build) void {
     });
     ecs_mod.addImport("core", core_mod);
 
+    // ── M3 scripting module (LuaJIT; depends on core + ecs, no Dawn) ─────────
+    // Declared before the engine because the engine imports it by module name,
+    // and both compile the same sources once. Headless by construction: the only
+    // native dependency is LuaJIT itself (spec §9: every feature ships a test).
+    const script_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/script/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    script_mod.addImport("core", core_mod);
+    script_mod.addImport("ecs", ecs_mod);
+    // LuaJIT 2.1 (Lua 5.1 API) from the system. The include path is where the
+    // distro headers live; the linker resolves `-lluajit-5.1`. `cwd_relative`
+    // because it is an absolute path outside the build root.
+    script_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
+    script_mod.linkSystemLibrary("luajit-5.1", .{});
+
     // ── Engine module (public boundary: core + platform + render) ───────────
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/root.zig"),
@@ -33,6 +51,10 @@ pub fn build(b: *std.Build) void {
     // Separate modules: each subsystem compiles and tests on its own.
     engine_mod.addImport("core", core_mod);
     engine_mod.addImport("ecs", ecs_mod);
+    // M3: the LuaJIT scripting layer. It links LuaJIT but NOT Dawn, so the
+    // scripting tests and the M3 bench run headless like the ECS ones do.
+    engine_mod.addImport("script", script_mod);
+
     // The render module declares extern Dawn procs, so anything that links the
     // engine whole (the runtime, the render tests) needs the libraries. They are
     // declared once here instead of per-artifact.
@@ -89,6 +111,12 @@ pub fn build(b: *std.Build) void {
         runtime_mod.linkSystemLibrary(lib, .{});
     }
 
+    // M3: the runtime drives the LuaJIT behavior system. Declared here (like
+    // Dawn) because anything that links the engine whole needs the library, and
+    // it is exported so the binary finds `libluajit-5.1.so` at runtime.
+    runtime_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
+    runtime_mod.linkSystemLibrary("luajit-5.1", .{});
+
     const ember = b.addExecutable(.{
         .name = "ember",
         .root_module = runtime_mod,
@@ -104,15 +132,36 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .link_libc = true,
     });
-    // Only `core` and `ecs`: headless by construction, so it never links Dawn
-    // nor needs a window to measure (spec §9: every feature ships a benchmark).
+    // `core`, `ecs` and `script`: headless by construction, so it never links
+    // Dawn nor needs a window to measure (spec §9: every feature ships a
+    // benchmark). `script` brings LuaJIT for the M3 behavior criteria.
     bench_mod.addImport("core", core_mod);
     bench_mod.addImport("ecs", ecs_mod);
+    bench_mod.addImport("script", script_mod);
+    bench_mod.linkSystemLibrary("luajit-5.1", .{});
     const bench = b.addExecutable(.{ .name = "ember-bench", .root_module = bench_mod });
     const bench_cmd = b.addRunArtifact(bench);
     if (b.args) |args| bench_cmd.addArgs(args);
     const bench_step = b.step("bench", "Run the M1 ECS benchmark suite");
     bench_step.dependOn(&bench_cmd.step);
+
+    // ── M3 benchmark suite (LuaJIT): acceptance criteria of ROADMAP M3 ──────
+    // A SEPARATE artifact because it links LuaJIT: the M1 bench must stay
+    // runnable while the renderer or the script layer is mid-edit. `zig build
+    // bench` runs both, so there is still one command (spec §9).
+    const script_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/script.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    script_bench_mod.addImport("core", core_mod);
+    script_bench_mod.addImport("ecs", ecs_mod);
+    script_bench_mod.addImport("script", script_mod);
+    const script_bench = b.addExecutable(.{ .name = "ember-bench-script", .root_module = script_bench_mod });
+    const script_bench_cmd = b.addRunArtifact(script_bench);
+    if (b.args) |args| script_bench_cmd.addArgs(args);
+    bench_step.dependOn(&script_bench_cmd.step);
 
     const run_cmd = b.addRunArtifact(ember);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -147,6 +196,11 @@ pub fn build(b: *std.Build) void {
 
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
+
+    // M3 scripting tests: the VM, the sandbox, hot-reload, the bindings and the
+    // metadata/stub layers. They link LuaJIT but not Dawn, so they run headless.
+    const script_tests = b.addTest(.{ .root_module = script_mod });
+    test_step.dependOn(&b.addRunArtifact(script_tests).step);
 
     // Render tests (M2): the batcher, the atlas packer and the Dawn binding
     // layouts. They need the engine module (hence `core`), but NOT a window:
