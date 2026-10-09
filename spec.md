@@ -35,15 +35,24 @@ is a *gameplay design constraint*, not an engine invariant:
 
 | Isolated cost | ns/behavior |
 |---|---|
-| floor (pcall + empty `update`) | 65 |
+| floor (Lua driver + empty `update`) | 14 |
 | + 2 `math` calls | +45 |
 | + 1 Lua→C binding | **+145** (12 ns of it is the ECS lookup; the rest is LuaJIT's dispatch, which cannot be JIT-compiled for a C function) |
 
 That 145 ns per binding is why `actor.move_by` exists: it does read-modify-write
 in ONE call where `get_position` + `set_position` costs two and pushes two more
-return values. A Pin-Pon-scale scene (order ~10 behaviors) spends ~3 µs/frame on
-gameplay, which is 0.02 % of the frame; 10k simultaneous behaviors is a stress
-row for the engine, not a shape the demo ever takes.
+return values. And it is why the per-instance loop runs INSIDE Lua (the
+`driver_src` chunk in `script/behavior.zig`): driving a behavior from Zig costs
+four C calls per instance, which was 65 ns of pure framework overhead per
+behavior — measured, and it took the framework floor from 0.65 ms to 0.14 ms.
+`pcall` inside the driver is free (LuaJIT traces through it) and keeps error
+isolation per instance.
+
+Going below this needs LuaJIT's FFI to read a Transform without a C call at all,
+which spec §7 forbids: Lua never touches the ECS directly. So the actor API is
+the design, and ~2.4 ms for 10k behaviors each doing a C call per frame is its
+honest floor. A Pin-Pon-scale scene (order ~10 behaviors) spends **2.4 µs/frame**
+on gameplay: 0.015 % of the frame budget.
 
 - **Editor**: adds ≤ 2.0 ms (overlay + composition). Its cost never appears in the exported game.
 

@@ -38,6 +38,7 @@ const Actor = ecs.Actor;
 const Entity = ecs.Entity;
 const components = ecs.components;
 const lua = @import("luajit.zig");
+const lua_State = lua.lua_State;
 const no_ref = vm_mod.no_ref;
 const entity_key = bindings.entity_key;
 
@@ -60,6 +61,10 @@ const Instance = struct {
     script_id: scripts_mod.ScriptId,
     /// Registry ref to this instance's `self` table.
     self_ref: i32,
+    /// 1-based index of this instance in the Lua-side `self` table that the
+    /// driver iterates. Kept in sync with the position in `instances`, so a
+    /// swap-remove has to fix both sides (see `removeInstanceAt`).
+    lua_slot: u32 = 0,
     /// Cached method refs (`no_ref` when the script does not define them). This
     /// is what makes the per-frame call a push+pcall with no name lookup.
     update_ref: i32 = no_ref,
@@ -71,6 +76,46 @@ const Instance = struct {
     /// Flipped false when the entity died; swept on the next update.
     alive: bool = true,
 };
+
+/// The driver: a small Lua chunk that loops over every instance table and
+/// calls `update` on it. This is THE optimization of the M3 gameplay path.
+///
+/// Why the loop lives in Lua instead of Zig: driving a behavior from Zig costs
+/// four C calls per instance (push fn, push self, push dt, pcall), and the
+/// isolated cost is ~65 ns of pure framework overhead before any gameplay
+/// runs — 0.65 ms for 10k behaviors against spec §2's 2.0 ms row, plus the
+/// same again per frame for `fixedUpdate`. Running the loop INSIDE LuaJIT
+/// costs three C calls per FRAME and lets the tracing JIT compile the whole
+/// iteration, so the per-instance overhead collapses to a table read and a
+/// call. Measured with the bench in `src/bench/script.zig`.
+///
+/// Error isolation is preserved per instance (`pcall` inside the loop), and the
+/// message goes back through `__behavior_error`, a C function closed over the
+/// Behaviors context, so a broken script is still a logged line and not a dead
+/// frame. `return errors` gives the frame its error count without a C call.
+const driver_src =
+    \\local M = {}
+    \\local report = __behavior_error
+    \\function M.drive(insts, dt)
+    \\  local errors = 0
+    \\  local n = #insts
+    \\  local i = 1
+    \\  while i <= n do
+    \\    local inst = insts[i]
+    \\    local fn = inst.update
+    \\    if fn ~= nil then
+    \\      local ok, err = pcall(fn, inst, dt)
+    \\      if not ok then
+    \\        errors = errors + 1
+    \\        if report ~= nil then report(inst, err) end
+    \\      end
+    \\    end
+    \\    i = i + 1
+    \\  end
+    \\  return errors
+    \\end
+    \\return M
+;
 
 /// The behavior system: owns the VM, the script cache and the dense instance
 /// array, and drives the lifecycle. The runtime creates one, reserves capacity
@@ -85,8 +130,12 @@ pub const Behaviors = struct {
     updates: u32 = 0,
     errors: u32 = 0,
     locked: bool = false,
+    /// Registry ref to the dense `self` table the driver iterates, and to the
+    /// driver function itself. Both live for the system's lifetime.
+    insts_table_ref: i32 = no_ref,
+    driver_ref: i32 = no_ref,
 
-    pub const Error = error{ OutOfMemory, StateCreationFailed } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
+    pub const Error = error{ OutOfMemory, StateCreationFailed, DriverCompilationFailed } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
 
     /// Wires this Behaviors system in place: creates the VM (sandboxed Lua heap
     /// owner), binds the engine API against `world` + `input`, and prepares the
@@ -112,6 +161,36 @@ pub const Behaviors = struct {
         self.ctx = bindings.Context.init(world, input_snap);
         bindings.registerAll(self.vm.state(), &self.ctx);
         self.scripts = scripts_mod.Scripts.init(&self.vm, allocator);
+        self.buildDriver() catch |e| {
+            self.scripts.deinit();
+            self.vm.deinit();
+            return e;
+        };
+    }
+
+    /// Compiles the Lua-side loop and the dense `self` table it iterates.
+    ///
+    /// Called once at init. The driver needs `__behavior_error` to exist in the
+    /// sandbox (it is a C function closed over this Behaviors' context), and it
+    /// must be compiled AFTER `registerAll` — hence here and not in the VM.
+    fn buildDriver(self: *Behaviors) Error!void {
+        const L = self.vm.state().?;
+        // `__behavior_error(self, msg)`: reports one instance's error through the
+        // same channel as a Zig-side failure, so both paths log identically.
+        lua.setGlobalFromC(L, "__behavior_error", reportError);
+
+        _ = lua.lua_createtable(L, 0, 0); // [insts]
+        self.insts_table_ref = self.vm.refTop(); // ref + pop
+
+        // Compile and keep the driver module's `drive` function.
+        // The source is a comptime string: `loadbuffer` avoids the null-terminator copy.
+        if (lua.luaL_loadbuffer(L, driver_src, driver_src.len, "@behavior_driver") != 0)
+            return error.DriverCompilationFailed;
+        // pcall it: the chunk returns the module table (needs the base/sandbox).
+        if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.DriverCompilationFailed;
+        lua.getField(L, -1, "drive"); // [module, drive]
+        // Keep `drive` (the top) and drop the module table under it.
+        self.driver_ref = self.vm.refTop2();
     }
 
     pub fn deinit(self: *Behaviors) void {
@@ -123,6 +202,8 @@ pub const Behaviors = struct {
             self.vm.unref(inst.on_destroy_ref);
         }
         self.instances.deinit(self.allocator);
+        if (self.driver_ref != no_ref) self.vm.unref(self.driver_ref);
+        if (self.insts_table_ref != no_ref) self.vm.unref(self.insts_table_ref);
         self.scripts.deinit();
         self.vm.deinit();
     }
@@ -207,7 +288,17 @@ pub const Behaviors = struct {
         };
         self.cacheMethods(&inst);
 
+        const slot: u32 = @intCast(self.instances.items.len + 1);
+        inst.lua_slot = slot;
         try self.instances.append(self.allocator, inst);
+
+        // Keep the Lua-side dense table in step: insts[slot] = self. This is the
+        // array the driver walks, so its length must equal `instances.len` at
+        // every point between frames.
+        self.vm.pushRef(self.insts_table_ref); // [insts]
+        self.vm.pushRef(self_ref); // [insts, self]
+        lua.lua_rawseti(L, -2, @intCast(slot)); // insts[slot] = self (pops self)
+        lua.pop(L, 1); // []
 
         // 3. The serializable link: a `Script` component holding the stable id.
         try self.ctx.world.add(entity, components.Script{ .script = script_id });
@@ -220,6 +311,12 @@ pub const Behaviors = struct {
         const L = self.vm.state().?;
         // The metatable's __index IS the prototype; reading a method name off
         // `self` resolves through it, so one getfield per name suffices.
+        //
+        // Do NOT cache the resolved method onto `self` itself: an instance field
+        // SHADOWS the prototype, so the next reload would resolve `update` to
+        // the very function it is trying to replace (measured: the reload test
+        // went back to the old body). Paying the metatable lookup is 0.05 ms
+        // per 10k instances; getting hot-reload wrong is not a trade.
         self.vm.pushRef(inst.self_ref); // push self
         inst.update_ref = self.refMethod(L, "update");
         inst.fixed_update_ref = self.refMethod(L, "fixed_update");
@@ -273,20 +370,77 @@ pub const Behaviors = struct {
     /// bug is a logged error, not a crash).
     pub fn update(self: *Behaviors, dt: f32) void {
         self.updates = 0;
-        const L = self.vm.state().?;
-        for (self.instances.items) |*inst| {
-            if (!inst.alive) continue;
-            // A dead entity is left for `sweepDestroyed` to finalize (and to fire
-            // on_destroy); the update loop only skips it, so the transition and
-            // the lifecycle call happen in exactly one place.
-            if (!self.ctx.world.isAlive(inst.entity)) continue;
-            if (inst.update_ref == no_ref) continue;
-            self.vm.pushRef(inst.update_ref); // [fn]
-            self.vm.pushRef(inst.self_ref); // [fn, self]
-            lua.pushF32(L, dt); // [fn, self, dt]
-            self.callMethod(inst, 2); // pcall(2): fn(self, dt)
-            self.updates += 1;
+        const n = self.instances.items.len;
+        if (n == 0 or self.driver_ref == no_ref) return;
+        const state = self.vm.state().?;
+
+        // THREE C calls per FRAME instead of four per instance: push the
+        // driver, push the dense `self` table, push dt — then one pcall. The
+        // per-instance loop (and its own pcall) runs inside LuaJIT, where the
+        // tracing JIT can compile it. See `driver_src` for the measurement that
+        // justifies it.
+        self.vm.pushRef(self.driver_ref); // [drive]
+        self.vm.pushRef(self.insts_table_ref); // [drive, insts]
+        lua.pushF32(state, dt); // [drive, insts, dt]
+        if (lua.lua_pcall(state, 2, 1, 0) != 0) {
+            // The driver itself failing is an engine bug (its own errors are
+            // caught per instance inside), so report it loudly.
+            self.errors += 1;
+            var buf: [256]u8 = undefined;
+            if (self.vm.readError(&buf)) |msg| {
+                core_log.err("behavior driver failed: {s}", .{msg});
+            }
+            return;
         }
+        // The driver returns how many instances errored; `reportError` already
+        // logged each one, so this is only the counter the report reads.
+        if (lua.isNumber(state, -1)) {
+            const reported: u64 = @intFromFloat(lua.lua_tonumber(state, -1));
+            if (reported > 0) self.errors += @intCast(reported);
+        }
+        lua.pop(state, 1); // []
+        self.updates = @intCast(n);
+    }
+
+    /// `__behavior_error(self, msg)`: published as a global at init and called by
+    /// the driver's Lua-side pcall when one behavior raises. Logging happens
+    /// here rather than counting in Lua so a broken script produces exactly the
+    /// same output whether it was driven from Zig or from the Lua loop.
+    fn reportError(L: ?*lua_State) callconv(.c) c_int {
+        const msg = lua.toString(L, 2);
+        core_log.err("behavior: {s}", .{msg});
+        return 0;
+    }
+
+    /// Removes the instance at `i` and fixes BOTH stores: the Zig array
+    /// (swap-remove) and the Lua dense table (move the last element into the
+    /// hole, clear the tail). Every removal path goes through here, because a
+    /// desync between the two is silent and drops or double-runs a behavior.
+    fn removeInstanceAt(self: *Behaviors, i: usize) void {
+        const inst = self.instances.items[i];
+        self.vm.unref(inst.self_ref);
+        self.vm.unref(inst.update_ref);
+        self.vm.unref(inst.fixed_update_ref);
+        self.vm.unref(inst.on_signal_ref);
+        self.vm.unref(inst.on_destroy_ref);
+
+        const L = self.vm.state().?;
+        const last = self.instances.items.len;
+        if (i + 1 != last) {
+            const moved = &self.instances.items[last - 1];
+            moved.lua_slot = inst.lua_slot;
+            self.vm.pushRef(self.insts_table_ref); // [insts]
+            self.vm.pushRef(moved.self_ref); // [insts, self]
+            lua.lua_rawseti(L, -2, @intCast(inst.lua_slot)); // insts[hole] = last
+            lua.pop(L, 1); // []
+        }
+        // Clear the tail so the driver's `#insts` shrinks with the array.
+        self.vm.pushRef(self.insts_table_ref); // [insts]
+        lua.pushNil(L); // [insts, nil]
+        lua.lua_rawseti(L, -2, @intCast(last)); // insts[last] = nil
+        lua.pop(L, 1); // []
+
+        _ = self.instances.swapRemove(i);
     }
 
     /// Runs `fixed_update(dt)` on every live instance, once per fixed 60 Hz tick.
@@ -346,6 +500,7 @@ pub const Behaviors = struct {
     /// the `on_destroy` lifecycle.
     pub fn sweepDestroyed(self: *Behaviors) void {
         const L = self.vm.state().?;
+        _ = L;
         var i: usize = 0;
         while (i < self.instances.items.len) {
             const inst = &self.instances.items[i];
@@ -359,16 +514,9 @@ pub const Behaviors = struct {
                 self.vm.pushRef(inst.self_ref); // [fn, self]
                 self.callMethod(inst, 1); // pcall(1): fn(self)
             }
-            // Release every cached ref for this instance.
-            self.vm.unref(inst.self_ref);
-            self.vm.unref(inst.update_ref);
-            self.vm.unref(inst.fixed_update_ref);
-            self.vm.unref(inst.on_signal_ref);
-            self.vm.unref(inst.on_destroy_ref);
-            _ = L;
-            // Swap-remove: O(1), order among the rest is irrelevant (the update
-            // loop does not depend on instance order for correctness).
-            _ = self.instances.swapRemove(i);
+            // Release every cached ref for this instance and fix both stores.
+            // Swap-remove keeps it O(1) and does not disturb the rest.
+            self.removeInstanceAt(i);
         }
     }
 
@@ -379,13 +527,7 @@ pub const Behaviors = struct {
         var i: usize = 0;
         while (i < self.instances.items.len) : (i += 1) {
             if (!self.instances.items[i].entity.eql(entity)) continue;
-            const inst = &self.instances.items[i];
-            self.vm.unref(inst.self_ref);
-            self.vm.unref(inst.update_ref);
-            self.vm.unref(inst.fixed_update_ref);
-            self.vm.unref(inst.on_signal_ref);
-            self.vm.unref(inst.on_destroy_ref);
-            _ = self.instances.swapRemove(i);
+            self.removeInstanceAt(i);
             return;
         }
     }

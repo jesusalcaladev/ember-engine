@@ -249,6 +249,16 @@ pub const Vm = struct {
         return lua.luaL_ref(L, lua.REGISTRYINDEX);
     }
 
+    /// Refs the TOP stack entry and pops it, then pops the one below it without
+    /// keeping a ref. Used when a chunk leaves [module, method] and only the
+    /// method must survive.
+    pub fn refTop2(self: *Vm) i32 {
+        const L = self.L.?;
+        const keep = lua.luaL_ref(L, lua.REGISTRYINDEX); // refs and pops the top
+        lua.pop(L, 1); // drop the leftover below it (the module table)
+        return keep;
+    }
+
     /// Pushes `ref` (a registry ref) onto the stack.
     pub fn pushRef(self: *Vm, ref: i32) void {
         const L = self.L.?;

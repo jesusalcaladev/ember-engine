@@ -153,6 +153,7 @@ pub extern "c" fn luaL_ref(L: ?*lua_State, t: c_int) c_int;
 pub extern "c" fn luaL_unref(L: ?*lua_State, t: c_int, ref: c_int) void;
 pub extern "c" fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: ?[*:0]const u8, mode: ?[*:0]const u8) c_int;
 pub extern "c" fn luaL_loadstring(L: ?*lua_State, s: [*:0]const u8) c_int;
+pub extern "c" fn luaL_loadbuffer(L: ?*lua_State, buff: [*]const u8, size: usize, name: [*:0]const u8) c_int;
 pub extern "c" fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int;
 pub extern "c" fn luaL_argerror(L: ?*lua_State, numarg: c_int, extramsg: [*:0]const u8) c_int;
 pub extern "c" fn luaL_checklstring(L: ?*lua_State, numArg: c_int, l: ?*usize) [*:0]const u8;
@@ -270,6 +271,18 @@ pub inline fn upvalueindex(i: c_int) c_int {
 
 /// Pops the top and stores it as the global `name`.
 pub inline fn setGlobal(L: ?*lua_State, name: [*:0]const u8) void {
+    lua_setfield(L, GLOBALSINDEX, name);
+}
+
+/// Reads a string value (empty string if the value is not a string).
+pub inline fn toString(L: ?*lua_State, idx: c_int) []const u8 {
+    return toSlice(L, idx) orelse "";
+}
+
+/// Sets `_G[name]` to a plain C function. The behavior driver uses it to
+/// publish `__behavior_error`, which the Lua-side update loop calls on failure.
+pub inline fn setGlobalFromC(L: ?*lua_State, name: [*:0]const u8, func: lua_CFunction) void {
+    lua_pushcclosure(L, func, 0);
     lua_setfield(L, GLOBALSINDEX, name);
 }
 
