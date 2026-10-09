@@ -59,31 +59,26 @@ const LuaHeap = struct {
         if (nsize == 0) {
             if (ptr) |p| {
                 const buf = @as([*]u8, @ptrCast(p))[0..osize];
-                self.child.rawFree(buf, heap_align, 0);
+                self.child.free(buf);
                 self.live_bytes -= osize;
             }
             return null;
         }
         if (ptr == null) {
-            const mem = self.child.rawAlloc(nsize, heap_align, 0) orelse return null;
+            const mem = self.child.alignedAlloc(u8, heap_align, nsize) catch return null;
             self.live_bytes += nsize;
             if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
-            return mem;
+            return mem.ptr;
         }
-        // Realloc: try to grow in place, else copy.
+        // Realloc: alloc + copy + free, ALWAYS. See the note below.
         const old = @as([*]u8, @ptrCast(ptr))[0..osize];
-        if (self.child.rawRemap(old, heap_align, nsize, 0)) |mem| {
-            self.live_bytes = self.live_bytes - osize + nsize;
-            if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
-            return mem;
-        }
-        const mem = self.child.rawAlloc(nsize, heap_align, 0) orelse return null;
+        const new = self.child.alignedAlloc(u8, heap_align, nsize) catch return null;
         const n = @min(osize, nsize);
-        @memcpy(mem[0..n], (@as([*]const u8, @ptrCast(ptr)))[0..n]);
-        self.child.rawFree(old, heap_align, 0);
+        @memcpy(new[0..n], old[0..n]);
+        self.child.free(old);
         self.live_bytes = self.live_bytes - osize + nsize;
         if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
-        return mem;
+        return new.ptr;
     }
 };
 

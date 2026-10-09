@@ -197,6 +197,70 @@ pub fn build(b: *std.Build) void {
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 
+    // M3 API acceptance: an EXECUTABLE, not a `zig test`. LuaJIT installs its
+    // own signal/`longjmp` handling, which does not survive Zig's test runner
+    // (the identical code segfaults inside `lua_pcall` under `zig test` and
+    // runs clean here) — so every live-VM check in this repo goes through an
+    // artifact, exactly like the M3 bench does. Exit 0 = green.
+    const api_acceptance_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/script/api_acceptance_test.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    api_acceptance_mod.addImport("core", core_mod);
+    api_acceptance_mod.addImport("ecs", ecs_mod);
+    api_acceptance_mod.addImport("script", script_mod);
+    const t1 = b.createModule(.{ .root_source_file = b.path("src/engine/script/t1_tmp.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    t1.addImport("core", core_mod);
+    t1.addImport("ecs", ecs_mod);
+    t1.addImport("script", script_mod);
+    t1.addImport("core", core_mod);
+    b.installArtifact(b.addExecutable(.{ .name = "t1", .root_module = t1 }));
+    const api_acceptance_exe = b.addExecutable(.{ .name = "ember-api-test", .root_module = api_acceptance_mod });
+    b.installArtifact(api_acceptance_exe);
+    const api_acceptance_run = b.addRunArtifact(api_acceptance_exe);
+    api_acceptance_run.has_side_effects = true;
+    const api_acceptance_step = b.step("test-api", "Run the Lua API acceptance suites");
+    api_acceptance_step.dependOn(&api_acceptance_run.step);
+    test_step.dependOn(&api_acceptance_run.step);
+
+    // The M3 surface (actor + math + vec2 + spatial), kept as its OWN runner so
+    // it never collides with the suites that grew in api_acceptance_test.zig.
+    const m3_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/script/m3_api_test.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    m3_mod.addImport("core", core_mod);
+    m3_mod.addImport("ecs", ecs_mod);
+    m3_mod.addImport("script", script_mod);
+    const m3_exe = b.addExecutable(.{ .name = "ember-m3-test", .root_module = m3_mod });
+    b.installArtifact(m3_exe);
+    const m3_run = b.addRunArtifact(m3_exe);
+    m3_run.has_side_effects = true;
+    api_acceptance_step.dependOn(&m3_run.step);
+    test_step.dependOn(&m3_run.step);
+
+    // The stubs are written by the TOOL itself (it owns the output path), so
+    // the build step just runs it. CI diffs `meta/ember.lua`, which is
+    // committed, so a drift between the registry and the stubs is a build
+    // failure rather than a stale autocomplete.
+    const stubs_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/script/stubs_main.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    stubs_mod.addImport("script", script_mod);
+    stubs_mod.addImport("core", core_mod);
+    const stubs_exe = b.addExecutable(.{ .name = "ember-stubs", .root_module = stubs_mod });
+    const stubs_cmd = b.addRunArtifact(stubs_exe);
+    stubs_cmd.has_side_effects = true;
+    const stubs_step = b.step("stubs", "Generate the LuaLS/EmmyLua stubs from the binding metadata");
+    stubs_step.dependOn(&stubs_cmd.step);
+
     // M3 scripting tests: the VM, the sandbox, hot-reload, the bindings and the
     // metadata/stub layers. They link LuaJIT but not Dawn, so they run headless.
     const script_tests = b.addTest(.{ .root_module = script_mod });
