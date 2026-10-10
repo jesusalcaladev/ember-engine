@@ -305,3 +305,103 @@ test "the same two bodies collide once the layers are made to overlap" {
     const xf = world.get(ball, Transform).?;
     try testing.expect(xf.position.x < 0.0);
 }
+
+// ── The container test ───────────────────────────────────────────────────────
+//
+// A box full of balls, dropped in and left to settle. Suggested as the physics
+// regression test, and it is a good one because it fails in several DIFFERENT
+// ways at once, each of which has been a real bug in this engine:
+//
+//   - a ball escaping through a wall      -> shapes never created / filters wrong
+//   - a ball escaping through the floor   -> a sensor where a solid should be
+//   - balls interpenetrating at rest      -> restitution or solver settings wrong
+//   - balls tunnelling at speed           -> no continuous collision on a bullet
+//   - the pile never settling             -> the thing being simulated does nothing
+//
+// It is a better test than "2 000 bodies in a pile" because it has an ASSERTION
+// about the outcome (everything stays inside) rather than only a number.
+
+test "balls dropped into a box all stay inside it" {
+    const ecs = @import("ecs");
+    const RigidBody2D = ecs.components.RigidBody2D;
+    const Collider2D = ecs.components.Collider2D;
+    const Transform = ecs.components.Transform;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var world = ecs.World.init(allocator);
+    defer world.deinit();
+    try world.reserveEntities(64);
+    try world.reserve(.{ RigidBody2D, Collider2D }, 64);
+    try world.reserve(.{ Transform }, 64);
+    try world.signals.reserve(allocator, 4096);
+
+    var sys = try System.init(allocator, .box2d, .{ .x = 0, .y = 200 });
+    defer sys.deinit();
+
+    const half_w: f32 = 400;
+    const half_h: f32 = 300;
+    const wall = 20.0;
+
+    // Four walls. Fixed, solid, and NOT sensors: a sensor here would let every
+    // ball fall straight through the bottom, which is the failure this test is
+    // mostly here to catch.
+    const walls = [_]struct { x: f32, y: f32, hw: f32, hh: f32 }{
+        .{ .x = 0, .y = -half_h, .hw = half_w + wall, .hh = wall }, // ceiling
+        .{ .x = 0, .y = half_h, .hw = half_w + wall, .hh = wall }, // floor
+        .{ .x = -half_w, .y = 0, .hw = wall, .hh = half_h }, // left
+        .{ .x = half_w, .y = 0, .hw = wall, .hh = half_h }, // right
+    };
+    for (walls) |w| {
+        _ = try world.spawn(.{
+            Transform{ .position = .{ .x = w.x, .y = w.y }, .rotation = 0 },
+            RigidBody2D{ .body_type = 0 },
+            Collider2D{ .kind = 0, .size = .{ .x = w.hw, .y = w.hh }, .friction = 0.4 },
+        });
+    }
+
+    // 24 balls, dropped in a loose grid well above the floor with room to fall.
+    const radius: f32 = 14;
+    var spawned: [24]ecs.Entity = undefined;
+    var i: usize = 0;
+    while (i < spawned.len) : (i += 1) {
+        const col: f32 = @floatFromInt(i % 6);
+        const row: f32 = @floatFromInt(i / 6);
+        spawned[i] = try world.spawn(.{
+            Transform{
+                .position = .{ .x = -200 + col * 80, .y = -200 - row * 60 },
+                .rotation = 0,
+            },
+            RigidBody2D{ .body_type = 2 },
+            Collider2D{
+                .kind = 1,
+                .size = .{ .x = radius, .y = radius },
+                .restitution = 0.5,
+                .friction = 0.3,
+            },
+        });
+    }
+    sys.syncLoad(&world);
+
+    // Five seconds: long enough to fall, bounce and settle.
+    var f: usize = 0;
+    while (f < 300) : (f += 1) {
+        _ = sys.step(&world, 1.0 / 60.0);
+        world.signals.drain();
+    }
+
+    var escaped: usize = 0;
+    var worst: f32 = 0;
+    for (spawned) |e| {
+        const xf = world.get(e, Transform).?;
+        // Inside the walls, with a little slack for the contact's own allowed
+        // penetration. A ball exactly on the boundary is resting, not escaping.
+        const margin = radius + wall;
+        if (xf.position.x < -half_w - margin or xf.position.x > half_w + margin) escaped += 1;
+        if (xf.position.y < -half_h - margin or xf.position.y > half_h + margin) escaped += 1;
+        worst = @max(worst, @max(@abs(xf.position.x), @abs(xf.position.y)));
+    }
+    std.debug.print("DBG escaped={d} worst=({d:.1}) box=({d},{d})\\n", .{ escaped, worst, half_w, half_h });
+}

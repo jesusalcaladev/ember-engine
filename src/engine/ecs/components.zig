@@ -275,7 +275,7 @@ pub const Collider2D = struct {
     shape: u32 = std.math.maxInt(u32),
     generation: u32 = 0,
 
-    /// 0 box, 1 circle, 2 capsule, 3 polygon — mirrors `physics.ShapeKind`.
+    /// 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon — mirrors `physics.ShapeKind`.
     kind: u8 = 0,
 
     /// Half-extents (box), or x = radius / y = cap offset (capsule).

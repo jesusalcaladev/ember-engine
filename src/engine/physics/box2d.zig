@@ -474,6 +474,17 @@ fn createShape(ctx: *anyopaque, body: physics.BodyId, shape: physics.Shape, mat:
             c.center = toB2Vec(shape.offset);
             break :blk b2.b2CreateCircleShape(b2id, &sd, &c);
         },
+        .cylinder => blk: {
+            // Box2D has no cylinder, so one is built as a regular polygon. The
+            // hull is on the stack and bounded by the port's own constant, so
+            // this cannot overflow it -- the port is what fixes the vertex count,
+            // not a number typed in here that could drift out of range.
+            var hull = b2.b2Hull{ .count = @intCast(physics.cylinder_sides) };
+            const ring = physics.cylinderHull(shape.half_extents.x, shape.half_extents.y);
+            for (ring, hull.points[0..physics.cylinder_sides]) |src, *dst| dst.* = toB2Vec(src);
+            const poly = b2.b2MakePolygon(&hull, polygon_skin);
+            break :blk b2.b2CreatePolygonShape(b2id, &sd, &poly);
+        },
         .capsule => blk: {
             var cap = b2.b2Capsule{
                 .center1 = .{ .x = 0, .y = -shape.radius },

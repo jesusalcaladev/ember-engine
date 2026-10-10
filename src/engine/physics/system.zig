@@ -214,6 +214,19 @@ pub const System = struct {
         _ = self.activity.setFocus(p);
     }
 
+    /// Tells the activity system what the camera can see.
+    ///
+    /// Enabling this is what turns on physics view culling. It is separate from
+    /// `setFocus` because many games have a focus point and no camera — a
+    /// multiplayer simulation is authoritative over the whole world and must
+    /// simulate the whole world.
+    pub fn setView(self: *System, centre: physics.Vec2, half: physics.Vec2, enabled: bool) void {
+        self.activity.view_centre = centre;
+        self.activity.view_half = half;
+        self.activity.view_enabled = enabled;
+        self.list_dirty = true;
+    }
+
     // ── Load / unload ───────────────────────────────────────────────────────
 
     /// Creates the solver body for every entity carrying a `RigidBody2D` that
@@ -765,6 +778,10 @@ fn shapeKindFromByte(b: u8) physics.ShapeKind {
         0 => .box,
         1 => .circle,
         2 => .capsule,
+        3 => .cylinder,
+        // Anything else is a polygon, because a polygon is the one kind that
+        // can express whatever the caller meant. Defaulting to a BOX would turn
+        // a mistyped 4 into a square, which looks like it worked.
         else => .polygon,
     };
 }
@@ -774,13 +791,17 @@ fn shapeKindToByte(k: physics.ShapeKind) u8 {
         .box => 0,
         .circle => 1,
         .capsule => 2,
-        .polygon => 3,
+        .cylinder => 3,
+        .polygon => 4,
     };
 }
 
 fn shapeFromComponent(c: Collider2D) physics.Shape {
     return .{
         .kind = shapeKindFromByte(c.kind),
+        // A cylinder is described by its half-extents, like a box. Using the
+        // radius field for it would make a wide, flat cylinder and a tall, round
+        // one the same shape.
         .half_extents = c.size,
         .radius = c.size.x,
         .offset = c.offset,

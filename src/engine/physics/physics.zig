@@ -83,8 +83,21 @@ pub const ShapeKind = enum {
     box,
     circle,
     capsule,
+    /// A circle swept along the y axis: half-width `half_extents.x`, half-height
+    /// `half_extents.y`. Distinct from `capsule` in that it is FLAT on the ends,
+    /// which matters for stacking and for a barrel that must not roll.
+    cylinder,
     polygon,
 };
+
+/// How many sides a cylinder is approximated with.
+///
+/// Box2D has no cylinder, so one is built as a regular polygon. Six is the
+/// smallest that reads as round at gameplay scale and is enough for a collider;
+/// more sides buy accuracy nobody can see and cost contact tests on every
+/// touching body. Exposed as a constant because "why is my barrel not round" is
+/// a question with a number as its answer.
+pub const cylinder_sides: usize = 8;
 
 pub const Shape = struct {
     kind: ShapeKind = .box,
@@ -92,7 +105,8 @@ pub const Shape = struct {
     /// Half-extents for `box` (width/2, height/2).
     half_extents: Vec2 = .{ .x = 0.5, .y = 0.5 },
     /// Radius for `circle`; x also used as the radius for `capsule`, y as the
-    /// half-height between the cap centres.
+    /// half-height between the cap centres. For `cylinder`, both components are
+    /// the half-extents and `radius` is derived from them by the adapter.
     radius: f32 = 0.5,
     /// Local offset from the body's transform. Lets one body carry several
     /// shapes in different places (a character's head and torso).
@@ -191,6 +205,26 @@ pub const StepStats = struct {
 /// several shapes that answer to different things — a character's head stops
 /// projectiles, its feet stop the floor, and its pickup sensor stops nothing.
 /// A body-wide filter cannot express that and would force three bodies.
+/// The `cylinder` primitive, as the convex polygon Box2D will actually build.
+///
+/// Kept here rather than in the adapter so the approximation is part of the
+/// PORT's definition and not a property of this backend: a different solver
+/// would get the same shape, and a saved scene means the same thing everywhere.
+pub fn cylinderHull(radius_x: f32, radius_y: f32) [cylinder_sides]Vec2 {
+    var out: [cylinder_sides]Vec2 = undefined;
+    const n: f32 = @floatFromInt(cylinder_sides);
+    var i: usize = 0;
+    while (i < cylinder_sides) : (i += 1) {
+        // Start at -90 degrees so the polygon has a FLAT top and bottom, which
+        // is what makes a stacked column of barrels stable. A cylinder rotated
+        // by half a step has a vertex at the top, and a barrel on another barrel
+        // then balances on that vertex and rolls.
+        const a = -std.math.pi / 2.0 + @as(f32, @floatFromInt(i)) * 2.0 * std.math.pi / n;
+        out[i] = .{ .x = @cos(a) * radius_x, .y = @sin(a) * radius_y };
+    }
+    return out;
+}
+
 pub const Filter = struct {
     /// The bit(s) this shape is on.
     category_bits: u64 = ~@as(u64, 0),

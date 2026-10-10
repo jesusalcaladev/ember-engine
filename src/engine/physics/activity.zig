@@ -92,6 +92,38 @@ pub const Tier = enum(u8) {
 
 pub const tier_count = 4;
 
+/// An axis-aligned box. Used for the camera's view and for the culling test.
+pub const Rect = struct {
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+
+    pub fn contains(self: Rect, p: Vec2) bool {
+        return p.x >= self.min_x and p.x <= self.max_x and
+            p.y >= self.min_y and p.y <= self.max_y;
+    }
+
+    /// The distance from `p` to the nearest edge of the rect, negative inside.
+    ///
+    /// Signed on purpose: it answers "how far outside, or how far inside" in one
+    /// number, which is what a margin comparison needs. Returning only the
+    /// outside distance would make a body at the centre look infinitely far from
+    /// every edge.
+    pub fn signedDistance(self: Rect, p: Vec2) f32 {
+        const dx = @max(@max(self.min_x - p.x, p.x - self.max_x), 0);
+        const dy = @max(@max(self.min_y - p.y, p.y - self.max_y), 0);
+        const outside = std.math.sqrt(dx * dx + dy * dy);
+        if (outside > 0) return outside;
+        // Inside: the distance to the nearest edge, negated.
+        const inside = @min(
+            @min(p.x - self.min_x, self.max_x - p.x),
+            @min(p.y - self.min_y, self.max_y - p.y),
+        );
+        return -inside;
+    }
+};
+
 /// Radii, in world units, and the knobs that make them not thrash.
 pub const Config = struct {
     /// Beyond this the body is downgraded to a circle proxy.
@@ -106,6 +138,13 @@ pub const Config = struct {
     /// 1.0 means "change on the boundary", which is the thrashing case: a body
     /// resting on a radius flips every frame and pays a shape rebuild for it.
     hysteresis: f32 = 1.25,
+
+    /// How far beyond the view rect a body is still kept, in world units.
+    ///
+    /// Not decoration: without it a player walking right culls everything to
+    /// their right — including the ground they are about to step on — and the
+    /// ground vanishes one frame before it is needed.
+    view_margin: f32 = 256.0,
 
     /// How far the focus must move before tiers are recomputed.
     ///
@@ -167,6 +206,24 @@ pub const Activity = struct {
 
     /// Where the camera (or player) is. Set by the runtime each frame.
     focus: Vec2 = .{ .x = 0, .y = 0 },
+
+    /// The camera's view, in world units.
+    ///
+    /// This is the 2D answer to frustum culling for physics. In 3D a body off
+    /// the frustum cannot affect what you see; in 2D the statement is stronger
+    /// — a body off-screen usually cannot affect anything at all, because there
+    /// is no perspective to reveal it round a corner.
+    ///
+    /// It is deliberately SEPARATE from the distance radii. Distance is about
+    /// COST: a far body is cheap to simulate. The view rect is about the
+    /// CORRECTNESS of the assumption underneath — it is what lets a body be
+    /// skipped outright rather than merely simulated badly.
+    ///
+    /// Off by default. A server or a headless test has no camera, and culling
+    /// against a zero-sized view would delete the entire world.
+    view_centre: Vec2 = .{ .x = 0, .y = 0 },
+    view_half: Vec2 = .{ .x = 0, .y = 0 },
+    view_enabled: bool = false,
     /// Where the focus was at the last retune.
     last_tune: Vec2 = .{ .x = 0, .y = 0 },
     /// Whether the first retune has happened. `last_tune` alone cannot say, since
@@ -250,6 +307,22 @@ pub const Activity = struct {
     }
 
     /// Distance from the focus, without a square root.
+    /// The camera's view, expanded by `margin` so that a body just off-screen
+    /// is not culled on the very frame it walks in.
+    ///
+    /// The margin is not decoration. Without it a player walking right culls
+    /// everything to their right — including the ground they are about to step
+    /// on — and the ground vanishes one frame before it is needed.
+    pub fn viewRect(self: *const Activity, margin: f32) ?Rect {
+        if (!self.view_enabled) return null;
+        return .{
+            .min_x = self.view_centre.x - self.view_half.x - margin,
+            .max_x = self.view_centre.x + self.view_half.x + margin,
+            .min_y = self.view_centre.y - self.view_half.y - margin,
+            .max_y = self.view_centre.y + self.view_half.y + margin,
+        };
+    }
+
     pub fn distanceTo(self: *const Activity, p: Vec2) f32 {
         const dx = p.x - self.focus.x;
         const dy = p.y - self.focus.y;
@@ -437,4 +510,45 @@ test "the active fraction is the number an open world is judged on" {
     try testing.expectEqual(@as(u32, 2000), s.total());
     // 50 of 2 000 -- 2.5% -- costs anything, which is the entire point.
     try testing.expectApproxEqAbs(@as(f64, 0.025), s.activeFraction(), 1e-9);
+}
+
+test "a body outside the view is culled even though it is nearby" {
+    // The case distance tiers alone cannot catch: a body right next to the focus
+    // but behind the camera. Distance says "simulate it", the view says "you
+    // cannot see it, and in 2D nothing can reveal it either".
+    var a = try Activity.init(.{ .coarse_radius = 10_000, .freeze_radius = 20_000, .unload_radius = 30_000 });
+    a.view_enabled = true;
+    a.view_centre = .{ .x = 0, .y = 0 };
+    a.view_half = .{ .x = 100, .y = 100 };
+
+    const view = a.viewRect(0).?;
+    // A body just inside the screen is kept.
+    try testing.expect(view.contains(.{ .x = 50, .y = 50 }));
+    // One 200 units to the left, off-screen but still well inside every radius.
+    try testing.expect(!view.contains(.{ .x = -250, .y = 0 }));
+}
+
+test "the view margin keeps the ground you are about to walk on" {
+    var a = try Activity.init(.{});
+    a.view_enabled = true;
+    a.view_half = .{ .x = 100, .y = 100 };
+
+    const tight = a.viewRect(0).?;
+    const padded = a.viewRect(64).?;
+    // At the screen edge without a margin, and past it with one.
+    try testing.expect(!tight.contains(.{ .x = 120, .y = 0 }));
+    try testing.expect(padded.contains(.{ .x = 120, .y = 0 }));
+}
+
+test "no camera means no culling, so a server or a test loses nothing" {
+    var a = try Activity.init(.{});
+    // Disabled by default, so a headless consumer keeps every body.
+    try testing.expect(a.viewRect(0) == null);
+}
+
+test "signed distance is negative inside and positive outside" {
+    const r = Rect{ .min_x = 0, .max_x = 100, .min_y = 0, .max_y = 100 };
+    try testing.expect(r.signedDistance(.{ .x = 50, .y = 50 }) < 0);
+    try testing.expectApproxEqAbs(@as(f32, 50.0), -r.signedDistance(.{ .x = 50, .y = 50 }), 1e-5); // centre: 50 from every edge
+    try testing.expectApproxEqAbs(@as(f32, 30.0), r.signedDistance(.{ .x = -30, .y = 50 }), 1e-5);
 }
