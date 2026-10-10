@@ -4,6 +4,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Where `bash libs/bootstrap.sh` installed Box2D. Absolute because the
+    // library lives outside the build root; the same convention LuaJIT's
+    // headers already use in this file.
+    const box2d_prefix = "/home/jesusalcala/Projects/z-engine/libs/box2d/install";
+
+    // ── Feature flags ───────────────────────────────────────────────────────
+    // `-Dsteering` publishes the M4.5 steering accumulator and the `world`
+    // table behind `world.nearby`.
+    //
+    // DEFAULT OFF, and that is a deliberate statement, not a staging accident:
+    // `world.nearby` measures ~16 us per call, roughly 100x what the spatial
+    // grid should cost, and the cause is not yet known. Shipping it enabled
+    // would put a known-wrong number inside the frame. Everything else in M4.5
+    // (`rand`, `noise`, the state machine) is unaffected and always on.
+    //
+    // Turn it on with `-Dsteering` once `nearby` is fixed; the acceptance suite
+    // exercises both configurations.
+    const steering = b.option(
+        bool,
+        "steering",
+        "Enable the M4.5 steering accumulator and world.nearby (default: off until nearby is within budget)",
+    ) orelse false;
+    const options = b.addOptions();
+    options.addOption(bool, "steering", steering);
+
     // ── Core module (foundations, pure/testable) ─────────────────────────────
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/core/root.zig"),
@@ -23,6 +48,28 @@ pub fn build(b: *std.Build) void {
     });
     ecs_mod.addImport("core", core_mod);
 
+    // ── Physics module (M4) ─────────────────────────────────────────────────
+    // The PORT (`physics.zig`) has no native dependency and is testable on its
+    // own; the Box2D backend links the static library built by
+    // `libs/bootstrap.sh` and is selected at comptime through
+    // `physics.createWorld(.box2d, ...)`.
+    const physics_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/physics/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    physics_mod.addImport("core", core_mod);
+    // The sync system walks the ECS, so physics depends on the ECS — but not
+    // the other way round: the ECS components are plain data and name no
+    // solver, which is what keeps the port replaceable.
+    physics_mod.addImport("ecs", ecs_mod);
+    // Box2D's headers, mirroring how LuaJIT's are reached: an absolute path
+    // outside the build root, so `cwd_relative`.
+    physics_mod.addIncludePath(.{ .cwd_relative = box2d_prefix ++ "/include" });
+
+    // An absolute -L as well as the library name: this version of Zig has no
+    // per-library search path option, and `addLibraryPath` is module-wide.
     // ── M3 scripting module (LuaJIT; depends on core + ecs, no Dawn) ─────────
     // Declared before the engine because the engine imports it by module name,
     // and both compile the same sources once. Headless by construction: the only
@@ -35,6 +82,18 @@ pub fn build(b: *std.Build) void {
     });
     script_mod.addImport("core", core_mod);
     script_mod.addImport("ecs", ecs_mod);
+    // Physics, for the raycast/impulse bindings. Declared before `physics_mod`
+    // because the import name must resolve to the same module instance the
+    // runtime passes the `World` through — two instances of the same file would
+    // produce two incompatible `physics.World` types.
+    script_mod.addImport("physics", physics_mod);
+    // Feature flags reach the code through this, not through build-time source
+    // rewriting: `zig build -Dsteering` has to be the ONLY way the feature
+    // changes, so a stale build can never disagree with what was asked for.
+    script_mod.addOptions("options", options);
+
+    physics_mod.addLibraryPath(.{ .cwd_relative = box2d_prefix ++ "/lib" });
+    physics_mod.linkSystemLibrary("box2d", .{ .preferred_link_mode = .static });
     // LuaJIT 2.1 (Lua 5.1 API) from the system. The include path is where the
     // distro headers live; the linker resolves `-lluajit-5.1`. `cwd_relative`
     // because it is an absolute path outside the build root.
@@ -51,6 +110,7 @@ pub fn build(b: *std.Build) void {
     // Separate modules: each subsystem compiles and tests on its own.
     engine_mod.addImport("core", core_mod);
     engine_mod.addImport("ecs", ecs_mod);
+    engine_mod.addImport("physics", physics_mod);
     // M3: the LuaJIT scripting layer. It links LuaJIT but NOT Dawn, so the
     // scripting tests and the M3 bench run headless like the ECS ones do.
     engine_mod.addImport("script", script_mod);
@@ -88,13 +148,13 @@ pub fn build(b: *std.Build) void {
 
     // GLFW 3.4 built statically (X11 backend only in M0).
     const glfw_files = [_][]const u8{
-        "context.c",        "init.c",          "input.c",
-        "monitor.c",        "platform.c",      "vulkan.c",
-        "window.c",         "glx_context.c",   "egl_context.c",
-        "osmesa_context.c", "x11_init.c",      "x11_monitor.c",
-        "x11_window.c",     "xkb_unicode.c",   "posix_module.c",
-        "posix_poll.c",     "posix_thread.c",  "posix_time.c",
-        "linux_joystick.c", "null_init.c",     "null_joystick.c",
+        "context.c",        "init.c",         "input.c",
+        "monitor.c",        "platform.c",     "vulkan.c",
+        "window.c",         "glx_context.c",  "egl_context.c",
+        "osmesa_context.c", "x11_init.c",     "x11_monitor.c",
+        "x11_window.c",     "xkb_unicode.c",  "posix_module.c",
+        "posix_poll.c",     "posix_thread.c", "posix_time.c",
+        "linux_joystick.c", "null_init.c",    "null_joystick.c",
         "null_monitor.c",   "null_window.c",
     };
     const glfw_flags = [_][]const u8{"-D_GLFW_X11"};
@@ -163,12 +223,67 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| script_bench_cmd.addArgs(args);
     bench_step.dependOn(&script_bench_cmd.step);
 
+    // ── M4.5 steering benchmark (LuaJIT) ───────────────────────────────────
+    // Separate artifact for the same reason as the script bench above, and a
+    // separate STEP because it is a one-off measurement of a design decision
+    // rather than a regression gate: it must not fail CI, just report.
+    const steer_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/steer.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    steer_bench_mod.addImport("core", core_mod);
+    steer_bench_mod.addImport("ecs", ecs_mod);
+    steer_bench_mod.addImport("script", script_mod);
+    steer_bench_mod.addOptions("options", options);
+    const steer_bench = b.addExecutable(.{ .name = "ember-bench-steer", .root_module = steer_bench_mod });
+    const steer_bench_cmd = b.addRunArtifact(steer_bench);
+    if (b.args) |args| steer_bench_cmd.addArgs(args);
+    // ── M4 physics benchmark ────────────────────────────────────────────────
+    // An executable, for the same reason as the others: it links Box2D and
+    // measures the determinism criterion (spec §6), which needs a real solver.
+    const phys_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/physics.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    phys_bench_mod.addImport("core", core_mod);
+    phys_bench_mod.addImport("ecs", ecs_mod);
+    phys_bench_mod.addImport("physics", physics_mod);
+    const phys_bench = b.addExecutable(.{ .name = "ember-bench-physics", .root_module = phys_bench_mod });
+    const phys_step = b.step("bench-physics", "M4: physics determinism (2 runs -> same hash) and the 2.0 ms budget");
+    phys_step.dependOn(&b.addRunArtifact(phys_bench).step);
+
+    // The M4 milestone's own criterion (ROADMAP M4), as an executable for the
+    // same reason as the physics bench: it needs a real solver.
+    const plat_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/platformer.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    plat_mod.addImport("core", core_mod);
+    plat_mod.addImport("ecs", ecs_mod);
+    plat_mod.addImport("physics", physics_mod);
+    const plat_exe = b.addExecutable(.{ .name = "ember-demo-platformer", .root_module = plat_mod });
+    const plat_step = b.step("demo-platformer", "M4: the platformer demo — runs, and runs the same way twice");
+    plat_step.dependOn(&b.addRunArtifact(plat_exe).step);
+
+    const steer_step = b.step("bench-steer", "Measure the M4.5 steering + spatial path against spec §2");
+    // Refuses to run without the feature rather than reporting the disabled
+    // path's numbers: a benchmark of a subsystem that is compiled out is worse
+    // than no benchmark, because it looks like a result.
+    if (steering) {
+        steer_step.dependOn(&steer_bench_cmd.step);
+    }
+
     const run_cmd = b.addRunArtifact(ember);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args); // `zig build run -- --frames N`
     const run_step = b.step("run", "Run the ember runtime");
     run_step.dependOn(&run_cmd.step);
-
 
     // ── ember-profile (the CI gate: reads report.json, roadmap M11) ─────────
     const profile_mod = b.createModule(.{
@@ -197,6 +312,9 @@ pub fn build(b: *std.Build) void {
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 
+    const physics_tests = b.addTest(.{ .root_module = physics_mod });
+    test_step.dependOn(&b.addRunArtifact(physics_tests).step);
+
     // M3 API acceptance: an EXECUTABLE, not a `zig test`. LuaJIT installs its
     // own signal/`longjmp` handling, which does not survive Zig's test runner
     // (the identical code segfaults inside `lua_pcall` under `zig test` and
@@ -211,12 +329,8 @@ pub fn build(b: *std.Build) void {
     api_acceptance_mod.addImport("core", core_mod);
     api_acceptance_mod.addImport("ecs", ecs_mod);
     api_acceptance_mod.addImport("script", script_mod);
-    const t1 = b.createModule(.{ .root_source_file = b.path("src/engine/script/t1_tmp.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
-    t1.addImport("core", core_mod);
-    t1.addImport("ecs", ecs_mod);
-    t1.addImport("script", script_mod);
-    t1.addImport("core", core_mod);
-    b.installArtifact(b.addExecutable(.{ .name = "t1", .root_module = t1 }));
+    api_acceptance_mod.addImport("physics", physics_mod);
+    api_acceptance_mod.addOptions("options", options);
     const api_acceptance_exe = b.addExecutable(.{ .name = "ember-api-test", .root_module = api_acceptance_mod });
     b.installArtifact(api_acceptance_exe);
     const api_acceptance_run = b.addRunArtifact(api_acceptance_exe);

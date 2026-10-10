@@ -107,14 +107,23 @@ pub fn Query(comptime WorldT: type, comptime with: anytype, comptime without: an
 
         /// One entity row at a time; systems that can should use `nextBatch`.
         pub fn next(self: *Self) ?Row {
-            const arch = self.current orelse null;
-            if (arch == null or self.row >= arch.?.len) {
-                const batch = self.nextBatch() orelse return null;
-                return .{ .arch = batch.arch, .cols = batch.cols, .row = self.row };
+            // A loop, not an `if`: an archetype can MATCH the filter while
+            // holding zero rows (every entity in it despawned), and yielding its
+            // row 0 would hand the caller a row index past the end.
+            while (true) {
+                if (self.current) |arch| {
+                    if (self.row < arch.len) {
+                        const cursor = Row{ .arch = arch, .cols = self.cols, .row = self.row };
+                        self.row += 1;
+                        return cursor;
+                    }
+                }
+                // `nextBatch` rewinds `self.row` to 0 for the archetype it
+                // selects, so the row it lands on must be consumed HERE. Not
+                // doing so re-yields row 0 on the following call, which is how
+                // a single-archetype query over 5 entities returned 6 rows.
+                _ = self.nextBatch() orelse return null;
             }
-            const cursor = Row{ .arch = arch.?, .cols = self.cols, .row = self.row };
-            self.row += 1;
-            return cursor;
         }
     };
 }

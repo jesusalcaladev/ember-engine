@@ -34,7 +34,7 @@ const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
 // procs are null stubs; the real implementation lives in libdawn_native.
 const DawnProcTable = opaque {};
 extern fn dawnProcSetProcs(procs: *const DawnProcTable) void;
-extern fn @"_ZN4dawn6native15GetProcsAutogenEv"() *const DawnProcTable;
+extern fn _ZN4dawn6native15GetProcsAutogenEv() *const DawnProcTable;
 
 fn initProcTable() void {
     dawnProcSetProcs(_ZN4dawn6native15GetProcsAutogenEv());

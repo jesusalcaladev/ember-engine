@@ -222,7 +222,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     r2d.options.sort = args.sort;
     r2d.lock();
 
-
     var loop = core.loop.FixedLoop.init(fixed_dt);
     var limiter = core.loop.FrameLimiter.init(args.max_fps, args.vsync);
     var last_ns = core.time.monotonicNs();

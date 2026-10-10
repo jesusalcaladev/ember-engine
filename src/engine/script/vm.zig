@@ -195,10 +195,10 @@ pub const Vm = struct {
         if (self.sandboxed) return;
         const L = self.L.?;
         const removed = [_][*:0]const u8{
-            "io",         "os",           "package",  "debug",
-            "require",    "dofile",       "loadfile", "load",
-            "loadstring", "newproxy",     "module",   "collectgarbage",
-            "rawequal",   "rawget",       "rawset",   "gcinfo",
+            "io",         "os",       "package",  "debug",
+            "require",    "dofile",   "loadfile", "load",
+            "loadstring", "newproxy", "module",   "collectgarbage",
+            "rawequal",   "rawget",   "rawset",   "gcinfo",
         };
         for (removed) |name| {
             lua.pushNil(L);
@@ -266,7 +266,6 @@ pub const Vm = struct {
         lua.luaL_unref(self.L.?, lua.REGISTRYINDEX, ref);
     }
 
-
     // ── GC (spec §3.2) ──────────────────────────────────────────────────────
 
     /// One incremental GC step. This is the ONLY collection the frame performs:
@@ -330,4 +329,3 @@ pub const Vm = struct {
         return present;
     }
 };
-

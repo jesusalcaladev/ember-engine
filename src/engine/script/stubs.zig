@@ -52,6 +52,12 @@ pub const Buffer = struct {
     }
 };
 
+/// Upper bound on distinct modules. A fixed array keeps the generator
+/// allocation-free (it runs in a build step, but it also runs inside a `zig
+/// test`, where a failed allocation would be a confusing second error on top of
+/// the real one).
+const max_modules = 32;
+
 /// Writes the complete stub file for every documented binding into `writer`.
 /// Deterministic: same registry → same bytes, which is what lets CI diff them.
 pub fn writeStubs(writer: anytype) !void {
@@ -62,9 +68,30 @@ pub fn writeStubs(writer: anytype) !void {
     try writer.writeAll("---@meta\n\n");
 
     // Group bindings by module, preserving registry order within each module.
+    //
+    // `seen` is a SET, not a comparison against the previous entry. Comparing
+    // against the previous entry only works if the registry happens to be
+    // sorted by module; the day one binding is appended at the end instead of
+    // into its section, the same module gets a second header and its functions
+    // are emitted twice — which is exactly what happened when the M4 physics
+    // bindings were added at the end of the list rather than in place.
+    //
+    // Emitting a module twice is not cosmetic: an editor reading the stubs sees
+    // two definitions of the same function and the second shadows the first.
+    var seen: [max_modules][]const u8 = undefined;
+    var seen_len: usize = 0;
+
     var module_i: usize = 0;
     while (module_i < metadata.bindings.len) : (module_i += 1) {
         const module = metadata.bindings[module_i].module;
+        var already = false;
+        for (seen[0..seen_len]) |s| {
+            if (std.mem.eql(u8, s, module)) already = true;
+        }
+        if (already) continue;
+        if (seen_len == max_modules) return error.TooManyModules;
+        seen[seen_len] = module;
+        seen_len += 1;
         try writer.print("-- ── {s} ──\n", .{module});
 
         var i: usize = 0;
@@ -90,8 +117,9 @@ fn writeBinding(writer: anytype, b: Binding) !void {
             try writer.print("---@param {s} {s} {s}\n", .{ p.name, lua_type, p.doc });
         }
     }
-    if (b.returns.len > 0) {
-        try writer.print("---@return any #{s}#\n", .{b.returns});
+    for (b.returns) |r| {
+        const lua_type = r.kind.luaName();
+        try writer.print("---@return {s} {s}\n", .{ lua_type, r.doc });
     }
 
     // `self`-taking actor methods are emitted as `Actor:method` so LuaLS
@@ -102,11 +130,11 @@ fn writeBinding(writer: anytype, b: Binding) !void {
         try writer.writeAll(shortName(b.name));
         try writer.writeByte('(');
         try writeParamList(writer, b.params[1..]);
-        try writer.writeAll(" end\n\n");
+        try writer.writeAll(") end\n\n");
     } else {
         try writer.print("function {s}.{s}(", .{ b.module, shortName(b.name) });
         try writeParamList(writer, b.params);
-        try writer.writeAll(" end\n\n");
+        try writer.writeAll(") end\n\n");
     }
 }
 
@@ -127,7 +155,7 @@ fn shortName(qualified: []const u8) []const u8 {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "stub generation covers every binding and annotates types" {
-    var buf: [64 * 1024]u8 = undefined;
+    var buf: [1024 * 1024]u8 = undefined;
     var sink = Buffer{ .buf = &buf };
     try writeStubs(&sink);
 
@@ -142,18 +170,24 @@ test "stub generation covers every binding and annotates types" {
     try std.testing.expect(std.mem.indexOf(u8, out, "function Actor:get_position(") != null);
     // Module functions keep the `module.name` form.
     try std.testing.expect(std.mem.indexOf(u8, out, "function input.is_action_down(") != null);
-    // Typed params are annotated.
+    try std.testing.expect(std.mem.indexOf(u8, out, "function math.clamp(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "function vec2.dist(") != null);
+    // Typed params are annotated (from the structured params, exact types).
     try std.testing.expect(std.mem.indexOf(u8, out, "---@param x number") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "---@param action string") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "---@param self Actor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "---@param other Actor") != null);
+    // The Emmylua optional/default form for parameters that have one.
+    try std.testing.expect(std.mem.indexOf(u8, out, "---@param y number? #0#") != null);
+    // Vec2/Rect2 kinds map to their LuaLS names.
+    try std.testing.expect(std.mem.indexOf(u8, out, "---@param v Vec2") != null);
 }
 
 test "stub generation is deterministic (CI can diff it)" {
-    var buf_a: [64 * 1024]u8 = undefined;
-    var buf_b: [64 * 1024]u8 = undefined;
+    var buf_a: [1024 * 1024]u8 = undefined;
+    var buf_b: [1024 * 1024]u8 = undefined;
     var a = Buffer{ .buf = &buf_a };
     var b = Buffer{ .buf = &buf_b };
     try writeStubs(&a);
     try writeStubs(&b);
     try std.testing.expectEqualStrings(a.written(), b.written());
 }
-

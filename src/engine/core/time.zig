@@ -58,7 +58,10 @@ pub var ns_zero: u64 = 0;
 /// calibration). Informational: it goes into the report's environment block.
 pub var last_calibration_ppm: i64 = 0;
 
-fn clockGetTimeNs() u64 {
+/// The engine's monotonic clock, in nanoseconds. Public so benchmarks can time
+/// themselves with the SAME clock every other measurement in the repo uses —
+/// mixing clocks would make two reported numbers incomparable.
+pub fn clockGetTimeNs() u64 {
     var ts: Timespec = undefined;
     const rc = clock_gettime(CLOCK_MONOTONIC, &ts);
     if (rc != 0) @panic("clock_gettime failed");
@@ -87,8 +90,7 @@ inline fn readStart() u64 {
         : [lo] "={eax}" (lo),
           [hi] "={edx}" (hi),
         :
-        : .{}
-    );
+        : .{});
     return (@as(u64, hi) << 32) | lo;
 }
 

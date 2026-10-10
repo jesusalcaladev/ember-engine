@@ -508,7 +508,8 @@ pub const World = struct {
         const index: u32 = @intCast(self.archetypes.items.len);
         try self.archetypes.append(self.allocator, try Archetype.init(self.allocator, key.ids[0..]));
         return index;
-    }};
+    }
+};
 
 // ── Archetype keys ──────────────────────────────────────────────────────────
 
@@ -529,7 +530,8 @@ fn keyOfTypes(comptime types: []const type) KeyOf(types.len) {
         }
     }
     var ids: [types.len]ComponentId = undefined;
-    inline for (types, &ids) |T, *slot| slot.* = components.componentId(T);    std.mem.sort(ComponentId, &ids, {}, std.sort.asc(ComponentId));
+    inline for (types, &ids) |T, *slot| slot.* = components.componentId(T);
+    std.mem.sort(ComponentId, &ids, {}, std.sort.asc(ComponentId));
     var mask = Mask.initEmpty();
     for (ids) |id| mask.set(id);
     return .{ .mask = mask, .ids = ids };

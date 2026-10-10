@@ -315,7 +315,7 @@ fn sceneFile(io: std.Io, allocator: std.mem.Allocator) !void {
 
     core.log.info("scene {s}: {d} entities, {d} bytes", .{ path, world.entityCount(), text.len });
     core.log.info("hash before {d} / after {d} ({s})", .{
-        ecs.zson.hash(&world), ecs.zson.hash(&reloaded),
+        ecs.zson.hash(&world),                                                               ecs.zson.hash(&reloaded),
         if (ecs.zson.hash(&world) == ecs.zson.hash(&reloaded)) "identical" else "DIFFERENT",
     });
     if (ecs.zson.hash(&world) != ecs.zson.hash(&reloaded)) return error.HashMismatch;

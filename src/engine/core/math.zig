@@ -247,8 +247,6 @@ pub fn isClose(a: f32, b: f32, tolerance: f32) bool {
     return @abs(a - b) <= tolerance;
 }
 
-
-
 pub const Mat4 = struct {
     /// Column-major: m[col * 4 + row]
     m: [16]f32,
@@ -276,10 +274,10 @@ pub const Mat4 = struct {
         const c = @cos(radians);
         const s = @sin(radians);
         return .{ .m = .{
-            c,   s,   0, 0,
-            -s,  c,   0, 0,
-            0,   0,   1, 0,
-            0,   0,   0, 1,
+            c,  s, 0, 0,
+            -s, c, 0, 0,
+            0,  0, 1, 0,
+            0,  0, 0, 1,
         } };
     }
 
@@ -395,8 +393,6 @@ pub const Rect2 = struct {
         return .{ .position = pos, .size = end.sub(pos) };
     }
 };
-
-
 
 test "ortho maps corners to clip space" {
     const m = Mat4.orthoPixels(1280, 720);
@@ -520,7 +516,6 @@ test "is_close honours the tolerance" {
     try std.testing.expect(!isClose(1.0, 1.1, 0.001));
 }
 
-
 // ── M3 Vec2 method tests ─────────────────────────────────────────────────────
 
 test "Vec2 len and normalized" {
@@ -597,4 +592,3 @@ test "Rect2 fromCenter places the box around a point" {
     try std.testing.expectEqual(Vec2{ .x = 40, .y = 20 }, r.size);
     try std.testing.expectEqual(Vec2{ .x = 100, .y = 100 }, r.center());
 }
-

@@ -154,4 +154,3 @@ test "unknown actions are inert, not crashes" {
     try std.testing.expect(!input.pressed("nope"));
     try std.testing.expectEqual(@as(f32, 0), input.axis("a", "b"));
 }
-

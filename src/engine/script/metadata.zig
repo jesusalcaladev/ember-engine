@@ -363,6 +363,70 @@ pub const bindings = [_]Binding{
         ,
     },
 
+    // ── actor: physics (M4) ──────────────────────────────────────────────
+    .{
+        .name = "actor.set_linear_velocity",
+        .module = "actor",
+        .signature = "actor.set_linear_velocity(self, vx, vy)",
+        .summary = "Sets the velocity outright. Leaves the angular velocity alone.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "vx", .kind = .number, .doc = "velocity x in units/second" },
+            .{ .name = "vy", .kind = .number, .doc = "velocity y in units/second" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- a conveyor belt, or a knockback
+        \\actor.set_linear_velocity(self, 0, -120)
+        ,
+    },
+    .{
+        .name = "actor.get_linear_velocity",
+        .module = "actor",
+        .signature = "actor.get_linear_velocity(self) -> number, number",
+        .summary = "The velocity the solver has for this actor, as `vx, vy`.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "velocity x in units/second" },
+            .{ .kind = .number, .doc = "velocity y in units/second" },
+        },
+        .example =
+        \\local vx, vy = actor.get_linear_velocity(self)
+        \\self.speed = math.sqrt(vx * vx + vy * vy)
+        ,
+    },
+    .{
+        .name = "actor.apply_impulse",
+        .module = "actor",
+        .signature = "actor.apply_impulse(self, ix, iy)",
+        .summary = "An instantaneous push at the centre of mass. Wakes a sleeping actor.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "ix", .kind = .number, .doc = "impulse x (mass * units/second)" },
+            .{ .name = "iy", .kind = .number, .doc = "impulse y (mass * units/second)" },
+        },
+        .returns = &.{},
+        .example =
+        \\if input.is_action_pressed("jump") and self.on_floor then
+        \\  actor.apply_impulse(self, 0, -self.jump_impulse)
+        \\end
+        ,
+    },
+    .{
+        .name = "actor.is_awake",
+        .module = "actor",
+        .signature = "actor.is_awake(self) -> boolean",
+        .summary = "False once the body has stopped moving and the solver may put it to sleep.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true while the body is still moving" }},
+        .example =
+        \\-- an actor asleep on a ledge must still be able to jump
+        \\if input.is_action_pressed("jump") and not actor.is_awake(self) then
+        \\  actor.apply_impulse(self, 0, -self.jump_impulse)
+        \\end
+        ,
+    },
+
     // ── math: the scalar set ───────────────────────────────────────────────
     .{
         .name = "math.clamp",
@@ -374,7 +438,7 @@ pub const bindings = [_]Binding{
             .{ .name = "lo", .kind = .number, .doc = "minimum allowed value" },
             .{ .name = "hi", .kind = .number, .doc = "maximum allowed value" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "`v` constrained to [lo, hi]" } },
+        .returns = &.{.{ .kind = .number, .doc = "`v` constrained to [lo, hi]" }},
         .example =
         \\self.hp = math.clamp(self.hp - damage, 0, self.max_hp)
         ,
@@ -385,7 +449,7 @@ pub const bindings = [_]Binding{
         .signature = "math.min(a, b) -> number",
         .summary = "The smaller of two numbers.",
         .params = &.{ .{ .name = "a", .kind = .number }, .{ .name = "b", .kind = .number } },
-        .returns = &.{ .{ .kind = .number, .doc = "the lesser of `a` and `b`" } },
+        .returns = &.{.{ .kind = .number, .doc = "the lesser of `a` and `b`" }},
         .example =
         \\local steps = math.min(self.queue_len, 4)
         ,
@@ -396,7 +460,7 @@ pub const bindings = [_]Binding{
         .signature = "math.max(a, b) -> number",
         .summary = "The larger of two numbers.",
         .params = &.{ .{ .name = "a", .kind = .number }, .{ .name = "b", .kind = .number } },
-        .returns = &.{ .{ .kind = .number, .doc = "the greater of `a` and `b`" } },
+        .returns = &.{.{ .kind = .number, .doc = "the greater of `a` and `b`" }},
         .example =
         \\local scale = math.max(1, self.level * 0.5)
         ,
@@ -407,7 +471,7 @@ pub const bindings = [_]Binding{
         .signature = "math.abs(v) -> number",
         .summary = "Absolute value: the distance from zero, always >= 0.",
         .params = &.{.{ .name = "v", .kind = .number, .doc = "any number; the sign is discarded" }},
-        .returns = &.{ .{ .kind = .number, .doc = "`v` without its sign" } },
+        .returns = &.{.{ .kind = .number, .doc = "`v` without its sign" }},
         .example =
         \\local overshoot = math.abs(self.best - self.time)
         ,
@@ -418,7 +482,7 @@ pub const bindings = [_]Binding{
         .signature = "math.sign(v) -> number",
         .summary = "The sign of `v`: -1, 0 or +1 (zero maps to 0, not +1).",
         .params = &.{.{ .name = "v", .kind = .number }},
-        .returns = &.{ .{ .kind = .number, .doc = "-1, 0 or +1" } },
+        .returns = &.{.{ .kind = .number, .doc = "-1, 0 or +1" }},
         .example =
         \\actor.move_by(self, math.sign(self.vx) * 10, 0)
         ,
@@ -429,7 +493,7 @@ pub const bindings = [_]Binding{
         .signature = "math.floor(v) -> number",
         .summary = "Largest integer not greater than `v`.",
         .params = &.{.{ .name = "v", .kind = .number }},
-        .returns = &.{ .{ .kind = .integer, .doc = "the integral float floor of `v`" } },
+        .returns = &.{.{ .kind = .integer, .doc = "the integral float floor of `v`" }},
         .example =
         \\self.row = math.floor(self.index / self.cols)
         ,
@@ -440,7 +504,7 @@ pub const bindings = [_]Binding{
         .signature = "math.ceil(v) -> number",
         .summary = "Smallest integer not less than `v`.",
         .params = &.{.{ .name = "v", .kind = .number }},
-        .returns = &.{ .{ .kind = .integer, .doc = "the integral float ceil of `v`" } },
+        .returns = &.{.{ .kind = .integer, .doc = "the integral float ceil of `v`" }},
         .example =
         \\local pages = math.ceil(self.items / self.per_page)
         ,
@@ -451,7 +515,7 @@ pub const bindings = [_]Binding{
         .signature = "math.round(v) -> number",
         .summary = "Nearest integer, halves away from zero (not banker's rounding).",
         .params = &.{.{ .name = "v", .kind = .number, .doc = "any finite number" }},
-        .returns = &.{ .{ .kind = .integer, .doc = "nearest integral float; .5 rounds away from zero" } },
+        .returns = &.{.{ .kind = .integer, .doc = "nearest integral float; .5 rounds away from zero" }},
         .example =
         \\log.info("score: " .. math.round(self.score))
         ,
@@ -462,7 +526,7 @@ pub const bindings = [_]Binding{
         .signature = "math.fract(v) -> number",
         .summary = "Fractional part of `v`, always in [0, 1) regardless of sign.",
         .params = &.{.{ .name = "v", .kind = .number, .doc = "any number; the integer part is discarded" }},
-        .returns = &.{ .{ .kind = .number, .doc = "fractional part in [0, 1)" } },
+        .returns = &.{.{ .kind = .number, .doc = "fractional part in [0, 1)" }},
         .example =
         \\local pulse = math.fract(self.t)   -- 0..1 sawtooth
         ,
@@ -473,7 +537,7 @@ pub const bindings = [_]Binding{
         .signature = "math.sqrt(v) -> number",
         .summary = "Square root.",
         .params = &.{.{ .name = "v", .kind = .number, .doc = "non-negative value" }},
-        .returns = &.{ .{ .kind = .number, .doc = "the non-negative square root" } },
+        .returns = &.{.{ .kind = .number, .doc = "the non-negative square root" }},
         .example =
         \\local speed = math.sqrt(self.vx * self.vx + self.vy * self.vy)
         ,
@@ -487,7 +551,7 @@ pub const bindings = [_]Binding{
             .{ .name = "base", .kind = .number, .doc = "the base" },
             .{ .name = "exp", .kind = .number, .doc = "the exponent" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "base^exp" } },
+        .returns = &.{.{ .kind = .number, .doc = "base^exp" }},
         .example =
         \\local damage = 10 * math.pow(2, self.combo)
         ,
@@ -498,7 +562,7 @@ pub const bindings = [_]Binding{
         .signature = "math.sin(radians) -> number",
         .summary = "Sine of an angle in radians.",
         .params = &.{.{ .name = "radians", .kind = .number, .doc = "angle in radians" }},
-        .returns = &.{ .{ .kind = .number, .doc = "sine of the angle, in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "sine of the angle, in [-1, 1]" }},
         .example =
         \\local bob = math.sin(self.t * 2) * 8
         ,
@@ -509,7 +573,7 @@ pub const bindings = [_]Binding{
         .signature = "math.cos(radians) -> number",
         .summary = "Cosine of an angle in radians.",
         .params = &.{.{ .name = "radians", .kind = .number, .doc = "angle in radians" }},
-        .returns = &.{ .{ .kind = .number, .doc = "cosine of the angle, in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "cosine of the angle, in [-1, 1]" }},
         .example =
         \\local phase = math.cos(self.t * 2)
         ,
@@ -523,7 +587,7 @@ pub const bindings = [_]Binding{
             .{ .name = "y", .kind = .number, .doc = "y component" },
             .{ .name = "x", .kind = .number, .doc = "x component" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "angle in radians, in (-pi, pi]" } },
+        .returns = &.{.{ .kind = .number, .doc = "angle in radians, in (-pi, pi]" }},
         .example =
         \\local heading = math.atan2(dy, dx)
         ,
@@ -538,7 +602,7 @@ pub const bindings = [_]Binding{
             .{ .name = "b", .kind = .number, .doc = "value at t=1" },
             .{ .name = "t", .kind = .number, .doc = "blend factor, usually 0..1" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "a*(1-t) + b*t" } },
+        .returns = &.{.{ .kind = .number, .doc = "a*(1-t) + b*t" }},
         .example =
         \\self.charge = math.lerp(self.charge, 1, 0.1)
         ,
@@ -553,7 +617,7 @@ pub const bindings = [_]Binding{
             .{ .name = "b", .kind = .number, .doc = "end of the range" },
             .{ .name = "v", .kind = .number, .doc = "value to locate within the range" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "0 at a, 1 at b; may go outside 0..1" } },
+        .returns = &.{.{ .kind = .number, .doc = "0 at a, 1 at b; may go outside 0..1" }},
         .example =
         \\local progress = math.inverse_lerp(self.from_x, self.to_x, self.x)
         ,
@@ -570,7 +634,7 @@ pub const bindings = [_]Binding{
             .{ .name = "out_lo", .kind = .number, .doc = "output range minimum" },
             .{ .name = "out_hi", .kind = .number, .doc = "output range maximum" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "`v` mapped to the output range" } },
+        .returns = &.{.{ .kind = .number, .doc = "`v` mapped to the output range" }},
         .example =
         \\-- health 0..100 -> a bar's 0..200 pixel width
         \\self.bar_w = math.remap(self.hp, 0, 100, 0, 200)
@@ -586,7 +650,7 @@ pub const bindings = [_]Binding{
             .{ .name = "edge1", .kind = .number, .doc = "upper edge of the transition" },
             .{ .name = "v", .kind = .number, .doc = "value to evaluate" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "smooth 0..1 blend based on where `v` sits" } },
+        .returns = &.{.{ .kind = .number, .doc = "smooth 0..1 blend based on where `v` sits" }},
         .example =
         \\local glow = math.smoothstep(100, 400, self.dist)
         ,
@@ -600,7 +664,7 @@ pub const bindings = [_]Binding{
             .{ .name = "edge", .kind = .number, .doc = "threshold value" },
             .{ .name = "v", .kind = .number, .doc = "value to test" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "0 if v < edge, 1 otherwise" } },
+        .returns = &.{.{ .kind = .number, .doc = "0 if v < edge, 1 otherwise" }},
         .example =
         \\self.lit = math.step(0.5, self.darkness)
         ,
@@ -615,7 +679,7 @@ pub const bindings = [_]Binding{
             .{ .name = "target", .kind = .number, .doc = "value to move toward" },
             .{ .name = "max_delta", .kind = .number, .doc = "maximum step per frame" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "`current` moved toward `target`, clamped to max_delta" } },
+        .returns = &.{.{ .kind = .number, .doc = "`current` moved toward `target`, clamped to max_delta" }},
         .example =
         \\self.x = math.move_toward(self.x, self.target_x, 200 * dt)
         ,
@@ -631,7 +695,7 @@ pub const bindings = [_]Binding{
             .{ .name = "rate", .kind = .number, .doc = "time constant; larger is slower" },
             .{ .name = "dt", .kind = .number, .doc = "delta time in seconds" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "smoothed value between `a` and `b`" } },
+        .returns = &.{.{ .kind = .number, .doc = "smoothed value between `a` and `b`" }},
         .example =
         \\self.x = math.damp(self.x, self.target_x, 8, dt)
         ,
@@ -646,7 +710,7 @@ pub const bindings = [_]Binding{
             .{ .name = "lo", .kind = .number, .doc = "lower bound (inclusive)" },
             .{ .name = "hi", .kind = .number, .doc = "upper bound (exclusive)" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "`v` wrapped into [lo, hi)" } },
+        .returns = &.{.{ .kind = .number, .doc = "`v` wrapped into [lo, hi)" }},
         .example =
         \\self.lap = self.lap + 1
         \\self.t = math.wrap(self.t, 0, 1)
@@ -661,7 +725,7 @@ pub const bindings = [_]Binding{
             .{ .name = "v", .kind = .number, .doc = "time or phase value" },
             .{ .name = "length", .kind = .number, .doc = "maximum value before bouncing back" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "triangle wave between 0 and length" } },
+        .returns = &.{.{ .kind = .number, .doc = "triangle wave between 0 and length" }},
         .example =
         \\local sway = math.pingpong(self.t, 40)   -- 0..40..0..40
         ,
@@ -672,7 +736,7 @@ pub const bindings = [_]Binding{
         .signature = "math.deg_to_rad(degrees) -> number",
         .summary = "Degrees to radians.",
         .params = &.{.{ .name = "degrees", .kind = .number, .doc = "angle in degrees" }},
-        .returns = &.{ .{ .kind = .number, .doc = "the same angle in radians" } },
+        .returns = &.{.{ .kind = .number, .doc = "the same angle in radians" }},
         .example =
         \\actor.set_rotation(self, math.deg_to_rad(45))
         ,
@@ -683,7 +747,7 @@ pub const bindings = [_]Binding{
         .signature = "math.rad_to_deg(radians) -> number",
         .summary = "Radians to degrees.",
         .params = &.{.{ .name = "radians", .kind = .number, .doc = "angle in radians" }},
-        .returns = &.{ .{ .kind = .number, .doc = "the same angle in degrees" } },
+        .returns = &.{.{ .kind = .number, .doc = "the same angle in degrees" }},
         .example =
         \\log.info("heading: " .. math.rad_to_deg(actor.get_rotation(self)))
         ,
@@ -698,7 +762,7 @@ pub const bindings = [_]Binding{
             .{ .name = "b", .kind = .number, .doc = "second value" },
             .{ .name = "tolerance", .kind = .number, .doc = "maximum acceptable difference" },
         },
-        .returns = &.{ .{ .kind = .boolean, .doc = "true when |a-b| <= tolerance" } },
+        .returns = &.{.{ .kind = .boolean, .doc = "true when |a-b| <= tolerance" }},
         .example =
         \\if math.is_close(self.x, self.target_x, 0.01) then self.x = self.target_x end
         ,
@@ -714,7 +778,7 @@ pub const bindings = [_]Binding{
             .{ .name = "x", .kind = .number, .default = "0" },
             .{ .name = "y", .kind = .number, .default = "0" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "a table with `x` and `y` fields" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "a table with `x` and `y` fields" }},
         .example =
         \\self.target = vec2.new(100, 200)
         ,
@@ -728,7 +792,7 @@ pub const bindings = [_]Binding{
             .{ .name = "x", .kind = .number, .doc = "x component" },
             .{ .name = "y", .kind = .number, .doc = "y component" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "a table with `x` and `y` fields" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "a table with `x` and `y` fields" }},
         .example =
         \\local forward = vec2.to_vec(math.cos(a), math.sin(a))
         ,
@@ -744,7 +808,7 @@ pub const bindings = [_]Binding{
             .{ .name = "bx", .kind = .number, .doc = "second point x (or a Vec2 table)" },
             .{ .name = "by", .kind = .number, .doc = "second point y (or a Vec2 table)" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "distance" } },
+        .returns = &.{.{ .kind = .number, .doc = "distance" }},
         .example =
         \\local d = vec2.dist(self.x, self.y, other_x, other_y)
         \\-- or, with tables:
@@ -762,7 +826,7 @@ pub const bindings = [_]Binding{
             .{ .name = "bx", .kind = .number, .doc = "second point x (or a Vec2 table)" },
             .{ .name = "by", .kind = .number, .doc = "second point y (or a Vec2 table)" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "distance squared" } },
+        .returns = &.{.{ .kind = .number, .doc = "distance squared" }},
         .example =
         \\if vec2.dist_sq(self.x, self.y, px, py) <= r * r then end
         ,
@@ -773,7 +837,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.length(v) -> number",
         .summary = "Length of a vector (also accepts `x, y` as two numbers).",
         .params = &.{.{ .name = "v", .kind = .vec2, .doc = "a Vec2 table or x, y as two numbers" }},
-        .returns = &.{ .{ .kind = .number, .doc = "length; 0 for the zero vector" } },
+        .returns = &.{.{ .kind = .number, .doc = "length; 0 for the zero vector" }},
         .example =
         \\local speed = vec2.length(self.vel)
         ,
@@ -784,7 +848,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.length_sq(v) -> number",
         .summary = "Squared length: the comparison form, no square root.",
         .params = &.{.{ .name = "v", .kind = .vec2, .doc = "a Vec2 table" }},
-        .returns = &.{ .{ .kind = .number, .doc = "length squared" } },
+        .returns = &.{.{ .kind = .number, .doc = "length squared" }},
         .example =
         \\if vec2.length_sq(self.vel) > self.max_speed * self.max_speed then end
         ,
@@ -795,7 +859,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.normalized(v) -> Vec2",
         .summary = "The vector scaled to length 1; the zero vector maps to zero (never NaN).",
         .params = &.{.{ .name = "v", .kind = .vec2, .doc = "a Vec2 table" }},
-        .returns = &.{ .{ .kind = .vec2, .doc = "a unit vector (length 1); zero maps to zero" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "a unit vector (length 1); zero maps to zero" }},
         .example =
         \\local dir = vec2.normalized(vec2.new(dx, dy))
         ,
@@ -811,7 +875,7 @@ pub const bindings = [_]Binding{
             .{ .name = "bx", .kind = .number, .doc = "target point x" },
             .{ .name = "by", .kind = .number, .doc = "target point y" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "a unit vector; (0,0) when the points coincide" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "a unit vector; (0,0) when the points coincide" }},
         .example =
         \\local to_ball = vec2.direction(self.x, self.y, ball_x, ball_y)
         ,
@@ -826,7 +890,7 @@ pub const bindings = [_]Binding{
             .{ .name = "b", .kind = .vec2, .doc = "value at t=1" },
             .{ .name = "t", .kind = .number, .doc = "blend factor, usually 0..1" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "the blended vector" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the blended vector" }},
         .example =
         \\self.pos = vec2.lerp(self.pos, self.target, 0.1)
         ,
@@ -840,7 +904,7 @@ pub const bindings = [_]Binding{
             .{ .name = "a", .kind = .vec2, .doc = "first vector" },
             .{ .name = "b", .kind = .vec2, .doc = "second vector" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "the dot product" } },
+        .returns = &.{.{ .kind = .number, .doc = "the dot product" }},
         .example =
         \\if vec2.dot(self.dir, vec2.normalized(to_player)) > 0.9 then end  -- in the cone
         ,
@@ -854,7 +918,7 @@ pub const bindings = [_]Binding{
             .{ .name = "a", .kind = .vec2, .doc = "first vector" },
             .{ .name = "b", .kind = .vec2, .doc = "second vector" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "the scalar cross (z of the 3D cross); positive when b is clockwise from a" } },
+        .returns = &.{.{ .kind = .number, .doc = "the scalar cross (z of the 3D cross); positive when b is clockwise from a" }},
         .example =
         \\local side = vec2.cross(self.dir, to_player)   -- + or -
         ,
@@ -865,7 +929,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.angle(v) -> number",
         .summary = "Angle of a vector in radians, relative to +X.",
         .params = &.{.{ .name = "v", .kind = .vec2, .doc = "a Vec2 table" }},
-        .returns = &.{ .{ .kind = .number, .doc = "angle in radians" } },
+        .returns = &.{.{ .kind = .number, .doc = "angle in radians" }},
         .example =
         \\local heading = vec2.angle(self.vel)
         ,
@@ -879,7 +943,7 @@ pub const bindings = [_]Binding{
             .{ .name = "a", .kind = .vec2, .doc = "first vector" },
             .{ .name = "b", .kind = .vec2, .doc = "second vector" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "signed angle in (-pi, pi]" } },
+        .returns = &.{.{ .kind = .number, .doc = "signed angle in (-pi, pi]" }},
         .example =
         \\local turn = vec2.angle_between(self.dir, to_target)
         ,
@@ -893,7 +957,7 @@ pub const bindings = [_]Binding{
             .{ .name = "v", .kind = .vec2, .doc = "vector to rotate" },
             .{ .name = "radians", .kind = .number, .doc = "rotation angle in radians (positive = clockwise)" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "the rotated vector" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the rotated vector" }},
         .example =
         \\local aim = vec2.rotate(vec2.new(1, 0), math.deg_to_rad(30))
         ,
@@ -904,7 +968,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.perpendicular(v) -> Vec2",
         .summary = "The 90-degree rotation of a vector: a wall normal from a direction.",
         .params = &.{.{ .name = "v", .kind = .vec2, .doc = "a Vec2 table" }},
-        .returns = &.{ .{ .kind = .vec2, .doc = "the perpendicular vector (90° clockwise rotation)" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the perpendicular vector (90° clockwise rotation)" }},
         .example =
         \\local normal = vec2.perpendicular(vec2.normalized(self.edge))
         ,
@@ -918,7 +982,7 @@ pub const bindings = [_]Binding{
             .{ .name = "v", .kind = .vec2, .doc = "vector to clamp" },
             .{ .name = "max_len", .kind = .number, .doc = "maximum length" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "the capped vector" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the capped vector" }},
         .example =
         \\self.vel = vec2.clamp_length(self.vel, self.max_speed)
         ,
@@ -932,7 +996,7 @@ pub const bindings = [_]Binding{
             .{ .name = "v", .kind = .vec2, .doc = "vector to clamp" },
             .{ .name = "max_len", .kind = .number, .doc = "maximum length" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "the capped vector" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the capped vector" }},
         .example =
         \\self.push = vec2.clamped(self.push, 5)
         ,
@@ -946,7 +1010,7 @@ pub const bindings = [_]Binding{
             .{ .name = "d", .kind = .vec2, .doc = "incoming direction" },
             .{ .name = "n", .kind = .vec2, .doc = "unit normal of the surface" },
         },
-        .returns = &.{ .{ .kind = .vec2, .doc = "the reflected direction" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "the reflected direction" }},
         .example =
         \\-- the ball off a wall (normal points at the ball)
         \\self.vel = vec2.reflect(self.vel, vec2.new(1, 0))
@@ -958,7 +1022,7 @@ pub const bindings = [_]Binding{
         .signature = "vec2.from_angle(radians) -> Vec2",
         .summary = "Unit vector at an angle (Godot's `Vector2.from_angle`).",
         .params = &.{.{ .name = "radians", .kind = .number, .doc = "angle in radians" }},
-        .returns = &.{ .{ .kind = .vec2, .doc = "a unit vector pointing at the given angle" } },
+        .returns = &.{.{ .kind = .vec2, .doc = "a unit vector pointing at the given angle" }},
         .example =
         \\local muzzle = vec2.from_angle(actor.get_rotation(self))
         ,
@@ -991,7 +1055,7 @@ pub const bindings = [_]Binding{
             .{ .name = "lo", .kind = .number, .doc = "inclusive lower bound" },
             .{ .name = "hi", .kind = .number, .doc = "exclusive upper bound" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "a random number in [lo, hi)" } },
+        .returns = &.{.{ .kind = .number, .doc = "a random number in [lo, hi)" }},
         .example =
         \\local jitter = rand.float(-10, 10)   -- spread an object a little
         ,
@@ -1005,7 +1069,7 @@ pub const bindings = [_]Binding{
             .{ .name = "lo", .kind = .number, .doc = "inclusive lower bound" },
             .{ .name = "hi", .kind = .number, .doc = "exclusive upper bound" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "a random number in [lo, hi)" } },
+        .returns = &.{.{ .kind = .number, .doc = "a random number in [lo, hi)" }},
         .example =
         \\local damage = rand.range(8, 14)   -- 8..13.99
         ,
@@ -1019,7 +1083,7 @@ pub const bindings = [_]Binding{
             .{ .name = "lo", .kind = .integer, .doc = "inclusive lower bound" },
             .{ .name = "hi", .kind = .integer, .doc = "inclusive upper bound" },
         },
-        .returns = &.{ .{ .kind = .integer, .doc = "a random integer in [lo, hi]" } },
+        .returns = &.{.{ .kind = .integer, .doc = "a random integer in [lo, hi]" }},
         .example =
         \\local roll = rand.int(1, 6)   -- a d6; 1 and 6 are both reachable
         ,
@@ -1030,7 +1094,7 @@ pub const bindings = [_]Binding{
         .signature = "rand.chance(p) -> boolean",
         .summary = "True with probability `p`. `p <= 0` never fires, `p >= 1` always does.",
         .params = &.{.{ .name = "p", .kind = .number, .doc = "probability, 0..1" }},
-        .returns = &.{ .{ .kind = .boolean, .doc = "true about p of the time" } },
+        .returns = &.{.{ .kind = .boolean, .doc = "true about p of the time" }},
         .example =
         \\if rand.chance(0.25) then   -- a 25% critical hit
         \\  self.damage = self.damage * 2
@@ -1043,7 +1107,7 @@ pub const bindings = [_]Binding{
         .signature = "rand.sign() -> number",
         .summary = "Returns -1 or +1 with equal probability.",
         .params = &.{},
-        .returns = &.{ .{ .kind = .number, .doc = "-1 or +1" } },
+        .returns = &.{.{ .kind = .number, .doc = "-1 or +1" }},
         .example =
         \\actor.move_by(self, rand.sign() * 100 * dt, 0)   -- coin-flip drift
         ,
@@ -1057,7 +1121,7 @@ pub const bindings = [_]Binding{
             .{ .name = "mu", .kind = .number, .doc = "mean (centre of the bell)" },
             .{ .name = "sigma", .kind = .number, .doc = "standard deviation (spread)" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "a sample from N(mu, sigma^2)" } },
+        .returns = &.{.{ .kind = .number, .doc = "a sample from N(mu, sigma^2)" }},
         .example =
         \\-- enemy accuracy: mostly on target, occasionally off by a lot
         \\local spread = rand.gauss(0.0, 3.0)
@@ -1071,7 +1135,7 @@ pub const bindings = [_]Binding{
         .params = &.{
             .{ .name = "table", .kind = .any, .doc = "array-like Lua table" },
         },
-        .returns = &.{ .{ .kind = .any, .doc = "one element of the table, or nil if empty" } },
+        .returns = &.{.{ .kind = .any, .doc = "one element of the table, or nil if empty" }},
         .example =
         \\local drops = { "coin", "gem", "potion" }
         \\local drop = rand.choice(drops)
@@ -1085,7 +1149,7 @@ pub const bindings = [_]Binding{
         .params = &.{
             .{ .name = "table", .kind = .any, .doc = "array-like Lua table" },
         },
-        .returns = &.{ .{ .kind = .any, .doc = "the same table, shuffled" } },
+        .returns = &.{.{ .kind = .any, .doc = "the same table, shuffled" }},
         .example =
         \\local deck = rand.shuffle({ 1, 2, 3, 4, 5 })
         \\local top = deck[1]
@@ -1115,7 +1179,7 @@ pub const bindings = [_]Binding{
             .{ .name = "x", .kind = .number, .doc = "sample x" },
             .{ .name = "y", .kind = .number, .doc = "sample y" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "noise sample in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "noise sample in [-1, 1]" }},
         .example =
         \\local h = noise.value(px * 0.05, py * 0.05)   -- terrain height
         ,
@@ -1129,7 +1193,7 @@ pub const bindings = [_]Binding{
             .{ .name = "x", .kind = .number, .doc = "sample x" },
             .{ .name = "y", .kind = .number, .doc = "sample y" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "noise sample in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "noise sample in [-1, 1]" }},
         .example =
         \\local h = noise.perlin(px * 0.02, py * 0.02)
         ,
@@ -1143,7 +1207,7 @@ pub const bindings = [_]Binding{
             .{ .name = "x", .kind = .number, .doc = "sample x" },
             .{ .name = "y", .kind = .number, .doc = "sample y" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "noise sample in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "noise sample in [-1, 1]" }},
         .example =
         \\-- a wander angle that stays isotropic instead of biasing along the axes
         \\self.heading = noise.simplex(self.t * 0.1, self.seed) * math.tau
@@ -1160,7 +1224,7 @@ pub const bindings = [_]Binding{
             .{ .name = "octaves", .kind = .integer, .default = "4", .doc = "how many layers; clamped to 12" },
             .{ .name = "basis", .kind = .string, .default = "\"perlin\"", .doc = "\"value\", \"perlin\" or \"simplex\"" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "combined noise in [-1, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "combined noise in [-1, 1]" }},
         .example =
         \\-- rolling hills: detail at several scales, not one
         \\local h = noise.fbm(px * 0.01, py * 0.01, 5)
@@ -1177,10 +1241,196 @@ pub const bindings = [_]Binding{
             .{ .name = "octaves", .kind = .integer, .default = "4", .doc = "how many layers; clamped to 12" },
             .{ .name = "basis", .kind = .string, .default = "\"perlin\"", .doc = "\"value\", \"perlin\" or \"simplex\"" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "ridge height in [0, 1]" } },
+        .returns = &.{.{ .kind = .number, .doc = "ridge height in [0, 1]" }},
         .example =
         \\-- mountain silhouettes instead of rolling noise
         \\local ridge = noise.ridged(px * 0.01, py * 0.01, 6)
+        ,
+    },
+
+    // ── sm: declarative state machines (M4.5) ───────────────────────────────
+    // ONE mechanism, every case. The same seven calls declare an enemy's AI, the
+    // player's own states (idle/run/jump/dash), a spawner, a UI screen and the
+    // game flow — only the declaring script differs, which is the point of
+    // making it a component rather than an AI-specific system.
+    .{
+        .name = "sm.add_state",
+        .module = "sm",
+        .signature = "sm.add_state(name, hooks) -> boolean",
+        .summary = "Declares a state with optional `enter`/`update`/`exit` callbacks.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "name", .kind = .string, .doc = "state name, unique within the machine" },
+            .{ .name = "hooks", .kind = .any, .default = "{}", .doc = "table with optional enter/update/exit functions" },
+        },
+        .returns = &.{.{ .kind = .boolean, .doc = "true when the state was declared" }},
+        .example =
+        \\self:sm_add_state("idle", {
+        \\  enter = function(self) self.wait = 1.0 end,
+        \\  update = function(self, dt) self.wait = self.wait - dt end,
+        \\  exit  = function(self) log.info("leaving idle") end,
+        \\})
+        ,
+    },
+    .{
+        .name = "sm.add_transition",
+        .module = "sm",
+        .signature = "sm.add_transition(from, event, to)",
+        .summary = "Moves from one state to another when an event is fired.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "from", .kind = .string, .doc = "state the transition starts in" },
+            .{ .name = "event", .kind = .string, .doc = "event name that triggers it" },
+            .{ .name = "to", .kind = .string, .doc = "state to enter" },
+        },
+        .returns = &.{},
+        .example =
+        \\self:sm_add_transition("idle", "see_player", "chase")
+        \\self:sm_add_transition("chase", "in_range", "attack")
+        ,
+    },
+    .{
+        .name = "sm.set_initial",
+        .module = "sm",
+        .signature = "sm.set_initial(name)",
+        .summary = "Sets the state entered when the machine starts.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "name", .kind = .string, .doc = "state to start in" },
+        },
+        .returns = &.{},
+        .example =
+        \\self:sm_set_initial("idle")   -- optional: the first declared state is the default
+        ,
+    },
+    .{
+        .name = "sm.fire",
+        .module = "sm",
+        .signature = "sm.fire(event)",
+        .summary = "Requests a transition; applied before the next update.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "event", .kind = .string, .doc = "event name" },
+        },
+        .returns = &.{},
+        .example =
+        \\if actor.distance_to(self, player) < 300 then
+        \\  self:sm_fire("see_player")   -- takes effect next tick
+        \\end
+        ,
+    },
+    .{
+        .name = "sm.set_state",
+        .module = "sm",
+        .signature = "sm.set_state(name)",
+        .summary = "Jumps to a state immediately, running exit then enter.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "name", .kind = .string, .doc = "state to enter now" },
+        },
+        .returns = &.{},
+        .example =
+        \\self:sm_set_state("attack")   -- from inside a callback: no one-frame gap
+        ,
+    },
+    .{
+        .name = "sm.state",
+        .module = "sm",
+        .signature = "sm.state() -> string",
+        .summary = "The active state's name; empty before the first update.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .string, .doc = "the current state name" }},
+        .example =
+        \\log.info("enemy is: " .. self:sm_state())
+        ,
+    },
+    .{
+        .name = "sm.is_in",
+        .module = "sm",
+        .signature = "sm.is_in(name) -> boolean",
+        .summary = "True when the machine is currently in that state.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "name", .kind = .string, .doc = "state name to test" },
+        },
+        .returns = &.{.{ .kind = .boolean, .doc = "true when the active state is `name`" }},
+        .example =
+        \\if self:sm_is_in("attack") then self.hitbox_on = true end
+        ,
+    },
+
+    // ── world: spatial queries (M4.5) ─────────────────────────────────────
+    // One primitive, not one per AI behaviour. Flocking, obstacle avoidance,
+    // "the closest threat", area triggers and squad cohesion are the same
+    // question with different consumers, so the engine answers it once.
+    .{
+        .name = "world.nearby",
+        .module = "world",
+        .signature = "world.nearby(self, x, y, radius, fn)",
+        .summary = "Calls `fn(other_self)` for every actor within `radius`, excluding the caller.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x", .kind = .number, .doc = "centre x in world units" },
+            .{ .name = "y", .kind = .number, .doc = "centre y in world units" },
+            .{ .name = "radius", .kind = .number, .doc = "search radius in world units" },
+            .{ .name = "fn", .kind = .any, .doc = "visitor called as fn(other_self)" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- "who is close enough to push me?"
+        \\world.nearby(self, self.px, self.py, 80, function(other)
+        \\  self.push = self.push + (other.px - self.px) * 0.01
+        \\end)
+        ,
+    },
+
+    // ── physics (M4) ───────────────────────────────────────────────────────
+
+    .{
+        .name = "physics.cast_ray",
+        .module = "physics",
+        .signature = "physics.cast_ray(x1, y1, x2, y2) -> boolean, number, number, number, number, number",
+        .summary = "Casts a segment and reports what it hit: `hit, t, px, py, nx, ny`.",
+        .params = &.{
+            .{ .name = "x1", .kind = .number, .doc = "segment start x" },
+            .{ .name = "y1", .kind = .number, .doc = "segment start y" },
+            .{ .name = "x2", .kind = .number, .doc = "segment end x" },
+            .{ .name = "y2", .kind = .number, .doc = "segment end y" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "false when nothing blocks the segment" },
+            .{ .kind = .number, .doc = "how far along the segment the hit is, 0 at the start and 1 at the end" },
+            .{ .kind = .number, .doc = "hit point x" },
+            .{ .kind = .number, .doc = "hit point y" },
+            .{ .kind = .number, .doc = "surface normal x (points away from the surface)" },
+            .{ .kind = .number, .doc = "surface normal y" },
+        },
+        .example =
+        \\-- place a bullet impact where the shot lands
+        \\local hit, t, px, py = physics.cast_ray(self.px, self.py, tx, ty)
+        \\if hit then
+        \\  effects.spawn("impact", px, py)
+        \\  target.take_damage(10)
+        \\end
+        ,
+    },
+    .{
+        .name = "physics.line_of_sight",
+        .module = "physics",
+        .signature = "physics.line_of_sight(x1, y1, x2, y2) -> boolean",
+        .summary = "True when nothing solid blocks the segment between the two points.",
+        .params = &.{
+            .{ .name = "x1", .kind = .number, .doc = "segment start x" },
+            .{ .name = "y1", .kind = .number, .doc = "segment start y" },
+            .{ .name = "x2", .kind = .number, .doc = "segment end x" },
+            .{ .name = "y2", .kind = .number, .doc = "segment end y" },
+        },
+        .returns = &.{.{ .kind = .boolean, .doc = "true when the target is visible" }},
+        .example =
+        \\-- a turret that only fires what it can see
+        \\if physics.line_of_sight(self.px, self.py, player.px, player.py) then
+        \\  self.fire()
+        \\end
         ,
     },
 
@@ -1191,7 +1441,7 @@ pub const bindings = [_]Binding{
         .signature = "input.is_action_pressed(name) -> boolean",
         .summary = "True on the frame an action went down.",
         .params = &.{.{ .name = "name", .kind = .string, .doc = "input action name (e.g. \"jump\")" }},
-        .returns = &.{ .{ .kind = .boolean, .doc = "true on the frame the action was pressed" } },
+        .returns = &.{.{ .kind = .boolean, .doc = "true on the frame the action was pressed" }},
         .example =
         \\if input.is_action_pressed("jump") then self.can_jump = true end
         ,
@@ -1202,7 +1452,7 @@ pub const bindings = [_]Binding{
         .signature = "input.is_action_down(name) -> boolean",
         .summary = "True while an action is held.",
         .params = &.{.{ .name = "name", .kind = .string, .doc = "input action name (e.g. \"move_right\")" }},
-        .returns = &.{ .{ .kind = .boolean, .doc = "true while the action is held" } },
+        .returns = &.{.{ .kind = .boolean, .doc = "true while the action is held" }},
         .example =
         \\if input.is_action_down("move_right") then actor.move_by(self, 200 * dt, 0) end
         ,
@@ -1216,7 +1466,7 @@ pub const bindings = [_]Binding{
             .{ .name = "negative", .kind = .string, .doc = "action for the negative direction (e.g. \"move_left\")" },
             .{ .name = "positive", .kind = .string, .doc = "action for the positive direction (e.g. \"move_right\")" },
         },
-        .returns = &.{ .{ .kind = .number, .doc = "-1, 0 or +1 (fractional once more devices are mapped)" } },
+        .returns = &.{.{ .kind = .number, .doc = "-1, 0 or +1 (fractional once more devices are mapped)" }},
         .example =
         \\local move = input.get_axis("move_left", "move_right")
         ,
@@ -1326,4 +1576,3 @@ test "assertAllDocumented accepts the exact registry" {
     };
     assertAllDocumented(&names);
 }
-

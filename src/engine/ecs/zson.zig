@@ -738,11 +738,11 @@ fn pow10At(comptime T: type, n: usize) T {
 
 test "fast float path agrees bit for bit with the standard parser" {
     const samples = [_][]const u8{
-        "0",          "1",         "12.5",       "-1.5",       "0.1",
-        "1.0",        "100",       "0.001",      "-0.0",       "12345.6789",
-        "3.4028235",  "1.1754944", "0.0000001",  "16777216",   "16777217",
-        "0.33333333", "9999999.9", "-12345.6789", "2.5e3",     "1e-7",
-        "nan",        "inf",       "0x1p3",      "",
+        "0",          "1",         "12.5",        "-1.5",     "0.1",
+        "1.0",        "100",       "0.001",       "-0.0",     "12345.6789",
+        "3.4028235",  "1.1754944", "0.0000001",   "16777216", "16777217",
+        "0.33333333", "9999999.9", "-12345.6789", "2.5e3",    "1e-7",
+        "nan",        "inf",       "0x1p3",       "",
     };
     for (samples) |text| {
         // f32: the fast path only claims values it can do exactly.
@@ -996,8 +996,8 @@ test "deeper hierarchy round-trips with references by tag" {
     defer world.deinit();
 
     const root = try world.spawn(.{components.Name.init("root")});
-    const middle = try world.spawn(.{components.Name.init("middle"), components.Parent{ .parent = root } });
-    const leaf = try world.spawn(.{components.Name.init("leaf"), components.Parent{ .parent = middle }});
+    const middle = try world.spawn(.{ components.Name.init("middle"), components.Parent{ .parent = root } });
+    const leaf = try world.spawn(.{ components.Name.init("leaf"), components.Parent{ .parent = middle } });
     try std.testing.expect(leaf.index != middle.index);
 
     const text = try encodeToString(&world, std.testing.allocator);

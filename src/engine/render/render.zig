@@ -76,7 +76,7 @@ pub const MAX_SPRITES_PER_BATCH: usize = 4096;
 /// Orthographic camera: view-projection matrix + viewport.
 pub const Camera = struct {
     /// Column-major view-projection matrix (ortho).
-    vp: [16]f32 = [_]f32{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1},
+    vp: [16]f32 = [_]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
     /// Viewport in pixels (for scissor / SMAA resolve).
     viewport_x: u32 = 0,
     viewport_y: u32 = 0,
@@ -236,9 +236,9 @@ pub fn makeCamera(width: f32, height: f32) Camera {
 
     return Camera{
         .vp = .{
-            sx, 0, 0, 0,
-            0, sy, 0, 0,
-            0, 0, sz, 0,
+            sx, 0,  0,  0,
+            0,  sy, 0,  0,
+            0,  0,  sz, 0,
             tx, ty, tz, 1,
         },
         .viewport_w = @intFromFloat(width),

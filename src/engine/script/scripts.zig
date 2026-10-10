@@ -179,4 +179,3 @@ pub const Scripts = struct {
         return self.by_name.get(name);
     }
 };
-

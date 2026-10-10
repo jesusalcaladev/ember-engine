@@ -133,7 +133,7 @@ fn chase(alloc: std.mem.Allocator) !void {
     var world = ecs.World.init(alloc);
     defer world.deinit();
     try world.reserveEntities(16);
-    try world.reserve(.{ components.Transform }, 16);
+    try world.reserve(.{components.Transform}, 16);
     var input = script.Input{};
     input.define("jump");
     input.define("move_left");
@@ -175,7 +175,7 @@ fn mathSet(alloc: std.mem.Allocator) !void {
     var world = ecs.World.init(alloc);
     defer world.deinit();
     try world.reserveEntities(16);
-    try world.reserve(.{ components.Transform }, 16);
+    try world.reserve(.{components.Transform}, 16);
     var input = script.Input{};
     input.define("jump");
     var b: script.Behaviors = undefined;
@@ -207,7 +207,7 @@ fn vec2All(alloc: std.mem.Allocator) !void {
     var world = ecs.World.init(alloc);
     defer world.deinit();
     try world.reserveEntities(16);
-    try world.reserve(.{ components.Transform }, 16);
+    try world.reserve(.{components.Transform}, 16);
     var input = script.Input{};
     input.define("jump");
     var b: script.Behaviors = undefined;
@@ -242,7 +242,7 @@ fn spatial(alloc: std.mem.Allocator) !void {
     var world = ecs.World.init(alloc);
     defer world.deinit();
     try world.reserveEntities(16);
-    try world.reserve(.{ components.Transform }, 16);
+    try world.reserve(.{components.Transform}, 16);
     var input = script.Input{};
     input.define("jump");
     var b: script.Behaviors = undefined;

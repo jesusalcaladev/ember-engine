@@ -31,6 +31,10 @@ const core_log = core.log.scoped("behavior");
 const vm_mod = @import("vm.zig");
 const scripts_mod = @import("scripts.zig");
 const bindings = @import("bindings.zig");
+const statemachine_mod = @import("statemachine.zig");
+const spatial_mod = @import("spatial.zig");
+const steer_mod = @import("steer.zig");
+const build_options = @import("options");
 const input = @import("input.zig");
 
 const World = ecs.World;
@@ -126,6 +130,15 @@ pub const Behaviors = struct {
     ctx: bindings.Context,
     instances: std.ArrayListUnmanaged(Instance) = .empty,
     allocator: std.mem.Allocator,
+    /// The state-machine registry (ROADMAP M4.5). Owned here rather than by the
+    /// runtime because it holds Lua refs into `self.vm`: the registry must be
+    /// destroyed before the VM, and this struct already owns that ordering.
+    machines: statemachine_mod.Registry,
+    /// The spatial grid behind `world.nearby` (ROADMAP M4.5), plus the steering
+    /// module. Owned here for the same reason as `machines`.
+    grid: spatial_mod.Grid,
+    /// Registry ref of the steering module's `for` constructor.
+    steer_ref: i32 = no_ref,
     /// Per-frame counters for the acceptance report (M3 criteria).
     updates: u32 = 0,
     errors: u32 = 0,
@@ -135,7 +148,7 @@ pub const Behaviors = struct {
     insts_table_ref: i32 = no_ref,
     driver_ref: i32 = no_ref,
 
-    pub const Error = error{ OutOfMemory, StateCreationFailed, DriverCompilationFailed } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
+    pub const Error = error{ OutOfMemory, StateCreationFailed, DriverCompilationFailed, SteerCompilationFailed } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
 
     /// Wires this Behaviors system in place: creates the VM (sandboxed Lua heap
     /// owner), binds the engine API against `world` + `input`, and prepares the
@@ -154,18 +167,70 @@ pub const Behaviors = struct {
         world: *World,
         input_snap: *const input.Input,
     ) Error!void {
-        self.* = Behaviors{ .vm = undefined, .scripts = undefined, .ctx = undefined, .allocator = allocator };
+        self.* = Behaviors{ .vm = undefined, .scripts = undefined, .ctx = undefined, .allocator = allocator, .machines = undefined, .grid = undefined, .steer_ref = no_ref };
         self.vm = try vm_mod.Vm.init(allocator);
         errdefer self.vm.deinit();
         self.vm.sandbox();
+        // Before `ctx`: the context hands the machine registry to the `sm.*`
+        // bindings as its upvalue, and the registry outlives both.
+        self.machines = statemachine_mod.Registry.init(allocator, &self.vm);
+        // Sized from the world the caller already reserved, so the grid never
+        // allocates while it is being filled (spec §10).
+        self.grid = spatial_mod.Grid.init(allocator, spatial_mod.default_cell_size, spatial_mod.default_extent, world.slotCount()) catch {
+            self.machines.deinit();
+            self.vm.deinit();
+            return error.OutOfMemory;
+        };
         self.ctx = bindings.Context.init(world, input_snap);
+        self.ctx.machines = &self.machines;
+        self.ctx.spatial = &self.grid;
         bindings.registerAll(self.vm.state(), &self.ctx);
+        if (build_options.steering) {
+            self.buildSteer() catch |e| {
+                self.machines.deinit();
+                self.grid.deinit();
+                self.vm.deinit();
+                return e;
+            };
+        }
         self.scripts = scripts_mod.Scripts.init(&self.vm, allocator);
         self.buildDriver() catch |e| {
             self.scripts.deinit();
             self.vm.deinit();
             return e;
         };
+    }
+
+    /// Compiles the steering module and publishes it as the global `steer`.
+    /// Built after `registerAll` because its neighbour terms call `world.nearby`
+    /// and `actor.get_position`, which must already exist.
+    fn buildSteer(self: *Behaviors) Error!void {
+        const L = self.vm.state().?;
+        if (lua.luaL_loadbuffer(L, steer_mod.source, steer_mod.source.len, "@steer") != 0)
+            return error.SteerCompilationFailed;
+        if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.SteerCompilationFailed;
+        // [module]
+        // Publish the MODULE table (the stack top), so scripts get
+        // `steer.at(...)` rather than a callable global.
+        lua.setGlobal(L, steer_mod.global_name);
+        // The module table itself has no reason to outlive this line: `at` is
+        // the only entry point, and keeping it as a global is one less
+        // reference the sandbox can mutate.
+        lua.pop(L, 1);
+    }
+
+    /// Rebuilds the spatial grid and republishes each entity's `self` ref, so
+    /// `world.nearby` can hand Lua a real `self` table.
+    fn rebuildGrid(self: *Behaviors) void {
+        self.grid.rebuild(self.ctx.world);
+        // `self_refs` is indexed by entity slot; the instance array is dense and
+        // small next to the slot space, so a linear pass over instances beats
+        // any lookup structure here.
+        for (self.instances.items) |inst| {
+            if (!self.ctx.world.isAlive(inst.entity)) continue;
+            if (inst.entity.index >= self.grid.self_refs.len) continue;
+            self.grid.self_refs[inst.entity.index] = inst.self_ref;
+        }
     }
 
     /// Compiles the Lua-side loop and the dense `self` table it iterates.
@@ -370,6 +435,16 @@ pub const Behaviors = struct {
     /// bug is a logged error, not a crash).
     pub fn update(self: *Behaviors, dt: f32) void {
         self.updates = 0;
+        // The state machines advance BEFORE the behaviors, and that order is the
+        // contract: a state's `update` may call `sm_fire` or `sm_set_state`, and a
+        // behavior's `update` reads `sm.state()`. Ticking machines first means a
+        // behavior sees the state its machine just entered, rather than the one
+        // it left last frame.
+        if (self.machines.binding_count != 0) self.machines.tick();
+        // The grid is rebuilt AFTER the machines tick and BEFORE the behaviors
+        // run: a machine that moved actors must be visible to the neighbours
+        // those actors query this same frame, or the flock lags a frame behind.
+        if (build_options.steering) self.rebuildGrid();
         const n = self.instances.items.len;
         if (n == 0 or self.driver_ref == no_ref) return;
         const state = self.vm.state().?;
@@ -570,7 +645,6 @@ fn readGlobalNumber(b: *Behaviors, key: [*:0]const u8) ?f64 {
 }
 
 /// A single test harness wiring a World + Input + Behaviors. The `var` storage
-
 const counter_src =
     \\local M = {}
     \\function M:start()

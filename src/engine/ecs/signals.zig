@@ -178,6 +178,20 @@ pub const Signals = struct {
         return total;
     }
 
+    /// True when anything is subscribed to `name`.
+    ///
+    /// Exists so a producer can skip building an event nobody will receive. The
+    /// physics bridge needs it: a 2 000-body pile generates thousands of
+    /// contacts a step, and publishing a signal for each one — only for every
+    /// listener to filter it out — fills the queue and panics, even though the
+    /// game never asked for a single collision event.
+    pub fn hasListeners(self: *const Self, name: []const u8) bool {
+        for (self.signals.items) |signal| {
+            if (std.mem.eql(u8, signal.name, name)) return signal.conns.items.len > 0;
+        }
+        return false;
+    }
+
     pub fn signalCount(self: *const Self) usize {
         return self.signals.items.len;
     }

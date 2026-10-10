@@ -8,6 +8,9 @@ zig-out/
 # Downloaded dependencies (fetched with libs/bootstrap.sh)
 libs/dawn/
 libs/glfw/
+# Box2D is built from source by libs/bootstrap.sh; the pin lives in
+# libs/box2d.commit, which IS tracked, and the 6.5 MB of build output is not.
+libs/box2d/
 
 # Logs and development artifacts
 *.log

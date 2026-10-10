@@ -266,80 +266,80 @@ pub const Batcher = struct {
 
     /// Stable counting sort by layer: O(n + span), no comparisons, no
     /// allocations. `layer_counts` and `scratch` are reserved at boot.
-///
-/// This is the sort that actually matters. It is measured at ~30 µs for 50k
+    ///
+    /// This is the sort that actually matters. It is measured at ~30 µs for 50k
     /// sprites on the reference hardware, against ~200 ms for a comparison
     /// sort of the same data, and the layer boundary is a correctness rule
     /// (painter's order), so it can never be "skipped for speed".
-fn sortByLayer(self: *Batcher, items: []const SpriteCommand, ord: []u32) void {
-    if (items.len < 2) return;
-    var min_layer: u16 = std.math.maxInt(u16);
-    var max_layer: u16 = 0;
-    for (items) |c| {
-        const l = c.layer();
-        min_layer = @min(min_layer, l);
-        max_layer = @max(max_layer, l);
-    }
-    const span: usize = @as(usize, max_layer - min_layer) + 1;
-    // A pathological layer range (sprites in layers 0 and 65000) would turn
-    // the counting array into 256 KB of memset for nothing; fall back to the
-    // comparison sort in that (rare) case. NOTE: the bound is `capacity`, not
-    // `items.len`: reserve() sets the capacity and leaves the length at 0, and
-    // checking the length made EVERY frame fall through to the heap sort
-    // (21 ms at 50k sprites instead of 30 us).
-    if (span > self.layer_counts.len) {
-        self.sortWithinLayerByArea(items, ord, .by_layer);
-        return;
-    }
-    const counts = self.layer_counts[0..span];
-    @memset(counts, 0);
-    for (items) |c| counts[c.layer() - min_layer] += 1;
-
-    // Prefix sums turn the counts into write cursors.
-    var acc: u32 = 0;
-    for (counts) |*c| {
-        const n = c.*;
-        c.* = acc;
-        acc += n;
-    }
-    // Stable scatter into the scratch buffer, then back.
-    const scratch = self.scratch[0..items.len];
-    for (items, 0..) |c, i| {
-        const l = c.layer() - min_layer;
-        scratch[counts[l]] = @intCast(i);
-        counts[l] += 1;
-    }
-    @memcpy(ord, scratch);
-}
-
-/// O(n log n) ordering INSIDE each layer, with the layer as the primary key so
-/// the grouping from `sortByLayer` survives. Opt-in only: this is the pass
-/// that costs ~200 ms at 50k sprites because every comparison is a random
-/// access into the command array.
-fn sortWithinLayerByArea(self: *Batcher, items: []const SpriteCommand, ord: []u32, mode: SortMode) void {
-    _ = self;
-    if (ord.len < 2) return;
-    const Ctx = struct {
-        items: []const SpriteCommand,
-        mode: SortMode,
-
-        fn lessThan(ctx: @This(), ia: u32, ib: u32) bool {
-            const a = ctx.items[ia];
-            const b = ctx.items[ib];
-            const la = a.layer();
-            const lb = b.layer();
-            if (la != lb) return la < lb;
-            if (ctx.mode == .by_layer) return false;
-            const aa = a.half_w * a.half_h;
-            const bb = b.half_w * b.half_h;
-            return if (ctx.mode == .front_to_back) aa > bb else aa < bb;
+    fn sortByLayer(self: *Batcher, items: []const SpriteCommand, ord: []u32) void {
+        if (items.len < 2) return;
+        var min_layer: u16 = std.math.maxInt(u16);
+        var max_layer: u16 = 0;
+        for (items) |c| {
+            const l = c.layer();
+            min_layer = @min(min_layer, l);
+            max_layer = @max(max_layer, l);
         }
-        fn swap(ctx: @This(), ia: u32, ib: u32) void {
-            std.mem.swap(u32, &ctx.items[ia], &ctx.items[ib]);
+        const span: usize = @as(usize, max_layer - min_layer) + 1;
+        // A pathological layer range (sprites in layers 0 and 65000) would turn
+        // the counting array into 256 KB of memset for nothing; fall back to the
+        // comparison sort in that (rare) case. NOTE: the bound is `capacity`, not
+        // `items.len`: reserve() sets the capacity and leaves the length at 0, and
+        // checking the length made EVERY frame fall through to the heap sort
+        // (21 ms at 50k sprites instead of 30 us).
+        if (span > self.layer_counts.len) {
+            self.sortWithinLayerByArea(items, ord, .by_layer);
+            return;
         }
-    };
-    std.sort.heap(u32, ord, Ctx{ .items = items, .mode = mode }, Ctx.lessThan);
-}
+        const counts = self.layer_counts[0..span];
+        @memset(counts, 0);
+        for (items) |c| counts[c.layer() - min_layer] += 1;
+
+        // Prefix sums turn the counts into write cursors.
+        var acc: u32 = 0;
+        for (counts) |*c| {
+            const n = c.*;
+            c.* = acc;
+            acc += n;
+        }
+        // Stable scatter into the scratch buffer, then back.
+        const scratch = self.scratch[0..items.len];
+        for (items, 0..) |c, i| {
+            const l = c.layer() - min_layer;
+            scratch[counts[l]] = @intCast(i);
+            counts[l] += 1;
+        }
+        @memcpy(ord, scratch);
+    }
+
+    /// O(n log n) ordering INSIDE each layer, with the layer as the primary key so
+    /// the grouping from `sortByLayer` survives. Opt-in only: this is the pass
+    /// that costs ~200 ms at 50k sprites because every comparison is a random
+    /// access into the command array.
+    fn sortWithinLayerByArea(self: *Batcher, items: []const SpriteCommand, ord: []u32, mode: SortMode) void {
+        _ = self;
+        if (ord.len < 2) return;
+        const Ctx = struct {
+            items: []const SpriteCommand,
+            mode: SortMode,
+
+            fn lessThan(ctx: @This(), ia: u32, ib: u32) bool {
+                const a = ctx.items[ia];
+                const b = ctx.items[ib];
+                const la = a.layer();
+                const lb = b.layer();
+                if (la != lb) return la < lb;
+                if (ctx.mode == .by_layer) return false;
+                const aa = a.half_w * a.half_h;
+                const bb = b.half_w * b.half_h;
+                return if (ctx.mode == .front_to_back) aa > bb else aa < bb;
+            }
+            fn swap(ctx: @This(), ia: u32, ib: u32) void {
+                std.mem.swap(u32, &ctx.items[ia], &ctx.items[ib]);
+            }
+        };
+        std.sort.heap(u32, ord, Ctx{ .items = items, .mode = mode }, Ctx.lessThan);
+    }
 
     /// Sorts and groups into draw batches. Zero allocations when the order and
     /// batch arrays were reserved at boot.

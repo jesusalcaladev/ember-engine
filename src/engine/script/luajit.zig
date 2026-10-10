@@ -291,4 +291,3 @@ pub inline fn setGlobalFromC(L: ?*lua_State, name: [*:0]const u8, func: lua_CFun
 pub inline fn setFuncs(L: ?*lua_State, l: [*]const luaL_Reg) void {
     luaL_setfuncs(L, l, 0);
 }
-

@@ -158,7 +158,7 @@ pub const Hierarchy = struct {
 
         // Count children per parent and mark the children with this stamp.
         var edge_count: usize = 0;
-        var parents = world.query(.{components.Parent, components.Transform});
+        var parents = world.query(.{ components.Parent, components.Transform });
         while (parents.nextBatch()) |batch| {
             const parent_components = batch.slice(components.Parent);
             const entities = batch.entitySlice();
@@ -190,7 +190,7 @@ pub const Hierarchy = struct {
 
         // Fill the CSR. Order within a parent is reversed, which is stable and
         // irrelevant to the result: a child only depends on its parent.
-        var edges = world.query(.{components.Parent, components.Transform});
+        var edges = world.query(.{ components.Parent, components.Transform });
         while (edges.nextBatch()) |batch| {
             const parent_components = batch.slice(components.Parent);
             const entities = batch.entitySlice();

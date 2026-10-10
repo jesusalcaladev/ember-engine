@@ -402,7 +402,6 @@ fn report(b: Budget) void {
     });
 }
 
-
 fn percentile(sorted: []const f64, p: f64) f64 {
     const idx = @as(usize, @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * p));
     return sorted[@min(idx, sorted.len - 1)];
@@ -411,7 +410,7 @@ fn percentile(sorted: []const f64, p: f64) f64 {
 fn initWorld(allocator: std.mem.Allocator, n: usize) !ecs.World {
     var world = ecs.World.init(allocator);
     try world.reserveEntities(n);
-    try world.reserve(.{ components.Transform }, n);
+    try world.reserve(.{components.Transform}, n);
     return world;
 }
 

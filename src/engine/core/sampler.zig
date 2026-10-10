@@ -230,7 +230,8 @@ fn parseStatTicks(text: []const u8) u64 {
 /// /proc/self/status -> VmRSS (kB) and Threads. Allocation-free line parser.
 fn readProcStatus(rss_out: *u64, threads_out: *u32) void {
     var buf: [4096]u8 = undefined;
-    const len = readFileInto("/proc/self/status", &buf) orelse return;    var lines = std.mem.splitSequence(u8, buf[0..len], "\n");
+    const len = readFileInto("/proc/self/status", &buf) orelse return;
+    var lines = std.mem.splitSequence(u8, buf[0..len], "\n");
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "VmRSS:")) {
             var kb: u64 = 0;

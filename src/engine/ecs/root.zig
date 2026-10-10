@@ -31,4 +31,8 @@ pub const WorldTransform = hierarchy.WorldTransform;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    // The cursor regression suite lives in its own file: it is about the
+    // contract BETWEEN `query` and `world`, not about either one's internals,
+    // and keeping it separate makes that boundary the thing under test.
+    _ = @import("query_cursor_test.zig");
 }

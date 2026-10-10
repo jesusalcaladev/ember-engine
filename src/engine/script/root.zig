@@ -14,11 +14,21 @@
 //! - `input`: the action-based input snapshot Lua reads (never raw keys).
 //! - `behavior`: the Behaviors system — start/update/fixed_update/on_signal/
 //!   on_destroy over a dense instance array, driving the 10k-update budget.
+//! - `statemachine`: declarative states + transitions behind a handle component
+//!   (M4.5). One implementation serves enemy AI, the player, spawners, UI screens
+//!   and game flow; only the declaring script differs.
 //!
 //! The public API is the `Behaviors` system plus the `Input` snapshot; the ECS
 //! stays hidden behind the Actor facade (spec §7).
 
 const std = @import("std");
+
+/// Build-time feature flags (`-Dsteering`, see build.zig). Read through this so
+/// the reason a subsystem is gated is in one place rather than scattered.
+pub const options = @import("options");
+
+/// Whether the steering accumulator and `world.nearby` are compiled in.
+pub const steering_enabled = options.steering;
 
 pub const luajit = @import("luajit.zig");
 pub const vm = @import("vm.zig");
@@ -29,6 +39,9 @@ pub const stubs = @import("stubs.zig");
 pub const input = @import("input.zig");
 pub const behavior = @import("behavior.zig");
 pub const context = @import("context.zig");
+pub const statemachine = @import("statemachine.zig");
+pub const spatial = @import("spatial.zig");
+pub const steer = @import("steer.zig");
 
 // Short names for what the runtime imports constantly.
 pub const Vm = vm.Vm;
@@ -37,6 +50,7 @@ pub const ScriptId = scripts.ScriptId;
 pub const Behaviors = behavior.Behaviors;
 pub const Input = input.Input;
 pub const Context = context.Context;
+pub const StateMachines = statemachine.Registry;
 
 test {
     @import("std").testing.refAllDecls(@This());

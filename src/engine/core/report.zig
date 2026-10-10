@@ -98,8 +98,7 @@ pub fn print(prof: *const Profiler, ctr: *const Counters, sampler: ?*const Sampl
         const z = prof.zones[i];
         const hits_per_frame = @as(f64, @floatFromInt(z.hits)) / @as(f64, @floatFromInt(measured));
         const avg_ms = @as(f64, @floatFromInt(z.ns_total)) / @as(f64, @floatFromInt(@max(measured, 1))) / 1_000_000.0;
-        const self_share = if (z.ns_total == 0) 0 else
-            @as(f64, @floatFromInt(z.self_ns_total)) * 100.0 / @as(f64, @floatFromInt(z.ns_total));
+        const self_share = if (z.ns_total == 0) 0 else @as(f64, @floatFromInt(z.self_ns_total)) * 100.0 / @as(f64, @floatFromInt(z.ns_total));
         log.info("    {s:<24} {d:>8.4} ms/f  p99 {d:>8.4} ms  calls/f {d:>7.2}  self {d:>5.1}%  max {d:.4} ms", .{
             z.name,
             avg_ms,

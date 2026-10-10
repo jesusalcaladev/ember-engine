@@ -176,6 +176,117 @@ pub const Script = struct {
     script: u32 = 0,
 };
 
+/// A link to a state machine defined by Lua (ROADMAP M4.5).
+///
+/// The same component serves every case — an enemy's AI, the player's own
+/// states, a spawner, a UI screen, the game flow — because the states and their
+/// transitions are script data, not component data.
+///
+/// It is a HANDLE, not the machine itself, and that is forced by rule 1 above:
+/// a machine holds names and Lua callbacks, which are pointers and slices, so it
+/// cannot live in a component. The engine owns the machines in a side registry
+/// (`script/statemachine.zig`) and the component stores the index, exactly as
+/// `Script` stores a script id. Two consequences worth knowing:
+///
+/// - **The handle is what serializes.** A `.zson` file saves `machine = 3`, not a
+///   Lua closure, so save/load stays bit-exact (spec §6). The transitions are
+///   rebuilt from the script when the behavior attaches.
+/// - **0 means "no machine"**, matching `Script`'s convention, so an entity that
+///   has never opted in costs one branch in every tick.
+pub const StateMachine = struct {
+    /// Index into the engine's state-machine registry; 0 is "none".
+    machine: u32 = 0,
+
+    /// True once the machine has been entered, so the first tick runs `enter` on
+    /// the starting state exactly once instead of every frame until something
+    /// transitions it away and back.
+    started: bool = false,
+};
+
+/// A rigid body in the physics world (ROADMAP M4).
+///
+/// The three body kinds Godot calls StaticBody2D / AnimatableBody2D /
+/// RigidBody2D are ONE component with a `body_type`, not three components. That
+/// is the difference that matters: an actor switching from fixed to kinematic at
+/// runtime — a door opening, a platform starting to move, a character mounting
+/// one — does not change archetype, so it does not trigger a row move, a
+/// structural change, or a spike (spec §3.1).
+///
+/// It is a HANDLE, forced by rule 1 above: a body id from the physics backend is
+/// not plain data, so the component stores the port's generation-tagged id and
+/// the solver's own state stays on the physics side. Swapping the backend
+/// changes nothing here.
+///
+/// `prev_*` are the fixed-step snapshots the renderer interpolates between, the
+/// same trick `Transform` uses: the solver must not be asked to interpolate, and
+/// gameplay must not see a half-step position.
+pub const RigidBody2D = struct {
+    /// Port body handle; `invalid` means "not in a physics world".
+    body: u32 = invalid_body,
+    generation: u32 = 0,
+
+    /// 0 fixed, 1 kinematic, 2 dynamic — mirrors `physics.BodyType` and is
+    /// stored as a small integer because components are byte-compared by the
+    /// archetype mover.
+    body_type: u8 = 2,
+
+    /// Linear velocity in units/second, kept in the component as well as in the
+    /// solver: gameplay reads and writes it every frame without a physics call.
+    linear_velocity: Vec2 = .{},
+    /// Radians per second, positive clockwise on screen.
+    angular_velocity: f32 = 0.0,
+
+    linear_damping: f32 = 0.0,
+    angular_damping: f32 = 0.0,
+    gravity_scale: f32 = 1.0,
+    /// Locked rotation. The default for anything that must not tip over.
+    fixed_rotation: bool = false,
+    allow_sleep: bool = true,
+    is_bullet: bool = false,
+
+    /// The snapshot from the previous fixed step, for render interpolation.
+    prev_position: Vec2 = .{},
+    prev_rotation: f32 = 0.0,
+
+    pub const invalid_body = std.math.maxInt(u32);
+
+    pub fn isSimulated(self: RigidBody2D) bool {
+        return self.body != invalid_body;
+    }
+};
+
+/// A collision shape attached to a body (ROADMAP M4).
+///
+/// Separate from `RigidBody2D` so one body can carry several — a character's
+/// torso, head and feet, a platform's surface and its trigger — each with its
+/// own material. It also means the (much larger) shape description lives in the
+/// physics backend, and the component stays small enough that a hundred shapes
+/// do not matter.
+pub const Collider2D = struct {
+    /// Port shape handle; `invalid` means "not in a physics world".
+    shape: u32 = std.math.maxInt(u32),
+    generation: u32 = 0,
+
+    /// 0 box, 1 circle, 2 capsule, 3 polygon — mirrors `physics.ShapeKind`.
+    kind: u8 = 0,
+
+    /// Half-extents (box), or x = radius / y = cap offset (capsule).
+    size: Vec2 = .{ .x = 0.5, .y = 0.5 },
+    offset: Vec2 = .{},
+
+    density: f32 = 1.0,
+    friction: f32 = 0.3,
+    restitution: f32 = 0.0,
+    /// Reports overlaps without generating a contact response.
+    is_sensor: bool = false,
+
+    pub const invalid_shape = std.math.maxInt(u32);
+
+    pub fn isLive(self: Collider2D) bool {
+        return self.shape != invalid_shape;
+    }
+};
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 /// One entry per component type. Order defines the dense ids, so it is also
@@ -212,6 +323,9 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "Velocity", .type = Velocity },
     .{ .name = "Sprite", .type = Sprite },
     .{ .name = "Script", .type = Script },
+    .{ .name = "StateMachine", .type = StateMachine },
+    .{ .name = "RigidBody2D", .type = RigidBody2D },
+    .{ .name = "Collider2D", .type = Collider2D },
 };
 
 comptime {

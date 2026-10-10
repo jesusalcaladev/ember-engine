@@ -182,7 +182,7 @@ test "actor facade: parenting and cycle refusal" {
     // So must self-parenting.
     try std.testing.expectError(error.SelfParent, root.setParent(root));
 
-    // The world transform of the child is the parent's composed in. 
+    // The world transform of the child is the parent's composed in.
     world.hierarchy.resolve(&world);
     const composed = child.worldPosition();
     try std.testing.expectApproxEqAbs(@as(f32, 10), composed.position.x, 0.0001);
