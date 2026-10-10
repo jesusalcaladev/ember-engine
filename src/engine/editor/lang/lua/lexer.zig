@@ -31,6 +31,15 @@
 //! gap in the list would mean a colour the editor never chose.
 
 const std = @import("std");
+const api_meta = @import("api_meta");
+
+// The registry is walked once at comptime to derive the globals list below,
+// and Zig's comptime evaluator stops at 1000 backwards branches. The code that
+// does it is a fixed loop over a fixed table — the quota is what is wrong, not
+// the loop.
+comptime {
+    @setEvalBranchQuota(20000);
+}
 
 pub const Kind = enum {
     /// Ordinary bytes: whitespace, and identifiers that are not keywords.
@@ -65,10 +74,13 @@ pub const Span = struct {
 /// The Lua keywords. Lua 5.1 (which is what LuaJIT implements) has no `goto` and
 /// no `continue`, so neither is here: highlighting `continue` as a keyword would
 /// tell a user the line does something, and it silently does not.
-const keywords = [_][]const u8{
-    "and",   "break", "do",   "else",     "elseif", "end",   "false", "for",
-    "function", "if", "in",   "local",    "nil",    "not",   "or",    "repeat",
-    "return", "then", "true", "until",    "while",
+///
+/// Public because the completion engine offers them, and a list that exists
+/// twice is a list that disagrees with itself the moment one of them changes.
+pub const keywords = [_][]const u8{
+    "and",      "break", "do",   "else",  "elseif", "end", "false", "for",
+    "function", "if",    "in",   "local", "nil",    "not", "or",    "repeat",
+    "return",   "then",  "true", "until", "while",
 };
 
 /// Names that exist in every Ember script. Kept as its own kind rather than
@@ -76,17 +88,59 @@ const keywords = [_][]const u8{
 /// a user is most likely to look up — and colouring them distinctly makes a typo
 /// (`actr.get_position`) visible on the line it is written.
 ///
+/// ## Why this list is derived, not written
+///
+/// It used to be a hand-written list, and it drifted: `material`, `render` and
+/// `sprite` landed in the registry while this file kept colouring them as plain
+/// names, which is the exact failure a list that exists twice produces. The
+/// engine's half of it is now read out of `metadata.zig` at comptime, so a new
+/// module cannot be registered without the highlighter knowing about it. The
+/// Lua half is written here because the registry documents what the ENGINE adds
+/// and says nothing about what Lua already had.
+///
 /// Public because the diagnostics read it too: an unknown global and a
 /// miscoloured global are the same question answered twice, and two answers is
 /// one drift too many.
-pub const globals = [_][]const u8{
-    "actor", "input", "log", "math", "noise", "physics", "rand", "self",
-    "sm", "steer", "vec2", "world",
-    // The Lua standard library, which is whitelisted by the sandbox.
-    "assert", "collectgarbage", "error", "ipairs", "next", "pairs", "pcall",
-    "print", "rawequal", "rawget", "rawset", "require", "select", "setmetatable",
-    "string", "table", "tonumber", "tostring", "type", "unpack", "xpcall",
+const stdlib = [_][]const u8{
+    // The Lua standard library the sandbox whitelists, plus `self`, which is
+    // the per-behavior actor every update is handed.
+    "self",         "assert", "collectgarbage", "error",    "ipairs",   "next",    "pairs",
+    "pcall",        "print",  "rawequal",       "rawget",   "rawset",   "require", "select",
+    "setmetatable", "string", "table",          "tonumber", "tostring", "type",    "unpack",
+    "xpcall",
+    // The steering helpers are behind the `-Dsteering` feature flag, and the
+    // editor module cannot see build options. Listing them unconditionally
+    // means they colour in a build that does not ship them, which is a ghost
+    // colour for two names rather than a wrong one for eighty.
+          "steer",
 };
+
+/// Every engine module in the registry, deduplicated at comptime. The registry
+/// is the single source of truth for the Lua surface, so the list a user sees
+/// coloured has to be the same list the engine actually ships.
+const modules = blk: {
+    // The quota has to be raised where the loop happens: Zig's comptime
+    // evaluator resets it between top-level declarations.
+    @setEvalBranchQuota(20000);
+    var names: [api_meta.bindings.len][]const u8 = undefined;
+    var n: usize = 0;
+    for (api_meta.bindings) |b| {
+        var seen = false;
+        for (names[0..n]) |m| {
+            if (std.mem.eql(u8, m, b.module)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            names[n] = b.module;
+            n += 1;
+        }
+    }
+    break :blk names[0..n].*;
+};
+
+pub const globals = stdlib ++ modules;
 
 fn isKeyword(word: []const u8) bool {
     for (keywords) |k| if (std.mem.eql(u8, k, word)) return true;

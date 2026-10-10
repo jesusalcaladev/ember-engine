@@ -168,9 +168,21 @@ pub const no_scope: u32 = std.math.maxInt(u32);
 
 /// A foldable range: a block whose header is on the first line and whose `end`
 /// (or `until`) is the last.
+/// A foldable range: a block whose header is on the first line and whose `end`
+/// (or `until`) is the last.
 pub const Fold = struct {
     start: u32,
     len: u32,
+};
+
+/// Where a scope is live, in byte offsets. This is what makes "the locals in
+/// scope at the caret" answerable: a scope is a range, and an offset is or is
+/// not inside it. Without it a completion engine can only offer every local in
+/// the file, which is how popups fill with names from other functions.
+pub const ScopeSpan = struct {
+    start: u32,
+    end: u32,
+    scope: u32,
 };
 
 /// What an argument literally is, for the API checks (a string literal where a
@@ -216,16 +228,28 @@ pub const Result = struct {
     calls: []Call,
     args: []Arg,
     folds: []Fold,
+    scope_spans: []ScopeSpan,
 
     /// The callee text of a call, with surrounding bytes trimmed: a newline
     /// between `actor` and `.` is legal Lua, and the metadata path is not.
     pub fn callPath(src: []const u8, call: Call) []const u8 {
-        const raw = src[call.path_start .. @min(call.path_start + call.path_len, src.len)];
+        const raw = src[call.path_start..@min(call.path_start + call.path_len, src.len)];
         return std.mem.trim(u8, raw, " \t\r\n");
     }
 
     pub fn name(src: []const u8, sym: Symbol) []const u8 {
         return src[sym.name_start .. sym.name_start + sym.name_len];
+    }
+
+    /// The innermost scope live at `offset`, or the chunk's scope 0.
+    pub fn scopeAt(self: Result, offset: u32) u32 {
+        var best: u32 = 0;
+        for (self.scope_spans) |sp| {
+            if (offset < sp.start or offset >= sp.end) continue;
+            if (sp.scope == 0) continue;
+            best = sp.scope;
+        }
+        return best;
     }
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
@@ -236,6 +260,7 @@ pub const Result = struct {
         allocator.free(self.calls);
         allocator.free(self.args);
         allocator.free(self.folds);
+        allocator.free(self.scope_spans);
     }
 };
 
@@ -255,6 +280,7 @@ pub fn parse(allocator: std.mem.Allocator, src: []const u8) !Result {
         .calls = try p.calls.toOwnedSlice(allocator),
         .args = try p.args.toOwnedSlice(allocator),
         .folds = try p.folds.toOwnedSlice(allocator),
+        .scope_spans = try p.scope_spans.toOwnedSlice(allocator),
     };
 }
 
@@ -297,6 +323,7 @@ const Parser = struct {
     calls: std.ArrayListUnmanaged(Call) = .empty,
     args: std.ArrayListUnmanaged(Arg) = .empty,
     folds: std.ArrayListUnmanaged(Fold) = .empty,
+    scope_spans: std.ArrayListUnmanaged(ScopeSpan) = .empty,
     depth: u16 = 0,
     cur_scope: u32 = 0,
 
@@ -317,6 +344,7 @@ const Parser = struct {
         self.calls.deinit(self.allocator);
         self.args.deinit(self.allocator);
         self.folds.deinit(self.allocator);
+        self.scope_spans.deinit(self.allocator);
     }
 
     // ── Diagnostics ────────────────────────────────────────────────────────
@@ -439,10 +467,26 @@ const Parser = struct {
     fn pushScope(self: *Parser) V {
         try self.scopes.append(self.allocator, .{ .parent = self.cur_scope });
         self.cur_scope = @intCast(self.scopes.items.len - 1);
+        try self.scope_spans.append(self.allocator, .{
+            .start = u(self.tok.start),
+            // Filled in by `popScope`, which is the moment the end is known.
+            .end = std.math.maxInt(u32),
+            .scope = self.cur_scope,
+        });
     }
 
     fn popScope(self: *Parser) void {
-        const parent = self.scopes.items[self.cur_scope].parent;
+        const id = self.cur_scope;
+        // The span is live through the block's `end`: this runs from the
+        // `defer`, which is to say before `end` has been consumed, so the end
+        // is the end of the token that is there when the body stops — which is
+        // the `end` itself. A caret on the `end` line is still inside the block
+        // it closes, and a scope that stopped one token early would leave that
+        // one position without its locals.
+        for (self.scope_spans.items) |*sp| {
+            if (sp.scope == id and sp.end == std.math.maxInt(u32)) sp.end = u(self.tok.end());
+        }
+        const parent = self.scopes.items[id].parent;
         if (parent != no_scope) self.cur_scope = parent;
     }
 
@@ -481,7 +525,7 @@ const Parser = struct {
     fn advance(self: *Parser) V {
         self.prev_end = self.tok.end();
         const r = self.scan();
-            self.tok = r.tok;
+        self.tok = r.tok;
         if (r.diag) |d| try self.pushDiag(d);
     }
 
@@ -1627,11 +1671,11 @@ test "locals are declared in the scope they are declared in" {
 test "garbage never loops or crashes" {
     const a = testing.allocator;
     const inputs = [_][]const u8{
-        "end",              "end end end",     ")))",         "[[[[",
-        "'abc",             "function f(",     "local local", "= = =",
-        "{[(<",             "else then do",    "1 + 2 +",     "repeat until",
-        "::",               "...",             "'\\",          "--[[",
-        "goto",             "local x,",        "if if if",    "}}}}",
+        "end",  "end end end",  ")))",         "[[[[",
+        "'abc", "function f(",  "local local", "= = =",
+        "{[(<", "else then do", "1 + 2 +",     "repeat until",
+        "::",   "...",          "'\\",         "--[[",
+        "goto", "local x,",     "if if if",    "}}}}",
     };
     for (inputs) |src| {
         var r = try parse(a, src);

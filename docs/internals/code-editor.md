@@ -15,6 +15,7 @@ engine.Cursor   caret, selection, intent         doc/cursor.zig
 engine.tokenize Lua -> coloured spans           lang/lua/lexer.zig
 engine.parse      Lua -> tree, with recovery      lang/lua/parser.zig
 engine.diagnostics parse + metadata -> the lens   lang/lua/diagnostics.zig
+engine.complete    what to offer at the caret   lang/lua/complete.zig
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -26,7 +27,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 85 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 96 tests.
 
 ## Where it may allocate
 
@@ -156,12 +157,24 @@ whole affected region into a scratch buffer and writes it with a single
 Case-insensitive search folds both sides rather than lowercasing a copy of the
 file.
 
+## Completion
+
+Four sources, ranked so the likely answer comes first: the locals in scope at the
+caret (from the scope spans the parser leaves behind), the engine's API from the
+registry — tables at the top level, members after a `.`, each with the signature
+and summary as the popup's second and third rows — the Lua keywords, and a
+handful of block snippets that leave the caret where the user has to type next.
+
+Ranking rather than sorting is the design decision worth knowing about: a list
+sorted alphabetically makes the user read it, and a ranked list does not. The
+rank is deliberately simple — a local beats the API, an exact prefix beats a fuzzy
+one, shorter beats longer — because a scoring function nobody can explain is one
+nobody can tune when it guesses wrong.
+
 ## What is deliberately not here
 
 - **Tabs, split panes, the help panel, Ctrl+Click.** Those are M5.5 UI work and
   they consume this module rather than extending it.
-- **Autocompletion.** Next up, on top of the symbols and calls the parser already
-  produces.
 - **An LSP.** Stubs ship at v1; the LSP is post-1.0 (ROADMAP §Post-1.0).
 
 ## Running it
@@ -177,4 +190,5 @@ zig build test          # the editor suite runs first, in milliseconds
 | `lang/lua/lexer.zig` | 12 — long brackets, escapes, span coverage, unterminated forms |
 | `lang/lua/parser.zig` | 16 — recovery, spans, calls, scopes, the depth guard, garbage that cannot loop |
 | `lang/lua/diagnostics.zig` | 13 — every rule, in both directions, at scale |
+| `lang/lua/complete.zig` | 11 — context, scope, ranking, snippets |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |
