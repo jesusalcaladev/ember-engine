@@ -385,6 +385,157 @@ function Actor:get_params() end
 function Actor:get_shader() end
 
 
+-- ── light ──
+---Adds a light to an actor. Position and direction come from its Transform.
+---@param self Actor 
+---@param kind integer 0 point, 1 spot, 2 directional
+---@param radius number reach in world units
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param energy number brightness multiplier
+function Actor:new(kind, radius, r, g, b, energy) end
+
+---0 point, 1 spot, 2 directional.
+---@param self Actor 
+---@param kind integer 0 point, 1 spot, 2 directional
+function Actor:set_kind(kind) end
+
+---The light's reach in world units. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff.
+---@param self Actor 
+---@param radius number reach
+function Actor:set_radius(radius) end
+
+---Colour. Alpha is the light's opacity, so a light fades out by its alpha and not a separate field.
+---@param self Actor 
+---@param r number red
+---@param g number green
+---@param b number blue
+---@param a number alpha
+function Actor:set_color(r, g, b, a) end
+
+---Brightness multiplier.
+---@param self Actor 
+---@param e number multiplier
+function Actor:set_energy(e) end
+
+---Direction for a spot, or the direction it travels for a directional light. Unused by a point light.
+---@param self Actor 
+---@param radians number angle
+function Actor:set_angle(radians) end
+
+---A spot's opening and its soft edge. The penumbra is the fraction of the cone given over to a fade: 0.2 means full strength to 80% and a fade over the last 20%.
+---@param self Actor 
+---@param degrees number full opening
+---@param penumbra number 0..1 soft-edge fraction
+function Actor:set_cone(degrees, penumbra) end
+
+---0 add, 1 subtract, 2 mix. `mix` is the energy-conserving one: a white surface under it stays white.
+---@param self Actor 
+---@param kind integer 0 add, 1 subtract, 2 mix
+function Actor:set_blend(kind) end
+
+---Whether this light casts shadows, how the edge is filtered, and how wide the filter's taps are. Only four lights in a scene can get shadow channels, ranked by area.
+---@param self Actor 
+---@param enabled boolean cast shadows
+---@param filter integer 0 off, 1 one tap, 2 three, 3 five
+---@param smoothness number tap radius in mask texels
+function Actor:set_shadow(enabled, filter, smoothness) end
+
+---How much of the global-illumination enclosure term this light applies. Zero by default: a scene that did not ask for bounce should not have it.
+---@param self Actor 
+---@param contribution number 0..1
+function Actor:set_gi(contribution) end
+
+---Which sprite layers this light affects, as a bitmask of `Sprite.layer`. A light on layer 2 lights only layer 2, which is how a scene gets a lamp that does not brighten its own interface.
+---@param self Actor 
+---@param bitmask integer mask of layer bits
+function Actor:set_mask(bitmask) end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return integer 0 point, 1 spot, 2 directional
+function Actor:get_kind() end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return number reach
+function Actor:get_radius() end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return number red
+---@return number green
+---@return number blue
+---@return number alpha
+function Actor:get_color() end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return number brightness multiplier
+function Actor:get_energy() end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return number opening in degrees
+---@return number penumbra 0..1
+function Actor:get_cone() end
+
+---The inspector reads as well as writes, and its field list is generated from this same registry.
+---@param self Actor 
+---@return boolean casts shadows
+---@return integer filter
+---@return number smoothness
+function Actor:get_shadow() end
+
+
+-- ── occluder ──
+---Adds a light occluder to an actor.
+---@param self Actor 
+---@param mode integer 0 auto from the sprite's alpha, 1 manual polygon, 2 none
+function Actor:new(mode) end
+
+---0 derives the shape from the sprite's alpha at `set_threshold`, 1 uses the polygon, 2 blocks nothing. Mode 2 is how a sprite that looks like it occludes says it must not.
+---@param self Actor 
+---@param mode integer 0 auto, 1 manual, 2 none
+function Actor:set_mode(mode) end
+
+---The alpha at which the automatic shape decides a texel is solid. Raising it is the fix for most 'my sprite has a fringe of shadow' reports.
+---@param self Actor 
+---@param alpha number 0..1
+function Actor:set_threshold(alpha) end
+
+---Which lights this occluder blocks. 0 blocks everything, which is what a wall wants; a pane that blocks the sun but not the lamps sets it.
+---@param self Actor 
+---@param bitmask integer 0 for all lights
+function Actor:set_mask(bitmask) end
+
+---The manual shape, as a flat list of coordinates. Read from a table because eight positional arguments are unreadable and an editor dragging vertices produces a list anyway.
+---@param self Actor 
+---@param points table flat x/y pairs
+function Actor:set_polygon(points) end
+
+---The inspector reads as well as writes.
+---@param self Actor 
+---@return integer 0 auto, 1 manual, 2 none
+function Actor:get_mode() end
+
+---The automatic shape's alpha threshold.
+---@param self Actor 
+---@return number alpha 0..1
+function Actor:get_threshold() end
+
+---Which lights this occluder blocks.
+---@param self Actor 
+---@return integer the mask
+function Actor:get_mask() end
+
+---The manual shape as a flat list of coordinates. An editor that lets a user drag vertices reads this back to draw them.
+---@param self Actor 
+---@return table flat x/y pairs
+function Actor:get_polygon() end
+
+
 -- ── math ──
 ---Clamps `v` into the range `[lo, hi]`.
 ---@param v number value to clamp

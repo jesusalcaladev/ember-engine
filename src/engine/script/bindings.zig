@@ -38,6 +38,7 @@ const Transform = context_mod.Transform;
 /// And for the Sprite, which `get_half_size` reads (the collision-style half
 /// extents of what is drawn).
 const Sprite = context_mod.components.Sprite;
+const components = context_mod.components;
 const ShaderMaterial = context_mod.components.ShaderMaterial;
 
 // ── self <-> entity bridge ───────────────────────────────────────────────────
@@ -1606,6 +1607,307 @@ fn lua_render_all_resident(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
+// ── 2D lighting (M7) ────────────────────────────────────────────────────────
+//
+// Godot's field names, because an editor author already knows them: a light is
+// a Transform + a Light2D, and the interesting part is what it touches. The
+// setters are typed and per-field on purpose — a generic setter costs a string
+// lookup in the frame loop, and this surface is written once and read by an
+// inspector that generated its field list from the metadata registry.
+//
+// The occluder's polygon is passed as a Lua table of numbers rather than as
+// eight positional arguments, for the same reason English has commas: a shape
+// with eight coordinates is unreadable as a flat list, and an editor that lets a
+// user drag vertices produces them as a list anyway.
+
+// `LUA_TTABLE` is 5 in every Lua 5.x. Declared here rather than imported from
+// the header so this layer stays self-contained.
+const TTable: c_int = 5;
+
+const Light = components.Light2D;
+const Occluder = components.LightOccluder2D;
+
+fn lightOf(L: ?*lua_State) ?*Light {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    return ctx.world.get(e, Light);
+}
+
+/// `light.new(self, kind, radius, r, g, b, energy)` — adds the component.
+fn lua_light_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Light) == null) {
+        _ = ctx.world.add(e, Light{
+            .kind = @enumFromInt(@as(u8, @intFromFloat(@max(lua.toF32(L, 2), 0)))),
+            .radius = @max(lua.toF32(L, 3), 1),
+            .color = .{ lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6), lua.toF32(L, 7) },
+            .energy = lua.toF32(L, 8),
+        }) catch return 0;
+    }
+    return 0;
+}
+
+fn lua_light_set_kind(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    const k: u8 = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    l.kind = @enumFromInt(k);
+    return 0;
+}
+
+fn lua_light_set_radius(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    // A zero radius is not a hard edge, it is a divide-by-zero in every
+    // falloff, so it is clamped at load rather than caught at draw time.
+    l.radius = @max(lua.toF32(L, 2), 1);
+    return 0;
+}
+
+fn lua_light_set_color(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    return 0;
+}
+
+fn lua_light_set_energy(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.energy = lua.toF32(L, 2);
+    return 0;
+}
+
+fn lua_light_set_angle(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.angle = lua.toF32(L, 2);
+    return 0;
+}
+
+/// `light.set_cone(self, degrees, penumbra)` — the spot's opening and its soft
+/// edge. Two numbers rather than two calls because nothing ever sets one
+/// without the other.
+fn lua_light_set_cone(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.cone_angle = m.degToRad(@max(lua.toF32(L, 2), 0));
+    l.penumbra = @min(@max(lua.toF32(L, 3), 0), 1);
+    return 0;
+}
+
+fn lua_light_set_blend(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    const k: u8 = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    l.blend = @enumFromInt(k);
+    return 0;
+}
+
+/// `light.set_shadow(self, enabled, filter, smoothness)`.
+///
+/// `filter` is 0 off / 1 one tap / 2 three / 3 five. Exposed as the raw number
+/// because it is a quality dial, and a string per draw call is a lookup in the
+/// middle of a frame for nothing.
+fn lua_light_set_shadow(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.cast_shadows = lua.toBool(L, 2);
+    const f: u8 = @intFromFloat(@max(lua.toF32(L, 3), 0));
+    l.shadow_filter = @enumFromInt(f);
+    l.shadow_filter_smooth = @max(lua.toF32(L, 4), 0);
+    return 0;
+}
+
+/// `light.set_gi(self, contribution)` — how much of the global-illumination
+/// enclosure term this light applies. Zero by default, because a scene that did
+/// not ask for bounce should not have it.
+fn lua_light_set_gi(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.gi_contribution = @min(@max(lua.toF32(L, 2), 0), 1);
+    return 0;
+}
+
+fn lua_light_set_mask(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    l.item_cull_mask = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    return 0;
+}
+
+/// `light.get_kind(self)`, `light.get_radius(self)`, ... — the inspector reads
+/// as well as writes, and it is generated from the same registry as these docs.
+fn lua_light_get_kind(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    lua.pushF32(L, @floatFromInt(@intFromEnum(l.kind)));
+    return 1;
+}
+
+fn lua_light_get_radius(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    lua.pushF32(L, l.radius);
+    return 1;
+}
+
+fn lua_light_get_color(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    for (l.color) |c| lua.pushF32(L, c);
+    return 4;
+}
+
+fn lua_light_get_energy(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    lua.pushF32(L, l.energy);
+    return 1;
+}
+
+fn lua_light_get_cone(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    lua.pushF32(L, m.radToDeg(l.cone_angle));
+    lua.pushF32(L, l.penumbra);
+    return 2;
+}
+
+fn lua_light_get_shadow(L: ?*lua_State) callconv(.c) c_int {
+    const l = lightOf(L) orelse return 0;
+    lua.lua_pushboolean(L, @intFromBool(l.cast_shadows));
+    lua.pushF32(L, @floatFromInt(@intFromEnum(l.shadow_filter)));
+    lua.pushF32(L, l.shadow_filter_smooth);
+    return 3;
+}
+
+fn occluderOf(L: ?*lua_State) ?*Occluder {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    return ctx.world.get(e, Occluder);
+}
+
+/// `occluder.new(self, mode)` — adds the component. Mode 0 auto-from-sprite,
+/// 1 manual polygon, 2 none.
+fn lua_occluder_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Occluder) == null) {
+        _ = ctx.world.add(e, Occluder{
+            .mode = @enumFromInt(@as(u8, @intFromFloat(@max(lua.toF32(L, 2), 0)))),
+        }) catch return 0;
+    }
+    return 0;
+}
+
+/// `occluder.set_mode(self, mode)` — 0 auto (the alpha-derived shape, with no
+/// authoring), 1 manual, 2 none. `none` is how a sprite that looks like it
+/// occludes says that it must not: a fog card, a UI panel.
+fn lua_occluder_set_mode(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    o.mode = @enumFromInt(@as(u8, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    return 0;
+}
+
+/// `occluder.set_threshold(self, alpha)` — where the automatic shape draws its
+/// own edge. 0.5 is what a human means by "the shape", and raising it is the fix
+/// for most "my sprite has a fringe of shadow" reports.
+fn lua_occluder_set_threshold(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    o.alpha_threshold = @min(@max(lua.toF32(L, 2), 0), 1);
+    return 0;
+}
+
+/// `occluder.set_mask(self, bitmask)` — which lights this occluder blocks.
+/// 0 (all) is what a wall wants; a one-way occluder, like a pane that blocks the
+/// sun but not the lamps, sets it.
+fn lua_occluder_set_mask(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    o.cull_mask = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    return 0;
+}
+
+/// `occluder.set_polygon(self, {x0,y0, x1,y1, ...})` — the manual shape.
+///
+/// Read as a table of numbers rather than eight positional arguments, because a
+/// shape with eight coordinates is unreadable as a flat list and an editor that
+/// lets a user drag vertices produces them as a list anyway. The table is
+/// optional too: a call that clears the polygon turns the occluder back into
+/// whatever its automatic shape is.
+fn lua_occluder_set_polygon(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    if (lua.lua_type(L, 2) != TTable) return 0;
+
+    var poly = components.OccluderPolygon{};
+    const n: usize = @intCast(lua.lua_objlen(L, 2));
+    var i: usize = 0;
+    while (i < n and i < poly.points.len) : (i += 1) {
+        // t[i] by pushing the index and calling gettable, then dropping both
+        // with settop: this layer has no , and  is the
+        // same thing with one fewer dependency on the Lua ABI.
+        lua.lua_pushinteger(L, @intCast(i + 1));
+        lua.lua_gettable(L, 2);
+        poly.points[i] = lua.toF32(L, -1);
+        lua.lua_settop(L, -2);
+    }
+    poly.count = @intCast(i);
+    o.polygon = poly;
+    return 0;
+}
+
+/// `occluder.get_mode(self)`, `occluder.get_threshold(self)`,
+/// `occluder.get_polygon(self) -> table` — the inspector's half of the surface.
+fn lua_occluder_get_mode(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    lua.pushF32(L, @floatFromInt(@intFromEnum(o.mode)));
+    return 1;
+}
+
+fn lua_occluder_get_threshold(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    lua.pushF32(L, o.alpha_threshold);
+    return 1;
+}
+
+fn lua_occluder_get_mask(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    lua.pushF32(L, @floatFromInt(o.cull_mask));
+    return 1;
+}
+
+fn lua_occluder_get_polygon(L: ?*lua_State) callconv(.c) c_int {
+    const o = occluderOf(L) orelse return 0;
+    lua.lua_createtable(L, @intCast(o.polygon.count), 0);
+    const n = o.polygon.count;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        lua.pushF32(L, o.polygon.points[i]);
+        lua.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+const light_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_light_new },
+    .{ .name = "set_kind", .func = lua_light_set_kind },
+    .{ .name = "set_radius", .func = lua_light_set_radius },
+    .{ .name = "set_color", .func = lua_light_set_color },
+    .{ .name = "set_energy", .func = lua_light_set_energy },
+    .{ .name = "set_angle", .func = lua_light_set_angle },
+    .{ .name = "set_cone", .func = lua_light_set_cone },
+    .{ .name = "set_blend", .func = lua_light_set_blend },
+    .{ .name = "set_shadow", .func = lua_light_set_shadow },
+    .{ .name = "set_gi", .func = lua_light_set_gi },
+    .{ .name = "set_mask", .func = lua_light_set_mask },
+    .{ .name = "get_kind", .func = lua_light_get_kind },
+    .{ .name = "get_radius", .func = lua_light_get_radius },
+    .{ .name = "get_color", .func = lua_light_get_color },
+    .{ .name = "get_energy", .func = lua_light_get_energy },
+    .{ .name = "get_cone", .func = lua_light_get_cone },
+    .{ .name = "get_shadow", .func = lua_light_get_shadow },
+    .{ .name = null, .func = null },
+};
+
+const occluder_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_occluder_new },
+    .{ .name = "set_mode", .func = lua_occluder_set_mode },
+    .{ .name = "set_threshold", .func = lua_occluder_set_threshold },
+    .{ .name = "set_mask", .func = lua_occluder_set_mask },
+    .{ .name = "set_polygon", .func = lua_occluder_set_polygon },
+    .{ .name = "get_mode", .func = lua_occluder_get_mode },
+    .{ .name = "get_threshold", .func = lua_occluder_get_threshold },
+    .{ .name = "get_mask", .func = lua_occluder_get_mask },
+    .{ .name = "get_polygon", .func = lua_occluder_get_polygon },
+    .{ .name = null, .func = null },
+};
+
 const material_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_material_new },
     .{ .name = "set_params", .func = lua_material_set_params },
@@ -2167,6 +2469,32 @@ pub const registered_names = [_][]const u8{
     "render.stats",
     "render.set_resident",
     "render.all_resident",
+    "light.new",
+    "light.set_kind",
+    "light.set_radius",
+    "light.set_color",
+    "light.set_energy",
+    "light.set_angle",
+    "light.set_cone",
+    "light.set_blend",
+    "light.set_shadow",
+    "light.set_gi",
+    "light.set_mask",
+    "light.get_kind",
+    "light.get_radius",
+    "light.get_color",
+    "light.get_energy",
+    "light.get_cone",
+    "light.get_shadow",
+    "occluder.new",
+    "occluder.set_mode",
+    "occluder.set_threshold",
+    "occluder.set_mask",
+    "occluder.set_polygon",
+    "occluder.get_mode",
+    "occluder.get_threshold",
+    "occluder.get_mask",
+    "occluder.get_polygon",
     "material.new",
     "material.set_params",
     "material.get_params",
@@ -2222,6 +2550,8 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "render", &render_regs);
     installModule(L, ctx, "sprite", &sprite_regs);
     installModule(L, ctx, "material", &material_regs);
+    installModule(L, ctx, "light", &light_regs);
+    installModule(L, ctx, "occluder", &occluder_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

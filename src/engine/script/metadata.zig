@@ -960,6 +960,413 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "light.new",
+        .module = "light",
+        .signature = "light.new(self, kind, radius, r, g, b, energy)",
+        .summary = "Adds a light to an actor. Position and direction come from its Transform.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
+            .{ .name = "radius", .kind = .number, .doc = "reach in world units" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "energy", .kind = .number, .doc = "brightness multiplier" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.new(self, 0, 192, 1.0, 0.69, 0.41, 1)
+        ,
+    },
+    .{
+        .name = "light.set_kind",
+        .module = "light",
+        .signature = "light.set_kind(self, kind)",
+        .summary = "0 point, 1 spot, 2 directional.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_kind(self, 1)
+        ,
+    },
+    .{
+        .name = "light.set_radius",
+        .module = "light",
+        .signature = "light.set_radius(self, radius)",
+        .summary = "The light's reach in world units. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radius", .kind = .number, .doc = "reach" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_radius(self, 256)
+        ,
+    },
+    .{
+        .name = "light.set_color",
+        .module = "light",
+        .signature = "light.set_color(self, r, g, b, a)",
+        .summary = "Colour. Alpha is the light's opacity, so a light fades out by its alpha and not a separate field.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "r", .kind = .number, .doc = "red" },
+            .{ .name = "g", .kind = .number, .doc = "green" },
+            .{ .name = "b", .kind = .number, .doc = "blue" },
+            .{ .name = "a", .kind = .number, .doc = "alpha" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_color(self, 1.0, 0.69, 0.41, 0.8)
+        ,
+    },
+    .{
+        .name = "light.set_energy",
+        .module = "light",
+        .signature = "light.set_energy(self, e)",
+        .summary = "Brightness multiplier.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "e", .kind = .number, .doc = "multiplier" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_energy(self, 2.4)
+        ,
+    },
+    .{
+        .name = "light.set_angle",
+        .module = "light",
+        .signature = "light.set_angle(self, radians)",
+        .summary = "Direction for a spot, or the direction it travels for a directional light. Unused by a point light.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radians", .kind = .number, .doc = "angle" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_angle(self, math.rad_to_deg(0.7854))
+        ,
+    },
+    .{
+        .name = "light.set_cone",
+        .module = "light",
+        .signature = "light.set_cone(self, degrees, penumbra)",
+        .summary = "A spot's opening and its soft edge. The penumbra is the fraction of the cone given over to a fade: 0.2 means full strength to 80% and a fade over the last 20%.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "degrees", .kind = .number, .doc = "full opening" },
+            .{ .name = "penumbra", .kind = .number, .doc = "0..1 soft-edge fraction" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_cone(self, 45, 0.2)
+        ,
+    },
+    .{
+        .name = "light.set_blend",
+        .module = "light",
+        .signature = "light.set_blend(self, kind)",
+        .summary = "0 add, 1 subtract, 2 mix. `mix` is the energy-conserving one: a white surface under it stays white.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 add, 1 subtract, 2 mix" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_blend(self, 2)
+        ,
+    },
+    .{
+        .name = "light.set_shadow",
+        .module = "light",
+        .signature = "light.set_shadow(self, enabled, filter, smoothness)",
+        .summary = "Whether this light casts shadows, how the edge is filtered, and how wide the filter's taps are. Only four lights in a scene can get shadow channels, ranked by area.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "cast shadows" },
+            .{ .name = "filter", .kind = .integer, .doc = "0 off, 1 one tap, 2 three, 3 five" },
+            .{ .name = "smoothness", .kind = .number, .doc = "tap radius in mask texels" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_shadow(self, true, 2, 2)
+        ,
+    },
+    .{
+        .name = "light.set_gi",
+        .module = "light",
+        .signature = "light.set_gi(self, contribution)",
+        .summary = "How much of the global-illumination enclosure term this light applies. Zero by default: a scene that did not ask for bounce should not have it.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "contribution", .kind = .number, .doc = "0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_gi(self, 0.3)
+        ,
+    },
+    .{
+        .name = "light.set_mask",
+        .module = "light",
+        .signature = "light.set_mask(self, bitmask)",
+        .summary = "Which sprite layers this light affects, as a bitmask of `Sprite.layer`. A light on layer 2 lights only layer 2, which is how a scene gets a lamp that does not brighten its own interface.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "bitmask", .kind = .integer, .doc = "mask of layer bits" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\light.set_mask(self, 0xFFFF)
+        ,
+    },
+    .{
+        .name = "light.get_kind",
+        .module = "light",
+        .signature = "light.get_kind(self) -> integer",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
+        },
+        .example =
+        \\local k = light.get_kind(self)
+        ,
+    },
+    .{
+        .name = "light.get_radius",
+        .module = "light",
+        .signature = "light.get_radius(self) -> number",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "reach" },
+        },
+        .example =
+        \\local k = light.get_radius(self)
+        ,
+    },
+    .{
+        .name = "light.get_color",
+        .module = "light",
+        .signature = "light.get_color(self) -> number, number, number, number",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "red" },
+            .{ .kind = .number, .doc = "green" },
+            .{ .kind = .number, .doc = "blue" },
+            .{ .kind = .number, .doc = "alpha" },
+        },
+        .example =
+        \\local k = light.get_color(self)
+        ,
+    },
+    .{
+        .name = "light.get_energy",
+        .module = "light",
+        .signature = "light.get_energy(self) -> number",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "brightness multiplier" },
+        },
+        .example =
+        \\local k = light.get_energy(self)
+        ,
+    },
+    .{
+        .name = "light.get_cone",
+        .module = "light",
+        .signature = "light.get_cone(self) -> number, number",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "opening in degrees" },
+            .{ .kind = .number, .doc = "penumbra 0..1" },
+        },
+        .example =
+        \\local k = light.get_cone(self)
+        ,
+    },
+    .{
+        .name = "light.get_shadow",
+        .module = "light",
+        .signature = "light.get_shadow(self) -> boolean, integer, number",
+        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "casts shadows" },
+            .{ .kind = .integer, .doc = "filter" },
+            .{ .kind = .number, .doc = "smoothness" },
+        },
+        .example =
+        \\local k = light.get_shadow(self)
+        ,
+    },
+    .{
+        .name = "occluder.new",
+        .module = "occluder",
+        .signature = "occluder.new(self, mode)",
+        .summary = "Adds a light occluder to an actor.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "mode", .kind = .integer, .doc = "0 auto from the sprite's alpha, 1 manual polygon, 2 none" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\occluder.new(self, 1)
+        ,
+    },
+    .{
+        .name = "occluder.set_mode",
+        .module = "occluder",
+        .signature = "occluder.set_mode(self, mode)",
+        .summary = "0 derives the shape from the sprite's alpha at `set_threshold`, 1 uses the polygon, 2 blocks nothing. Mode 2 is how a sprite that looks like it occludes says it must not.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "mode", .kind = .integer, .doc = "0 auto, 1 manual, 2 none" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\occluder.set_mode(self, 2)  -- a fog card
+        ,
+    },
+    .{
+        .name = "occluder.set_threshold",
+        .module = "occluder",
+        .signature = "occluder.set_threshold(self, alpha)",
+        .summary = "The alpha at which the automatic shape decides a texel is solid. Raising it is the fix for most 'my sprite has a fringe of shadow' reports.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "alpha", .kind = .number, .doc = "0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\occluder.set_threshold(self, 0.6)
+        ,
+    },
+    .{
+        .name = "occluder.set_mask",
+        .module = "occluder",
+        .signature = "occluder.set_mask(self, bitmask)",
+        .summary = "Which lights this occluder blocks. 0 blocks everything, which is what a wall wants; a pane that blocks the sun but not the lamps sets it.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "bitmask", .kind = .integer, .doc = "0 for all lights" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\occluder.set_mask(self, 0xFF)
+        ,
+    },
+    .{
+        .name = "occluder.set_polygon",
+        .module = "occluder",
+        .signature = "occluder.set_polygon(self, {x0, y0, x1, y1, ...})",
+        .summary = "The manual shape, as a flat list of coordinates. Read from a table because eight positional arguments are unreadable and an editor dragging vertices produces a list anyway.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "points", .kind = .table, .doc = "flat x/y pairs" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\occluder.set_polygon(self, {0, 0, 32, 0, 32, 48, 0, 48})
+        ,
+    },
+    .{
+        .name = "occluder.get_mode",
+        .module = "occluder",
+        .signature = "occluder.get_mode(self) -> integer",
+        .summary = "The inspector reads as well as writes.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "0 auto, 1 manual, 2 none" },
+        },
+        .example =
+        \\local mode = occluder.get_mode(self)
+        ,
+    },
+    .{
+        .name = "occluder.get_threshold",
+        .module = "occluder",
+        .signature = "occluder.get_threshold(self) -> number",
+        .summary = "The automatic shape's alpha threshold.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "alpha 0..1" },
+        },
+        .example =
+        \\local a = occluder.get_threshold(self)
+        ,
+    },
+    .{
+        .name = "occluder.get_mask",
+        .module = "occluder",
+        .signature = "occluder.get_mask(self) -> integer",
+        .summary = "Which lights this occluder blocks.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "the mask" },
+        },
+        .example =
+        \\local m = occluder.get_mask(self)
+        ,
+    },
+    .{
+        .name = "occluder.get_polygon",
+        .module = "occluder",
+        .signature = "occluder.get_polygon(self) -> table",
+        .summary = "The manual shape as a flat list of coordinates. An editor that lets a user drag vertices reads this back to draw them.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "flat x/y pairs" },
+        },
+        .example =
+        \\local pts = occluder.get_polygon(self)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

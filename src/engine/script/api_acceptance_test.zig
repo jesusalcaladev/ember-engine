@@ -471,6 +471,31 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "a light and an occluder can be configured and read back",
+            .src =
+            \\local self = T.__actor_self
+            \\light.new(self, 0, 192, 1.0, 0.69, 0.41, 1)
+            \\light.set_cone(self, 45, 0.25)
+            \\light.set_shadow(self, true, 2, 2)
+            \\light.set_gi(self, 0.3)
+            \\light.set_mask(self, 255)
+            \\local r, e = light.get_radius(self), light.get_energy(self)
+            \\local degs, pen = light.get_cone(self)
+            \\local casts, filter, smooth = light.get_shadow(self)
+            \\-- A manual occluder: the shape, not the sprite's alpha.
+            \\occluder.new(self, 1)
+            \\occluder.set_mode(self, 1)
+            \\occluder.set_threshold(self, 0.6)
+            \\occluder.set_mask(self, 255)
+            \\occluder.set_polygon(self, {0, 0, 32, 0, 32, 48, 0, 48})
+            \\local pts = occluder.get_polygon(self)
+            \\local mode = occluder.get_mode(self)
+            \\return r == 192 and e == 1 and degs == 45 and pen == 0.25
+            \\    and casts == true and filter == 2 and smooth == 2
+            \\    and mode == 1 and #pts == 8 and pts[1] == 0 and pts[5] == 48
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self
