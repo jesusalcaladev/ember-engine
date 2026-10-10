@@ -171,6 +171,13 @@ pub const StepStats = struct {
     shapes: u32 = 0,
     contacts: u32 = 0,
     islands: u32 = 0,
+    /// Bodies the solver has put to sleep.
+    ///
+    /// This is the number that decides whether an open world is affordable. A
+    /// sleeping body costs nothing to step, so the cost of a scene is its
+    /// AWAKE bodies, not its total. Watching this catch up to `bodies` is how
+    /// you know a settled level has actually stopped costing money.
+    sleeping: u32 = 0,
     /// Simulation time spent inside `step`, measured by the driver.
     step_ms: f32 = 0,
 };

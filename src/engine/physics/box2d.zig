@@ -56,6 +56,9 @@ const WorldCtx = struct {
 
     /// Where the ECS wants simulation stopped, for the Play-in-editor case.
     paused: bool = false,
+
+    /// Bodies asleep after the last step. Cached so `stats()` stays free.
+    sleeping_now: u32 = 0,
 };
 
 // ── Conversions ──────────────────────────────────────────────────────────────
@@ -374,6 +377,19 @@ fn setAwake(ctx: *anyopaque, body: physics.BodyId, awake: bool) void {
     }
 }
 
+/// How many live bodies are asleep, recomputed at the end of each step.
+fn tallySleeping(ctx: *anyopaque) void {
+    const w: *WorldCtx = @ptrCast(@alignCast(ctx));
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (i < w.body_gen.len) : (i += 1) {
+        const id = w.body_ids[i];
+        if (b2.b2Body_IsValid(id) == false) continue;
+        if (b2.b2Body_IsAwake(id) == false) n += 1;
+    }
+    w.sleeping_now = n;
+}
+
 fn getGravityScale(ctx: *anyopaque, body: physics.BodyId) f32 {
     const w: *WorldCtx = @ptrCast(@alignCast(ctx));
     const b2id = validBodyId(w, body) orelse return 0.0;
@@ -506,6 +522,7 @@ fn step(ctx: *anyopaque, dt: f32) void {
     // iteration pairs. 4 is the upstream default for a 60 Hz step: enough for a
     // resting stack not to sink, cheap enough for 2k bodies.
     b2.b2World_Step(w.world, dt, 4);
+    tallySleeping(ctx);
 }
 
 fn castRay(ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: physics.BodyType) ?physics.RayHit {
@@ -639,6 +656,10 @@ fn stats(ctx: *anyopaque) physics.StepStats {
         .shapes = count(s.shapeCount),
         .contacts = count(s.contactCount),
         .islands = count(s.islandCount),
+        // Counted by walking the pool, not by asking Box2D: the counters
+        // struct has no sleep tally, and one pass over our own slot table is
+        // cheap next to a step.
+        .sleeping = w.sleeping_now,
     };
 }
 

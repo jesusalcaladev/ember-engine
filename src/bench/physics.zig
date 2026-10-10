@@ -433,6 +433,13 @@ pub fn main() !void {
         std.debug.print("    motion     : {d}/{d} dynamic bodies moved\n", .{ probe.moved, probe.total });
         std.debug.print("    contacts   : {d} live in the solver\n", .{probe.stats.contacts});
         std.debug.print("    backend    : {d} bodies / {d} shapes\n", .{ probe.stats.bodies, probe.stats.shapes });
+        // The number that decides whether an open world is affordable: a
+        // sleeping body costs nothing, so the bill is for the AWAKE ones.
+        std.debug.print("    awake      : {d} of {d} still simulating, {d} asleep\n", .{
+            probe.stats.bodies - probe.stats.sleeping,
+            probe.stats.bodies,
+            probe.stats.sleeping,
+        });
         std.debug.print("    hold       : {s}\n", .{if (held) "PASS  nothing sank through the floor" else "FAIL  bodies fell through the floor"});
         if (scenario.expectsMotion()) {
             std.debug.print("    motion     : {s}\n", .{if (moved_enough) "PASS  the world is moving" else "FAIL  fewer than half moved — the solver is barely stepping"});
