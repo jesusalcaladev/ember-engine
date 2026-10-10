@@ -40,7 +40,14 @@ pub const driver = @import("driver.zig");
 /// The fixed-step driver: owns the clock half of physics (60 Hz, one catch-up,
 /// render interpolation).
 pub const Driver = driver.Driver;
+pub const activity = @import("activity.zig");
 pub const system = @import("system.zig");
+
+/// Distance-based activity tiers (ROADMAP M5, "open world").
+pub const Activity = activity.Activity;
+pub const ActivityConfig = activity.Config;
+pub const Tier = activity.Tier;
+pub const ActivityStats = activity.Stats;
 
 /// The ECS-facing physics system: owns the world and syncs it both ways.
 pub const System = system.System;
@@ -75,4 +82,8 @@ test {
     // rather than behind a flag: a test that only runs when something is
     // enabled is a test nobody runs.
     _ = @import("contacts_test.zig");
+    // The activity tier logic is pure decision-making with no solver in it, so
+    // it is tested as such: hysteresis bugs are invisible in a benchmark,
+    // because a thrashing body costs only slightly more than a still one.
+    _ = @import("activity.zig");
 }

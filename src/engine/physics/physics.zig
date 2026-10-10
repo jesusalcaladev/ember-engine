@@ -216,6 +216,14 @@ pub const VTable = struct {
     setGravityScale: *const fn (ctx: *anyopaque, body: BodyId, scale: f32) void,
     getGravityScale: *const fn (ctx: *anyopaque, body: BodyId) f32,
     setAwake: *const fn (ctx: *anyopaque, body: BodyId, awake: bool) void,
+    /// Takes a body out of the simulation AND out of every spatial query.
+    ///
+    /// This is the single primitive the whole activity system rests on: a
+    /// disabled body is not stepped and does not appear in the broadphase, so
+    /// it costs nothing at all — not "a little", nothing. It is stronger than
+    /// sleeping (which still occupies a slot and keeps its contacts) and much
+    /// cheaper than destroying and rebuilding the body.
+    setEnabled: *const fn (ctx: *anyopaque, body: BodyId, enabled: bool) void,
     /// An instantaneous change in momentum, applied at the body's centre of mass
     /// so it cannot spin the body — `applyImpulse` at the centre is the "jump"
     /// primitive, and a point impulse belongs in a separate call because the two
@@ -295,6 +303,10 @@ pub const World = struct {
     }
     pub fn setAwake(self: World, body: BodyId, awake: bool) void {
         self.vtable.setAwake(self.ctx, body, awake);
+    }
+    /// Enable/disable participation in the simulation.
+    pub fn setEnabled(self: World, body: BodyId, enabled: bool) void {
+        self.vtable.setEnabled(self.ctx, body, enabled);
     }
     /// Impulse at the centre of mass. `wake` is a separate argument because the
     /// two questions are separate: "make it move" and "make it move EVEN IF it

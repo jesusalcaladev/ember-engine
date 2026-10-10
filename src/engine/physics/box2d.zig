@@ -390,6 +390,20 @@ fn tallySleeping(ctx: *anyopaque) void {
     w.sleeping_now = n;
 }
 
+fn setEnabled(ctx: *anyopaque, body: physics.BodyId, enabled: bool) void {
+    const w: *WorldCtx = @ptrCast(@alignCast(ctx));
+    const b2id = validBodyId(w, body) orelse return;
+    // Guarded rather than called blindly: a redundant enable/disable is not
+    // free in Box2D (it dirties the broadphase), and the caller may well ask
+    // twice for the same state across two frames.
+    if (enabled == (b2.b2Body_IsEnabled(b2id) != false)) return;
+    if (enabled) {
+        b2.b2Body_Enable(b2id);
+    } else {
+        b2.b2Body_Disable(b2id);
+    }
+}
+
 fn getGravityScale(ctx: *anyopaque, body: physics.BodyId) f32 {
     const w: *WorldCtx = @ptrCast(@alignCast(ctx));
     const b2id = validBodyId(w, body) orelse return 0.0;
@@ -684,6 +698,7 @@ pub const vtable = physics.VTable{
     .setGravityScale = setGravityScale,
     .getGravityScale = getGravityScale,
     .setAwake = setAwake,
+    .setEnabled = setEnabled,
     .applyImpulse = applyImpulse,
     .createShape = createShape,
     .destroyShape = destroyShape,

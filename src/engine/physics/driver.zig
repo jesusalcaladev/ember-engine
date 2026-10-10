@@ -209,6 +209,11 @@ fn nopGetGravityScale(ctx: *anyopaque, body: physics.BodyId) f32 {
         _ = body;
         return 1.0;
     }
+fn nopSetEnabled(ctx: *anyopaque, body: physics.BodyId, enabled: bool) void {
+        _ = ctx;
+        _ = body;
+        _ = enabled;
+    }
     const vtable = physics.VTable{
         .createWorld = createWorld,
         .destroyWorld = destroyWorld,
@@ -222,6 +227,7 @@ fn nopGetGravityScale(ctx: *anyopaque, body: physics.BodyId) f32 {
         .setGravityScale = nopScale,
         .getGravityScale = nopGetGravityScale,
         .setAwake = nopAwake,
+        .setEnabled = nopSetEnabled,
         .applyImpulse = nopImpulse,
         .createShape = nopShape,
         .destroyShape = nopShapeId,

@@ -271,6 +271,21 @@ pub fn build(b: *std.Build) void {
     const plat_step = b.step("demo-platformer", "M4: the platformer demo — runs, and runs the same way twice");
     plat_step.dependOn(&b.addRunArtifact(plat_exe).step);
 
+    // The open-world bench (M5): the acceptance test for distance-based
+    // activity. An executable for the same reason as the others.
+    const ow_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/openworld.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    ow_mod.addImport("core", core_mod);
+    ow_mod.addImport("ecs", ecs_mod);
+    ow_mod.addImport("physics", physics_mod);
+    const ow_exe = b.addExecutable(.{ .name = "ember-bench-openworld", .root_module = ow_mod });
+    const ow_step = b.step("bench-openworld", "M5: 200k bodies, camera walk — is the frame cost a function of what is NEAR?");
+    ow_step.dependOn(&b.addRunArtifact(ow_exe).step);
+
     const steer_step = b.step("bench-steer", "Measure the M4.5 steering + spatial path against spec §2");
     // Refuses to run without the feature rather than reporting the disabled
     // path's numbers: a benchmark of a subsystem that is compiled out is worse

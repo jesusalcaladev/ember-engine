@@ -248,6 +248,14 @@ pub const RigidBody2D = struct {
     prev_position: Vec2 = .{},
     prev_rotation: f32 = 0.0,
 
+    /// How much physics this body is getting, as a `physics.Tier` ordinal.
+    /// 0 = full.
+    ///
+    /// Stored here rather than in a side table because it is part of the body's
+    /// state: it must survive save/load, and the determinism hash covers it, so
+    /// two runs that tier differently cannot pass.
+    tier: u8 = 0,
+
     pub const invalid_body = std.math.maxInt(u32);
 
     pub fn isSimulated(self: RigidBody2D) bool {
