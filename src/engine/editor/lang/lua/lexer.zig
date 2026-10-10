@@ -75,7 +75,11 @@ const keywords = [_][]const u8{
 /// folded into keywords because they are the engine's own vocabulary — the words
 /// a user is most likely to look up — and colouring them distinctly makes a typo
 /// (`actr.get_position`) visible on the line it is written.
-const globals = [_][]const u8{
+///
+/// Public because the diagnostics read it too: an unknown global and a
+/// miscoloured global are the same question answered twice, and two answers is
+/// one drift too many.
+pub const globals = [_][]const u8{
     "actor", "input", "log", "math", "noise", "physics", "rand", "self",
     "sm", "steer", "vec2", "world",
     // The Lua standard library, which is whitelisted by the sandbox.

@@ -2,16 +2,19 @@
 
 **Source:** `src/engine/editor/` — module root `root.zig`, text layer in `doc/`
 (`buffer.zig`, `cursor.zig`, `find.zig`), Lua language layer in `lang/lua/`
-(`lexer.zig`).
+(`lexer.zig`, `parser.zig`, `diagnostics.zig`).
 
 The non-UI half of ROADMAP M5.5. This is the part with no ImGui in it: a text
-document, a cursor, a Lua highlighter and a find engine. The UI half consumes it
-the way the renderer consumes a batcher.
+document, a cursor, a Lua highlighter, a Lua parser with recovery, an error-lens
+and a find engine. The UI half consumes it the way the renderer consumes a
+batcher.
 
 ```
 editor.Buffer   text + line index + undo        doc/buffer.zig
 engine.Cursor   caret, selection, intent         doc/cursor.zig
 engine.tokenize Lua -> coloured spans           lang/lua/lexer.zig
+engine.parse      Lua -> tree, with recovery      lang/lua/parser.zig
+engine.diagnostics parse + metadata -> the lens   lang/lua/diagnostics.zig
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -23,7 +26,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 58 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 85 tests.
 
 ## Where it may allocate
 
@@ -32,6 +35,43 @@ overlay has its own budget (spec §2) and disappears entirely in exports, so thi
 module allocates freely — what it must not do is allocate per rendered frame for
 state that did not change. Every mutation returns the span it touched, so the UI
 re-tokenizes one line instead of the file when a character is typed.
+
+## The two Lua layers, and why they are separate
+
+The lexer answers "what colour is this run" and never fails, because a highlighter
+that failed on a half-typed line would fail during exactly the work the user is
+doing. The parser answers "what does this mean" and is allowed to fail — it
+reports at the offending token and resyncs to the next statement, so one typo
+costs one underline and not the rest of the file. Splitting them is what lets the
+highlighter stay trivially correct on broken code while the structure layer stays
+useful on it.
+
+LuaJIT's own parser was the obvious thing to reach for, and it was rejected: one
+error and stop, no tree, a live `lua_State`, and a C dependency in a module that
+today compiles with no C runtime at all. What the editor gains from a tree it
+cannot get from a message: folds, an outline, and the scope information every
+"undefined global" answer depends on.
+
+## The diagnostics pass: the part no generic LSP has
+
+Error lens is normally a red underline for syntax. The half worth having is the
+one that is not about Lua at all: every binding this engine hands to scripts is
+described once in `metadata.zig` — signature, parameter types, defaults, a summary
+and an example — and that table is reachable from here as its own module, which
+is why `build.zig` has an `api_meta` module in the editor's block. From it three
+questions become answerable while the user types:
+
+- `actor.set_position(self, 1)` — three arguments, two written.
+- `actor.set_position(self, "home", 2)` — a `number` parameter handed a string.
+- `actr.get_position(...)` — a misspelled engine global, checked against the same
+  name list the highlighter colours with, so the two answers cannot drift.
+
+The rules are deliberately conservative. A wrong diagnostic teaches the user to
+ignore the lens, and then it protects nothing: the type check only fires on a
+literal of the wrong shape (a variable could hold anything; a table might be a
+Vec2), and the arity check only the lower bound. `x = 1` and `function f() ... end`
+are writes of a global, not reads, which is why the parser re-labels them rather
+than flagging them.
 
 ## The design decisions worth knowing
 
@@ -120,8 +160,8 @@ file.
 
 - **Tabs, split panes, the help panel, Ctrl+Click.** Those are M5.5 UI work and
   they consume this module rather than extending it.
-- **Parse-error markers.** A separate pass with different requirements — it has to
-  be able to fail.
+- **Autocompletion.** Next up, on top of the symbols and calls the parser already
+  produces.
 - **An LSP.** Stubs ship at v1; the LSP is post-1.0 (ROADMAP §Post-1.0).
 
 ## Running it
@@ -135,4 +175,6 @@ zig build test          # the editor suite runs first, in milliseconds
 | `doc/buffer.zig` | 14 — line index, undo/redo, coalescing, the 400-edit property test |
 | `doc/cursor.zig` | 18 — movement, intent, selection, auto-indent, word/page movement |
 | `lang/lua/lexer.zig` | 12 — long brackets, escapes, span coverage, unterminated forms |
+| `lang/lua/parser.zig` | 16 — recovery, spans, calls, scopes, the depth guard, garbage that cannot loop |
+| `lang/lua/diagnostics.zig` | 13 — every rule, in both directions, at scale |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |

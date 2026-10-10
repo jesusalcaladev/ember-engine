@@ -145,6 +145,9 @@ pub const Symbol = struct {
     kind: SymbolKind,
 };
 
+/// `assign` is a write of a global (`x = 1`, `function f() ... end`), which is
+/// not a read: a global being written for the first time is not a misspelling,
+/// and flagging one would put an underline under every top-level function.
 pub const UseKind = enum { decl, read, assign };
 
 pub const Use = struct {
@@ -186,6 +189,9 @@ pub const ArgKind = enum {
 
 pub const Arg = struct {
     start: u32,
+    /// Covers the whole argument expression, not just its first token, so a
+    /// diagnostic can underline what the user actually wrote.
+    len: u32,
     kind: ArgKind,
 };
 
@@ -386,14 +392,18 @@ const Parser = struct {
 
     // ── Recording ─────────────────────────────────────────────────────────
 
-    fn recordName(self: *Parser, kind: UseKind) V {
-        if (self.tok.kind != .name) return;
+    /// Records the use at the current token and returns its index, so the
+    /// caller can re-label it once the grammar says which kind it was: only a
+    /// statement-level rule knows whether `x` is being read or written.
+    fn recordName(self: *Parser, kind: UseKind) ErrSet!?u32 {
+        if (self.tok.kind != .name) return null;
         try self.uses.append(self.allocator, .{
             .start = u(self.tok.start),
             .len = u(self.tok.len),
             .scope = self.cur_scope,
             .kind = kind,
         });
+        return @intCast(self.uses.items.len - 1);
     }
 
     /// A declaration token (a local's name, a parameter): recorded as a use so
@@ -940,19 +950,26 @@ const Parser = struct {
             return error.Syntax;
         }
         // `a.b.c` reads a global and writes a field of it; only the LAST name
-        // is what the declaration is called.
-        try self.recordName(.read);
+        // is what the declaration is called. A bare `f` writes a global, which
+        // is not a read — see `UseKind.assign`.
+        const read_idx = try self.recordName(.read);
         var last = self.tok;
         try self.advance();
+        var wrote_field = false;
         while (self.tokIs(".")) {
+            wrote_field = true;
             try self.advance();
             last = self.tok;
             try self.expectName();
         }
         if (self.tokIs(":")) {
+            wrote_field = true;
             try self.advance();
             last = self.tok;
             try self.expectName();
+        }
+        if (!wrote_field) {
+            if (read_idx) |i| self.uses.items[i].kind = .assign;
         }
         try self.funcbody(start);
         try self.recordSymbol(last, start, self.prev_end - start, .fun);
@@ -1065,14 +1082,28 @@ const Parser = struct {
     /// An expression used as a statement: the only legal form is a function
     /// call. Assignment slips in here because it starts like one.
     fn exprStat(self: *Parser) V {
+        var targets: [8]u32 = undefined;
+        var n_targets: usize = 0;
         const s = try self.suffixedExpr();
+        if (s.read_idx) |i| if (n_targets < targets.len) {
+            targets[n_targets] = i;
+            n_targets += 1;
+        };
         if (self.tokIs(",") or self.tokIs("=")) {
             if (!s.assignable) try self.errAt(.cannot_assign, s.start_tok);
             while (self.tokIs(",")) {
                 try self.advance();
                 const lhs = try self.suffixedExpr();
                 if (!lhs.assignable) try self.errAt(.cannot_assign, lhs.start_tok);
+                if (lhs.read_idx) |i| if (n_targets < targets.len) {
+                    targets[n_targets] = i;
+                    n_targets += 1;
+                };
             }
+            // Now that the grammar has said this is an assignment, the left
+            // side is being written. Re-labelling is why `recordName` hands
+            // back an index.
+            for (targets[0..n_targets]) |i| self.uses.items[i].kind = .assign;
             try self.expectOp("=");
             try self.exprlist();
             return;
@@ -1090,7 +1121,7 @@ const Parser = struct {
         const start_tok = self.tok;
         var s = Suffixed{ .start_tok = start_tok };
         if (self.tok.kind == .name) {
-            try self.recordName(.read);
+            s.read_idx = try self.recordName(.read);
             s.assignable = true;
             try self.advance();
         } else if (self.tokIs("(")) {
@@ -1135,13 +1166,15 @@ const Parser = struct {
             arg_count = try self.arglist();
             try self.expectCallClose();
         } else if (self.tok.kind == .string) {
-            try self.args.append(self.allocator, .{ .start = u(self.tok.start), .kind = .string });
+            const start = self.tok.start;
             arg_count = 1;
             try self.advance();
+            try self.args.append(self.allocator, .{ .start = u(start), .len = u(self.prev_end - start), .kind = .string });
         } else if (self.tokIs("{")) {
-            try self.args.append(self.allocator, .{ .start = u(self.tok.start), .kind = .table });
-            try self.tableCtor();
+            const start = self.tok.start;
             arg_count = 1;
+            try self.tableCtor();
+            try self.args.append(self.allocator, .{ .start = u(start), .len = u(self.prev_end - start), .kind = .table });
         } else {
             try self.errExpected("function arguments");
             return error.Syntax;
@@ -1162,8 +1195,11 @@ const Parser = struct {
         while (!self.tokIs(")") and self.tok.kind != .eof) {
             if (n >= 4096) return n;
             const kind = argKindOf(self.tok, self.src);
-            try self.args.append(self.allocator, .{ .start = u(self.tok.start), .kind = kind });
+            const start = self.tok.start;
+            // Recorded after the parse, so the span covers the argument the
+            // user wrote rather than the first token of it.
             try self.expr();
+            try self.args.append(self.allocator, .{ .start = u(start), .len = u(self.prev_end - start), .kind = kind });
             n += 1;
             if (self.tokIs(",")) {
                 try self.advance();
@@ -1281,6 +1317,10 @@ const Suffixed = struct {
     start_tok: Token,
     is_call: bool = false,
     assignable: bool = false,
+    /// Index of the recorded read of the leading name, if there was one: the
+    /// statement that sees the whole expression decides whether that name was
+    /// read or written.
+    read_idx: ?u32 = null,
 };
 
 fn argKindOf(t: Token, src: []const u8) ArgKind {
