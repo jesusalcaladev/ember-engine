@@ -30,7 +30,7 @@
 //! identifiers, which is what people search for in code.
 
 const std = @import("std");
-const buffer_mod = @import("text_buffer.zig");
+const buffer_mod = @import("buffer.zig");
 
 const Buffer = buffer_mod.Buffer;
 

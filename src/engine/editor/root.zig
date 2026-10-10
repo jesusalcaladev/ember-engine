@@ -29,10 +29,10 @@
 
 const std = @import("std");
 
-pub const buffer = @import("text_buffer.zig");
-pub const highlight = @import("lua_highlight.zig");
-pub const cursor = @import("cursor.zig");
-pub const find = @import("find.zig");
+pub const buffer = @import("doc/buffer.zig");
+pub const highlight = @import("lang/lua/lexer.zig");
+pub const cursor = @import("doc/cursor.zig");
+pub const find = @import("doc/find.zig");
 
 // Short names for what the UI layer imports constantly. `Token` is a highlighted
 // run; `Span` is a plain byte range, and the two names are kept distinct because

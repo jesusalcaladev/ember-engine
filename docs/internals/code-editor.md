@@ -1,17 +1,18 @@
 # The In-Engine Code Editor (core)
 
-**Source:** `src/engine/editor/` (`text_buffer.zig`, `cursor.zig`,
-`lua_highlight.zig`, `find.zig`)
+**Source:** `src/engine/editor/` — module root `root.zig`, text layer in `doc/`
+(`buffer.zig`, `cursor.zig`, `find.zig`), Lua language layer in `lang/lua/`
+(`lexer.zig`).
 
 The non-UI half of ROADMAP M5.5. This is the part with no ImGui in it: a text
 document, a cursor, a Lua highlighter and a find engine. The UI half consumes it
 the way the renderer consumes a batcher.
 
 ```
-editor.Buffer   text + line index + undo        text_buffer.zig
-editor.Cursor   caret, selection, intent         cursor.zig
-editor.tokenize Lua -> coloured spans           lua_highlight.zig
-editor.Finder   find / replace over a Buffer     find.zig
+editor.Buffer   text + line index + undo        doc/buffer.zig
+engine.Cursor   caret, selection, intent         doc/cursor.zig
+engine.tokenize Lua -> coloured spans           lang/lua/lexer.zig
+engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
 ## Why the non-UI half is built first
@@ -131,7 +132,7 @@ zig build test          # the editor suite runs first, in milliseconds
 
 | File | Tests |
 |---|---|
-| `text_buffer.zig` | 14 — line index, undo/redo, coalescing, the 400-edit property test |
-| `cursor.zig` | 18 — movement, intent, selection, auto-indent, word/page movement |
-| `lua_highlight.zig` | 12 — long brackets, escapes, span coverage, unterminated forms |
-| `find.zig` | 14 — wrap, whole word, folding, replace-all as one act |
+| `doc/buffer.zig` | 14 — line index, undo/redo, coalescing, the 400-edit property test |
+| `doc/cursor.zig` | 18 — movement, intent, selection, auto-indent, word/page movement |
+| `lang/lua/lexer.zig` | 12 — long brackets, escapes, span coverage, unterminated forms |
+| `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |
