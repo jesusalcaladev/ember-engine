@@ -48,7 +48,14 @@ pub const SpriteInstance = struct {
     color: [4]u8,
     /// Atlas slot; consecutive instances with the same slot batch together.
     slot: u8,
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// How the quad is masked: 0 = quad, 1 = circle.
+    ///
+    /// It lives in what used to be padding rather than in a new field, because
+    /// `SpriteInstance` is a hard 32 bytes (asserted right below) and it is the
+    /// stride of the whole vertex buffer. Growing it to carry one enum would
+    /// double the buffer's memory for a prototype feature.
+    shape: u8 = 0,
+    _pad: [2]u8 = .{ 0, 0 },
 };
 
 comptime {

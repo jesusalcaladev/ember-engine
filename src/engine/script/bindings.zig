@@ -818,6 +818,11 @@ const actor_regs = [_]luaL_Reg{
     .{ .name = "get_linear_velocity", .func = lua_actor_get_linear_velocity },
     .{ .name = "apply_impulse", .func = lua_actor_apply_impulse },
     .{ .name = "is_awake", .func = lua_actor_is_awake },
+    // The component inspector (M2/editor): generic add/remove/has, so a tool
+    // does not need a setter per component.
+    .{ .name = "add_component", .func = lua_actor_add_component },
+    .{ .name = "has_component", .func = lua_actor_has_component },
+    .{ .name = "remove_component", .func = lua_actor_remove_component },
     .{ .name = null, .func = null },
 };
 
@@ -1360,12 +1365,185 @@ const render_regs = [_]luaL_Reg{
     .{ .name = null, .func = null },
 };
 
+// ── The component inspector ───────────────────────────────────────────────────
+//
+// Godot's model, and it is the right one: an actor is a bag of COMPONENTS, and
+// the editor adds one and then edits its fields. Without this, a tool has to
+// know every component in the engine and hard-code a setter for each one, and it
+// breaks the moment a component is added.
+//
+// So there are two layers here. `actor.has_component` / `add_component` /
+// `remove_component` are generic and know every registered component by name.
+// Below them sit typed setters for the fields an inspector actually shows,
+// because a generic `set_field(name, value)` in a C binding means stringly-typed
+// lookups in the frame loop and no way for an editor to discover what exists.
+//
+// The metadata registry is what ties the two together: a tool reads the same
+// `meta/ember.lua` a person reads, so the inspector's field list is generated
+// rather than maintained.
+
+/// `actor.add_component(name) -> boolean`
+///
+/// True when the component was added. False when the actor already had it, or
+/// when the name is not a component — a tool must not be able to add something
+/// the engine does not know, because nothing would ever read it.
+fn lua_actor_add_component(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    const name = lua.toSlice(L, 2) orelse "";
+
+    if (std.mem.eql(u8, name, "Sprite")) {
+        if (ctx.world.get(e, Sprite) != null) return pushFalse(L);
+        _ = ctx.world.add(e, Sprite{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "CollisionLayers")) {
+        if (ctx.world.get(e, CollisionLayers) != null) return pushFalse(L);
+        _ = ctx.world.add(e, CollisionLayers{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "Name")) {
+        if (ctx.world.get(e, context_mod.components.Name) != null) return pushFalse(L);
+        _ = ctx.world.add(e, context_mod.components.Name{}) catch return pushFalse(L);
+    } else {
+        // An unknown name is a reportable error, not a silent no-op: a tool that
+        // asks for a component that does not exist has a bug, and hiding it here
+        // is how an inspector ends up with a field that never does anything.
+        return pushFalse(L);
+    }
+    return pushTrue(L);
+}
+
+/// `actor.has_component(name) -> boolean`
+fn lua_actor_has_component(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    const name = lua.toSlice(L, 2) orelse "";
+    const present = if (std.mem.eql(u8, name, "Sprite"))
+        ctx.world.get(e, Sprite) != null
+    else if (std.mem.eql(u8, name, "CollisionLayers"))
+        ctx.world.get(e, CollisionLayers) != null
+    else if (std.mem.eql(u8, name, "RigidBody2D"))
+        ctx.world.get(e, RigidBody2D) != null
+    else if (std.mem.eql(u8, name, "Collider2D"))
+        ctx.world.get(e, Collider2D) != null
+    else if (std.mem.eql(u8, name, "Name"))
+        ctx.world.get(e, context_mod.components.Name) != null
+    else
+        false;
+    return pushBool(L, present);
+}
+
+/// `actor.remove_component(name) -> boolean`
+///
+/// Refuses on `Transform`: an actor with no transform has no position, and every
+/// other component, the renderer and the physics all assume it exists. Silently
+/// removing it would leave an actor that renders nowhere and cannot be found.
+fn lua_actor_remove_component(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    const name = lua.toSlice(L, 2) orelse "";
+    if (std.mem.eql(u8, name, "Transform")) return pushFalse(L);
+
+    const removed = if (std.mem.eql(u8, name, "Sprite"))
+        ctx.world.remove(e, Sprite)
+    else if (std.mem.eql(u8, name, "CollisionLayers"))
+        ctx.world.remove(e, CollisionLayers)
+    else if (std.mem.eql(u8, name, "Collider2D"))
+        ctx.world.remove(e, Collider2D)
+    else
+        false;
+    return pushBool(L, removed);
+}
+
+/// `sprite.set_size(self, w, h)`
+fn lua_sprite_set_size(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.size = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    return 0;
+}
+
+/// `sprite.set_tint(self, r, g, b, a)`
+fn lua_sprite_set_tint(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.tint = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    return 0;
+}
+
+/// `sprite.set_uv(self, u0, v0, u1, v1)` — the atlas region.
+fn lua_sprite_set_uv(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.uv = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    return 0;
+}
+
+/// `sprite.set_atlas(self, slot)`
+fn lua_sprite_set_atlas(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.atlas = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    return 0;
+}
+
+/// `sprite.set_shape(self, kind)` — 0 quad, 1 circle.
+fn lua_sprite_set_shape(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.shape = if (lua.toF32(L, 2) == 0) .quad else .circle;
+    return 0;
+}
+
+/// `sprite.set_blend(self, kind)` — 0 solid, 1 alpha, 2 additive.
+fn lua_sprite_set_blend(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.blend = switch (@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0)))) {
+        0 => .solid,
+        2 => .additive,
+        else => .alpha,
+    };
+    return 0;
+}
+
+/// `sprite.get_size(self) -> w, h` — the inspector reads as well as writes.
+fn lua_sprite_get_size(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    lua.pushF32(L, sprite.size.x);
+    lua.pushF32(L, sprite.size.y);
+    return 2;
+}
+
+/// `sprite.get_tint(self) -> r, g, b, a`
+fn lua_sprite_get_tint(L: ?*lua_State) callconv(.c) c_int {
+    const sprite = spriteOf(L) orelse return 0;
+    for (sprite.tint) |c| lua.pushF32(L, c);
+    return 4;
+}
+
+fn spriteOf(L: ?*lua_State) ?*Sprite {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    return ctx.world.get(e, Sprite);
+}
+
+fn pushBool(L: ?*lua_State, v: bool) c_int {
+    lua.lua_pushboolean(L, @intFromBool(v));
+    return 1;
+}
+fn pushTrue(L: ?*lua_State) c_int {
+    return pushBool(L, true);
+}
+fn pushFalse(L: ?*lua_State) c_int {
+    return pushBool(L, false);
+}
+
 const sprite_regs = [_]luaL_Reg{
     .{ .name = "rect", .func = lua_sprite_rect },
     .{ .name = "circle", .func = lua_sprite_circle },
     .{ .name = "texture", .func = lua_sprite_texture },
     .{ .name = "set_layer", .func = lua_sprite_set_layer },
     .{ .name = "set_visible", .func = lua_sprite_set_visible },
+    .{ .name = "set_size", .func = lua_sprite_set_size },
+    .{ .name = "set_tint", .func = lua_sprite_set_tint },
+    .{ .name = "set_uv", .func = lua_sprite_set_uv },
+    .{ .name = "set_atlas", .func = lua_sprite_set_atlas },
+    .{ .name = "set_shape", .func = lua_sprite_set_shape },
+    .{ .name = "set_blend", .func = lua_sprite_set_blend },
+    .{ .name = "get_size", .func = lua_sprite_get_size },
+    .{ .name = "get_tint", .func = lua_sprite_get_tint },
     .{ .name = null, .func = null },
 };
 
@@ -1908,6 +2086,17 @@ pub const registered_names = [_][]const u8{
     "sprite.texture",
     "sprite.set_layer",
     "sprite.set_visible",
+    "sprite.set_size",
+    "sprite.set_tint",
+    "sprite.set_uv",
+    "sprite.set_atlas",
+    "sprite.set_shape",
+    "sprite.set_blend",
+    "sprite.get_size",
+    "sprite.get_tint",
+    "actor.add_component",
+    "actor.has_component",
+    "actor.remove_component",
     "physics.create_shape",
     "physics.reshape",
     "physics.set_material",

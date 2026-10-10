@@ -687,6 +687,185 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "actor.add_component",
+        .module = "actor",
+        .signature = "actor.add_component(self, name) -> boolean",
+        .summary = "Adds a component by name. False if it was already there or the name is unknown.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "name", .kind = .string, .doc = "Sprite, CollisionLayers, Name, RigidBody2D, Collider2D" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when it was added" },
+        },
+        .example =
+        \\\actor.add_component(self, "Sprite")
+        ,
+    },
+    .{
+        .name = "actor.has_component",
+        .module = "actor",
+        .signature = "actor.has_component(self, name) -> boolean",
+        .summary = "Whether an actor carries a component.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "name", .kind = .string, .doc = "the component name" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when present" },
+        },
+        .example =
+        \\\if actor.has_component(self, "Sprite") then end
+        ,
+    },
+    .{
+        .name = "actor.remove_component",
+        .module = "actor",
+        .signature = "actor.remove_component(self, name) -> boolean",
+        .summary = "Removes a component. Refuses on Transform, which everything else assumes exists.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "name", .kind = .string, .doc = "the component name" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when removed" },
+        },
+        .example =
+        \\\actor.remove_component(self, "Sprite")
+        ,
+    },
+    .{
+        .name = "sprite.set_size",
+        .module = "sprite",
+        .signature = "sprite.set_size(self, w, h)",
+        .summary = "The sprite's size in world units.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "w", .kind = .number, .doc = "width" },
+            .{ .name = "h", .kind = .number, .doc = "height" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_size(self, 64, 64)
+        ,
+    },
+    .{
+        .name = "sprite.set_tint",
+        .module = "sprite",
+        .signature = "sprite.set_tint(self, r, g, b, a)",
+        .summary = "Colour, multiplied with the texel.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "alpha 0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_tint(self, 1, 0.5, 0, 1)
+        ,
+    },
+    .{
+        .name = "sprite.set_uv",
+        .module = "sprite",
+        .signature = "sprite.set_uv(self, u0, v0, u1, v1)",
+        .summary = "The atlas region to sample.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "u0", .kind = .number, .doc = "left" },
+            .{ .name = "v0", .kind = .number, .doc = "top" },
+            .{ .name = "u1", .kind = .number, .doc = "right" },
+            .{ .name = "v1", .kind = .number, .doc = "bottom" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_uv(self, 0, 0, 0.5, 0.5)
+        ,
+    },
+    .{
+        .name = "sprite.set_atlas",
+        .module = "sprite",
+        .signature = "sprite.set_atlas(self, slot)",
+        .summary = "Which texture in the table.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "slot", .kind = .integer, .doc = "index into the texture table; 0 is the white texture" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_atlas(self, 3)
+        ,
+    },
+    .{
+        .name = "sprite.set_shape",
+        .module = "sprite",
+        .signature = "sprite.set_shape(self, kind)",
+        .summary = "How the quad is masked: 0 quad, 1 circle.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 quad, 1 circle" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_shape(self, 1)
+        ,
+    },
+    .{
+        .name = "sprite.set_blend",
+        .module = "sprite",
+        .signature = "sprite.set_blend(self, kind)",
+        .summary = "Blending mode: 0 solid, 1 alpha, 2 additive.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 solid, 1 alpha, 2 additive" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_blend(self, 2)  -- a glow
+        ,
+    },
+    .{
+        .name = "sprite.get_size",
+        .module = "sprite",
+        .signature = "sprite.get_size(self) -> number, number",
+        .summary = "The sprite's size. The inspector reads as well as writes.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "width" },
+            .{ .kind = .number, .doc = "height" },
+        },
+        .example =
+        \\\local w, h = sprite.get_size(self)
+        ,
+    },
+    .{
+        .name = "sprite.get_tint",
+        .module = "sprite",
+        .signature = "sprite.get_tint(self) -> number, number, number, number",
+        .summary = "The sprite's tint.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "red" },
+            .{ .kind = .number, .doc = "green" },
+            .{ .kind = .number, .doc = "blue" },
+            .{ .kind = .number, .doc = "alpha" },
+        },
+        .example =
+        \\\local r, g, b, a = sprite.get_tint(self)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

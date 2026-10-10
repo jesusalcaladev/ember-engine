@@ -101,6 +101,24 @@ function Actor:direction_to(other) end
 ---@return number angle in radians
 function Actor:angle_to(other) end
 
+---Adds a component by name. False if it was already there or the name is unknown.
+---@param self Actor 
+---@param name string Sprite, CollisionLayers, Name, RigidBody2D, Collider2D
+---@return boolean true when it was added
+function Actor:add_component(name) end
+
+---Whether an actor carries a component.
+---@param self Actor 
+---@param name string the component name
+---@return boolean true when present
+function Actor:has_component(name) end
+
+---Removes a component. Refuses on Transform, which everything else assumes exists.
+---@param self Actor 
+---@param name string the component name
+---@return boolean true when removed
+function Actor:remove_component(name) end
+
 ---Sets the velocity outright. Leaves the angular velocity alone.
 ---@param self Actor 
 ---@param vx number velocity x in units/second
@@ -278,6 +296,57 @@ function Actor:set_layer(layer) end
 ---@param self Actor 
 ---@param visible boolean false to stop drawing it
 function Actor:set_visible(visible) end
+
+---The sprite's size in world units.
+---@param self Actor 
+---@param w number width
+---@param h number height
+function Actor:set_size(w, h) end
+
+---Colour, multiplied with the texel.
+---@param self Actor 
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number alpha 0..1
+function Actor:set_tint(r, g, b, a) end
+
+---The atlas region to sample.
+---@param self Actor 
+---@param u0 number left
+---@param v0 number top
+---@param u1 number right
+---@param v1 number bottom
+function Actor:set_uv(u0, v0, u1, v1) end
+
+---Which texture in the table.
+---@param self Actor 
+---@param slot integer index into the texture table; 0 is the white texture
+function Actor:set_atlas(slot) end
+
+---How the quad is masked: 0 quad, 1 circle.
+---@param self Actor 
+---@param kind integer 0 quad, 1 circle
+function Actor:set_shape(kind) end
+
+---Blending mode: 0 solid, 1 alpha, 2 additive.
+---@param self Actor 
+---@param kind integer 0 solid, 1 alpha, 2 additive
+function Actor:set_blend(kind) end
+
+---The sprite's size. The inspector reads as well as writes.
+---@param self Actor 
+---@return number width
+---@return number height
+function Actor:get_size() end
+
+---The sprite's tint.
+---@param self Actor 
+---@return number red
+---@return number green
+---@return number blue
+---@return number alpha
+function Actor:get_tint() end
 
 
 -- ── math ──

@@ -29,12 +29,15 @@ struct Instance {
     @location(2) uv: vec4f,       // (u0, v0, u1, v1) unorm16
     @location(3) color: vec4f,    // rgba unorm8
     @location(4) slot: u32,       // atlas slot (unused here; drives batching)
+    @location(5) shape: u32,      // 0 = quad, 1 = circle
 };
 
 struct VSOut {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
+    @location(2) local: vec2f,    // -1..1 across the quad, for the mask
+    @location(3) shape: u32,      // which mask to apply
 };
 
 /// Triangle-strip corners from the vertex index: (0,0) (1,0) (0,1) (1,1).
@@ -49,6 +52,11 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VSOut {
     out.pos = globals.vp * vec4f(inst.pos + corner * inst.half, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, vec2f(cx, cy));
     out.color = inst.color;
+    // Carried so the fragment stage can mask the quad without recomputing where
+    // it is. One vec2 per vertex, and it is what makes `sprite.circle` a real
+    // circle rather than a square pretending to be one.
+    out.local = corner;
+    out.shape = inst.shape;
     return out;
 }
 
@@ -69,6 +77,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         vec2f(0.0),
         vec2f(1.0),
     );
+
+    // SHAPE MASK. A circle is the quad with the corners knocked off, tested on
+    // the LOCAL coordinate rather than the sampled one -- sampling would make the
+    // shape depend on which atlas region happened to be bound, so the same
+    // sprite would be round or square depending on its texture.
+    //
+    // The radius is 1.0 in local space, so the test is a plain length. The
+    // discard rather than an alpha ramp: a faded edge on a prototype circle
+    // looks like a bug, and `discard` costs nothing here because the sprite is
+    // already blended.
+    if (shape == 1u) {
+        if (dot(in.local, in.local) > 1.0) {
+            discard;
+        }
+    }
+
     return in.color * textureSample(atlas_tex, atlas_smp, uv);
 }
 

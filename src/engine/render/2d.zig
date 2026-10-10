@@ -244,6 +244,9 @@ pub const Renderer2D = struct {
                 }
                 const t = transforms[i].interpolated(alpha);
                 self.instances[self.count] = instanceFor(t, sprite);
+                // The shape rides in the instance's former padding byte; see
+                // SpriteInstance for why it is not a field of its own.
+                self.instances[self.count].shape = @intFromEnum(sprite.shape);
                 self.layers[self.count] = sprite.layer;
                 self.count += 1;
                 // Draw order is layer order; detect whether the query already
@@ -353,6 +356,7 @@ fn instanceFor(t: Transform, sprite: *const Sprite) render.SpriteInstance {
     return .{
         .pos = .{ t.position.x, t.position.y },
         .half = .{ @abs(size_x) * 0.5, @abs(size_y) * 0.5 },
+        .shape = @intFromEnum(sprite.shape),
         .uv = .{
             render.toUnorm16(sprite.uv[0]),
             render.toUnorm16(sprite.uv[1]),

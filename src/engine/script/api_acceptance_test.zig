@@ -450,6 +450,27 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "the editor can add, inspect and remove a component",
+            .src =
+            \\local self = T.__actor_self
+            \\-- Godot's model: an actor is a bag of components.
+            \\if actor.has_component(self, "Sprite") then actor.remove_component(self, "Sprite") end
+            \\local added = actor.add_component(self, "Sprite")
+            \\if not added then return false end
+            \\-- adding twice is refused rather than duplicating
+            \\if actor.add_component(self, "Sprite") then return false end
+            \\if not actor.has_component(self, "Sprite") then return false end
+            \\sprite.set_size(self, 40, 24)
+            \\sprite.set_tint(self, 1, 0, 0, 1)
+            \\local w, h = sprite.get_size(self)
+            \\local r, g, b, a = sprite.get_tint(self)
+            \\-- and Transform cannot be removed: everything assumes it exists
+            \\local no_transform = actor.remove_component(self, "Transform")
+            \\local gone = actor.remove_component(self, "Sprite")
+            \\return w == 40 and h == 24 and r == 1 and g == 0 and no_transform == false and gone == true
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self
