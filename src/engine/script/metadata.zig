@@ -563,6 +563,130 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "render.set_view",
+        .module = "render",
+        .signature = "render.set_view(cx, cy, half_w, half_h)",
+        .summary = "What the camera can see. Turning this on makes the renderer cull.",
+        .params = &.{
+            .{ .name = "x", .kind = .number, .doc = "camera centre x" },
+            .{ .name = "x", .kind = .number, .doc = "camera centre y" },
+            .{ .name = "half_w", .kind = .number, .doc = "half the view width" },
+            .{ .name = "half_h", .kind = .number, .doc = "half the view height" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\render.set_view(cam.px, cam.py, 480, 270)
+        ,
+    },
+    .{
+        .name = "render.stats",
+        .module = "render",
+        .signature = "render.stats() -> integer, integer, integer, integer",
+        .summary = "Last frame's counters: entities, instances, culled, hidden.",
+        .params = &.{
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "entities visited" },
+            .{ .kind = .integer, .doc = "instances drawn" },
+            .{ .kind = .integer, .doc = "culled by the frustum" },
+            .{ .kind = .integer, .doc = "hidden by the designer" },
+        },
+        .example =
+        \\\local entities, drawn, culled, hidden = render.stats()
+        ,
+    },
+    .{
+        .name = "sprite.rect",
+        .module = "sprite",
+        .signature = "sprite.rect(self, w, h, r, g, b, a)",
+        .summary = "A filled rectangle, no texture needed. The first thing a prototype draws.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "w", .kind = .number, .doc = "width" },
+            .{ .name = "h", .kind = .number, .doc = "height" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "alpha 0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.rect(self, 32, 32, 1, 0, 0, 1)
+        ,
+    },
+    .{
+        .name = "sprite.circle",
+        .module = "sprite",
+        .signature = "sprite.circle(self, diameter, r, g, b, a)",
+        .summary = "A circle, no texture needed. One quad and one comparison in the shader.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "diameter", .kind = .number, .doc = "width and height" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "alpha 0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.circle(self, 24, 1, 1, 1, 1)
+        ,
+    },
+    .{
+        .name = "sprite.texture",
+        .module = "sprite",
+        .signature = "sprite.texture(self, w, h, atlas_slot, u0, v0, u1, v1)",
+        .summary = "The same shape, sampling a real atlas region. The 'now give it art' call.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "w", .kind = .number, .doc = "width" },
+            .{ .name = "h", .kind = .number, .doc = "height" },
+            .{ .name = "atlas_slot", .kind = .integer, .doc = "index into the texture table" },
+            .{ .name = "u0", .kind = .number, .doc = "atlas u0" },
+            .{ .name = "v0", .kind = .number, .doc = "atlas v0" },
+            .{ .name = "u1", .kind = .number, .doc = "atlas u1" },
+            .{ .name = "v1", .kind = .number, .doc = "atlas v1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.texture(self, 32, 32, 2, 0, 0, 0.5, 0.5)
+        ,
+    },
+    .{
+        .name = "sprite.set_layer",
+        .module = "sprite",
+        .signature = "sprite.set_layer(self, layer)",
+        .summary = "Draw order. Lower draws first; equal layers batch into one draw call.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "layer", .kind = .integer, .doc = "0 draws first" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_layer(self, 10)  -- above the floor
+        ,
+    },
+    .{
+        .name = "sprite.set_visible",
+        .module = "sprite",
+        .signature = "sprite.set_visible(self, visible)",
+        .summary = "Draw nothing without despawning. The editor's eye toggle.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "visible", .kind = .boolean, .doc = "false to stop drawing it" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\sprite.set_visible(self, not editor.hidden)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

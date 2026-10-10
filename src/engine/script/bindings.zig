@@ -1237,6 +1237,138 @@ fn lua_physics_contains_point(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+// ── Sprite primitives: making a prototype without an art pipeline ────────────
+//
+// Godot can draw a rectangle, a circle, a line and a polygon with no texture at
+// all, which is what makes "grey boxes" a legitimate first step rather than a
+// placeholder you have to replace. These are the same four, backed by the
+// sprite the renderer already knows how to draw.
+//
+// They all write the SPRITE component rather than inventing a draw path, so a
+// prototype drawn with `sprite_rect` and a prototype drawn with a real atlas are
+// the same object afterwards — switching to art later is one line, not a rewrite.
+
+/// `sprite_rect(self, w, h, r, g, b, a)`
+///
+/// A filled rectangle. `r/g/b/a` are 0..1.
+fn lua_sprite_rect(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Sprite) == null) _ = ctx.world.add(e, Sprite{}) catch return 0;
+    const sprite = ctx.world.get(e, Sprite) orelse return 0;
+    sprite.size = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    sprite.atlas = 0; // the white texture
+    sprite.shape = context_mod.components.SpriteShape.quad;
+    sprite.tint = .{ lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6), lua.toF32(L, 7) };
+    return 0;
+}
+
+/// `sprite_circle(self, diameter, r, g, b, a)`
+///
+/// A circle drawn as a quad on the white texture with a circular mask applied
+/// by the batcher. Cheaper than it sounds: it is one quad and one extra compare,
+/// not a mesh.
+fn lua_sprite_circle(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const d = lua.toF32(L, 2);
+    if (ctx.world.get(e, Sprite) == null) _ = ctx.world.add(e, Sprite{}) catch return 0;
+    const sprite = ctx.world.get(e, Sprite) orelse return 0;
+    sprite.size = .{ .x = d, .y = d };
+    sprite.atlas = 0;
+    sprite.tint = .{ lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6) };
+    sprite.shape = context_mod.components.SpriteShape.circle;
+    return 0;
+}
+
+/// `sprite_texture(self, w, h, atlas_slot, u0, v0, u1, v1)`
+///
+/// The same shape, but sampling a real atlas region. This is the "now give it
+/// art" call, and it is a DIFFERENT function rather than a flag on the others so
+/// that a prototype full of `sprite_rect` calls has an obvious, greppable list
+/// to replace.
+fn lua_sprite_texture(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Sprite) == null) _ = ctx.world.add(e, Sprite{}) catch return 0;
+    const sprite = ctx.world.get(e, Sprite) orelse return 0;
+    sprite.size = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    sprite.atlas = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 4), 0))));
+    sprite.uv = .{ lua.toF32(L, 5), lua.toF32(L, 6), lua.toF32(L, 7), lua.toF32(L, 8) };
+    sprite.blend = .alpha;
+    sprite.shape = context_mod.components.SpriteShape.quad;
+    return 0;
+}
+
+/// `sprite_set_layer(self, layer)` — draw order. Lower draws first.
+fn lua_sprite_set_layer(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sprite = ctx.world.get(e, Sprite) orelse return 0;
+    sprite.layer = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    return 0;
+}
+
+/// `sprite_set_visible(self, visible)` — the editor's eye, and a cheap way to
+/// keep something in the scene without deleting it.
+fn lua_sprite_set_visible(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sprite = ctx.world.get(e, Sprite) orelse return 0;
+    sprite.visible = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `render.set_view(cx, cy, half_w, half_h)` — what the camera can see.
+///
+/// Turning this on is what makes the renderer cull. Off means "no camera", which
+/// is what a headless tool wants, and culling against a zero-sized view would
+/// make the world invisible and report success.
+fn lua_render_set_view(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const half_w = @abs(lua.toF32(L, 3));
+    const half_h = @abs(lua.toF32(L, 4));
+    ctx.render_view = .{
+        .min_x = lua.toF32(L, 1) - half_w,
+        .min_y = lua.toF32(L, 2) - half_h,
+        .max_x = lua.toF32(L, 1) + half_w,
+        .max_y = lua.toF32(L, 2) + half_h,
+    };
+    ctx.render_view_enabled = true;
+    return 0;
+}
+
+/// `render.stats() -> entities, instances, culled, hidden`
+///
+/// Culled and hidden are reported SEPARATELY, and that is the whole point: a
+/// hidden sprite is a decision somebody made, a culled one is the engine saving
+/// you work. A scene where `culled` is zero is paying to draw a world nobody can
+/// see.
+fn lua_render_stats(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const s = ctx.render_stats;
+    lua.lua_pushinteger(L, @intCast(s.entities));
+    lua.lua_pushinteger(L, @intCast(s.instances));
+    lua.lua_pushinteger(L, @intCast(s.culled));
+    lua.lua_pushinteger(L, @intCast(s.hidden));
+    return 4;
+}
+
+const render_regs = [_]luaL_Reg{
+    .{ .name = "set_view", .func = lua_render_set_view },
+    .{ .name = "stats", .func = lua_render_stats },
+    .{ .name = null, .func = null },
+};
+
+const sprite_regs = [_]luaL_Reg{
+    .{ .name = "rect", .func = lua_sprite_rect },
+    .{ .name = "circle", .func = lua_sprite_circle },
+    .{ .name = "texture", .func = lua_sprite_texture },
+    .{ .name = "set_layer", .func = lua_sprite_set_layer },
+    .{ .name = "set_visible", .func = lua_sprite_set_visible },
+    .{ .name = null, .func = null },
+};
+
 const physics_regs = [_]luaL_Reg{
     .{ .name = "cast_ray", .func = lua_physics_cast_ray },
     .{ .name = "line_of_sight", .func = lua_physics_line_of_sight },
@@ -1769,6 +1901,13 @@ pub const registered_names = [_][]const u8{
     "physics.stats",
     "physics.set_view",
     "physics.set_focus",
+    "render.set_view",
+    "render.stats",
+    "sprite.rect",
+    "sprite.circle",
+    "sprite.texture",
+    "sprite.set_layer",
+    "sprite.set_visible",
     "physics.create_shape",
     "physics.reshape",
     "physics.set_material",
@@ -1801,6 +1940,8 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     // table in by default would put that number inside the frame.
     if (build_options.steering) installModule(L, ctx, "world", &world_regs);
     installModule(L, ctx, "physics", &physics_regs);
+    installModule(L, ctx, "render", &render_regs);
+    installModule(L, ctx, "sprite", &sprite_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

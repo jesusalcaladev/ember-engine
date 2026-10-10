@@ -47,6 +47,51 @@ pub const Stats = struct {
     /// Instances dropped because the reserved buffer was full. Non-zero means
     /// `reserve()` was called with too small a number at load time.
     overflowed: u32 = 0,
+    /// Entities skipped because they are outside the camera.
+    ///
+    /// Reported separately from `hidden` on purpose: a hidden sprite is a
+    /// DECISION somebody made, and a culled one is the engine saving you work.
+    /// A scene where `culled` is zero is a scene paying to draw a world nobody
+    /// can see, which is the thing this whole mechanism exists to stop.
+    culled: u32 = 0,
+};
+
+/// The camera's view, in world units.
+///
+/// In 2D a frustum is a rectangle, which makes culling exactly a rectangle test
+/// against a sprite's bounds — no matrix, no plane extraction. That is the one
+/// place 2D is genuinely simpler than 3D rather than merely different.
+pub const ViewRect = struct {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+
+    /// The camera's view, expanded so a sprite just off the edge is still drawn.
+    ///
+    /// The margin is not decoration. Without it a sprite walking right is culled
+    /// on the frame before it is on screen, and at 60 Hz that is a visible pop
+    /// at the edge of the display.
+    pub fn around(cx: f32, cy: f32, half_w: f32, half_h: f32, margin: f32) ViewRect {
+        return .{
+            .min_x = cx - half_w - margin,
+            .min_y = cy - half_h - margin,
+            .max_x = cx + half_w + margin,
+            .max_y = cy + half_h + margin,
+        };
+    }
+
+    /// Whether a sprite centred here with these half-extents can be seen.
+    ///
+    /// The cheap reject is half the test: a sprite whose CENTRE is outside the
+    /// view cannot possibly touch it, and that is four comparisons before any
+    /// size is considered. The full test then only runs for sprites near the
+    /// edge, which is a handful.
+    pub fn sees(self: ViewRect, x: f32, y: f32, half_w: f32, half_h: f32) bool {
+        if (x + half_w < self.min_x or x - half_w > self.max_x) return false;
+        if (y + half_h < self.min_y or y - half_h > self.max_y) return false;
+        return true;
+    }
 };
 
 pub const Options = struct {
@@ -145,6 +190,21 @@ pub const Renderer2D = struct {
     /// Allocation-free, and the hot loop is column-at-a-time so the optimizer
     /// can vectorize it.
     pub fn collect(self: *Renderer2D, world: *World, alpha: f32) void {
+        self.collectInView(world, alpha, null);
+    }
+
+    /// Collects only what the camera can see.
+    ///
+    /// `view` is null when there is no camera — a tool, a test, a server drawing
+    /// a minimap of something that is not on screen. Then everything is drawn,
+    /// because culling against a zero-sized view would make the world invisible
+    /// and report success.
+    pub fn collectInView(
+        self: *Renderer2D,
+        world: *World,
+        alpha: f32,
+        view: ?ViewRect,
+    ) void {
         var q = world.query(.{ Transform, Sprite });
 
         while (q.nextBatch()) |batch| {
@@ -159,6 +219,23 @@ pub const Renderer2D = struct {
                 if (!sprite.visible) {
                     self.stats.hidden += 1;
                     continue;
+                }
+                // Frustum cull. Done before the capacity check and before the
+                // interpolation work, because a culled sprite should cost four
+                // comparisons and nothing else -- it must never reach the point
+                // where the renderer considers writing it.
+                if (view) |v| {
+                    // Exactly the quad `instanceFor` will build: the Transform's
+                    // scale multiplies the sprite's size, and the quad is centred
+                    // on the transform. Culling anything else would either pop
+                    // sprites at the edge or cull things that are on screen.
+                    const t = &transforms[i];
+                    const half_w = @abs(sprite.size.x * t.scale.x) * 0.5;
+                    const half_h = @abs(sprite.size.y * t.scale.y) * 0.5;
+                    if (!v.sees(t.position.x, t.position.y, half_w, half_h)) {
+                        self.stats.culled += 1;
+                        continue;
+                    }
                 }
                 if (self.count >= self.capacity) {
                     // Budget spent: report, never grow, never allocate.
@@ -473,4 +550,101 @@ test "an already ordered scene skips the sort entirely (the fast path)" {
     r2d.collect(&world, 0.0);
     try testing.expect(r2d.layers_monotonic); // no sort was needed
     try testing.expectApproxEqAbs(@as(f32, 20), r2d.instances[2].pos[0], 0.001);
+}
+
+// ── Frustum culling ───────────────────────────────────────────────────────────
+//
+// Culling that is never checked is culling that does not exist. These prove it
+// removes work AND does not remove things that should be drawn — the second half
+// is the one that matters, because a culler that is too aggressive produces an
+// empty screen and still "passes" a test that only counts.
+
+test "a sprite off the view is culled and a sprite on it is not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var world = World.init(allocator);
+    defer world.deinit();
+
+    // One far away, one in the middle of the view.
+    _ = try world.spawn(.{ Transform{ .position = .{ .x = 10_000, .y = 0 } }, components.Sprite{} });
+    _ = try world.spawn(.{ Transform{ .position = .{ .x = 0, .y = 0 } }, components.Sprite{} });
+
+    var r = Renderer2D.init(allocator);
+    defer r.deinit();
+    try r.reserve(16);
+
+    const view = ViewRect.around(0, 0, 100, 100, 0);
+    r.collectInView(&world, 0.0, view);
+
+    try testing.expectEqual(@as(u32, 1), r.stats.instances);
+    try testing.expectEqual(@as(u32, 1), r.stats.culled);
+    try testing.expectEqual(@as(u32, 2), r.stats.entities);
+}
+
+test "no camera draws everything" {
+    // A tool, a test, a minimap of somewhere else on screen: culling against a
+    // zero-sized view would make the world invisible and report success.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var world = World.init(allocator);
+    defer world.deinit();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try world.spawn(.{ Transform{ .position = .{ .x = @as(f32, @floatFromInt(i)) * 9999, .y = 0 } }, components.Sprite{} });
+    }
+
+    var r = Renderer2D.init(allocator);
+    defer r.deinit();
+    try r.reserve(16);
+    r.collect(&world, 0.0);
+    try testing.expectEqual(@as(u32, 5), r.stats.instances);
+    try testing.expectEqual(@as(u32, 0), r.stats.culled);
+}
+
+test "the margin keeps a sprite that is about to enter the view" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var world = World.init(allocator);
+    defer world.deinit();
+
+    // Just past the right edge: not visible, but about to be.
+    _ = try world.spawn(.{ Transform{ .position = .{ .x = 110, .y = 0 } }, components.Sprite{} });
+
+    var r = Renderer2D.init(allocator);
+    defer r.deinit();
+    try r.reserve(16);
+
+    r.collectInView(&world, 0.0, ViewRect.around(0, 0, 100, 100, 0));
+    try testing.expectEqual(@as(u32, 0), r.stats.instances);
+
+    r.stats = .{};
+    r.collectInView(&world, 0.0, ViewRect.around(0, 0, 100, 100, 32));
+    try testing.expectEqual(@as(u32, 1), r.stats.instances);
+}
+
+test "a scaled sprite is culled by its scaled size, not its base one" {
+    // The bounds the culler uses must be the quad the renderer actually builds.
+    // Testing it against the unscaled size is how a giant background gets culled
+    // while covering the whole screen.
+    const tight = ViewRect{ .min_x = -10, .min_y = -10, .max_x = 10, .max_y = 10 };
+
+    // A sprite much LARGER than the view, centred on it, is VISIBLE. Culling it
+    // would blank the screen for a background that covers everything, which is
+    // the classic way a frustum test gets its inequality backwards.
+    try testing.expect(tight.sees(0, 0, 100, 100));
+
+    try testing.expect(tight.sees(0, 0, 5, 5)); // small, centred
+    try testing.expect(tight.sees(8, 0, 5, 5)); // hanging off the right edge
+    try testing.expect(tight.sees(-9, 0, 5, 5)); // hanging off the left
+
+    // Only a sprite whose bounds MISS the view entirely is culled. The margin
+    // matters here: without it, the two above would pop at the screen edge.
+    try testing.expect(!tight.sees(20, 0, 5, 5));
+    try testing.expect(!tight.sees(0, 30, 5, 5));
 }

@@ -222,6 +222,64 @@ function physics.cast_ray(x1, y1, x2, y2) end
 function physics.line_of_sight(x1, y1, x2, y2) end
 
 
+-- ── render ──
+---What the camera can see. Turning this on makes the renderer cull.
+---@param x number camera centre x
+---@param x number camera centre y
+---@param half_w number half the view width
+---@param half_h number half the view height
+function render.set_view(x, x, half_w, half_h) end
+
+---Last frame's counters: entities, instances, culled, hidden.
+---@return integer entities visited
+---@return integer instances drawn
+---@return integer culled by the frustum
+---@return integer hidden by the designer
+function render.stats() end
+
+
+-- ── sprite ──
+---A filled rectangle, no texture needed. The first thing a prototype draws.
+---@param self Actor 
+---@param w number width
+---@param h number height
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number alpha 0..1
+function Actor:rect(w, h, r, g, b, a) end
+
+---A circle, no texture needed. One quad and one comparison in the shader.
+---@param self Actor 
+---@param diameter number width and height
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number alpha 0..1
+function Actor:circle(diameter, r, g, b, a) end
+
+---The same shape, sampling a real atlas region. The 'now give it art' call.
+---@param self Actor 
+---@param w number width
+---@param h number height
+---@param atlas_slot integer index into the texture table
+---@param u0 number atlas u0
+---@param v0 number atlas v0
+---@param u1 number atlas u1
+---@param v1 number atlas v1
+function Actor:texture(w, h, atlas_slot, u0, v0, u1, v1) end
+
+---Draw order. Lower draws first; equal layers batch into one draw call.
+---@param self Actor 
+---@param layer integer 0 draws first
+function Actor:set_layer(layer) end
+
+---Draw nothing without despawning. The editor's eye toggle.
+---@param self Actor 
+---@param visible boolean false to stop drawing it
+function Actor:set_visible(visible) end
+
+
 -- ── math ──
 ---Clamps `v` into the range `[lo, hi]`.
 ---@param v number value to clamp

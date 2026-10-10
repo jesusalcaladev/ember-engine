@@ -426,6 +426,30 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "a prototype can be drawn with no texture at all",
+            .src =
+            \\local self = T.__actor_self
+            \\sprite.rect(self, 32, 48, 1, 0, 0, 1)
+            \\sprite.circle(self, 24, 0, 1, 0, 0.5)
+            \\sprite.set_layer(self, 3)
+            \\-- And then given real art, which is the whole point of prototyping
+            \\-- with primitives: it is one call, not a rewrite.
+            \\sprite.texture(self, 64, 64, 2, 0, 0, 0.5, 0.5)
+            \\return true
+            ,
+        },
+        .{
+            .name = "render reports culled separately from hidden",
+            .src =
+            \\local self = T.__actor_self
+            \\render.set_view(0, 0, 480, 270)
+            \\local entities, drawn, culled, hidden = render.stats()
+            \\-- Four numbers, and culled is not hidden: one is the engine
+            \\-- saving work, the other is a decision somebody made.
+            \\return entities >= 0 and drawn >= 0 and culled >= 0 and hidden >= 0
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self

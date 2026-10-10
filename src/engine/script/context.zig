@@ -59,6 +59,23 @@ pub const PhysicsWorld = physics_mod.World;
 /// frame, and gameplay needs the frame's semantics.
 pub const PhysicsSystem = physics_mod.System;
 
+/// What the camera can see, for render culling. Mirrors `render.ViewRect` but is
+/// declared here so the script module does not have to import the renderer.
+pub const RenderViewRect = struct {
+    min_x: f32 = 0,
+    min_y: f32 = 0,
+    max_x: f32 = 0,
+    max_y: f32 = 0,
+};
+
+/// The counters `render.stats()` reports.
+pub const RenderStats = struct {
+    entities: u32 = 0,
+    instances: u32 = 0,
+    culled: u32 = 0,
+    hidden: u32 = 0,
+};
+
 /// The shared engine state shared by all Lua bindings. One per runtime; tests build
 /// their own. It borrows `world` (does not own it): the runtime owns the World
 /// and the Vm, and this struct is the bridge between them for script calls.
@@ -89,6 +106,17 @@ pub const Context = struct {
     /// line-of-sight test, and a guard the AI reads as "clear shot" is worse
     /// than a hard failure. The bindings report the failure instead.
     physics: ?*PhysicsSystem = null,
+
+    /// The camera's view for RENDER culling, which is a different rectangle from
+    /// the physics one on purpose: the renderer asks "can I see it", physics asks
+    /// "can it affect anything", and those are not the same question. A sprite
+    /// just off-screen is not worth drawing and IS worth simulating if something
+    /// can still walk into it.
+    render_view: RenderViewRect = .{},
+    render_view_enabled: bool = false,
+    /// The last frame's render stats, so `render.stats()` is a read rather than
+    /// a cross-module call from a binding.
+    render_stats: RenderStats = .{},
 
     pub fn init(world: *World, input: *const Input) Context {
         return .{
