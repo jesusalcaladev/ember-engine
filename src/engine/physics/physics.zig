@@ -195,6 +195,43 @@ pub const StepStats = struct {
     sleeping: u32 = 0,
     /// Simulation time spent inside `step`, measured by the driver.
     step_ms: f32 = 0,
+
+    // ── Broadphase ───────────────────────────────────────────────────────────
+    //
+    // Box2D keeps a dynamic AABB tree over every moving shape and a second one
+    // over the static ones, and a contact only exists between pairs the tree
+    // says are close. That is the whole reason 2 000 bodies do not cost
+    // 2 000-squared: the tree turns "who could possibly touch" into a handful of
+    // candidate pairs.
+    //
+    // These are exposed because the broadphase is the one part of a solver that
+    // can fail SILENTLY and still look fine -- a broadphase that stopped
+    // rejecting pairs would not crash, it would just get slower, and the only
+    // way to notice is to watch the numbers.
+    //
+    // `pairs_per_step` is the one that matters: it is how many pairs the solver
+    // actually solved. Divide it by the body count and a healthy world is a
+    // small number; a number climbing toward N means the tree is no longer
+    // helping, which is what a badly scaled world looks like before it becomes
+    // a stutter.
+    broadphase_pairs: u32 = 0,
+    /// Height of the moving-body tree. Flat is good; logarithmic is expected.
+    broadphase_height: u32 = 0,
+    /// Height of the static tree. Static bodies never move, so this one should
+    /// settle and stay put.
+    broadphase_static_height: u32 = 0,
+    /// Bytes the solver is holding for this world. The number that decides
+    /// whether a large level fits in memory at all.
+    solver_bytes: u32 = 0,
+
+    /// Candidate pairs per simulated body, 0 when nothing is simulated.
+    ///
+    /// The single health number for a broadphase. Below ~4 a tree is doing its
+    /// job; approaching the body count means it is not.
+    pub fn pairsPerBody(self: StepStats) f64 {
+        if (self.bodies == 0) return 0.0;
+        return @as(f64, @floatFromInt(self.broadphase_pairs)) / @as(f64, @floatFromInt(self.bodies));
+    }
 };
 
 /// The contract. One row per capability; a backend that cannot do something

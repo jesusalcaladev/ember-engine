@@ -39,6 +39,10 @@ pub const Kind = enum {
     boolean,
     vec2,
     rect2,
+    /// A Lua table. Present because `physics.stats()` returns one, and a stub
+    /// that said `any` for it would tell an editor nothing about the shape it
+    /// is about to autocomplete.
+    table,
     actor,
     any,
 
@@ -50,6 +54,7 @@ pub const Kind = enum {
             .boolean => "boolean",
             .vec2 => "Vec2",
             .rect2 => "Rect2",
+            .table => "table",
             .actor => "Actor",
             .any => "any",
         };
@@ -364,6 +369,54 @@ pub const bindings = [_]Binding{
     },
 
     // ── actor: physics (M4) ──────────────────────────────────────────────
+    .{
+        .name = "physics.stats",
+        .module = "physics",
+        .signature = "physics.stats() -> table",
+        .summary = "Engine counters: broadphase health, what the solver is thinking about, what the activity system decided.",
+        .params = &.{},
+        .returns = &.{.{ .kind = .table, .doc = "with pairs, pairs_per_body, tree_height, static_tree_height, solver_bytes, bodies, shapes, contacts, islands, sleeping, simulated, active_fraction, transitions" }},
+        .example =
+        \\- "why is this scene slow? start here."
+        \\local s = physics.stats()
+        \\if s.pairs_per_body > 8 then
+        \\  -- the broadphase is no longer rejecting pairs: something is awake
+        \\  -- that should not be. Look at sleeping and simulated.
+        \\end
+        ,
+    },
+    .{
+        .name = "physics.set_view",
+        .module = "physics",
+        .signature = "physics.set_view(cx, cy, half_w, half_h, enabled)",
+        .summary = "Tells the engine what the camera can see. Enabling this turns on physics view culling.",
+        .params = &.{
+            .{ .name = "cx", .kind = .number, .doc = "view centre x in world units" },
+            .{ .name = "cy", .kind = .number, .doc = "view centre y in world units" },
+            .{ .name = "half_w", .kind = .number, .doc = "half the view width, plus a margin" },
+            .{ .name = "half_h", .kind = .number, .doc = "half the view height, plus a margin" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "false to fall back to distance tiers alone" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- once a frame, from the camera
+        \\physics.set_view(camera.cx, camera.cy, camera.half_w, camera.half_h, true)
+        ,
+    },
+    .{
+        .name = "physics.set_focus",
+        .module = "physics",
+        .signature = "physics.set_focus(x, y)",
+        .summary = "Where the player is. Bodies are tiered by their distance to this point.",
+        .params = &.{
+            .{ .name = "x", .kind = .number, .doc = "player x in world units" },
+            .{ .name = "y", .kind = .number, .doc = "player y in world units" },
+        },
+        .returns = &.{},
+        .example =
+        \\physics.set_focus(player.px, player.py)
+        ,
+    },
     .{
         .name = "actor.set_linear_velocity",
         .module = "actor",

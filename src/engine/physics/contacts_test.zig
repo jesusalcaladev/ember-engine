@@ -362,7 +362,14 @@ test "balls dropped into a box all stay inside it" {
         });
     }
 
-    // 24 balls, dropped in a loose grid well above the floor with room to fall.
+    // 24 balls, dropped in a loose grid with room to fall.
+    //
+    // The FIRST version of this spawned rows at y = -320 and -380, which is
+    // INSIDE the ceiling (it spans -320..-280). Six balls were ejected upward
+    // through it and the test called that "penetration". It was not: a body
+    // created inside a static box is supposed to be pushed out, and the solver
+    // pushed them the short way out. The rows now start clear of the ceiling,
+    // which is the only thing that was ever wrong here.
     const radius: f32 = 14;
     var spawned: [24]ecs.Entity = undefined;
     var i: usize = 0;
@@ -371,7 +378,7 @@ test "balls dropped into a box all stay inside it" {
         const row: f32 = @floatFromInt(i / 6);
         spawned[i] = try world.spawn(.{
             Transform{
-                .position = .{ .x = -200 + col * 80, .y = -200 - row * 60 },
+                .position = .{ .x = -200 + col * 80, .y = -240 + row * 60 },
                 .rotation = 0,
             },
             RigidBody2D{ .body_type = 2 },
@@ -403,5 +410,14 @@ test "balls dropped into a box all stay inside it" {
         if (xf.position.y < -half_h - margin or xf.position.y > half_h + margin) escaped += 1;
         worst = @max(worst, @max(@abs(xf.position.x), @abs(xf.position.y)));
     }
-    std.debug.print("DBG escaped={d} worst=({d:.1}) box=({d},{d})\\n", .{ escaped, worst, half_w, half_h });
+
+    // The DEPTH, not just the verdict. "6 balls escaped" is a bug report; how
+    // far they got is what says whether the floor was never solid (they would
+    // be kilometres away) or the solver let a pile squeeze through (a few body
+    // widths out). Those are different bugs with different fixes.
+    std.debug.print(
+        "      escaped {d}/{d}, worst |position| {d:.1}, box {d}x{d}, limit {d:.1}\n",
+        .{ escaped, spawned.len, worst, half_w, half_h, half_h + radius + wall },
+    );
+    try testing.expectEqual(@as(usize, 0), escaped);
 }

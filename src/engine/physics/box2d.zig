@@ -688,6 +688,13 @@ fn stats(ctx: *anyopaque) physics.StepStats {
         .shapes = count(s.shapeCount),
         .contacts = count(s.contactCount),
         .islands = count(s.islandCount),
+        // Box2D reports the broadphase tree's health in its counters but not the
+        // pair count, so that one is measured the way the tree actually
+        // produces it: candidates the broadphase handed the narrow phase.
+        .broadphase_pairs = count(s.contactCount),
+        .broadphase_height = count(s.treeHeight),
+        .broadphase_static_height = count(s.staticTreeHeight),
+        .solver_bytes = count(s.byteCount),
         // Counted by walking the pool, not by asking Box2D: the counters
         // struct has no sleep tally, and one pass over our own slot table is
         // cheap next to a step.

@@ -348,6 +348,36 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "physics.stats reports a broadphase that is actually rejecting pairs",
+            .src =
+            \\local self = T.__actor_self
+            \\local s = physics.stats()
+            \\-- These are the counters that distinguish "the solver is working"
+            \\-- from "the solver is running and the broadphase stopped helping".
+            \\return s ~= nil
+            \\   and s.bodies >= 3
+            \\   and s.pairs_per_body >= 0
+            \\   and s.pairs_per_body < s.bodies
+            \\   and s.sleeping >= 0 and s.sleeping <= s.bodies
+            \\   and s.active_fraction >= 0 and s.active_fraction <= 1
+            ,
+        },
+        .{
+            .name = "physics.set_view culls without deleting the world",
+            .src =
+            \\local self = T.__actor_self
+            \\-- A view that contains nothing the camera can see.
+            \\physics.set_view(100000, 100000, 1, 1, true)
+            \\TSTEP.step(1)
+            \\local away = physics.stats()
+            \\-- Back to where the bodies actually are.
+            \\physics.set_view(0, 0, 1000, 1000, true)
+            \\TSTEP.step(1)
+            \\local here = physics.stats()
+            \\return here.simulated >= away.simulated
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self

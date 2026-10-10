@@ -439,9 +439,16 @@ item below attacks that number rather than "make the solver faster".
       sleep thresholds, `time_before_sleep`, solver iterations, max steps per
       frame — validated at load, because a sleep threshold of zero looks exactly
       like "the sleeping code does not work".
-- [ ] **Broadphase.** Box2D already has one (SAP, with a dynamic tree); the work
-      is exposing it and proving it is being used. Godot does the same thing by
-      hand via `_cull_aabb_for_body`; we do not need to.
+- [x] **Broadphase, exposed.** Box2D keeps a dynamic AABB tree over the moving
+      shapes and a second over the static ones, and only pairs the tree says are
+      close ever become contacts. That is the whole reason 2 000 bodies do not
+      cost 2 000 squared. `StepStats` now carries `broadphase_pairs`,
+      `tree_height`, `static_tree_height`, `solver_bytes` and a derived
+      `pairsPerBody()`, all reachable from Lua as `physics.stats()`.
+      Exposed because a broadphase that stops rejecting pairs does not crash —
+      it just gets slower, and the counters are the only way to notice before it
+      becomes a stutter. Two acceptance checks drive it from Lua.
+- [x] **The `cylinder` primitive.** The four the editor needs; there were three.
 - [ ] **Physics on a separate thread.** Godot's
       `physics/2d/run_on_separate_thread`. Real, but it trades the deterministic
       fixed-step contract for multicore, and spec §6 is worth more here. Revisit

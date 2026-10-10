@@ -967,9 +967,85 @@ fn lua_actor_is_awake(L: ?*lua_State) callconv(.c) c_int {
 }
 
 /// The `physics` table: world-level queries about the simulation.
+/// `physics.stats() -> table`
+///
+/// The one function here that is about the ENGINE rather than the world. It
+/// returns the counters a developer needs when a scene is slower than it should
+/// be, and it is the difference between "physics is slow" and "physics is slow
+/// because 1 900 of your bodies are awake and in contact".
+///
+/// Everything in it is a measurement, so it is safe to poll every frame from a
+/// debug overlay. It allocates one small table, which is why it is not something
+/// to call from a hot gameplay path by accident.
+fn lua_physics_stats(L: ?*lua_State) callconv(.c) c_int {
+    const sys = ctxOf(L).physics orelse return 0;
+    const s = sys.world.stats();
+    const a = &sys.activity.stats;
+
+    lua.lua_createtable(L, 0, 10); // [t]
+
+    const put = struct {
+        fn str(state: ?*lua_State, k: [*:0]const u8, v: []const u8) void {
+            lua.pushSlice(state, v);
+            lua.setField(state, -2, k);
+        }
+        fn num(state: ?*lua_State, k: [*:0]const u8, v: f64) void {
+            lua.lua_pushnumber(state, v);
+            lua.setField(state, -2, k);
+        }
+    };
+
+    // The broadphase, which is the part that can fail silently.
+    put.num(L, "pairs", @floatFromInt(s.broadphase_pairs));
+    put.num(L, "pairs_per_body", s.pairsPerBody());
+    put.num(L, "tree_height", @floatFromInt(s.broadphase_height));
+    put.num(L, "static_tree_height", @floatFromInt(s.broadphase_static_height));
+    put.num(L, "solver_bytes", @floatFromInt(s.solver_bytes));
+
+    // What the solver is actually thinking about.
+    put.num(L, "bodies", @floatFromInt(s.bodies));
+    put.num(L, "shapes", @floatFromInt(s.shapes));
+    put.num(L, "contacts", @floatFromInt(s.contacts));
+    put.num(L, "islands", @floatFromInt(s.islands));
+    put.num(L, "sleeping", @floatFromInt(s.sleeping));
+
+    // What the activity system decided.
+    put.num(L, "simulated", @floatFromInt(a.by_tier[0] + a.by_tier[1]));
+    put.num(L, "active_fraction", a.activeFraction());
+    put.num(L, "transitions", @floatFromInt(a.transitions));
+    return 1;
+}
+
+/// `physics.set_view(cx, cy, half_w, half_h, enabled)`
+///
+/// Tells the engine what the camera can see, which is what turns on physics view
+/// culling. Separate from the focus point because a multiplayer server has a
+/// focus and no camera, and culling against a zero-sized view would delete the
+/// world out from under it.
+fn lua_physics_set_view(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const sys = ctx.physics orelse return 0;
+    sys.setView(
+        .{ .x = lua.toF32(L, 1), .y = lua.toF32(L, 2) },
+        .{ .x = lua.toF32(L, 3), .y = lua.toF32(L, 4) },
+        lua.toBool(L, 5),
+    );
+    return 0;
+}
+
+/// `physics.set_focus(x, y)` — where the player is, for distance tiers.
+fn lua_physics_set_focus(L: ?*lua_State) callconv(.c) c_int {
+    const sys = ctxOf(L).physics orelse return 0;
+    sys.setFocus(.{ .x = lua.toF32(L, 1), .y = lua.toF32(L, 2) });
+    return 0;
+}
+
 const physics_regs = [_]luaL_Reg{
     .{ .name = "cast_ray", .func = lua_physics_cast_ray },
     .{ .name = "line_of_sight", .func = lua_physics_line_of_sight },
+    .{ .name = "stats", .func = lua_physics_stats },
+    .{ .name = "set_view", .func = lua_physics_set_view },
+    .{ .name = "set_focus", .func = lua_physics_set_focus },
     .{ .name = null, .func = null },
 };
 
@@ -1483,7 +1559,10 @@ pub const registered_names = [_][]const u8{
     "world.nearby",
     // physics (M4)
                  "physics.cast_ray",
-    "physics.line_of_sight",     "actor.set_linear_velocity",
+    "physics.line_of_sight",
+    "physics.stats",
+    "physics.set_view",
+    "physics.set_focus",     "actor.set_linear_velocity",
     "actor.get_linear_velocity", "actor.apply_impulse",
     "actor.is_awake",
 };

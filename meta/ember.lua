@@ -125,6 +125,46 @@ function Actor:apply_impulse(ix, iy) end
 function Actor:is_awake() end
 
 
+-- ── physics ──
+---Engine counters: broadphase health, what the solver is thinking about, what the activity system decided.
+---@return table with pairs, pairs_per_body, tree_height, static_tree_height, solver_bytes, bodies, shapes, contacts, islands, sleeping, simulated, active_fraction, transitions
+function physics.stats() end
+
+---Tells the engine what the camera can see. Enabling this turns on physics view culling.
+---@param cx number view centre x in world units
+---@param cy number view centre y in world units
+---@param half_w number half the view width, plus a margin
+---@param half_h number half the view height, plus a margin
+---@param enabled boolean false to fall back to distance tiers alone
+function physics.set_view(cx, cy, half_w, half_h, enabled) end
+
+---Where the player is. Bodies are tiered by their distance to this point.
+---@param x number player x in world units
+---@param y number player y in world units
+function physics.set_focus(x, y) end
+
+---Casts a segment and reports what it hit: `hit, t, px, py, nx, ny`.
+---@param x1 number segment start x
+---@param y1 number segment start y
+---@param x2 number segment end x
+---@param y2 number segment end y
+---@return boolean false when nothing blocks the segment
+---@return number how far along the segment the hit is, 0 at the start and 1 at the end
+---@return number hit point x
+---@return number hit point y
+---@return number surface normal x (points away from the surface)
+---@return number surface normal y
+function physics.cast_ray(x1, y1, x2, y2) end
+
+---True when nothing solid blocks the segment between the two points.
+---@param x1 number segment start x
+---@param y1 number segment start y
+---@param x2 number segment end x
+---@param y2 number segment end y
+---@return boolean true when the target is visible
+function physics.line_of_sight(x1, y1, x2, y2) end
+
+
 -- ── math ──
 ---Clamps `v` into the range `[lo, hi]`.
 ---@param v number value to clamp
@@ -540,29 +580,6 @@ function Actor:is_in(name) end
 ---@param radius number search radius in world units
 ---@param fn any visitor called as fn(other_self)
 function Actor:nearby(x, y, radius, fn) end
-
-
--- ── physics ──
----Casts a segment and reports what it hit: `hit, t, px, py, nx, ny`.
----@param x1 number segment start x
----@param y1 number segment start y
----@param x2 number segment end x
----@param y2 number segment end y
----@return boolean false when nothing blocks the segment
----@return number how far along the segment the hit is, 0 at the start and 1 at the end
----@return number hit point x
----@return number hit point y
----@return number surface normal x (points away from the surface)
----@return number surface normal y
-function physics.cast_ray(x1, y1, x2, y2) end
-
----True when nothing solid blocks the segment between the two points.
----@param x1 number segment start x
----@param y1 number segment start y
----@param x2 number segment end x
----@param y2 number segment end y
----@return boolean true when the target is visible
-function physics.line_of_sight(x1, y1, x2, y2) end
 
 
 -- ── input ──
