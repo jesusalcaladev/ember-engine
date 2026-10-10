@@ -240,28 +240,48 @@ pub const Cursor = struct {
 
     /// Inserts text at the caret, replacing any selection. Returns the caret span
     /// so the caller can re-render without scanning.
+    /// Inserts text, replacing any selection as ONE act.
+    ///
+    /// The selection case goes through `replace`, not "delete then insert",
+    /// because the user did one thing: overwriting "he" with "HE" must be a single
+    /// undo step. Doing it in two is the difference between undo restoring the line
+    /// and undo leaving "llo world" behind.
     pub fn insert(self: *Cursor, text: []const u8) !void {
         self.buffer.breakRun();
-        const from = self.replaceSelection() orelse self.pos;
-        try self.buffer.insert(from, text);
-        self.anchor = null;
-        self.moveTo(from + @as(u32, @intCast(text.len)));
+        const span = self.replaceSelectionSpan();
+        if (span) |s| {
+            try self.buffer.replace(s.from, s.to, text);
+            self.anchor = null;
+            self.moveTo(s.from + @as(u32, @intCast(text.len)));
+        } else {
+            try self.buffer.insert(self.pos, text);
+            self.anchor = null;
+            self.moveTo(self.pos + @as(u32, @intCast(text.len)));
+        }
     }
 
     /// Types one character, as a keypress: the run is opened first, so consecutive
     /// keystrokes coalesce into one undo step.
     pub fn typeChar(self: *Cursor, text: []const u8) !void {
         self.buffer.beginRun();
-        const from = self.replaceSelection() orelse self.pos;
-        try self.buffer.insert(from, text);
-        self.anchor = null;
-        self.moveTo(from + @as(u32, @intCast(text.len)));
+        const span = self.replaceSelectionSpan();
+        if (span) |s| {
+            try self.buffer.replace(s.from, s.to, text);
+            self.anchor = null;
+            self.moveTo(s.from + @as(u32, @intCast(text.len)));
+        } else {
+            try self.buffer.insert(self.pos, text);
+            self.anchor = null;
+            self.moveTo(self.pos + @as(u32, @intCast(text.len)));
+        }
     }
 
     /// Backspace: deletes the selection, or the character before the caret.
     pub fn backspace(self: *Cursor) !void {
         self.buffer.breakRun();
-        if (self.replaceSelection() != null) {
+        if (self.replaceSelectionSpan()) |s| {
+            try self.buffer.delete(s.from, s.len());
+            self.moveTo(s.from);
             self.anchor = null;
             return;
         }
@@ -274,7 +294,9 @@ pub const Cursor = struct {
     /// Delete: deletes the selection, or the character after the caret.
     pub fn delete(self: *Cursor) !void {
         self.buffer.breakRun();
-        if (self.replaceSelection() != null) {
+        if (self.replaceSelectionSpan()) |s| {
+            try self.buffer.delete(s.from, s.len());
+            self.moveTo(s.from);
             self.anchor = null;
             return;
         }
@@ -289,7 +311,8 @@ pub const Cursor = struct {
     /// old line is already in the buffer.
     pub fn insertNewline(self: *Cursor) !void {
         self.buffer.breakRun();
-        const from = self.replaceSelection() orelse self.pos;
+        const span = self.replaceSelectionSpan();
+        const from = if (span) |s| s.from else self.pos;
         const at_line = self.buffer.lineOfOffset(from);
         const line_text = self.buffer.lineText(at_line);
         var lead: usize = 0;
@@ -302,15 +325,25 @@ pub const Cursor = struct {
         var buf: [64]u8 = undefined;
         buf[0] = '\n';
         @memcpy(buf[1 .. 1 + room], prefix[0..room]);
-        try self.buffer.insert(from, buf[0 .. 1 + room]);
+        const payload = buf[0 .. 1 + room];
+        if (span) |s| {
+            try self.buffer.replace(s.from, s.to, payload);
+        } else {
+            try self.buffer.insert(from, payload);
+        }
         self.anchor = null;
         self.moveTo(from + 1 + @as(u32, @intCast(room)));
     }
 
     /// Tab: inserts `default_tab_width` spaces, or indents every line the
     /// selection touches (outdent removes them). A selection that spans lines is
-    /// an indent gesture, not a replace — which is why the selection is NOT
-    /// cleared here, so repeated Shift+Tab keeps working on the same lines.
+    /// an indent gesture, not a replace — which is why the selection is NOT cleared
+    /// here, so repeated Shift+Tab keeps working on the same lines.
+    ///
+    /// The whole affected region is rebuilt and written with ONE `replace`, so
+    /// indenting twenty lines is one undo step rather than twenty. That is not a
+    /// nicety: an editor where undoing an indent leaves the file half-indented is
+    /// one where users stop using indent at all.
     pub fn indent(self: *Cursor, outdent: bool) !void {
         const sel = self.selection();
         if (sel == null or sel.?.isEmpty()) {
@@ -324,26 +357,40 @@ pub const Cursor = struct {
         var end_line = self.buffer.lineOfOffset(s.to);
         if (s.to > s.from and self.buffer.lineStart(end_line) == s.to) end_line -= 1;
         const start_line = self.buffer.lineOfOffset(s.from);
+        const start = self.buffer.lineStart(start_line);
+        const end = self.buffer.lineEnd(end_line);
+        const line_count = end_line - start_line + 1;
 
-        // Apply from the LAST line up, so the offsets of earlier lines stay valid.
-        var l: i64 = @intCast(end_line);
-        while (l >= @as(i64, @intCast(start_line))) : (l -= 1) {
-            const line_index: u32 = @intCast(l);
-            const start = self.buffer.lineStart(line_index);
+        // Enough for the region plus four columns per line and one byte of slack.
+        const capacity = (end - start) + line_count * (default_tab_width + 1) + 16;
+        const buf = try self.buffer.allocator.alloc(u8, capacity);
+        defer self.buffer.allocator.free(buf);
+        var w: usize = 0;
+
+        var l = start_line;
+        while (l <= end_line) : (l += 1) {
+            const line_text = self.buffer.lineText(l);
             if (outdent) {
-                const line_text = self.buffer.lineText(line_index);
-                var n: u32 = 0;
+                var n: usize = 0;
                 while (n < line_text.len and n < default_tab_width and line_text[n] == ' ') : (n += 1) {}
-                if (n > 0) try self.buffer.delete(start, n);
+                @memcpy(buf[w..][0 .. line_text.len - n], line_text[n..]);
+                w += line_text.len - n;
             } else {
-                try self.buffer.insert(start, " " ** default_tab_width);
+                @memcpy(buf[w..][0..default_tab_width], "    ");
+                w += default_tab_width;
+                @memcpy(buf[w..][0..line_text.len], line_text);
+                w += line_text.len;
+            }
+            if (l < end_line) {
+                buf[w] = '\n';
+                w += 1;
             }
         }
+        try self.buffer.replace(start, end, buf[0..w]);
+
         // Keep the selection covering the same lines, now shifted.
-        const start = self.buffer.lineStart(start_line);
-        const end = self.buffer.lineEnd(@intCast(l + 1));
         self.anchor = start;
-        self.moveTo(end);
+        self.moveTo(start + @as(u32, @intCast(w)));
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
@@ -366,11 +413,13 @@ pub const Cursor = struct {
     /// Deletes the selection and returns where it was, or null when there was
     /// none. Every edit calls this first, which is what makes typing over a
     /// selection replace it without any caller remembering to check.
-    fn replaceSelection(self: *Cursor) ?u32 {
+    /// The selected range WITHOUT deleting anything. The caller decides whether
+    /// this is a delete, a replace, or nothing — which is what lets each edit be a
+    /// single undo entry instead of two.
+    fn replaceSelectionSpan(self: *Cursor) ?Selection {
         const s = self.selection() orelse return null;
-        self.buffer.delete(s.from, s.len()) catch {};
         self.anchor = null;
-        return s.from;
+        return s;
     }
 
     fn moveVerticalBy(self: *Cursor, lines: u32, extend: bool, dir: enum { up, down }) void {
@@ -546,17 +595,19 @@ test "backspace deletes the selection, else the character before" {
     try b.load("abc");
     var c = Cursor.init(&b);
 
-    c.moveTo(2);
+    c.moveTo(1);
     try c.backspace();
-    try testing.expectEqualStrings("ac", b.textBytes());
-    try testing.expectEqual(@as(u32, 1), c.pos);
+    try testing.expectEqualStrings("bc", b.textBytes());
+    try testing.expectEqual(@as(u32, 0), c.pos);
 
-    // With a selection, it takes the whole selection instead.
+    // With a selection it takes the whole selection, and leaves the caret where
+    // the selection started rather than where the caret was.
     c.moveTo(2);
     c.moveLeft(true);
     c.moveLeft(true);
     try c.backspace();
-    try testing.expectEqualStrings("c", b.textBytes());
+    try testing.expectEqualStrings("", b.textBytes());
+    try testing.expectEqual(@as(u32, 0), c.pos);
 }
 
 test "backspace at the start of the document does nothing" {
@@ -598,10 +649,11 @@ test "newline auto-indents to the line the caret was on" {
     try b.load("    return 1");
     var c = Cursor.init(&b);
 
-    c.moveTo(10); // end of the line
+    c.moveLineEnd(false); // end of the line
     try c.insertNewline();
     try testing.expectEqualStrings("    return 1\n    ", b.textBytes());
-    try testing.expectEqual(@as(u32, 2), c.line());
+    // The caret is on the NEW line (1), four columns in.
+    try testing.expectEqual(@as(u32, 1), c.line());
     try testing.expectEqual(@as(u32, 4), c.column());
 }
 
@@ -648,8 +700,10 @@ test "word movement treats names and punctuation as different destinations" {
         c.moveWordRight(false);
         if (stops > 20) break; // a runaway would spin forever otherwise
     }
-    // foo | . | bar |   | + |   | baz  -- six stops.
-    try testing.expectEqual(@as(u32, 6), stops);
+    // foo | . | bar |   | + |   | baz -- seven stops: the two spaces are stops
+    // too, which is what makes "Ctrl+Right, Ctrl+Right" walk out of a gap rather
+    // than jumping over it.
+    try testing.expectEqual(@as(u32, 7), stops);
 }
 
 test "page movement moves by page_lines and clamps at the edges" {
@@ -664,9 +718,13 @@ test "page movement moves by page_lines and clamps at the edges" {
     c.movePageDown(false);
     try testing.expectEqual(@as(u32, 6), c.line());
     c.movePageDown(false);
-    try testing.expectEqual(@as(u32, 7), c.line()); // the last line, clamped
+    // The file ends with a newline, so it has nine lines and line 8 is the last.
+    try testing.expectEqual(@as(u32, 8), c.line());
     c.movePageUp(false);
-    try testing.expectEqual(@as(u32, 4), c.line());
+    try testing.expectEqual(@as(u32, 5), c.line());
+    c.movePageUp(false);
+    c.movePageUp(false);
+    try testing.expectEqual(@as(u32, 0), c.line()); // clamped at the top
 }
 
 test "select all selects the whole document" {

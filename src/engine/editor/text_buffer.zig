@@ -301,11 +301,20 @@ pub const Buffer = struct {
     /// a character start would report itself. If `pos` is a continuation byte, the
     /// scan alone finds the head of ITS sequence, which is the wrong answer — the
     /// boundary the caller wants is the one before the character they just left.
+    ///
+    /// The `i < text.len` guard is not defensive: a caret at EOF is the common
+    /// case, and reading `text[len]` is an out-of-bounds panic that only shows up
+    /// when someone backspaces at the end of a file.
     pub fn prevBoundary(self: *const Buffer, pos: u32) u32 {
         if (pos == 0) return 0;
         const text = self.text.items;
+        // Always step back one byte first, then walk back to the head of that
+        // character. Two lines, and no special case for EOF: `pos == text.len` is
+        // the caret-at-the-end-of-the-file case, and the earlier version of this
+        // read `text[len]` on exactly that path — which is why backspacing at the
+        // end of a file panicked and backspacing in the middle did not.
         var i: usize = @min(pos, text.len);
-        if (i > 0 and (text[i] & 0xC0) != 0x80) i -= 1;
+        if (i > 0) i -= 1;
         while (i > 0 and (text[i] & 0xC0) == 0x80) : (i -= 1) {}
         return @intCast(i);
     }
