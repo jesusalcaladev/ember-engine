@@ -15,6 +15,8 @@ pub const batcher = @import("render/batcher.zig");
 pub const atlas = @import("render/atlas.zig");
 /// M2/M3: the ECS-driven render system (Actors -> GPU instances).
 pub const render2d = @import("render/2d.zig");
+/// M7: 2D lighting. Lights, occluders, 1D shadow maps and the GI field.
+pub const light = @import("render/light.zig");
 /// M3: the LuaJIT scripting layer (behaviors, bindings, metadata). Exposed
 /// through the engine boundary so gameplay/runtime can drive it without ever
 /// importing LuaJIT directly (spec §7: Lua never touches the platform).

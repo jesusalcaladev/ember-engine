@@ -100,16 +100,55 @@ pub fn build(b: *std.Build) void {
     script_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
     script_mod.linkSystemLibrary("luajit-5.1", .{});
 
+    // ── Asset module (M6: the pipeline, the VFS and the importers) ───────────
+    // Depends on `core` for allocators and profiling, `ecs` for the Sprite
+    // component the resolved sprites fill, and `render` for the atlas packer
+    // (the importer hands it raw pixels and gets back a rect + UVs). Zero new
+    // external dependency: the PNG codec is pure Zig on top of
+    // std.compress.flate, and the WAV path parses RIFF by hand, so an importer
+    // crash is ours to debug and not a C library's.
+    const asset_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/asset/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    asset_mod.addImport("core", core_mod);
+    asset_mod.addImport("ecs", ecs_mod);
+    // The atlas packer is the one part of the renderer the importers need:
+    // sprites go in as pixels and come out as a rect plus UVs. It is exposed as
+    // its own module rather than pulling the whole renderer in, because
+    // render.zig's own imports reach ../platform and would drag the window
+    // layer into a dependency that only packs rectangles.
+    const atlas_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/render/atlas.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    asset_mod.addImport("atlas", atlas_mod);
+
     // ── Editor module (M5.5: the non-UI half of the code editor) ─────────────
-    // Depends on nothing. A document, a cursor, a highlighter and a find engine
-    // are pure Zig, which is exactly why they are built and tested here rather
-    // than inside the editor UI: no Dawn, no window, no ImGui. The UI half of
-    // M5.5 consumes this the way the renderer consumes a batcher.
+    // Depends on nothing but itself. A document, a cursor, a highlighter, a
+    // parser and a find engine are pure Zig, which is exactly why they are
+    // built and tested here rather than inside the editor UI: no Dawn, no
+    // window, no ImGui. The UI half of M5.5 consumes this the way the renderer
+    // consumes a batcher.
+    //
+    // The one exception is the API metadata, reached as its own module: the
+    // engine-aware diagnostics check a call's arguments against the signature
+    // every binding is documented with, and a check that hand-copied the table
+    // would drift. metadata.zig imports only std, so the editor still compiles
+    // and tests with no LuaJIT, no Box2D and no Dawn in sight.
+    const api_meta_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/script/metadata.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const editor_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/editor/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    editor_mod.addImport("api_meta", api_meta_mod);
 
     // ── Engine module (public boundary: core + platform + render) ───────────
     const engine_mod = b.createModule(.{
@@ -215,6 +254,34 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_cmd.addArgs(args);
     const bench_step = b.step("bench", "Run the M1 ECS benchmark suite");
     bench_step.dependOn(&bench_cmd.step);
+
+    // ── M7 lighting benchmark: the CPU half, measured ───────────────────────
+    // A separate artifact from `bench` on purpose: the M1 suite must keep
+    // running while the renderer is mid-edit, and the lighting bench needs the
+    // engine module. It links the same headless modules and nothing else — no
+    // Dawn, no window — so it runs anywhere `zig build test` does.
+    const light_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/light.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    light_bench_mod.addImport("core", core_mod);
+    light_bench_mod.addImport("ecs", ecs_mod);
+    light_bench_mod.addImport("engine", engine_mod);
+    // The engine module declares the Dawn externs, so anything linking it needs
+    // the libraries — declared once on `engine_mod`, which this shares.
+    light_bench_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn"));
+    light_bench_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn/native"));
+    light_bench_mod.linkSystemLibrary("dawn_proc", .{});
+    light_bench_mod.linkSystemLibrary("dawn_native", .{});
+    const light_bench = b.addExecutable(.{
+        .name = "ember-bench-light",
+        .root_module = light_bench_mod,
+    });
+    const light_bench_cmd = b.addRunArtifact(light_bench);
+    const light_bench_step = b.step("bench-light", "Run the M7 lighting benchmark");
+    light_bench_step.dependOn(&light_bench_cmd.step);
 
     // ── M3 benchmark suite (LuaJIT): acceptance criteria of ROADMAP M3 ──────
     // A SEPARATE artifact because it links LuaJIT: the M1 bench must stay
@@ -339,6 +406,12 @@ pub fn build(b: *std.Build) void {
     const editor_tests = b.addTest(.{ .root_module = editor_mod });
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
 
+    // M6 asset tests: the PNG codec, the VFS/pak, the GUIDs and the cache.
+    // They link no library and read no window, so they are the cheapest
+    // evidence in the suite.
+    const asset_tests = b.addTest(.{ .root_module = asset_mod });
+    test_step.dependOn(&b.addRunArtifact(asset_tests).step);
+
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
@@ -418,7 +491,10 @@ pub fn build(b: *std.Build) void {
     // they run headless, so the only native dependency is Dawn itself.
     const render_tests = b.addTest(.{
         .root_module = engine_mod,
-        .filters = &.{"render"},
+        // "render" covers the M2 batcher/atlas/Dawn layouts; "light" covers M7.
+        // Both filters matter: a test whose name misses every filter does not
+        // fail, it simply never runs, which is a green suite measuring nothing.
+        .filters = &.{ "render", "light" },
     });
     test_step.dependOn(&b.addRunArtifact(render_tests).step);
 }
