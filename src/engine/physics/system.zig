@@ -36,6 +36,7 @@ const std = @import("std");
 const ecs = @import("ecs");
 const physics = @import("physics.zig");
 const activity_mod = @import("activity.zig");
+const sectors = @import("sectors.zig");
 
 const World = ecs.World;
 const Entity = ecs.Entity;
@@ -121,6 +122,10 @@ pub const System = struct {
     /// Set when a body was created or destroyed and the list must be rebuilt.
     list_dirty: bool = true,
 
+    /// Where every body is filed, so a retune visits cells near the focus
+    /// instead of every body in the world (see `sectors.zig`).
+    grid: sectors.Grid = sectors.Grid.init(1024),
+
     /// Bodies created this session, kept so a despawn can destroy them.
     created: u32 = 0,
     dropped: u32 = 0,
@@ -190,6 +195,7 @@ pub const System = struct {
     }
 
     pub fn deinit(self: *System) void {
+        self.grid.deinit(self.allocator);
         self.active.deinit(self.allocator);
         self.body_index.deinit(self.allocator);
         self.pending.deinit(self.allocator);
@@ -227,10 +233,33 @@ pub const System = struct {
                 self.createFor(world, e) catch {};
             }
         }
-        self.list_dirty = true;
+        self.reindex(world);
         // Give every body its starting tier before the first frame, so the
         // world opens already tiered rather than simulating everything once.
         self.retune(world);
+    }
+
+    /// Files every simulated body into the spatial index.
+    ///
+    /// Whole-index rebuild, so it is a load-time operation. Called after a
+    /// teleport or a level change; never from the frame loop.
+    pub fn reindex(self: *System, world: *World) void {
+        self.grid.entries.clearRetainingCapacity();
+        var q = world.query(.{ RigidBody2D });
+        while (q.next()) |r| {
+            const entity = r.entity();
+            const rb = world.get(entity, RigidBody2D) orelse continue;
+            if (!rb.isSimulated()) continue;
+            const xf = world.get(entity, Transform) orelse continue;
+            self.grid.insert(self.allocator, .{
+                .index = entity.index,
+                .generation = entity.generation,
+            }, xf.position.x, xf.position.y, rb.tier) catch return;
+        }
+        // The entries were appended in a fresh order, so the cell ranges built
+        // for the previous order are meaningless.
+        self.grid.rebuild(self.allocator) catch {};
+        self.list_dirty = true;
     }
 
     /// Destroys the solver body for an entity and clears its handle. Called from

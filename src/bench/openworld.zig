@@ -72,6 +72,10 @@ const Report = struct {
     retune_ms: f64,
     /// Mean ms of retuning amortised into the frame average.
     retune_amortised_ms: f64,
+    /// How many tier transitions the isolated retune performed.
+    transitions: u32,
+    /// The same retune with tiering held still, i.e. the walk alone.
+    walk_ms: f64,
 };
 
 fn buildWorld(allocator: std.mem.Allocator) !World {
@@ -161,6 +165,26 @@ fn run(allocator: std.mem.Allocator, out: *Report) !u64 {
     sys.setFocus(cameraAt(0));
     sys.retune(&world);
 
+    // A direct, isolated measurement of one retune, taken before the run so it
+    // is not mixed with anything else the System did.
+    var probe_ns: u64 = 0;
+    var walk_ns: u64 = 0;
+    var probe_transitions: u32 = 0;
+    {
+        sys.setFocus(cameraAt(50));
+        const p0 = core.time.clockGetTimeNs();
+        sys.retune(&world);
+        probe_ns = core.time.clockGetTimeNs() -| p0;
+        probe_transitions = sys.activity.stats.transitions;
+
+        // The same retune a second time, with the camera already there: nothing
+        // changes tier, so what is left is the walk and nothing else. The
+        // difference between the two is the cost of the transitions.
+        const p1 = core.time.clockGetTimeNs();
+        sys.retune(&world);
+        walk_ns = core.time.clockGetTimeNs() -| p1;
+    }
+
     var total_ns: u64 = 0;
     var worst_ns: u64 = 0;
     var f: usize = 0;
@@ -189,7 +213,9 @@ fn run(allocator: std.mem.Allocator, out: *Report) !u64 {
         .hash = sys.stateHash(&world),
         .retunes = s.retunes,
         .simulated_steps = s.simulated_steps,
-        .retune_ms = last_retune_ms,
+        .retune_ms = @as(f64, @floatFromInt(probe_ns)) / 1_000_000.0,
+        .walk_ms = @as(f64, @floatFromInt(walk_ns)) / 1_000_000.0,
+        .transitions = probe_transitions,
         .retune_amortised_ms = last_retune_ms * @as(f64, @floatFromInt(s.retunes)) / @as(f64, @floatFromInt(frames)),
     };
     return sys.stateHash(&world);
@@ -303,7 +329,16 @@ pub fn main() !void {
         tiered.simulated_steps,
         @as(f64, @floatFromInt(tiered.simulated_steps)) / @as(f64, @floatFromInt(tiered.retunes)),
     });
-    std.debug.print("                   each of those walks all {d} bodies -- O(world), not O(near)\n", .{world_size});
+    std.debug.print("                   one retune costs {d:.3} ms. The spatial index means it only\n", .{
+        tiered.retune_ms,
+    });
+    std.debug.print("                   considers the {d} bodies in range, not all {d}. What is left\n", .{
+        tiered.simulated + tiered.frozen, world_size,
+    });
+    std.debug.print("                   {d} of them changed tier ({d} ms), versus {d:.3} ms for the\n", .{
+        tiered.transitions, tiered.retune_ms - tiered.walk_ms, tiered.walk_ms,
+    });
+    std.debug.print("                   walk alone. So the cost is promotion, not lookup.\n", .{});
 
     std.debug.print("\n", .{});
     if (failed) {
