@@ -255,6 +255,14 @@ function render.set_view(x, x, half_w, half_h) end
 ---@return integer hidden by the designer
 function render.stats() end
 
+---Marks an atlas page as present or evicted. Evicted pages are skipped at collection time.
+---@param slot integer index into the texture table
+---@param loaded boolean true when the page is resident
+function render.set_resident(slot, loaded) end
+
+---Marks every page resident. The default, and what a machine with no streaming wants.
+function render.all_resident() end
+
 
 -- ── sprite ──
 ---A filled rectangle, no texture needed. The first thing a prototype draws.
@@ -347,6 +355,34 @@ function Actor:get_size() end
 ---@return number blue
 ---@return number alpha
 function Actor:get_tint() end
+
+
+-- ── material ──
+---Attaches a shader material to an actor. Shader 0 is the stock sprite shader.
+---@param self Actor 
+---@param shader integer index into the shader table
+function Actor:new(shader) end
+
+---The material's four floats. Enough for a colour, a threshold, a time.
+---@param self Actor 
+---@param p0 number param 0
+---@param p1 number param 1
+---@param p2 number param 2
+---@param p3 number param 3
+function Actor:set_params(p0, p1, p2, p3) end
+
+---The material's four floats. The inspector reads as well as writes.
+---@param self Actor 
+---@return number param 0
+---@return number param 1
+---@return number param 2
+---@return number param 3
+function Actor:get_params() end
+
+---Which shader this material uses.
+---@param self Actor 
+---@return number shader index
+function Actor:get_shader() end
 
 
 -- ── math ──

@@ -866,6 +866,100 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "render.set_resident",
+        .module = "render",
+        .signature = "render.set_resident(slot, loaded)",
+        .summary = "Marks an atlas page as present or evicted. Evicted pages are skipped at collection time.",
+        .params = &.{
+            .{ .name = "slot", .kind = .integer, .doc = "index into the texture table" },
+            .{ .name = "loaded", .kind = .boolean, .doc = "true when the page is resident" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\render.set_resident(3, false)  -- streamed out
+        ,
+    },
+    .{
+        .name = "render.all_resident",
+        .module = "render",
+        .signature = "render.all_resident()",
+        .summary = "Marks every page resident. The default, and what a machine with no streaming wants.",
+        .params = &.{
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\render.all_resident()
+        ,
+    },
+    .{
+        .name = "material.new",
+        .module = "material",
+        .signature = "material.new(self, shader)",
+        .summary = "Attaches a shader material to an actor. Shader 0 is the stock sprite shader.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "shader", .kind = .integer, .doc = "index into the shader table" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\material.new(self, 1)  -- a dissolve
+        ,
+    },
+    .{
+        .name = "material.set_params",
+        .module = "material",
+        .signature = "material.set_params(self, p0, p1, p2, p3)",
+        .summary = "The material's four floats. Enough for a colour, a threshold, a time.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "p0", .kind = .number, .doc = "param 0" },
+            .{ .name = "p1", .kind = .number, .doc = "param 1" },
+            .{ .name = "p2", .kind = .number, .doc = "param 2" },
+            .{ .name = "p3", .kind = .number, .doc = "param 3" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\material.set_params(self, 0.5, 0, time, 0)
+        ,
+    },
+    .{
+        .name = "material.get_params",
+        .module = "material",
+        .signature = "material.get_params(self) -> number, number, number, number",
+        .summary = "The material's four floats. The inspector reads as well as writes.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "param 0" },
+            .{ .kind = .number, .doc = "param 1" },
+            .{ .kind = .number, .doc = "param 2" },
+            .{ .kind = .number, .doc = "param 3" },
+        },
+        .example =
+        \\\local a, b, c, d = material.get_params(self)
+        ,
+    },
+    .{
+        .name = "material.get_shader",
+        .module = "material",
+        .signature = "material.get_shader(self) -> number",
+        .summary = "Which shader this material uses.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "shader index" },
+        },
+        .example =
+        \\\local which = material.get_shader(self)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

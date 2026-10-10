@@ -47,6 +47,14 @@ pub const Stats = struct {
     /// Instances dropped because the reserved buffer was full. Non-zero means
     /// `reserve()` was called with too small a number at load time.
     overflowed: u32 = 0,
+    /// Entities skipped because the texture they sample is not resident.
+    ///
+    /// Separate from `culled` because it means something different and needs a
+    /// different response: a frustum-culled sprite will come back when the
+    /// camera moves, a sprite whose atlas page was evicted will come back when
+    /// the page is. Streaming systems that conflate the two produce "the
+    /// background vanished and we do not know why".
+    not_resident: u32 = 0,
     /// Entities skipped because they are outside the camera.
     ///
     /// Reported separately from `hidden` on purpose: a hidden sprite is a
@@ -199,11 +207,28 @@ pub const Renderer2D = struct {
     /// a minimap of something that is not on screen. Then everything is drawn,
     /// because culling against a zero-sized view would make the world invisible
     /// and report success.
-    pub fn collectInView(
+    pub fn collectInView(self: *Renderer2D, world: *World, alpha: f32, view: ?ViewRect) void {
+        self.collectFiltered(world, alpha, view, null);
+    }
+
+    /// Collects with an extra test: which atlas slots currently hold a resident
+    /// texture.
+    ///
+    /// `resident` is a 256-bit mask indexed by the sprite's atlas slot, because
+    /// that is the whole set of things a streaming system knows about — a page
+    /// is loaded or it is not. Null means "everything is resident", which is
+    /// what a machine with no streaming wants and what a headless test gets.
+    ///
+    /// The reason this belongs HERE and not in the batcher: the batcher sees
+    /// instances, which have already been written, and by then the work of
+    /// transforming an entity into an instance has been paid. Culling a sprite
+    /// nobody can see should cost nothing at all.
+    pub fn collectFiltered(
         self: *Renderer2D,
         world: *World,
         alpha: f32,
         view: ?ViewRect,
+        resident: ?*const [4]u64,
     ) void {
         var q = world.query(.{ Transform, Sprite });
 
@@ -219,6 +244,17 @@ pub const Renderer2D = struct {
                 if (!sprite.visible) {
                     self.stats.hidden += 1;
                     continue;
+                }
+                // Texture residency. Checked before the frustum because it is
+                // one mask lookup, and before the capacity check because a
+                // sprite whose page is gone must not occupy instance budget.
+                if (resident) |mask| {
+                    const word = sprite.atlas >> 6;
+                    const bit: u6 = @intCast(sprite.atlas & 63);
+                    if ((mask[word] & (@as(u64, 1) << bit)) == 0) {
+                        self.stats.not_resident += 1;
+                        continue;
+                    }
                 }
                 // Frustum cull. Done before the capacity check and before the
                 // interpolation work, because a culled sprite should cost four
@@ -651,4 +687,44 @@ test "a scaled sprite is culled by its scaled size, not its base one" {
     // matters here: without it, the two above would pop at the screen edge.
     try testing.expect(!tight.sees(20, 0, 5, 5));
     try testing.expect(!tight.sees(0, 30, 5, 5));
+}
+
+test "a sprite on an evicted atlas page is skipped, not drawn" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var world = World.init(allocator);
+    defer world.deinit();
+
+    // One sprite on page 0 (resident) and one on page 100 (evicted).
+    _ = try world.spawn(.{
+        Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.Sprite{ .atlas = 0 },
+    });
+    _ = try world.spawn(.{
+        Transform{ .position = .{ .x = 10, .y = 0 } },
+        components.Sprite{ .atlas = 100 },
+    });
+
+    var r = Renderer2D.init(allocator);
+    defer r.deinit();
+    try r.reserve(16);
+
+    // Everything resident: both draw.
+    r.collectFiltered(&world, 0.0, null, null);
+    try testing.expectEqual(@as(u32, 2), r.stats.instances);
+    try testing.expectEqual(@as(u32, 0), r.stats.not_resident);
+
+    // Page 100 evicted. It is reported SEPARATELY from a frustum cull, because
+    // the two recover differently: one clears when the camera moves, the other
+    // when the page is read back in.
+    r.stats = .{};
+    var mask = [4]u64{ 1, 1, 1, 1 };
+    mask[100 >> 6] &= ~(@as(u64, 1) << @as(u6, @intCast(100 & 63)));
+    r.collectFiltered(&world, 0.0, null, &mask);
+
+    try testing.expectEqual(@as(u32, 1), r.stats.instances);
+    try testing.expectEqual(@as(u32, 1), r.stats.not_resident);
+    try testing.expectEqual(@as(u32, 0), r.stats.culled);
 }

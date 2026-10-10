@@ -38,6 +38,7 @@ const Transform = context_mod.Transform;
 /// And for the Sprite, which `get_half_size` reads (the collision-style half
 /// extents of what is drawn).
 const Sprite = context_mod.components.Sprite;
+const ShaderMaterial = context_mod.components.ShaderMaterial;
 
 // ── self <-> entity bridge ───────────────────────────────────────────────────
 
@@ -1362,6 +1363,8 @@ fn lua_render_stats(L: ?*lua_State) callconv(.c) c_int {
 const render_regs = [_]luaL_Reg{
     .{ .name = "set_view", .func = lua_render_set_view },
     .{ .name = "stats", .func = lua_render_stats },
+    .{ .name = "set_resident", .func = lua_render_set_resident },
+    .{ .name = "all_resident", .func = lua_render_all_resident },
     .{ .name = null, .func = null },
 };
 
@@ -1529,6 +1532,87 @@ fn pushTrue(L: ?*lua_State) c_int {
 fn pushFalse(L: ?*lua_State) c_int {
     return pushBool(L, false);
 }
+
+// ── Shader materials ─────────────────────────────────────────────────────────
+//
+// A small, deliberate surface: pick a shader, set four floats. Not a general
+// uniform system -- a wider block needs a std140 layout and turns a hook into a
+// project.
+
+/// `material.new(self, shader)` — attaches a material to an actor.
+fn lua_material_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, ShaderMaterial) == null) {
+        _ = ctx.world.add(e, ShaderMaterial{}) catch return 0;
+    }
+    const mat = ctx.world.get(e, ShaderMaterial) orelse return 0;
+    mat.shader = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    return 0;
+}
+
+/// `material.set_params(self, p0, p1, p2, p3)`
+fn lua_material_set_params(L: ?*lua_State) callconv(.c) c_int {
+    const mat = materialOf(L) orelse return 0;
+    var i: usize = 2;
+    while (i < 6) : (i += 1) mat.params[i - 2] = lua.toF32(L, @intCast(i));
+    return 0;
+}
+
+/// `material.get_params(self) -> p0, p1, p2, p3`
+fn lua_material_get_params(L: ?*lua_State) callconv(.c) c_int {
+    const mat = materialOf(L) orelse return 0;
+    for (mat.params) |p| lua.pushF32(L, p);
+    return 4;
+}
+
+/// `material.get_shader(self) -> number`
+fn lua_material_get_shader(L: ?*lua_State) callconv(.c) c_int {
+    const mat = materialOf(L) orelse return 0;
+    lua.pushF32(L, @floatFromInt(mat.shader));
+    return 1;
+}
+
+fn materialOf(L: ?*lua_State) ?*ShaderMaterial {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    return ctx.world.get(e, ShaderMaterial);
+}
+
+/// `render.set_resident(slot, loaded)` — marks an atlas page as present or
+/// evicted, which is what `collectFiltered` skips against.
+///
+/// Separate from the frustum because the two recover differently: a frustum
+/// cull clears when the camera moves, a residency cull clears when the page is
+/// read back in. A system that conflates them produces "the background vanished
+/// and nobody knows why".
+fn lua_render_set_resident(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const slot: u8 = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 1), 0))));
+    const word = slot >> 6;
+    const bit: u6 = @intCast(slot & 63);
+    if (lua.toBool(L, 2)) {
+        ctx.render_resident[word] |= (@as(u64, 1) << bit);
+    } else {
+        ctx.render_resident[word] &= ~(@as(u64, 1) << bit);
+    }
+    return 0;
+}
+
+/// `render.all_resident()` — the default, and what a machine with no streaming
+/// wants.
+fn lua_render_all_resident(L: ?*lua_State) callconv(.c) c_int {
+    ctxOf(L).render_resident = .{ 1, 1, 1, 1 };
+    return 0;
+}
+
+const material_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_material_new },
+    .{ .name = "set_params", .func = lua_material_set_params },
+    .{ .name = "get_params", .func = lua_material_get_params },
+    .{ .name = "get_shader", .func = lua_material_get_shader },
+    .{ .name = null, .func = null },
+};
 
 const sprite_regs = [_]luaL_Reg{
     .{ .name = "rect", .func = lua_sprite_rect },
@@ -2081,6 +2165,12 @@ pub const registered_names = [_][]const u8{
     "physics.set_focus",
     "render.set_view",
     "render.stats",
+    "render.set_resident",
+    "render.all_resident",
+    "material.new",
+    "material.set_params",
+    "material.get_params",
+    "material.get_shader",
     "sprite.rect",
     "sprite.circle",
     "sprite.texture",
@@ -2131,6 +2221,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "physics", &physics_regs);
     installModule(L, ctx, "render", &render_regs);
     installModule(L, ctx, "sprite", &sprite_regs);
+    installModule(L, ctx, "material", &material_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

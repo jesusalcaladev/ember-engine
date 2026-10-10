@@ -114,6 +114,10 @@ pub const Context = struct {
     /// can still walk into it.
     render_view: RenderViewRect = .{},
     render_view_enabled: bool = false,
+    /// Which atlas slots currently hold a resident texture. All set by default:
+    /// a machine with no streaming wants no skipping, and a mask of zeroes would
+    /// render nothing at all and look like a bug rather than a policy.
+    render_resident: [4]u64 = .{ 1, 1, 1, 1 },
     /// The last frame's render stats, so `render.stats()` is a read rather than
     /// a cross-module call from a binding.
     render_stats: RenderStats = .{},
