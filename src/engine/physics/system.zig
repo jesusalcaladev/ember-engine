@@ -272,10 +272,14 @@ pub const System = struct {
             const rb = world.get(entity, RigidBody2D) orelse continue;
             if (!rb.isSimulated()) continue;
             const xf = world.get(entity, Transform) orelse continue;
-            self.grid.insert(self.allocator, .{
-                .index = entity.index,
-                .generation = entity.generation,
-            }, xf.position.x, xf.position.y, rb.tier) catch return;
+            self.grid.insert(
+                self.allocator,
+                .{ .index = entity.index, .generation = entity.generation },
+                .{ .index = rb.body, .generation = rb.generation },
+                xf.position.x,
+                xf.position.y,
+                rb.tier,
+            ) catch return;
         }
         // The entries were appended in a fresh order, so the cell ranges built
         // for the previous order are meaningless.
@@ -469,46 +473,193 @@ pub const System = struct {
     /// distance computation and nothing else.
     pub fn retune(self: *System, world: *World) void {
         const t0 = @import("core").time.clockGetTimeNs();
+        var stats = activity_mod.Stats{};
+        stats.retunes = self.activity.stats.retunes + 1;
+        self.active.clearRetainingCapacity();
+        // One allocation per retune, not per frame. Growing the list lazily
+        // would mean the first body of a newly-active region reallocates inside
+        // the frame loop (spec §3.1), and a retune is exactly when a whole
+        // region is coming back at once.
+        self.active.ensureTotalCapacity(self.allocator, 4096) catch {};
+
+        // PHASE 1 -- the movers. Bodies that are `full` or `coarse` have been
+        // moving, so their grid entry is only a hint; their real position comes
+        // from the ECS. There are a few thousand of these and they are already in
+        // `active`, so this walk is cheap.
+        for (self.active.items) |entry| {
+            const xf = world.get(entry.entity, Transform) orelse continue;
+            self.decide(world, entry.entity, xf.position, &stats);
+        }
+
+        // PHASE 2 -- the still. Everything else within reach of the focus, read
+        // straight out of the spatial index.
+        //
+        // This is the phase that makes a retune O(near) rather than O(world).
+        // The grid entry carries everything the DECISION needs, so a body whose
+        // tier is unchanged costs three field reads and a counter, and the ECS is
+        // touched only when something actually has to change.
+        const walk = RetuneWalk{ .system = self, .world = world, .stats = &stats };
+        self.grid.forEachNear(
+            walk,
+            self.activity.focus.x,
+            self.activity.focus.y,
+            self.cullRadius(),
+            RetuneWalk.visit,
+        );
+
         const done: u64 = @intCast(@max(@import("core").time.clockGetTimeNs() -| t0, 0));
         self.last_retune_ns = done;
         self.total_retune_ns += done;
-        var stats = activity_mod.Stats{};
-        self.active.clearRetainingCapacity();
-        // One allocation per retune, not per frame. Growing the list lazily
-        // would mean the first body of a newly-active region reallocates
-        // inside the frame loop (spec §3.1), and a retune is exactly when a
-        // whole region is coming back at once.
-        self.active.ensureTotalCapacity(self.allocator, 4096) catch {};
-        stats.retunes = self.activity.stats.retunes + 1;
-
-        var q = world.query(.{ RigidBody2D });
-        while (q.next()) |r| {
-            const entity = r.entity();
-            const rb = world.get(entity, RigidBody2D) orelse continue;
-            if (!rb.isSimulated()) continue;
-
-            const xf = world.get(entity, Transform) orelse continue;
-            const current: Tier = @enumFromInt(@min(rb.tier, activity_mod.tier_count - 1));
-            const d = self.activity.distanceTo(xf.position);
-            const want = self.activity.retier(current, d);
-
-            if (want != current) {
-                self.applyTier(world, entity, want);
-                stats.transitions += 1;
-            }
-            stats.by_tier[@intFromEnum(want)] += 1;
-
-            if (want.isActive()) {
-                self.active.append(self.allocator, .{
-                    .entity = entity,
-                    .body = .{ .index = rb.body, .generation = rb.generation },
-                }) catch {};
-            }
-        }
-
         self.list_dirty = false;
         self.activity.markTuned();
         self.activity.stats = stats;
+    }
+
+    /// The visitor `forEachNear` calls, one entry at a time.
+    const RetuneWalk = struct {
+        system: *System,
+        world: *World,
+        stats: *activity_mod.Stats,
+
+        fn visit(self: RetuneWalk, index: usize, e: sectors.Entry) void {
+            const sys = self.system;
+            const current: Tier = @enumFromInt(@min(e.tier, activity_mod.tier_count - 1));
+            const want = sys.tierFor(current, .{ .x = e.x, .y = e.y });
+
+            // The common case, and the one the whole design exists for: nothing
+            // about this body changed, so no ECS lookup is needed for the DECISION.
+            //
+            // It still has to be added to `active` if it is simulated -- that is
+            // what the frame walks, and returning early without doing so left the
+            // list holding only the bodies that had happened to change tier, so a
+            // settled world stopped simulating itself entirely.
+            if (want == current) {
+                self.stats.by_tier[@intFromEnum(want)] += 1;
+                if (want.isActive()) {
+                    sys.active.append(sys.allocator, .{
+                        .entity = ecs.Entity{ .index = e.entity.index, .generation = e.entity.generation },
+                        .body = .{ .index = e.body.index, .generation = e.body.generation },
+                    }) catch {};
+                }
+                return;
+            }
+
+            // A change. The body handle is IN the entry, so the common
+            // transition -- promoting a frozen body, which is most of them --
+            // needs no ECS lookup at all before the solver is asked to do
+            // anything. Only a change that rebuilds a shape has to go and find
+            // the Collider2D.
+            const entity = ecs.Entity{ .index = e.entity.index, .generation = e.entity.generation };
+            const id = physics.BodyId{ .index = e.body.index, .generation = e.body.generation };
+
+            if (sys.shapeChangeNeeded(current, want)) {
+                // Rare enough to pay for the lookups here.
+                const rb = self.world.get(entity, RigidBody2D) orelse return;
+                const collider = self.world.get(entity, Collider2D);
+                sys.applyTierWith(self.world, entity, rb, collider, want);
+                if (self.world.get(entity, Transform)) |xf| {
+                    sys.grid.touch(index, xf.position.x, xf.position.y);
+                }
+            } else {
+                // The cheap path: enable or disable, and record the tier.
+                switch (want) {
+                    .full, .coarse => sys.world.setEnabled(id, true),
+                    .frozen, .unloaded => sys.world.setEnabled(id, false),
+                }
+                if (want == .unloaded) sys.destroyShapeFor(self.world, entity, null);
+                if (self.world.get(entity, RigidBody2D)) |rb| rb.tier = @intFromEnum(want);
+                if (want.isActive()) {
+                    sys.active.append(sys.allocator, .{ .entity = entity, .body = id }) catch {};
+                }
+            }
+
+            self.stats.transitions += 1;
+            self.stats.by_tier[@intFromEnum(want)] += 1;
+        }
+    };
+
+    /// Whether moving between two tiers has to rebuild the shape.
+    ///
+    /// Only `unloaded` does, because it is the only tier where the shape does not
+    /// exist. Everything else is a change of enabled flag, and the shape swap for
+    /// `coarse` is opt-in (see `Config.coarse_shape_proxy`) precisely because it
+    /// is not worth its cost at scale.
+    fn shapeChangeNeeded(_: *const System, from: Tier, to: Tier) bool {
+        if (to == .unloaded and from != .unloaded) return true;
+        return false;
+    }
+
+    /// How far from the focus the retune has to look.
+    ///
+    /// With a camera this is the diagonal of the view rect plus its margin: a
+    /// body outside it is culled outright, so visiting further would only find
+    /// bodies the view already excluded. Without one, the unload radius is the
+    /// outermost tier boundary and there is nothing to cull against.
+    fn cullRadius(self: *const System) f32 {
+        const rect = self.activity.viewRect(self.activity.config.view_margin) orelse
+            return self.activity.config.unload_radius;
+        const dx = rect.max_x - rect.min_x;
+        const dy = rect.max_y - rect.min_y;
+        return @sqrt(dx * dx + dy * dy) / 2.0;
+    }
+
+    /// The tier a body should be at, given where it is.
+    ///
+    /// Distance and the camera view are two different rules and the view WINS,
+    /// because it is the stronger claim: a body off-screen in 2D cannot affect
+    /// anything, whereas a body merely far away might still be walked into.
+    ///
+    /// The distance decision is still computed, because a body that comes back
+    /// into view must land on the tier its DISTANCE says, not jump straight to
+    /// full -- otherwise the first frame it is visible would also be the frame it
+    /// rebuilds its shape.
+    fn tierFor(self: *const System, current: Tier, position: physics.Vec2) Tier {
+        const by_distance = self.activity.retier(current, self.activity.distanceTo(position));
+        const rect = self.activity.viewRect(self.activity.config.view_margin) orelse
+            return by_distance;
+        if (rect.contains(position)) return by_distance;
+
+        const outside = rect.signedDistance(position);
+        const want: Tier = if (outside > self.activity.config.unload_radius)
+            .unloaded
+        else if (outside > self.activity.config.freeze_radius)
+            .frozen
+        else
+            .coarse;
+        // Never promote on the strength of being off-screen.
+        // A body already demoted further than the view would put it stays where
+        // it is; the view can only ever make a body CHEAPER, never more detailed.
+        const lo: u8 = @intFromEnum(want);
+        const hi: u8 = @intFromEnum(by_distance);
+        return @enumFromInt(@min(lo, hi));
+    }
+
+    /// Decides one body's tier from a position already in hand, and applies it.
+    fn decide(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        position: physics.Vec2,
+        stats: *activity_mod.Stats,
+    ) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        const want = self.tierFor(tierOf(rb), position);
+        if (want != tierOf(rb)) {
+            self.applyTierWith(world, entity, rb, world.get(entity, Collider2D), want);
+            stats.transitions += 1;
+        }
+        stats.by_tier[@intFromEnum(want)] += 1;
+        if (want.isActive()) {
+            self.active.append(self.allocator, .{
+                .entity = entity,
+                .body = .{ .index = rb.body, .generation = rb.generation },
+            }) catch {};
+        }
+    }
+
+    /// Destroys a body's shape without needing the component pointer.
+    fn destroyShapeFor(self: *System, world: *World, entity: Entity, maybe_c: ?*Collider2D) void {
+        self.destroyShape(world, entity, maybe_c);
     }
 
     /// Moves one body to a tier, doing only the work that tier actually needs.

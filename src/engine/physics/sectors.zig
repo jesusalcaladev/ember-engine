@@ -58,6 +58,16 @@ pub const Handle = struct {
 /// instead would cost ~141 ns per body, which is the entire budget.
 pub const Entry = struct {
     entity: Handle,
+    /// The solver body, carried so a tier change does not have to go back to the
+    /// ECS for it.
+    ///
+    /// This is the field that made tier transitions expensive. Promoting a
+    /// frozen body used to cost three `world.get` calls — the ECS slot lookup
+    /// plus the archetype walk, ~141 ns each — before the solver was even asked
+    /// to do anything, and the answer was sitting here all along. A body that is
+    /// frozen has, by definition, not moved and not changed, so its handle is as
+    /// stable as its position.
+    body: Handle,
     x: f32,
     y: f32,
     /// `physics.Tier` ordinal.
@@ -113,10 +123,23 @@ pub const Grid = struct {
 
     /// Files one body. Called at load and whenever a body moves; `append`
     /// amortises, and a retune re-files only the bodies it actually visits.
-    pub fn insert(self: *Grid, allocator: std.mem.Allocator, entity: Handle, x: f32, y: f32, tier: u8) !void {
+    pub fn insert(
+        self: *Grid,
+        allocator: std.mem.Allocator,
+        entity: Handle,
+        body: Handle,
+        x: f32,
+        y: f32,
+        tier: u8,
+    ) !void {
         const index: u32 = @intCast(self.entries.items.len);
-        try self.entries.append(allocator, .{ .entity = entity, .x = x, .y = y, .tier = tier });
+        try self.entries.append(allocator, .{ .entity = entity, .body = body, .x = x, .y = y, .tier = tier });
         try self.appendToCell(allocator, index, x, y);
+    }
+
+    /// The solver body recorded for an entry, as a port handle.
+    pub fn bodyId(e: Entry) struct { index: u32, generation: u32 } {
+        return .{ .index = e.body.index, .generation = e.body.generation };
     }
 
     fn appendToCell(self: *Grid, allocator: std.mem.Allocator, index: u32, x: f32, y: f32) !void {
@@ -212,7 +235,7 @@ const Counter = struct {
 test "a body is found from a nearby point and missed from a far one" {
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
-    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 250, 250, 0);
+    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, .{ .index = 1, .generation = 0 }, 250, 250, 0);
 
     var c = Counter{};
     g.forEachNear(&c, 0, 0, 400, Counter.visit);
@@ -228,8 +251,8 @@ test "cells either side of the origin do not alias" {
     // would file everything on one side into the other's cells.
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
-    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, -50, -50, 0);
-    try g.insert(testing.allocator, .{ .index = 2, .generation = 0 }, 50, 50, 0);
+    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, .{ .index = 1, .generation = 0 }, -50, -50, 0);
+    try g.insert(testing.allocator, .{ .index = 2, .generation = 0 }, .{ .index = 2, .generation = 0 }, 50, 50, 0);
 
     var c = Counter{};
     g.forEachNear(&c, -50, -50, 10, Counter.visit);
@@ -243,7 +266,7 @@ test "cells either side of the origin do not alias" {
 test "touch refreshes the cached position without re-filing the cell" {
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
-    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 0, 0, 0);
+    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, .{ .index = 1, .generation = 0 }, 0, 0, 0);
 
     g.touch(0, 900, 900);
     try testing.expectApproxEqAbs(@as(f32, 900.0), g.entries.items[0].x, 1e-6);
@@ -264,7 +287,7 @@ test "touch refreshes the cached position without re-filing the cell" {
 test "rebuild re-files bodies at their cached positions" {
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
-    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 0, 0, 0);
+    try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, .{ .index = 1, .generation = 0 }, 0, 0, 0);
     g.touch(0, 500, 500);
 
     var c = Counter{};
@@ -291,7 +314,7 @@ test "every inserted body is reachable from its own position" {
     while (i < 400) : (i += 1) {
         const x = @as(f32, @floatFromInt(i % 20)) * 317.0 - 3000;
         const y = @as(f32, @floatFromInt(i / 20)) * 271.0 - 2000;
-        try g.insert(testing.allocator, .{ .index = i, .generation = 0 }, x, y, 0);
+        try g.insert(testing.allocator, .{ .index = i, .generation = 0 }, .{ .index = i, .generation = 0 }, x, y, 0);
     }
 
     const marks = try testing.allocator.alloc(bool, 400);
