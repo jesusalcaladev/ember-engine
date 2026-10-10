@@ -15,6 +15,7 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`noise`](#noise) | Procedural noise (value, Perlin, simplex, fBm, ridged) |
 | [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit) |
 | [`world`](#world) | World-level queries (neighborhood search) |
+| [`steer`](#steer) | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 
 The API is **unit-agnostic**: positions and distances are in world units (pixels by default, or whatever scale the game chooses).
 
@@ -1360,4 +1361,216 @@ World-level queries that are not about a single actor.
 world.nearby(self, self.px, self.py, 80, function(other)
   self.push = self.push + (other.px - self.px) * 0.01
 end)
+```
+
+---
+
+## `steer`
+
+Steering behaviors using an accumulator pattern. Create one accumulator per actor with [`steer.at`](#steerat), add steering terms each frame, then call [`acc:apply`](#accapply) to get the final velocity.
+
+**Key design principle:** every term is **normalized before it is weighted**. A target 500 units away and an obstacle 3 units away both contribute a unit vector scaled by their weight, so weights mean the same thing regardless of distance.
+
+Only `world.nearby` (used by the flocking terms) crosses into C — everything else is pure Lua.
+
+### `steer.at(x, y)`
+
+| | |
+|---|---|
+| **Signature** | `steer.at(x, y) -> Accumulator` |
+| **Parameters** | `x` — `number` — initial x position |
+| | `y` — `number` — initial y position |
+| **Returns** | `Accumulator` — a new steering accumulator |
+| **Description** | Creates a new steering accumulator bound to a position. One per actor, reused across frames — zero allocation after the first. Named `at`, not `for` (`for` is a Lua keyword). |
+
+```lua
+local acc = steer.at(self.x, self.y)
+```
+
+### `acc:reset(x, y)`
+
+| | |
+|---|---|
+| **Signature** | `acc:reset(x, y)` |
+| **Parameters** | `x` — `number` — (optional) new x position |
+| | `y` — `number` — (optional) new y position |
+| **Returns** | `self` |
+| **Description** | Resets the accumulator to zero force. Optionally updates the position. Call this at the start of each frame before adding terms. |
+
+```lua
+acc:reset(x, y)   -- reset and reposition
+acc:reset()        -- reset in place
+```
+
+### `acc:seek(tx, ty, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:seek(tx, ty, w)` |
+| **Parameters** | `tx` — `number` — target x |
+| | `ty` — `number` — target y |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Adds a term that pulls the actor toward the target. |
+
+```lua
+acc:seek(target_x, target_y, 1.0)
+```
+
+### `acc:flee(tx, ty, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:flee(tx, ty, w)` |
+| **Parameters** | `tx` — `number` — threat x |
+| | `ty` — `number` — threat y |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Adds a term that pushes the actor away from the threat. |
+
+```lua
+acc:flee(enemy_x, enemy_y, 0.5)
+```
+
+### `acc:arrive(tx, ty, slow_radius, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:arrive(tx, ty, slow_radius, w)` |
+| **Parameters** | `tx` — `number` — target x |
+| | `ty` — `number` — target y |
+| | `slow_radius` — `number` — distance at which braking begins |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Seek that brakes: full weight far away, fading to zero at the target so the actor decelerates instead of orbiting. |
+
+```lua
+acc:arrive(target_x, target_y, 50, 1.0)
+```
+
+### `acc:pursue(tx, ty, tvx, tvy, lead, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:pursue(tx, ty, tvx, tvy, lead, w)` |
+| **Parameters** | `tx` — `number` — target x |
+| | `ty` — `number` — target y |
+| | `tvx` — `number` — target velocity x |
+| | `tvy` — `number` — target velocity y |
+| | `lead` — `number` — prediction factor (0 = no lead, 1 = full lead) |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Leads a moving target: aims where it will be, not where it is. Purely arithmetic on the target's velocity — no prediction model, no state. |
+
+```lua
+acc:pursue(player.x, player.y, player.vx, player.vy, 0.5, 1.0)
+```
+
+### `acc:evade(tx, ty, tvx, tvy, lead, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:evade(tx, ty, tvx, tvy, lead, w)` |
+| **Parameters** | `tx` — `number` — threat x |
+| | `ty` — `number` — threat y |
+| | `tvx` — `number` — threat velocity x |
+| | `tvy` — `number` — threat velocity y |
+| | `lead` — `number` — prediction factor |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Flees from a moving threat, predicting its future position. |
+
+```lua
+acc:evade(bullet.x, bullet.y, bullet.vx, bullet.vy, 0.3, 1.0)
+```
+
+### `acc:wander(angle, radius, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:wander(angle, radius, w)` |
+| **Parameters** | `angle` — `number` — wander angle (from noise or other deterministic source) |
+| | `radius` — `number` — wander circle radius |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Deterministic wander: the heading comes from the caller (normally noise, which is seeded and reproducible), never from a clock or hidden random draw. |
+
+```lua
+local angle = noise.simplex(self.t * 0.1, self.seed) * math.pi * 2
+acc:wander(angle, 100, 0.5)
+```
+
+### `acc:avoid(ox, oy, radius, tx, ty, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:avoid(ox, oy, radius, tx, ty, w)` |
+| **Parameters** | `ox` — `number` — obstacle x |
+| | `oy` — `number` — obstacle y |
+| | `radius` — `number` — avoidance radius |
+| | `tx` — `number` — target x (for blending back toward path) |
+| | `ty` — `number` — target y |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Steers away from an obstacle without leaving the path: blends away from the obstacle but toward the target, so the actor slides around rather than reversing. |
+
+```lua
+acc:avoid(obstacle.x, obstacle.y, 80, target_x, target_y, 1.0)
+```
+
+### `acc:separate(radius, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:separate(radius, w)` |
+| **Parameters** | `radius` — `number` — separation radius |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Pushes away from neighbors within `radius`. Uses `world.nearby` — the only C call in the steering module. |
+
+```lua
+acc:separate(50, 1.0)
+```
+
+### `acc:align(radius, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:align(radius, w)` |
+| **Parameters** | `radius` — `number` — alignment radius |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Matches the average direction of neighbors within `radius`. Uses `world.nearby`. |
+
+```lua
+acc:align(100, 0.5)
+```
+
+### `acc:cohere(radius, w)`
+
+| | |
+|---|---|
+| **Signature** | `acc:cohere(radius, w)` |
+| **Parameters** | `radius` — `number` — cohesion radius |
+| | `w` — `number` — (default 1) weight |
+| **Returns** | `self` |
+| **Description** | Moves toward the centroid of neighbors within `radius`. Uses `world.nearby`. |
+
+```lua
+acc:cohere(100, 0.5)
+```
+
+### `acc:apply(max_speed)`
+
+| | |
+|---|---|
+| **Signature** | `acc:apply(max_speed) -> number, number` |
+| **Parameters** | `max_speed` — `number` — maximum speed cap |
+| **Returns** | `vx` — `number` — velocity x component |
+| | `vy` — `number` — velocity y component |
+| **Description** | Normalizes the accumulated force, caps it at `max_speed`, resets the accumulator, and returns the velocity. The accumulator is ready for the next frame. |
+
+```lua
+local vx, vy = acc:apply(self.max_speed)
+actor.move_by(self, vx * dt, vy * dt)
 ```

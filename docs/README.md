@@ -10,6 +10,12 @@
 
 New to Ember? Follow this path. Each step builds on the previous one.
 
+> **Editor Note:** The Ember Editor automates scene and script creation. In a
+> real workflow, you build scenes visually and attach behaviors from a
+> palette -- the editor generates `.zson` and `.lua` files for you. The guides
+> below teach the underlying concepts so you understand what the editor
+> produces and can debug, customize, and extend your games.
+
 ### Level 0 — I have never made a game
 
 1. [Installation](getting-started/installation.md) — Build and run the engine (10 min)
@@ -19,8 +25,8 @@ New to Ember? Follow this path. Each step builds on the previous one.
 ### Level 1 — I know Lua but never used Ember
 
 1. [Quickstart](getting-started/quickstart.md) — Get something running fast
-2. [First Scene](getting-started/first-scene.md) — The `.zson` format
-3. [First Script](getting-started/first-script.md) — Behaviors and the `self` table
+2. [Understanding Scenes](getting-started/first-scene.md) — The `.zson` format
+3. [Understanding Behaviors](getting-started/first-script.md) — Behaviors and the `self` table
 4. [Lua in Ember](guides/ember-lua.md) — The engine API in depth
 5. [First Game](guides/first-game.md) — Build a complete mini-game
 
@@ -58,8 +64,8 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | See something move | [Quickstart](getting-started/quickstart.md) |
 | Learn Lua from zero | [Learning Lua](guides/learning-lua.md) |
 | Learn the Ember API | [Lua in Ember](guides/ember-lua.md) |
-| Write a scene | [First Scene](getting-started/first-scene.md) |
-| Write a script | [First Script](getting-started/first-script.md) |
+| Understand scenes | [Understanding Scenes](getting-started/first-scene.md) |
+| Understand behaviors | [Understanding Behaviors](getting-started/first-script.md) |
 | Make a game | [First Game](guides/first-game.md) |
 | Copy-paste patterns | [Common Patterns](guides/common-patterns.md) |
 | Understand the engine | [Architecture](architecture/overview.md) |
@@ -72,8 +78,8 @@ New to Ember? Follow this path. Each step builds on the previous one.
 
 Ember is a **2D game engine** with these core ideas:
 
-- **Scenes are text.** You describe entities, components, and hierarchy in
-  `.zson` files — a canonical, diffable, bit-exact format.
+- **Scenes are text.** The editor generates `.zson` files as you build
+  visually — a canonical, diffable, bit-exact format.
 - **Behavior is Lua.** Gameplay logic runs in LuaJIT scripts bound to actors.
   Hot-reload works: edit the file, see the change, keep your state.
 - **The ECS is hidden.** You work with actors and components. The data-oriented
@@ -98,7 +104,7 @@ Ember exposes a small set of global tables to Lua scripts:
 | `noise` | Procedural noise: value, perlin, simplex, fbm, ridged |
 | `sm` | Declarative state machines: add_state, add_transition, fire, state |
 | `world` | Spatial queries: `world.nearby` |
-| `steer` | Steering behaviors: seek, flee, arrive, wander, separate, align, cohere |
+| `steer` | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 
 ### Project Structure
 

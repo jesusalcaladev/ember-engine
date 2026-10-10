@@ -14,6 +14,21 @@ Three bases are provided because games need different things from noise:
 
 ---
 
+## Quick Reference
+
+| Function | Range | Use When |
+|---|---|---|
+| `value(seed, x, y)` | `[-1, 1]` | Cheap terrain, blocky is fine |
+| `perlin(seed, x, y)` | `[-1, 1]` | Smooth terrain, default choice |
+| `simplex(seed, x, y)` | `[-1, 1]` | Isotropic, clouds, flow fields, wander |
+| `fbm(seed, x, y, octaves, basis)` | `[-1, 1]` | Multi-scale detail (hills + bumps) |
+| `fbmTuned(seed, x, y, octaves, basis, lac, gain)` | `[-1, 1]` | Custom lacunarity/gain for specific look |
+| `ridged(seed, x, y, octaves, basis)` | `[0, 1]` | Mountains, coastlines, sharp ridges |
+
+**Max octaves:** `12` (capped for all fractal functions)
+
+---
+
 ## Constants
 
 | Name | Value | Description |
@@ -140,3 +155,99 @@ pub fn ridged(seed: u64, x: f32, y: f32, octaves: u8, basis: Basis) f32
 ```zig
 const mountain = ridged(42, x, y, 4, .perlin);
 ```
+
+---
+
+## Practical Examples
+
+### Terrain Height Map
+
+```lua
+local seed = 42
+
+function M:update(dt)
+  -- Generate terrain heights for a tile at (tile_x, tile_y)
+  local tile_x, tile_y = self.x // 32, self.y // 32
+  local h = noise.fbm(seed, tile_x * 0.1, tile_y * 0.1, 5, noise.Basis.perlin)
+  -- h is in [-1, 1]; map to [0, 1] for a height value
+  local height = (h + 1) * 0.5
+end
+```
+
+### Cloud Drift (Isotropic)
+
+```lua
+function M:update(dt)
+  -- Simplex has no axis bias, so clouds look natural drifting in any direction
+  local c = noise.simplex(seed, self.x * 0.01 + self.time * 0.1, self.y * 0.01)
+  local opacity = (c + 1) * 0.5
+end
+```
+
+### Animal Wander (Deterministic)
+
+```lua
+function M:start()
+  self.wander_seed = 1234
+  self.wander_angle = 0
+end
+
+function M:update(dt)
+  -- Use noise to drive a smooth, deterministic wander angle
+  self.wander_angle = noise.fbm(self.wander_seed, self.x * 0.05, self.y * 0.05, 3, noise.Basis.simplex) * math.pi
+  local vx = math.cos(self.wander_angle) * self.speed * dt
+  local vy = math.sin(self.wander_angle) * self.speed * dt
+  actor.move_by(self, vx, vy)
+end
+```
+
+### Mountain Range (Ridged)
+
+```lua
+function M:generate_chunk(chunk_x)
+  for dy = 0, 31 do
+    for dx = 0, 31 do
+      local wx = (chunk_x * 32 + dx) * 0.02
+      local wy = dy * 0.02
+      local ridge = noise.ridged(seed, wx, wy, 4, noise.Basis.perlin)
+      -- ridge is in [0, 1]; higher values = mountain peaks
+      if ridge > 0.6 then
+        -- Place a mountain tile
+      end
+    end
+  end
+end
+```
+
+---
+
+## Lua Binding
+
+From Lua, use the `noise` global table:
+
+```lua
+noise.seed(42)                           -- default seed for subsequent calls
+local v = noise.value(x, y)              -- value noise
+local p = noise.perlin(x, y)             -- Perlin noise
+local s = noise.simplex(x, y)            -- simplex noise
+local f = noise.fbm(x, y, 4)             -- fractal Brownian motion, 4 octaves
+local r = noise.ridged(x, y, 4)          -- ridged multifractal
+```
+
+Each function also accepts an optional trailing seed argument, so you can
+keep two independent fields (terrain vs. weather) without reseeding:
+
+```lua
+local terrain = noise.perlin(x, y, 42)   -- seed 42 for terrain
+local clouds = noise.simplex(x, y, 99)    -- seed 99 for clouds
+```
+
+---
+
+## Performance Notes
+
+- All functions are **allocation-free** and **deterministic**.
+- The seed is passed in, not stored — no global state.
+- `fbm` and `ridged` are capped at 12 octaves to prevent frame-long stalls.
+- `value` is the cheapest; `simplex` is the most expensive. Choose accordingly.
+- `fbmTuned` clamps lacunarity to `[1.0, 4.0]` and gain to `[0.0, 1.0]` — out-of-range values are clamped, not propagated.

@@ -3,6 +3,12 @@
 This tutorial builds a complete mini-game: a player that moves with arrow keys,
 collects coins, and tracks score. It combines a `.zson` scene with Lua behaviors.
 
+> **Editor Note:** In a real workflow, the Ember Editor generates the scene
+> and all the scripts for you. You would create entities visually, attach
+> behaviors from a palette, and configure properties in the inspector. This
+> tutorial walks through the generated files so you understand what the
+> editor does for you.
+
 ## What We Are Building
 
 - A **player** that moves with arrow keys (or WASD)
@@ -22,7 +28,9 @@ my_game/
 
 ## Step 1: The Scene
 
-Create `game.zson`:
+In the editor, you would create the camera, player, and spawner entities,
+position them, and attach sprites. The editor generates the following
+`game.zson` for you:
 
 ```
 zson 1
@@ -55,7 +63,8 @@ This creates:
 
 ## Step 2: The Player Script
 
-Create `player.lua`:
+In the editor, you would attach a movement behavior to the player entity.
+The editor generates the following `player.lua` for you:
 
 ```lua
 local M = {}
@@ -106,7 +115,8 @@ return M
 
 ## Step 3: The Coin Script
 
-Create `coin.lua`:
+In the editor, you would attach a collection behavior to coin entities.
+The editor generates the following `coin.lua` for you:
 
 ```lua
 local M = {}
@@ -139,7 +149,8 @@ return M
 
 ## Step 4: The Spawner Script
 
-Create `spawner.lua`:
+In the editor, you would attach a spawner behavior to the spawner entity.
+The editor generates the following `spawner.lua` for you:
 
 ```lua
 local M = {}
@@ -210,8 +221,9 @@ return M
 ## Step 5: Wire It Up
 
 The scripts reference `self.world.player_ref`. This is a bridge the engine
-provides. In a real game, you would set this up in the scene or via the editor.
-For this tutorial, add this to `spawner.lua`'s `start`:
+provides. In the editor, you would set this up by linking entities in the
+inspector. For this tutorial, the editor generates this wiring in
+`spawner.lua`'s `start`:
 
 ```lua
 function M:start()
@@ -224,6 +236,8 @@ end
 ```
 
 ## Step 6: Run It
+
+In the editor, you would press Play. From the command line:
 
 ```bash
 zig build run -- game.zson
@@ -238,7 +252,7 @@ You should see:
 
 ## What You Learned
 
-- **Scenes**: How to define entities, components, and hierarchy in `.zson`
+- **Scenes**: How the editor represents entities, components, and hierarchy in `.zson`
 - **Behaviors**: The lifecycle (`start`, `update`, `on_signal`, `on_destroy`)
 - **Input**: Reading action-based input with `input.get_axis`
 - **Movement**: `actor.move_by` for per-frame movement
