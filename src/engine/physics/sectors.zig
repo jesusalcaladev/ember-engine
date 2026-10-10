@@ -193,19 +193,19 @@ pub const Grid = struct {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
-// These test the index, not the physics: a spatial index that puts a body in
+// These test the index, not the physics: a spatial index that files a body in
 // the wrong cell is indistinguishable from one that does not exist, and the
-// symptom (a body that never wakes up) is a gameplay bug rather than a crash.
+// symptom — a body that never wakes up — is a gameplay bug, not a crash.
 
 const testing = std.testing;
 
-const Seen = struct {
+const Counter = struct {
     hits: usize = 0,
-    last: f32 = 0,
+    marks: []bool = &.{},
 
-    fn visit(self: *Seen, _: usize, e: Entry) void {
+    fn visit(self: *Counter, _: usize, e: Entry) void {
         self.hits += 1;
-        self.last = e.x;
+        if (e.entity.index < self.marks.len) self.marks[e.entity.index] = true;
     }
 };
 
@@ -214,70 +214,73 @@ test "a body is found from a nearby point and missed from a far one" {
     defer g.deinit(testing.allocator);
     try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 250, 250, 0);
 
-    var s = Seen{};
-    g.forEachNear(&s, 0, 0, 400, Seen.visit);
-    try testing.expectEqual(@as(usize, 1), s.hits);
+    var c = Counter{};
+    g.forEachNear(&c, 0, 0, 400, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
 
-    s = .{};
-    g.forEachNear(&s, 0, 0, 100, Seen.visit);
-    try testing.expectEqual(@as(usize, 0), s.hits);
+    c = .{};
+    g.forEachNear(&c, 0, 0, 100, Counter.visit);
+    try testing.expectEqual(@as(usize, 0), c.hits);
 }
 
 test "cells either side of the origin do not alias" {
     // The player starts at or near the origin, so a sign error in the cell key
-    // would put everything on one side into the cells of the other.
+    // would file everything on one side into the other's cells.
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
     try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, -50, -50, 0);
     try g.insert(testing.allocator, .{ .index = 2, .generation = 0 }, 50, 50, 0);
 
-    var s = Seen{};
-    g.forEachNear(&s, -50, -50, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 1), s.hits);
+    var c = Counter{};
+    g.forEachNear(&c, -50, -50, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
 
-    s = .{};
-    g.forEachNear(&s, 50, 50, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 1), s.hits);
+    c = .{};
+    g.forEachNear(&c, 50, 50, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
 }
 
-test "touch re-files a body so it is findable from its new cell" {
+test "touch refreshes the cached position without re-filing the cell" {
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
     try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 0, 0, 0);
 
-    // Move it far away WITHOUT re-filing: it must not be findable there yet,
-    // because the index still believes it is at the origin.
-    g.entries.items[0].x = 900;
-    g.entries.items[0].y = 900;
-    var s = Seen{};
-    g.forEachNear(&s, 900, 900, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 0), s.hits);
+    g.touch(0, 900, 900);
+    try testing.expectApproxEqAbs(@as(f32, 900.0), g.entries.items[0].x, 1e-6);
 
-    // Re-file it, and now it is.
-    try g.touch(testing.allocator, 0, 900, 900);
-    s = .{};
-    g.forEachNear(&s, 900, 900, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 1), s.hits);
+    // Still filed at the origin, and therefore still found there. That is
+    // deliberate: every MOVING body is in the System's active list and is
+    // visited unconditionally, so its cell never has to be right. Re-filing
+    // would append a second copy to the cell array on every retune — growing it
+    // without bound and making every later walk longer — to fix nothing.
+    var c = Counter{};
+    g.forEachNear(&c, 0, 0, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
+
+    // And it did not leak a second entry anywhere.
+    try testing.expectEqual(@as(usize, 1), g.entries.items.len);
 }
 
-test "a rebuild removes stale duplicates" {
+test "rebuild re-files bodies at their cached positions" {
     var g = Grid.init(100);
     defer g.deinit(testing.allocator);
     try g.insert(testing.allocator, .{ .index = 1, .generation = 0 }, 0, 0, 0);
-    try g.touch(testing.allocator, 0, 0, 0); // duplicate filing, same cell
-    try g.touch(testing.allocator, 0, 500, 500);
+    g.touch(0, 500, 500);
 
-    var s = Seen{};
-    g.forEachNear(&s, 0, 0, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 2), s.hits); // the duplicate is still there
+    var c = Counter{};
+    g.forEachNear(&c, 0, 0, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
 
+    // After the rebuild it is filed where it actually holds. This is the
+    // promotion path: a body that sat frozen for a long time and has just been
+    // woken must end up filed where it IS, not where it was.
     try g.rebuild(testing.allocator);
-    s = .{};
-    g.forEachNear(&s, 0, 0, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 0), s.hits); // it had moved away
-    s = .{};
-    g.forEachNear(&s, 500, 500, 10, Seen.visit);
-    try testing.expectEqual(@as(usize, 1), s.hits);
+    c = .{};
+    g.forEachNear(&c, 0, 0, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 0), c.hits);
+    c = .{};
+    g.forEachNear(&c, 500, 500, 10, Counter.visit);
+    try testing.expectEqual(@as(usize, 1), c.hits);
 }
 
 test "every inserted body is reachable from its own position" {
@@ -291,25 +294,23 @@ test "every inserted body is reachable from its own position" {
         try g.insert(testing.allocator, .{ .index = i, .generation = 0 }, x, y, 0);
     }
 
-    // Walk a grid of probe points and confirm every body was seen at least once.
-    const seen = try testing.allocator.alloc(bool, 400);
-    defer testing.allocator.free(seen);
-    @memset(seen, false);
+    const marks = try testing.allocator.alloc(bool, 400);
+    defer testing.allocator.free(marks);
+    @memset(marks, false);
 
+    var c = Counter{ .marks = marks };
     var py: i32 = -12;
     while (py <= 12) : (py += 1) {
         var px: i32 = -12;
         while (px <= 12) : (px += 1) {
-            const probe = struct {
-                seen: []bool,
-                fn visit(self: @This(), index: usize, e: Entry) void {
-                    self.seen[e.entity.index] = true;
-                    _ = index;
-                }
-            }{ .seen = seen };
-            g.forEachNear(&probe, @as(f32, @floatFromInt(px)) * 250, @as(f32, @floatFromInt(py)) * 250, 10, probe.visit);
+            g.forEachNear(
+                &c,
+                @as(f32, @floatFromInt(px)) * 250,
+                @as(f32, @floatFromInt(py)) * 250,
+                10,
+                Counter.visit,
+            );
         }
     }
-
-    for (seen) |was| try testing.expect(was);
+    for (marks) |was| try testing.expect(was);
 }

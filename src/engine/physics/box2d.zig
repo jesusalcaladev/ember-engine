@@ -444,6 +444,11 @@ fn createShape(ctx: *anyopaque, body: physics.BodyId, shape: physics.Shape, mat:
     sd.material.friction = mat.friction;
     sd.material.restitution = mat.restitution;
     sd.isSensor = shape.is_sensor;
+    // Collision layers. Box2D's `categoryBits` is "what I am" and `maskBits` is
+    // "what I accept", which is the same pair the engine's `Pair` resolves, so
+    // the translation is a straight copy rather than an interpretation.
+    sd.filter.categoryBits = shape.filter.category_bits;
+    sd.filter.maskBits = shape.filter.mask_bits;
     // Contacts are queued for every shape, sensors included. This is a per-shape
     // cost the solver pays whether or not anyone listens, so the choice is not
     // "enable it if a game might use it" but "what does the engine owe its
@@ -539,19 +544,21 @@ fn step(ctx: *anyopaque, dt: f32) void {
     tallySleeping(ctx);
 }
 
-fn castRay(ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: physics.BodyType) ?physics.RayHit {
+fn castRay(ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: physics.Filter) ?physics.RayHit {
     const w: *WorldCtx = @ptrCast(@alignCast(ctx));
     var qf = b2.b2DefaultQueryFilter();
-    // v3.1 dropped v2's category presets — it only ships `B2_DEFAULT_CATEGORY_BITS`
-    // — so the engine owns the bit assignment. It is also the right call: these
-    // bits travel in `.zson`, and a backend-defined enum would make a saved
-    // scene depend on the solver's header.
-    qf.categoryBits = switch (filter) {
-        .fixed => category_fixed,
-        .kinematic => category_kinematic,
-        .dynamic => category_dynamic,
-    };
-    qf.maskBits = 0xFFFF_FFFF_FFFF_FFFF; // a line-of-sight test is not clipped
+    // The bits are the engine's, not the solver's. v3.1 dropped v2's category
+    // presets — it only ships `B2_DEFAULT_CATEGORY_BITS` — so the layer table
+    // lives in `ecs.collision_layers` and travels in `.zson`. That is the right
+    // call anyway: a saved scene must not depend on the solver's header.
+    //
+    // A line-of-sight test asks "is anything solid between these points", so it
+    // is clipped by the level's layers rather than by body type: a trigger
+    // volume the designer put on a non-colliding layer should not block sight.
+    qf.categoryBits = filter.category_bits;
+    qf.maskBits = filter.mask_bits;
+    qf.categoryBits = filter.category_bits;
+    qf.maskBits = filter.mask_bits;
 
     const translation = b2.b2Vec2{ .x = p2.x - p1.x, .y = p2.y - p1.y };
     const result = b2.b2World_CastRayClosest(w.world, toB2Vec(p1), translation, qf);

@@ -172,7 +172,7 @@ const null_backend = struct {
         ctx: *anyopaque,
         p1: physics.Vec2,
         p2: physics.Vec2,
-        filter: physics.BodyType,
+        filter: physics.Filter,
     ) ?physics.RayHit {
         _ = ctx;
         _ = p1;

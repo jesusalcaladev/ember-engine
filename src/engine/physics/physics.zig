@@ -88,6 +88,7 @@ pub const ShapeKind = enum {
 
 pub const Shape = struct {
     kind: ShapeKind = .box,
+    filter: Filter = Filter.pass_all,
     /// Half-extents for `box` (width/2, height/2).
     half_extents: Vec2 = .{ .x = 0.5, .y = 0.5 },
     /// Radius for `circle`; x also used as the radius for `capsule`, y as the
@@ -184,6 +185,23 @@ pub const StepStats = struct {
 
 /// The contract. One row per capability; a backend that cannot do something
 /// must say so in its own file rather than silently no-op.
+/// Which shapes a body may interact with, as raw bits.
+///
+/// Carried on the shape rather than the body because one body routinely has
+/// several shapes that answer to different things — a character's head stops
+/// projectiles, its feet stop the floor, and its pickup sensor stops nothing.
+/// A body-wide filter cannot express that and would force three bodies.
+pub const Filter = struct {
+    /// The bit(s) this shape is on.
+    category_bits: u64 = ~@as(u64, 0),
+    /// The bit(s) this shape is willing to interact with.
+    mask_bits: u64 = ~@as(u64, 0),
+
+    /// The permissive default, so a project that never sets a layer behaves
+    /// exactly like a project that has no layers at all.
+    pub const pass_all = Filter{};
+};
+
 /// One contact transition, in the port's vocabulary.
 ///
 /// `began` distinguishes a touch starting from one persisting, which is the
@@ -237,7 +255,7 @@ pub const VTable = struct {
     /// owns the accumulator and this only ever sees `fixed_dt`.
     step: *const fn (ctx: *anyopaque, dt: f32) void,
 
-    castRay: *const fn (ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: BodyType) ?RayHit,
+    castRay: *const fn (ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: Filter) ?RayHit,
 
     stats: *const fn (ctx: *anyopaque) StepStats,
 
@@ -271,7 +289,14 @@ pub const World = struct {
     pub fn stats(self: World) StepStats {
         return self.vtable.stats(self.ctx);
     }
-    pub fn castRay(self: World, p1: Vec2, p2: Vec2, filter: BodyType) ?RayHit {
+    /// Casts a segment against whatever the filter allows.
+    ///
+    /// A `Filter`, not a body type, because a line-of-sight test is a QUERY and
+    /// a query has to obey the same collision layers the solver does. Testing
+    /// "is anything between here and there" against a preset that ignores
+    /// layers means a trigger volume on a non-colliding layer still blocks
+    /// sight, which is the single most confusing thing a 2D game can ship.
+    pub fn castRay(self: World, p1: Vec2, p2: Vec2, filter: Filter) ?RayHit {
         return self.vtable.castRay(self.ctx, p1, p2, filter);
     }
     pub fn createBody(self: World, desc: BodyDesc) ?BodyId {

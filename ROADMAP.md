@@ -400,6 +400,67 @@ Read this before reordering. Each row says what the milestone actually waits on,
 
 **Ordering consequence**: M4.5 pays for itself in M12.1 (the demo needs `Camera2D`, `Flow`, timers and tweens just to build a menu, a rally, a score counter and a win/lose state), while M13–M17 are the subsystems that decide what kind of game v1.0 can ship.
 
+## M5 — Open world
+
+**Goal**: a world far larger than one screen, at 60 Hz.
+
+The cost of physics is not bodies, it is **bodies in contact at the same time**.
+A sleeping body costs nothing to step; a disabled one costs nothing at all. Every
+item below attacks that number rather than "make the solver faster".
+
+- [x] **Sleeping, and not waking it by accident.** Box2D wakes a body when its
+      velocity is written, so the sync only calls `setVelocity`/`setGravityScale`
+      when the value actually changed. Measured: a settled 2 000-body scene went
+      from 16.0 ms to 3.5 ms purely by not doing work the world had already told
+      us it did not need. `StepStats.sleeping` reports awake vs asleep.
+- [x] **Distance-based activity** (`physics/activity.zig`). Four tiers by
+      distance to a focus point — `full` / `coarse` (one-circle proxy, sized to
+      the half-diagonal so it is never smaller than the real shape) / `frozen`
+      (disabled: out of the simulation *and* the broadphase) / `unloaded`
+      (disabled, shape freed). Hysteresis on every boundary, because a body
+      resting on a radius would otherwise flip tier per frame and pay a shape
+      rebuild for it. Lazy retuning: the tier set is recomputed only when the
+      focus moves far enough to matter.
+- [x] **Sector partitioning** (`physics/sectors.zig`). A retune visits the cells
+      near the focus instead of every body: 21 901 of 200 000 at 8x the map size.
+      The index needs no rebuilding during play because a frozen body does not
+      move, and every body that *does* move is in the active list, which is
+      walked unconditionally.
+- [x] **Bounded steps per frame.** Already in `Driver`: one catch-up step, the
+      rest dropped, so a slow frame cannot start a spiral where catching up
+      makes the next one slower. Godot's `max_physics_steps_per_frame`.
+- [x] **Collision filtering / layers** (`ecs/collision_layers.zig`). 16 named
+      bits, configured by name at load, symmetric pair test
+      (`A.layer & B.mask` **and** `B.layer & A.mask`). Applies to shapes AND to
+      raycasts, so a trigger volume on a non-colliding layer does not block
+      sight. A body with no `CollisionLayers` is permissive, so a project that
+      does not use layers behaves exactly like one that has no layer concept.
+- [x] **Physics tuning as project settings** (`collision_layers.Tuning`):
+      sleep thresholds, `time_before_sleep`, solver iterations, max steps per
+      frame — validated at load, because a sleep threshold of zero looks exactly
+      like "the sleeping code does not work".
+- [ ] **Broadphase.** Box2D already has one (SAP, with a dynamic tree); the work
+      is exposing it and proving it is being used. Godot does the same thing by
+      hand via `_cull_aabb_for_body`; we do not need to.
+- [ ] **Physics on a separate thread.** Godot's
+      `physics/2d/run_on_separate_thread`. Real, but it trades the deterministic
+      fixed-step contract for multicore, and spec §6 is worth more here. Revisit
+      if a project profile proves the single thread is the limit.
+
+**Criterion**: `zig build bench-openworld` — 200 000 bodies, camera walking a
+circuit that crosses every tier boundary in both directions. Deterministic, and
+the frame cost is a function of what is NEAR rather than what EXISTS.
+
+**Status**: the tiering works and is verified — 2 024 of 200 000 bodies
+simulated (1.01%), 5-9x faster than the same world untiered, two camera walks
+with the same hash. **The budget check still fails at 200k**, and the bench says
+where the remaining time goes rather than hiding it: 8.5 ms of walk against 14.4
+ms of tier *transitions*, 22 517 of them at ~640 ns each. Promotion rebuilds a
+shape (destroy + create) and toggles the body; that is the next thing to make
+cheap, and it is the last item before this milestone closes.
+
+---
+
 ## Backlog — gaps found while planning M13–M17
 
 Detected while auditing the roadmap against what a general engine needs. Not yet milestones; listed so they do not stay invisible.

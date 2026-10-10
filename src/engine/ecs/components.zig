@@ -295,6 +295,36 @@ pub const Collider2D = struct {
     }
 };
 
+/// Named collision layers, as bitmasks (Godot-style `collision_layer` /
+/// `collision_mask`, configured by name in project settings).
+///
+/// Separate from `Collider2D` because it is a property of the BODY, not of one
+/// shape: a character on the `player` layer should hit the `enemy` layer with
+/// all of its parts. The shape carries the shape-specific exceptions.
+pub const CollisionLayers = struct {
+    /// Which layer(s) this body is on. A body may be on several at once — a
+    /// player that is both `player` and `hurtable`, say — which is what bits are
+    /// for.
+    layer: u16 = everything,
+    /// Which layer(s) this body is willing to interact with.
+    mask: u16 = everything,
+
+    pub const everything: u16 = std.math.maxInt(u16);
+
+    pub const inert = CollisionLayers{};
+
+    /// The pair test, once, so nothing re-implements it and gets the symmetry
+    /// wrong. See `collision_layers.zig` for why it is symmetric.
+    pub fn collides(self: CollisionLayers, other: CollisionLayers) bool {
+        if (self.layer == 0 or other.layer == 0) return false;
+        return (self.layer & other.mask) != 0 and (other.layer & self.mask) != 0;
+    }
+
+    pub fn eql(self: CollisionLayers, other: CollisionLayers) bool {
+        return self.layer == other.layer and self.mask == other.mask;
+    }
+};
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 /// One entry per component type. Order defines the dense ids, so it is also
@@ -334,6 +364,7 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "StateMachine", .type = StateMachine },
     .{ .name = "RigidBody2D", .type = RigidBody2D },
     .{ .name = "Collider2D", .type = Collider2D },
+    .{ .name = "CollisionLayers", .type = CollisionLayers },
 };
 
 comptime {

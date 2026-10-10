@@ -321,7 +321,10 @@ test "a body comes back only after clearly returning" {
     // Coming back: 299 is inside the radius but not enough.
     try testing.expectEqual(Tier.unloaded, a.retier(.unloaded, 299));
     try testing.expectEqual(Tier.unloaded, a.retier(.unloaded, 250));
-    try testing.expectEqual(Tier.frozen, a.retier(.unloaded, 199));
+    // 199 is inside the unload radius (300/1.5 = 200), so the body comes back --
+    // and it comes back to COARSE, not frozen: it is now within the freeze radius
+    // too, so it simulates again, just against a proxy shape.
+    try testing.expectEqual(Tier.coarse, a.retier(.unloaded, 199));
 }
 
 test "a demoted body climbs back through every tier as the focus returns" {
@@ -432,6 +435,6 @@ test "the active fraction is the number an open world is judged on" {
     s.by_tier[@intFromEnum(Tier.frozen)] = 950;
     s.by_tier[@intFromEnum(Tier.unloaded)] = 1000;
     try testing.expectEqual(@as(u32, 2000), s.total());
-    // 5% of the world costs anything, which is the entire point.
-    try testing.expectApproxEqAbs(@as(f64, 0.05), s.activeFraction(), 1e-9);
+    // 50 of 2 000 -- 2.5% -- costs anything, which is the entire point.
+    try testing.expectApproxEqAbs(@as(f64, 0.025), s.activeFraction(), 1e-9);
 }

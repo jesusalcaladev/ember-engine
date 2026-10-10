@@ -20,6 +20,7 @@ pub const query = @import("query.zig");
 pub const hierarchy = @import("hierarchy.zig");
 pub const zson = @import("zson.zig");
 pub const signals = @import("signals.zig");
+pub const collision_layers = @import("collision_layers.zig");
 pub const actor = @import("actor.zig");
 
 // Short names for what the runtime and the actor code import constantly.
@@ -28,6 +29,8 @@ pub const Actor = actor.Actor;
 pub const Entity = entity.Entity;
 pub const SceneId = entity.SceneId;
 pub const WorldTransform = hierarchy.WorldTransform;
+pub const Layers = collision_layers.Registry;
+pub const PhysicsTuning = collision_layers.Tuning;
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -35,4 +38,5 @@ test {
     // contract BETWEEN `query` and `world`, not about either one's internals,
     // and keeping it separate makes that boundary the thing under test.
     _ = @import("query_cursor_test.zig");
+    _ = @import("collision_layers.zig");
 }

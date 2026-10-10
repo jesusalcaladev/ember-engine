@@ -874,7 +874,7 @@ fn lua_physics_cast_ray(L: ?*lua_State) callconv(.c) c_int {
     // `.fixed` as the filter means "anything solid blocks me", which is what a
     // line of sight means. A body-type filter would answer "can a dynamic body
     // hit it", a different question the raycast does not ask.
-    const hit = solver.castRay(p1, p2, .fixed) orelse {
+    const hit = solver.castRay(p1, p2, .pass_all) orelse {
         lua.lua_pushboolean(L, 0);
         return 1;
     };
@@ -898,7 +898,7 @@ fn lua_physics_line_of_sight(L: ?*lua_State) callconv(.c) c_int {
     const solver = world.world;
     const p1 = physics_mod.Vec2{ .x = lua.toF32(L, 1), .y = lua.toF32(L, 2) };
     const p2 = physics_mod.Vec2{ .x = lua.toF32(L, 3), .y = lua.toF32(L, 4) };
-    const clear = solver.castRay(p1, p2, .fixed) == null;
+    const clear = solver.castRay(p1, p2, .pass_all) == null;
     lua.lua_pushboolean(L, @intFromBool(clear));
     return 1;
 }

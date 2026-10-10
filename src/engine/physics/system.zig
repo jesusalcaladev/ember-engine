@@ -314,7 +314,7 @@ pub const System = struct {
         // solid); that is a legitimate thing to want, so it is not an error.
         if (world.get(entity, Collider2D)) |c| {
             if (c.isLive()) return; // already has a shape
-            const shape_id = self.world.createShape(id, shapeFromComponent(c.*), materialFromComponent(c.*)) orelse return;
+            const shape_id = self.world.createShape(id, filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)), materialFromComponent(c.*)) orelse return;
             c.shape = shape_id.index;
             c.generation = shape_id.generation;
         }
@@ -521,12 +521,12 @@ pub const System = struct {
         const c = world.get(entity, Collider2D) orelse return;
         const radius = @sqrt(c.size.x * c.size.x + c.size.y * c.size.y);
         if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
-        const made = self.world.createShape(id, .{
+        const made = self.world.createShape(id, filterFromComponent(.{
             .kind = .circle,
             .radius = radius,
             .offset = c.offset,
             .is_sensor = c.is_sensor,
-        }, materialFromComponent(c.*)) orelse return;
+        }, filterFor(world, entity)), materialFromComponent(c.*)) orelse return;
         c.shape = made.index;
         c.generation = made.generation;
     }
@@ -535,7 +535,7 @@ pub const System = struct {
     fn swapFromProxy(self: *System, world: *World, entity: Entity, id: physics.BodyId) void {
         const c = world.get(entity, Collider2D) orelse return;
         if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
-        const made = self.world.createShape(id, shapeFromComponent(c.*), materialFromComponent(c.*)) orelse return;
+        const made = self.world.createShape(id, filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)), materialFromComponent(c.*)) orelse return;
         c.shape = made.index;
         c.generation = made.generation;
     }
@@ -658,7 +658,7 @@ pub const System = struct {
     /// A line-of-sight test, the primitive `ai.line_of_sight` needs.
     /// Returns null when nothing blocks the segment.
     pub fn lineOfSight(self: *const System, from: physics.Vec2, to: physics.Vec2) ?physics.RayHit {
-        return self.world.castRay(from, to, .fixed);
+        return self.world.castRay(from, to, .pass_all);
     }
 
     /// The physics state hash used by the determinism test (spec §6). Walks the
@@ -751,6 +751,32 @@ fn shapeFromComponent(c: Collider2D) physics.Shape {
         .offset = c.offset,
         .is_sensor = c.is_sensor,
     };
+}
+
+/// The collision filter a body's shapes are built with.
+///
+/// Read from `CollisionLayers` when the entity has one, and permissive when it
+/// does not. The permissive default is deliberate: a project that has not set up
+/// layers must behave exactly like a project that has no layer concept at all,
+/// and a body silently colliding with nothing is the loudest possible surprise.
+fn filterFor(world: *World, entity: Entity) physics.Filter {
+    const cl = world.get(entity, components.CollisionLayers) orelse return .pass_all;
+    if (cl.layer == 0 and cl.mask == 0) return .pass_all;
+    return .{
+        .category_bits = @as(u64, cl.layer),
+        .mask_bits = @as(u64, cl.mask),
+    };
+}
+
+/// Puts the body's filter on a shape that does not have one yet.
+///
+/// Separate from `shapeFromComponent` because a shape's own description and the
+/// body's filter are two different facts: the shape says what it IS, the filter
+/// says who it may talk to.
+fn filterFromComponent(shape: physics.Shape, filter: physics.Filter) physics.Shape {
+    var out = shape;
+    out.filter = filter;
+    return out;
 }
 
 fn materialFromComponent(c: Collider2D) physics.Material {
