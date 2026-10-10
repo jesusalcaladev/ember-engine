@@ -483,8 +483,29 @@ pub const System = struct {
     }
 
     /// Moves one body to a tier, doing only the work that tier actually needs.
+    ///
+    /// The components are fetched here rather than passed in because this is the
+    /// only caller path that is not already holding them. `applyTierWith` is the
+    /// hot one: see its comment for why the lookups were removed from it.
     fn applyTier(self: *System, world: *World, entity: Entity, want: Tier) void {
         const rb = world.get(entity, RigidBody2D) orelse return;
+        self.applyTierWith(world, entity, rb, null, want);
+    }
+
+    /// As `applyTier`, with the components the caller already has.
+    ///
+    /// A tier transition measured ~640 ns, and almost none of it was the solver:
+    /// it was four `world.get` calls at ~141 ns each — the ECS slot lookup plus
+    /// the archetype walk. The caller has usually just fetched two of those
+    /// components, so fetching them again is paying twice for the same column.
+    fn applyTierWith(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        rb: *RigidBody2D,
+        collider: ?*Collider2D,
+        want: Tier,
+    ) void {
         const id = physics.BodyId{ .index = rb.body, .generation = rb.generation };
         const from: Tier = @enumFromInt(@min(rb.tier, activity_mod.tier_count - 1));
 
@@ -497,15 +518,15 @@ pub const System = struct {
         switch (want) {
             .full, .coarse => {
                 if (!was_active) self.world.setEnabled(id, true);
-                if (want == .coarse and from == .full) self.swapToProxy(world, entity, id);
-                if (want == .full and from == .coarse) self.swapFromProxy(world, entity, id);
+                if (want == .coarse and from == .full) self.swapToProxy(world, entity, rb, collider, id);
+                if (want == .full and from == .coarse) self.swapFromProxy(world, entity, rb, collider, id);
             },
             .frozen => {
                 if (was_active) self.world.setEnabled(id, false);
             },
             .unloaded => {
                 if (was_active) self.world.setEnabled(id, false);
-                self.destroyShape(world, entity);
+                self.destroyShape(world, entity, collider);
             },
         }
         _ = becoming_active;
@@ -517,8 +538,15 @@ pub const System = struct {
     /// A box's half-diagonal is used, so the proxy is never SMALLER than the
     /// real shape. Under-covering would let something pass through a body that
     /// is visibly solid, which is the one failure mode an LOD must not have.
-    fn swapToProxy(self: *System, world: *World, entity: Entity, id: physics.BodyId) void {
-        const c = world.get(entity, Collider2D) orelse return;
+    fn swapToProxy(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        _: *RigidBody2D,
+        maybe_c: ?*Collider2D,
+        id: physics.BodyId,
+    ) void {
+        const c = maybe_c orelse world.get(entity, Collider2D) orelse return;
         const radius = @sqrt(c.size.x * c.size.x + c.size.y * c.size.y);
         if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
         const made = self.world.createShape(id, filterFromComponent(.{
@@ -532,16 +560,23 @@ pub const System = struct {
     }
 
     /// Rebuilds the shape the component describes, undoing `swapToProxy`.
-    fn swapFromProxy(self: *System, world: *World, entity: Entity, id: physics.BodyId) void {
-        const c = world.get(entity, Collider2D) orelse return;
+    fn swapFromProxy(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        _: *RigidBody2D,
+        maybe_c: ?*Collider2D,
+        id: physics.BodyId,
+    ) void {
+        const c = maybe_c orelse world.get(entity, Collider2D) orelse return;
         if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
         const made = self.world.createShape(id, filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)), materialFromComponent(c.*)) orelse return;
         c.shape = made.index;
         c.generation = made.generation;
     }
 
-    fn destroyShape(self: *System, world: *World, entity: Entity) void {
-        const c = world.get(entity, Collider2D) orelse return;
+    fn destroyShape(self: *System, world: *World, entity: Entity, maybe_c: ?*Collider2D) void {
+        const c = maybe_c orelse world.get(entity, Collider2D) orelse return;
         if (!c.isLive()) return;
         self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
         c.shape = Collider2D.invalid_shape;
