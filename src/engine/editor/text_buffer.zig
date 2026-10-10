@@ -590,13 +590,13 @@ test "movement never lands inside a UTF-8 sequence" {
     try testing.expectEqual(@as(u32, 1), b.charLenAt(0));
 }
 
-test "typing coalesces into one undo step, and breaks at a space" {
+test "typing coalesces into one undo step, and a break splits it" {
     var b = Buffer.init(testing.allocator);
     defer b.deinit();
     try b.load("");
 
-    // Five inserts, contiguous: one run. `beginRun` is called FIRST here, the way
-    // a UI does it — the keypress opens the run, then the character lands.
+    // Five inserts, contiguous, with the run opened the way a UI opens it —
+    // before the character lands. One run, one undo step.
     for ("hello") |ch| {
         b.beginRun();
         try b.insert(@intCast(b.byteLen()), &.{ch});
@@ -607,17 +607,25 @@ test "typing coalesces into one undo step, and breaks at a space" {
     try testing.expectEqual(@as(u32, 5), span.len);
     try expectText(&b, "");
 
-    // Redo puts the run back, and the caret is at the end again.
+    // Redo puts the run back.
     _ = b.redo();
     try expectText(&b, "hello");
-    try b.insert(@intCast(b.byteLen()), " ");
+
+    // A caret move is not typing: the caller breaks the run. What follows is a new
+    // step even though it is adjacent in the text — which is the whole reason
+    // `breakRun` is explicit rather than inferred from the position.
+    b.breakRun();
+    try b.insert(@intCast(b.byteLen()), " world");
+    try testing.expectEqual(@as(usize, 2), b.undo_stack.items.len);
     b.beginRun();
-    try b.insert(@intCast(b.byteLen()), "x");
-    b.beginRun();
-    // Two steps: the "hello" run, and the " x" that started a new one. The space
-    // and the "x" coalesce because they are adjacent — the break is what the CARET
-    // movement caused, which is the whole point of `breakRun` being explicit.
-    try testing.expectEqual(@as(usize, 3), b.undo_stack.items.len);
+    try b.insert(@intCast(b.byteLen()), "!");
+    // Adjacent and inside the run, so it joins the " world" step.
+    try testing.expectEqual(@as(usize, 2), b.undo_stack.items.len);
+    try expectText(&b, "hello world!");
+
+    // Undoing once removes " world!" — the whole run, not one character.
+    _ = b.undo().?;
+    try expectText(&b, "hello");
 }
 
 test "a paste or a replace does not join the typing run" {
@@ -630,8 +638,8 @@ test "a paste or a replace does not join the typing run" {
     b.breakRun();
     try b.insert(2, "w"); // not adjacent to a run: separate step
     b.breakRun();
-    // Three steps: the load, the coalesced "yz", and the lone "w".
-    try testing.expectEqual(@as(usize, 3), b.undo_stack.items.len);
+    // Two steps: the coalesced "yz" run, and the lone "w".
+    try testing.expectEqual(@as(usize, 2), b.undo_stack.items.len);
 }
 
 test "undo reverses a delete, redo reapplies it" {
@@ -701,4 +709,87 @@ test "the empty document still has a line to hold the caret" {
     try b.load("no trailing newline");
     try testing.expectEqual(@as(u32, 1), b.lineCount());
     try testing.expectEqualStrings("no trailing newline", b.lineText(0));
+}
+
+// ── The property test ────────────────────────────────────────────────────────
+//
+// Everything above tests a case someone thought of. This tests the invariant no
+// case list covers: after ANY sequence of edits, `line_starts` must be exactly
+// the set of positions that are 0 or follow a newline. That is the definition,
+// so deriving it independently and comparing catches the off-by-ones that the
+// hand-written cases exist to miss — and this file shipped one of those, twice,
+// while it was being written.
+
+/// Recomputes the index from the text, the slow way, for comparison only.
+fn linesFromScratch(text: []const u8, out: *std.ArrayListUnmanaged(u32)) !void {
+    out.clearRetainingCapacity();
+    try out.append(std.testing.allocator, 0);
+    for (text, 0..) |ch, i| {
+        if (ch == '\n') try out.append(std.testing.allocator, @intCast(i + 1));
+    }
+}
+
+test "the line index survives any sequence of random edits" {
+    const allocator = std.testing.allocator;
+    var b = Buffer.init(allocator);
+    defer b.deinit();
+    var expected: std.ArrayListUnmanaged(u32) = .empty;
+    defer expected.deinit(allocator);
+
+    // A fixed seed, so a failure is reproducible: a property test that finds a bug
+    // must be able to find the same bug again.
+    var prng = std.Random.DefaultPrng.init(0x5eed_1234);
+    const rand = prng.random();
+
+    // An alphabet heavy in newlines and multi-byte characters, because those are
+    // the two things that make positions interesting.
+    const alphabet = "ab\n\u{f1}\u{e9}\nc \t\n\n";
+
+    try b.load("start\n");
+    var step: usize = 0;
+    while (step < 400) : (step += 1) {
+        const text_len: u32 = @intCast(b.byteLen());
+        switch (rand.enumValue(enum { insert, delete, replace }) ) {
+            .insert => {
+                const pos = rand.intRangeAtMost(u32, 0, text_len);
+                var n = rand.intRangeAtMost(u8, 1, 6);
+                var bytes: [8]u8 = undefined;
+                var w: usize = 0;
+                while (n > 0 and w + 4 < bytes.len) : (n -= 1) {
+                    // One codepoint at a time, so multi-byte characters are whole.
+                    const idx = rand.intRangeAtMost(usize, 0, alphabet.len - 1);
+                    const cp = try std.unicode.utf8Encode(alphabet[idx], bytes[w..]);
+                    w += cp;
+                }
+                try b.insert(pos, bytes[0..w]);
+            },
+            .delete => {
+                if (text_len == 0) continue;
+                const pos = rand.intRangeAtMost(u32, 0, text_len - 1);
+                const max = text_len - pos;
+                const n = rand.intRangeAtMost(u32, 1, @min(max, 6));
+                try b.delete(pos, n);
+            },
+            .replace => {
+                if (text_len == 0) continue;
+                const pos = rand.intRangeAtMost(u32, 0, text_len - 1);
+                const n = rand.intRangeAtMost(u32, 1, @min(text_len - pos, 4));
+                try b.replace(pos, pos + n, "R");
+            },
+        }
+
+        // The invariant, recomputed from the text.
+        try linesFromScratch(b.textBytes(), &expected);
+        try testing.expectEqualSlices(u32, expected.items, b.line_starts.items);
+
+        // And the two views must agree with each other, which is what the renderer
+        // and the caret actually consume.
+        var line: u32 = 0;
+        while (line < b.lineCount()) : (line += 1) {
+            const start = b.lineStart(line);
+            try testing.expectEqual(line, b.lineOfOffset(start));
+            const lc = b.lineColOfOffset(start);
+            try testing.expectEqual(start, b.offsetOfLineCol(lc));
+        }
+    }
 }
