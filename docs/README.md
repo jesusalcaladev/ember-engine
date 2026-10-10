@@ -37,6 +37,12 @@ New to Ember? Follow this path. Each step builds on the previous one.
 3. [Determinism](architecture/determinism.md) — Fixed timestep, PRNG, serialization
 4. [Profiling](architecture/profiling.md) — spec.md, CI gate, budgets
 
+### Level 2.5 — I want to know how a subsystem is built
+
+- [Code Editor core](internals/code-editor.md) — Buffer, cursor, highlighter, find
+- [Benchmarks](internals/benchmarks.md) — What is measured and what it costs
+- [Build system](internals/build-system.md) — Modules, steps, tests
+
 ### Level 3 — I want the full API reference
 
 - [Lua API Reference](reference/script-lua-api.md) — Every binding, with examples
@@ -133,6 +139,7 @@ src/engine/ecs/        ECS: archetypes, queries, hierarchy, signals, actors, .zs
 src/engine/platform/   Window + input (GLFW 3.4 / X11)
 src/engine/render/     Renderer interface + Dawn backend + WebGPU bindings
 src/engine/script/     LuaJIT scripting: VM, sandbox, bindings, behaviors, steering
+src/engine/editor/     In-engine code editor core: buffer, cursor, highlighter, find
 src/runtime/           The ember executable (the game loop)
 src/bench/             Benchmark suites (acceptance criteria, measured)
 src/tools/             ember-profile: report reader + CI regression gate
