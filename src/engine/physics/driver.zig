@@ -214,6 +214,19 @@ fn nopSetEnabled(ctx: *anyopaque, body: physics.BodyId, enabled: bool) void {
         _ = body;
         _ = enabled;
     }
+fn nopOverlapBox(
+        ctx: *anyopaque,
+        box: physics.Aabb,
+        filter: physics.Filter,
+        visit: *const fn (user: *anyopaque, shape: physics.ShapeId) void,
+        user: *anyopaque,
+    ) void {
+        _ = ctx;
+        _ = box;
+        _ = filter;
+        _ = visit;
+        _ = user;
+    }
     const vtable = physics.VTable{
         .createWorld = createWorld,
         .destroyWorld = destroyWorld,
@@ -233,6 +246,7 @@ fn nopSetEnabled(ctx: *anyopaque, body: physics.BodyId, enabled: bool) void {
         .destroyShape = nopShapeId,
         .step = noopStep,
         .castRay = nopRay,
+        .overlapBox = nopOverlapBox,
         .stats = nopStats,
         .pollContacts = nopPollContacts,
     };

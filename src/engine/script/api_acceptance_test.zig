@@ -378,6 +378,54 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "the editor can place, resize and retune a shape",
+            .src =
+            \\local self = T.__actor_self
+            \\physics.create_shape(self, 0, 20, 20)   -- a box
+            \\TSTEP.step(1)
+            \\physics.reshape(self, 1, 8, 8)         -- now a circle, smaller
+            \\physics.set_material(self, 0.9, 0.2, 1.0)
+            \\TSTEP.step(1)
+            \\-- Reshaping repeatedly must not break the body: this is the
+            \\-- drag-a-handle path, and it fires every frame.
+            \\for i = 1, 20 do physics.reshape(self, 0, 10 + i, 10 + i) end
+            \\TSTEP.step(1)
+            \\local vx, vy = actor.get_linear_velocity(self)
+            \\return vx == vx and vy == vy   -- still a live body
+            ,
+        },
+        .{
+            .name = "the editor can toggle collision without losing the shape",
+            .src =
+            \\local self = T.__actor_self
+            \\physics.set_body_enabled(self, false)
+            \\TSTEP.step(1)
+            \\physics.set_body_enabled(self, true)
+            \\TSTEP.step(1)
+            \\local hit = physics.cast_ray(0, 0, 200, 0)
+            \\return hit == true
+            ,
+        },
+        .{
+            .name = "overlap_rect finds a shape the editor can select",
+            .src =
+            \\local self = T.__actor_self
+            \\physics.create_shape(self, 0, 10, 10)
+            \\TSTEP.step(1)
+            \\local n, found = physics.overlap_rect(0, 0, 60, 60)
+            \\-- The wall at x=100 and the ball at the origin are both in that box.
+            \\return n >= 1 and found ~= nil
+            ,
+        },
+        .{
+            .name = "contains_point picks what a click lands on",
+            .src =
+            \\local self = T.__actor_self
+            \\local hit = physics.contains_point(0, 0)
+            \\return hit ~= nil
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self

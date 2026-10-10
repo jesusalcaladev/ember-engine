@@ -143,6 +143,63 @@ function physics.set_view(cx, cy, half_w, half_h, enabled) end
 ---@param y number player y in world units
 function physics.set_focus(x, y) end
 
+---Gives an actor a solid shape, creating the solver body if it has none.
+---@param self Actor 
+---@param kind integer 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon
+---@param half_w number half width in world units
+---@param half_h number half height in world units
+function Actor:create_shape(kind, half_w, half_h) end
+
+---Replaces an actor's shape in place. Safe to call every frame while dragging a handle.
+---@param self Actor 
+---@param kind integer 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon
+---@param half_w number half width in world units
+---@param half_h number half height in world units
+function Actor:reshape(kind, half_w, half_h) end
+
+---Sets an actor's surface material.
+---@param self Actor 
+---@param friction number 0 slippery to 1 grippy
+---@param restitution number 0 no bounce to 1 full bounce
+---@param density number mass per area
+function Actor:set_material(friction, restitution, density) end
+
+---Turns a shape into a trigger volume: reports overlaps, generates no contact response.
+---@param self Actor 
+---@param is_sensor boolean true for a trigger
+function Actor:set_sensor(is_sensor) end
+
+---Assigns collision layers as bitmasks. Two shapes interact only if each is on a layer the other's mask has.
+---@param self Actor 
+---@param layer_mask integer which layers this actor is on
+---@param collide_mask integer which layers it is willing to interact with
+function Actor:set_layers(layer_mask, collide_mask) end
+
+---Changes how an actor is simulated: 0 fixed, 1 kinematic, 2 dynamic.
+---@param self Actor 
+---@param kind integer 0 fixed, 1 kinematic, 2 dynamic
+function Actor:set_body_type(kind) end
+
+---Turns collision on or off without destroying the shape. The editor's eye toggle.
+---@param self Actor 
+---@param enabled boolean false to make it intangible
+function Actor:set_body_enabled(enabled) end
+
+---Every actor overlapping a box. The selection query. Approximate: a shape is found when a ray crosses it.
+---@param cx number box centre x
+---@param cy number box centre y
+---@param half_w number half the box width
+---@param half_h number half the box height
+---@return integer how many actors were found
+---@return Actor each one, as varargs
+function physics.overlap_rect(cx, cy, half_w, half_h) end
+
+---The actor under a point, for click-to-select.
+---@param x number point x in world units
+---@param y number point y in world units
+---@return Actor the actor found, or nil
+function physics.contains_point(x, y) end
+
 ---Casts a segment and reports what it hit: `hit, t, px, py, nx, ny`.
 ---@param x1 number segment start x
 ---@param y1 number segment start y

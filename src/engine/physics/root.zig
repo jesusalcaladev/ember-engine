@@ -22,6 +22,7 @@ pub const BodyType = physics.BodyType;
 pub const BodyDesc = physics.BodyDesc;
 pub const Shape = physics.Shape;
 pub const ShapeKind = physics.ShapeKind;
+pub const Aabb = physics.Aabb;
 pub const Material = physics.Material;
 pub const Transform = physics.Transform;
 pub const Velocity = physics.Velocity;

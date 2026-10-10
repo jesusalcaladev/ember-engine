@@ -14,6 +14,7 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`rand`](#rand) | Deterministic random numbers (floats, ints, chance, gauss, shuffle, choice) |
 | [`noise`](#noise) | Procedural noise (value, Perlin, simplex, fBm, ridged) |
 | [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit) |
+| [`physics`](#physics) | Rigid-body queries: raycasts, line of sight, solver counters, activity tiers |
 | [`world`](#world) | World-level queries (neighborhood search) |
 | [`steer`](#steer) | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 
@@ -1335,6 +1336,159 @@ log.info("enemy is: " .. self:sm_state())
 
 ```lua
 if self:sm_is_in("attack") then self.hitbox_on = true end
+```
+
+---
+
+## `physics`
+
+World-level queries against the physics simulation (Box2D behind the engine's
+port). The rule that matters most is **gameplay writes the component, never the
+solver** — see [`actor.set_linear_velocity`](#actorset_linear_velocityself-vx-vy)
+and [`actor.apply_impulse`](#actorapply_impulseself-ix-iy).
+
+### `physics.cast_ray(x1, y1, x2, y2)`
+
+| | |
+|---|---|
+| **Signature** | `physics.cast_ray(x1, y1, x2, y2) -> boolean, number, number, number, number, number` |
+| **Parameters** | `x1`, `y1` — `number` — segment start |
+| | `x2`, `y2` — `number` — segment end |
+| **Returns** | `boolean` — false when nothing blocks the segment |
+| | `number` — how far along the segment the hit is, 0 at the start and 1 at the end |
+| | `number`, `number` — hit point x, y |
+| | `number`, `number` — surface normal x, y (points away from the surface) |
+| **Description** | Casts a segment and reports what it hit, honouring the same [collision layers](ecs-collision-layers.md) the solver does — so a trigger volume on a non-colliding layer does not block the ray. Consumes nothing and allocates nothing. |
+
+```lua
+-- place a bullet impact where the shot lands
+local hit, t, px, py, nx, ny = physics.cast_ray(self.px, self.py, tx, ty)
+if hit then
+  effects.spawn("impact", px, py)
+  self.reflect = math.atan2(ny, nx)
+end
+```
+
+### `physics.line_of_sight(x1, y1, x2, y2)`
+
+| | |
+|---|---|
+| **Signature** | `physics.line_of_sight(x1, y1, x2, y2) -> boolean` |
+| **Parameters** | `x1`, `y1`, `x2`, `y2` — `number` — the segment to test |
+| **Returns** | `boolean` — true when nothing solid blocks the segment |
+| **Description** | The cheap form of the question a turret, a guard or a camera AI asks every frame. Obeys the querying context's layers, so a sensor does not block sight. |
+
+```lua
+-- a turret that only fires what it can see
+if physics.line_of_sight(self.px, self.py, player.px, player.py) then
+  self.target_visible = true
+end
+```
+
+### `physics.stats()`
+
+| | |
+|---|---|
+| **Signature** | `physics.stats() -> table` |
+| **Returns** | `table` — `pairs`, `pairs_per_body`, `tree_height`, `static_tree_height`, `solver_bytes`, `bodies`, `shapes`, `contacts`, `islands`, `sleeping`, `simulated`, `active_fraction`, `transitions` |
+| **Description** | The difference between "physics is slow" and "physics is slow because 1 900 of your bodies are awake and in contact". Everything in it is a measurement, so it is safe to poll every frame from a debug overlay — it allocates one small table, which is why it is not something to call from a hot gameplay path by accident. |
+
+```lua
+-- "why is this scene slow? start here."
+local s = physics.stats()
+if s.pairs_per_body > 8 then
+  -- the broadphase is no longer rejecting pairs: something is awake that
+  -- should not be. Look at sleeping and simulated.
+  log.info("pairs/body " .. s.pairs_per_body .. ", sleeping " .. s.sleeping)
+end
+```
+
+### `physics.set_view(cx, cy, half_w, half_h, enabled)`
+
+| | |
+|---|---|
+| **Signature** | `physics.set_view(cx, cy, half_w, half_h, enabled)` |
+| **Parameters** | `cx`, `cy` — `number` — view centre in world units |
+| | `half_w`, `half_h` — `number` — half the view size, plus a margin |
+| | `enabled` — `boolean` — false to fall back to distance tiers alone |
+| **Description** | Tells the engine what the camera can see, which is what turns on physics view culling. A body off-screen costs nothing to simulate, and in 2D nothing can reveal it round a corner. Pass `false` for a server or a headless run, which has no camera and must simulate the whole world. |
+
+```lua
+-- once a frame, from the camera
+physics.set_view(camera.cx, camera.cy, camera.half_w, camera.half_h, true)
+```
+
+### `physics.set_focus(x, y)`
+
+| | |
+|---|---|
+| **Signature** | `physics.set_focus(x, y)` |
+| **Parameters** | `x`, `y` — `number` — the focus point in world units |
+| **Description** | Where the player is. Bodies are tiered by their distance to this point: exact shape near it, a circle proxy in the mid range, disabled beyond that. See [open world physics](physics-open-world.md). |
+
+```lua
+physics.set_focus(player.px, player.py)
+```
+
+### `actor.set_linear_velocity(self, vx, vy)`
+
+| | |
+|---|---|
+| **Signature** | `actor.set_linear_velocity(self, vx, vy)` |
+| **Parameters** | `self` — `Actor` |
+| | `vx`, `vy` — `number` — velocity in units/second |
+| **Returns** | *(nothing)* |
+| **Description** | Sets the velocity outright and leaves the angular velocity alone. Written into the component, which the engine pushes into the solver every step — this is the way to move a body, whether it is a conveyor belt or a knockback. |
+
+```lua
+-- a conveyor belt, or a knockback
+actor.set_linear_velocity(self, 0, -120)
+```
+
+### `actor.get_linear_velocity(self)`
+
+| | |
+|---|---|
+| **Signature** | `actor.get_linear_velocity(self) -> number, number` |
+| **Parameters** | `self` — `Actor` |
+| **Returns** | `number`, `number` — velocity x and y in units/second |
+| **Description** | The velocity the solver has for this actor. Because the engine writes the component's value down and reads the solver's back up each step, this is the authoritative momentum — not whatever gameplay last wrote. |
+
+```lua
+local vx, vy = actor.get_linear_velocity(self)
+self.speed = math.sqrt(vx * vx + vy * vy)
+```
+
+### `actor.apply_impulse(self, ix, iy)`
+
+| | |
+|---|---|
+| **Signature** | `actor.apply_impulse(self, ix, iy)` |
+| **Parameters** | `self` — `Actor` |
+| | `ix`, `iy` — `number` — impulse (mass × units/second) |
+| **Returns** | *(nothing)* |
+| **Description** | An instantaneous push at the centre of mass, which is the "jump" primitive: applied at the centre it cannot spin the body, so a jump goes where you aimed it. Wakes a sleeping actor, so a body asleep on a ledge can still jump. |
+
+```lua
+if input.is_action_pressed("jump") and self.on_floor then
+  actor.apply_impulse(self, 0, -self.jump_impulse)
+end
+```
+
+### `actor.is_awake(self)`
+
+| | |
+|---|---|
+| **Signature** | `actor.is_awake(self) -> boolean` |
+| **Parameters** | `self` — `Actor` |
+| **Returns** | `boolean` — true while the body is still moving |
+| **Description** | False once the body has stopped moving and the solver may put it to sleep. A sleeping body costs nothing to step, which is what makes a settled level affordable — the counter is `physics.stats().sleeping`. |
+
+```lua
+-- an actor asleep on a ledge must still be able to jump
+if input.is_action_pressed("jump") and not actor.is_awake(self) then
+  actor.apply_impulse(self, 0, -self.jump_impulse)
+end
 ```
 
 ---

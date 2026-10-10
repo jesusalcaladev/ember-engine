@@ -289,6 +289,18 @@ pub const Contact = struct {
     approach_speed: f32,
 };
 
+/// An axis-aligned box in world units, for volume queries.
+pub const Aabb = struct {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+
+    pub fn centred(x: f32, y: f32, half_w: f32, half_h: f32) Aabb {
+        return .{ .min_x = x - half_w, .min_y = y - half_h, .max_x = x + half_w, .max_y = y + half_h };
+    }
+};
+
 pub const VTable = struct {
     const Self = @This();
 
@@ -327,6 +339,24 @@ pub const VTable = struct {
     step: *const fn (ctx: *anyopaque, dt: f32) void,
 
     castRay: *const fn (ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: Filter) ?RayHit,
+
+    /// Every shape whose bounds overlap `box`, under the same filter rules a
+    /// contact would obey.
+    ///
+    /// This is the primitive an editor SELECTS with, and it is why it takes a
+    /// filter rather than hitting everything: a selection box dragged across a
+    /// level must not pick up the sensors, the triggers and the water, or every
+    /// click selects the whole scene.
+    ///
+    /// A visitor, like `pollContacts`, so the caller never holds a pointer into
+    /// the solver's memory.
+    overlapBox: *const fn (
+        ctx: *anyopaque,
+        box: Aabb,
+        filter: Filter,
+        visit: *const fn (user: *anyopaque, shape: ShapeId) void,
+        user: *anyopaque,
+    ) void,
 
     stats: *const fn (ctx: *anyopaque) StepStats,
 
@@ -411,6 +441,17 @@ pub const World = struct {
     pub fn applyImpulse(self: World, body: BodyId, impulse: Vec2, wake: bool) void {
         self.vtable.applyImpulse(self.ctx, body, impulse, wake);
     }
+    /// Every shape overlapping `box`. The editor's selection primitive.
+    pub fn overlapBox(
+        self: World,
+        box: Aabb,
+        filter: Filter,
+        visit: *const fn (user: *anyopaque, shape: ShapeId) void,
+        user: *anyopaque,
+    ) void {
+        self.vtable.overlapBox(self.ctx, box, filter, visit, user);
+    }
+
     /// Drains the contacts queued by the last `step`.
     pub fn pollContacts(
         self: World,

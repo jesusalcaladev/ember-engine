@@ -592,6 +592,70 @@ fn castRay(ctx: *anyopaque, p1: Vec2, p2: Vec2, filter: physics.Filter) ?physics
     };
 }
 
+/// Box2D's raycast callback, in the C ABI's shape.
+///
+/// `b2CastResultFcn` is the ONLY query callback in this version of Box2D that
+/// carries a shape id: `b2World_OverlapAABB` hands back a `b2ShapeProxy`, which
+/// is geometry with no identity, so an overlap test cannot be turned back into an
+/// entity. Rays therefore carry the selection query, which is also why the
+/// engine's selection is approximate and says so.
+fn castCallback(
+    shape_id: b2.b2ShapeId,
+    point: b2.b2Vec2,
+    normal: b2.b2Vec2,
+    fraction: f32,
+    context: ?*anyopaque,
+) callconv(.c) f32 {
+    _ = point;
+    _ = normal;
+    _ = fraction;
+    const box: *OverlapCtx = @ptrCast(@alignCast(@constCast(context.?)));
+    box.visit(box.user, .{ .index = @intCast(shape_id.index1 -| 1), .generation = @intCast(shape_id.generation) });
+    // 0 keeps going; returning the fraction would stop at the first hit.
+    return 0.0;
+}
+
+const OverlapCtx = struct {
+    visit: *const fn (user: *anyopaque, shape: physics.ShapeId) void,
+    user: *anyopaque,
+};
+
+/// The selection query, as a grid of rays across the box.
+///
+/// APPROXIMATE, and deliberately: a shape is found if any ray passes through it,
+/// so a selection narrower than the ray spacing can miss something. That is the
+/// right trade for a drag-select (a person cannot drag a box that narrow by
+/// accident) and it is the only shape-carrying query this Box2D version offers.
+/// A pixel-exact overlap test would need a different solver API.
+fn overlapBoxImpl(
+    ctx: *anyopaque,
+    box: physics.Aabb,
+    filter: physics.Filter,
+    visit: *const fn (user: *anyopaque, shape: physics.ShapeId) void,
+    user: *anyopaque,
+) void {
+    const w: *WorldCtx = @ptrCast(@alignCast(ctx));
+    var f = b2.b2DefaultQueryFilter();
+    f.categoryBits = filter.category_bits;
+    f.maskBits = filter.mask_bits;
+    var box_ctx = OverlapCtx{ .visit = visit, .user = user };
+
+    const width = box.max_x - box.min_x;
+    const height = box.max_y - box.min_y;
+    // Finer than any shape an editor places, so a selection catches everything
+    // inside it; coarse enough that a full-screen drag stays a few hundred rays.
+    const ray_step: f32 = @max(@min(width, height) / 32.0, 4.0);
+
+    var y = box.min_y;
+    while (y <= box.max_y) : (y += ray_step) {
+        var x = box.min_x;
+        while (x <= box.max_x) : (x += ray_step) {
+            _ = b2.b2World_CastRay(w.world, .{ .x = x, .y = y }, .{ .x = width, .y = 0 }, f, castCallback, @ptrCast(&box_ctx));
+            _ = b2.b2World_CastRay(w.world, .{ .x = x, .y = y }, .{ .x = 0, .y = height }, f, castCallback, @ptrCast(&box_ctx));
+        }
+    }
+}
+
 /// Drains Box2D's contact queue and translates it into the port's vocabulary.
 fn pollContacts(
     ctx: *anyopaque,
@@ -729,6 +793,7 @@ pub const vtable = physics.VTable{
     .destroyShape = destroyShape,
     .step = step,
     .castRay = castRay,
+    .overlapBox = overlapBoxImpl,
     .stats = stats,
     .pollContacts = pollContacts,
 };

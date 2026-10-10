@@ -55,7 +55,14 @@ Component set as a bitmask for fast superset/disjoint tests during queries.
 | `max_components` | `u16` (comptime) | Maximum distinct component types (256). Keeps archetype tests in 4 words. |
 | `max_stride` | `u32` (comptime) | Buffer size for decoding any component (128 bytes). |
 
-## Registered Components (7 total)
+## Registered Components (10 total)
+
+> Sizes in this document are measured with `@sizeOf` under the current layout and
+> pinned by `src/engine/ecs/components_test.zig`, which fails if one of them
+> changes. The first version of that test asserted hand-computed sizes and was
+> wrong twice over — `Parent` is 8, not 16 (both u32 fields pack into one
+> `Entity`), and `RigidBody2D` is 52, not the 56 you get adding the fields up.
+> Field reordering by hand is exactly what makes a table like this lie.
 
 ### 1. `Name`
 
@@ -236,6 +243,135 @@ component stores the index.
 | `machine` | `u32` | `0` | Index into the engine's state-machine registry; 0 is "none". |
 | `started` | `bool` | `false` | True once the machine has been entered, so the first tick runs `enter` exactly once. |
 
+### 8. `RigidBody2D`
+
+```zig
+pub const RigidBody2D = struct {
+	body: u32 = invalid_body,
+	generation: u32 = 0,
+	body_type: u8 = 2,
+	linear_velocity: Vec2 = .{},
+	angular_velocity: f32 = 0.0,
+	linear_damping: f32 = 0.0,
+	angular_damping: f32 = 0.0,
+	gravity_scale: f32 = 1.0,
+	fixed_rotation: bool = false,
+	allow_sleep: bool = true,
+	is_bullet: bool = false,
+	prev_position: Vec2 = .{},
+	prev_rotation: f32 = 0.0,
+	tier: u8 = 0,
+};
+```
+
+A rigid body in the physics world. `body_type` is **one** component with three
+kinds (fixed / kinematic / dynamic), not three components: an actor switching
+from fixed to kinematic at runtime — a door opening, a platform starting to move —
+does not change archetype, so it does not trigger a row move or a spike
+(spec §3.1).
+
+The field order is the contract: handles first because they are the hot lookup,
+then the plain data. Full documentation in
+[physics overview](physics-overview.md).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `body` | `u32` | `invalid_body` | Port body handle; index into the backend. |
+| `generation` | `u32` | `0` | Handle generation: a recycled slot is not mistaken for the body that used to live there. |
+| `body_type` | `u8` | `2` | 0 fixed, 1 kinematic, 2 dynamic — mirrors `physics.BodyType`. |
+| `linear_velocity` | `Vec2` | `(0, 0)` | Units/second. Gameplay writes this; the solver owns it after the step. |
+| `angular_velocity` | `f32` | `0` | Radians/second, positive clockwise (screen space y grows down). |
+| `linear_damping` | `f32` | `0` | |
+| `angular_damping` | `f32` | `0` | |
+| `gravity_scale` | `f32` | `1.0` | Multiplies world gravity. 0 is "unaffected". |
+| `fixed_rotation` | `bool` | `false` | Locked rotation — the default for anything that must not tip over. |
+| `allow_sleep` | `bool` | `true` | Sleeping is the default, not an opt-in. |
+| `is_bullet` | `bool` | `false` | Continuous collision for fast small bodies. |
+| `prev_position` | `Vec2` | `(0, 0)` | Previous fixed step, for render interpolation. |
+| `prev_rotation` | `f32` | `0` | Previous fixed step rotation. |
+| `tier` | `u8` | `0` | Activity tier ordinal (0 = full). Part of the body's state, so it covers the determinism hash. |
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `isSimulated` | `fn(self: RigidBody2D) bool` | False when the body is not in a physics world. |
+
+### 9. `Collider2D`
+
+```zig
+pub const Collider2D = struct {
+	shape: u32 = maxInt(u32),
+	generation: u32 = 0,
+	kind: u8 = 0,
+	size: Vec2 = .{ .x = 0.5, .y = 0.5 },
+	offset: Vec2 = .{},
+	density: f32 = 1.0,
+	friction: f32 = 0.3,
+	restitution: f32 = 0.0,
+	is_sensor: bool = false,
+};
+```
+
+A collision shape attached to a body. Separate from `RigidBody2D` so one body can
+carry several — a character's torso, head and feet, a platform's surface and its
+trigger — each with its own material.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `shape` | `u32` | `invalid_shape` | Port shape handle. |
+| `generation` | `u32` | `0` | Handle generation. |
+| `kind` | `u8` | `0` | 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon — mirrors `physics.ShapeKind`. |
+| `size` | `Vec2` | `(0.5, 0.5)` | Half-extents (box), or x = radius / y = cap offset (capsule). |
+| `offset` | `Vec2` | `(0, 0)` | Local offset from the body transform. |
+| `density` | `f32` | `1.0` | Mass per unit area for dynamic bodies. |
+| `friction` | `f32` | `0.3` | |
+| `restitution` | `f32` | `0.0` | 0 = dead stop, 1 = perfectly bouncy. |
+| `is_sensor` | `bool` | `false` | Reports overlaps, generates no contact response. |
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `isLive` | `fn(self: Collider2D) bool` | False when the shape is not in a physics world. |
+
+### 10. `CollisionLayers`
+
+```zig
+pub const CollisionLayers = struct {
+	layer: u16 = everything,
+	mask: u16 = everything,
+};
+```
+
+Which layer(s) this body is on, and which it is willing to interact with. Two
+bitmasks, four bytes, sixteen named layers. A property of the body, not of one
+shape: a character on the `player` layer hits the `enemy` layer with all of its
+parts.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `layer` | `u16` | `everything` | The layer bit(s) this body is on. |
+| `mask` | `u16` | `everything` | The layer bit(s) it is willing to interact with. |
+
+The pair test (`A.layer & B.mask` **and** `B.layer & A.mask`) is symmetric and
+applies to raycasts as well as collisions. Full documentation in
+[collision layers](ecs-collision-layers.md).
+
+#### Constants
+
+| Constant | Value | Description |
+|---|---|---|
+| `everything` | `maxInt(u16)` | All sixteen bits — the permissive default. |
+| `inert` | `CollisionLayers{}` | The zero-effort default: every bit set in both fields, so it collides with everything. Same value as a component that was never written. |
+
+#### Methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `collides` | `fn(self: CollisionLayers, other: CollisionLayers) bool` | The symmetric pair test. |
+| `eql` | `fn(self: CollisionLayers, other: CollisionLayers) bool` | Byte-equal comparison, used by the archetype byte-compare. |
+
 ## Registry Lookup Functions
 
 ### `componentId`
@@ -323,6 +459,15 @@ const name_str = components.nameOf(id); // "Transform"
 // Name comparison
 std.debug.assert(name.eql("player"));
 std.debug.assert(name.slice().len <= components.Name.max_len);
+
+// A dynamic body with a box collider and named layers
+const ball = components.RigidBody2D{ .body_type = 2, .fixed_rotation = true };
+const collider = components.Collider2D{ .kind = 1, .size = .{ .x = 0.5, .y = 0.5 }, .restitution = 0.8 };
+const layers = ecs.Layers.fromNames(&.{ "default", "player", "ball", "wall" });
+const filter = components.CollisionLayers{
+	.layer = layers.bit("ball").?,
+	.mask = layers.maskFromNames("wall player", null),
+};
 ```
 
 ## Component Sizes
@@ -331,8 +476,11 @@ std.debug.assert(name.slice().len <= components.Name.max_len);
 |---|---|---|
 | `Name` | 33 | 32 inline + len byte. |
 | `Transform` | 40 | Auto-layout interleaves prev_* snapshot with live fields. |
-| `Parent` | 16 | Two u32s packed in Entity. |
+| `Parent` | 8 | Both u32 fields pack into one `Entity`. |
 | `Velocity` | 12 | Vec2 + f32. |
 | `Sprite` | 52 | Kept small on purpose: 50k sprites = 2.6 MB of column data. |
 | `Script` | 4 | Single u32. |
 | `StateMachine` | 8 | u32 + bool. |
+| `RigidBody2D` | 52 | 2 handles + 13 plain-data fields. Grows with the world: 200k bodies = 10.4 MB. |
+| `Collider2D` | 40 | 2 handles + kind + 2 Vec2 + 3 f32 + a flag. |
+| `CollisionLayers` | 4 | Two `u16` bitmasks. |

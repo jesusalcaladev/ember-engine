@@ -418,6 +418,151 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "physics.create_shape",
+        .module = "physics",
+        .signature = "physics.create_shape(self, kind, half_w, half_h)",
+        .summary = "Gives an actor a solid shape, creating the solver body if it has none.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon" },
+            .{ .name = "half_w", .kind = .number, .doc = "half width in world units" },
+            .{ .name = "half_h", .kind = .number, .doc = "half height in world units" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.create_shape(self, 0, 16, 16)
+        ,
+    },
+    .{
+        .name = "physics.reshape",
+        .module = "physics",
+        .signature = "physics.reshape(self, kind, half_w, half_h)",
+        .summary = "Replaces an actor's shape in place. Safe to call every frame while dragging a handle.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon" },
+            .{ .name = "half_w", .kind = .number, .doc = "half width in world units" },
+            .{ .name = "half_h", .kind = .number, .doc = "half height in world units" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\-- called every frame while the gizmo is dragged
+        \\physics.reshape(self, 0, drag.w, drag.h)
+        ,
+    },
+    .{
+        .name = "physics.set_material",
+        .module = "physics",
+        .signature = "physics.set_material(self, friction, restitution, density)",
+        .summary = "Sets an actor's surface material.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "friction", .kind = .number, .doc = "0 slippery to 1 grippy" },
+            .{ .name = "restitution", .kind = .number, .doc = "0 no bounce to 1 full bounce" },
+            .{ .name = "density", .kind = .number, .doc = "mass per area" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.set_material(self, 0.9, 0.0, 1.0)
+        ,
+    },
+    .{
+        .name = "physics.set_sensor",
+        .module = "physics",
+        .signature = "physics.set_sensor(self, is_sensor)",
+        .summary = "Turns a shape into a trigger volume: reports overlaps, generates no contact response.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "is_sensor", .kind = .boolean, .doc = "true for a trigger" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.set_sensor(self, true)  -- a coin pickup        ,
+    },
+    .{
+        .name = "physics.set_layers",
+        .module = "physics",
+        .signature = "physics.set_layers(self, layer_mask, collide_mask)",
+        .summary = "Assigns collision layers as bitmasks. Two shapes interact only if each is on a layer the other's mask has.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "layer_mask", .kind = .integer, .doc = "which layers this actor is on" },
+            .{ .name = "collide_mask", .kind = .integer, .doc = "which layers it is willing to interact with" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.set_layers(self, 1, 2)  -- on layer 1, hits layer 2        ,
+    },
+    .{
+        .name = "physics.set_body_type",
+        .module = "physics",
+        .signature = "physics.set_body_type(self, kind)",
+        .summary = "Changes how an actor is simulated: 0 fixed, 1 kinematic, 2 dynamic.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "kind", .kind = .integer, .doc = "0 fixed, 1 kinematic, 2 dynamic" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.set_body_type(self, 0)  -- a static platform        ,
+    },
+    .{
+        .name = "physics.set_body_enabled",
+        .module = "physics",
+        .signature = "physics.set_body_enabled(self, enabled)",
+        .summary = "Turns collision on or off without destroying the shape. The editor's eye toggle.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "false to make it intangible" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\physics.set_body_enabled(self, not editor.hidden)
+        ,
+    },
+    .{
+        .name = "physics.overlap_rect",
+        .module = "physics",
+        .signature = "physics.overlap_rect(cx, cy, half_w, half_h) -> integer, actor...",
+        .summary = "Every actor overlapping a box. The selection query. Approximate: a shape is found when a ray crosses it.",
+        .params = &.{
+            .{ .name = "cx", .kind = .number, .doc = "box centre x" },
+            .{ .name = "cy", .kind = .number, .doc = "box centre y" },
+            .{ .name = "half_w", .kind = .number, .doc = "half the box width" },
+            .{ .name = "half_h", .kind = .number, .doc = "half the box height" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "how many actors were found" },
+            .{ .kind = .actor, .doc = "each one, as varargs" },
+        },
+        .example =
+        \\local n, a, b = physics.overlap_rect(mx, my, 80, 80)
+        ,
+    },
+    .{
+        .name = "physics.contains_point",
+        .module = "physics",
+        .signature = "physics.contains_point(x, y) -> actor|nil",
+        .summary = "The actor under a point, for click-to-select.",
+        .params = &.{
+            .{ .name = "x", .kind = .number, .doc = "point x in world units" },
+            .{ .name = "y", .kind = .number, .doc = "point y in world units" },
+        },
+        .returns = &.{
+            .{ .kind = .actor, .doc = "the actor found, or nil" },
+        },
+        .example =
+        \\local hit = physics.contains_point(mx, my)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

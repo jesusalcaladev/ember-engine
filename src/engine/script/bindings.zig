@@ -831,6 +831,8 @@ const actor_regs = [_]luaL_Reg{
 
 const physics_mod = @import("physics");
 const RigidBody2D = context_mod.components.RigidBody2D;
+const Collider2D = context_mod.components.Collider2D;
+const CollisionLayers = context_mod.components.CollisionLayers;
 
 /// The solver body behind an entity, or null when it has none.
 ///
@@ -1040,12 +1042,216 @@ fn lua_physics_set_focus(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
+// ── The editor surface ───────────────────────────────────────────────────────
+//
+// Everything an editor needs to PLACE, RESIZE, RETUNE and SELECT physics
+// without writing Zig. Each of these is the editor's verb, not the engine's:
+// "make a box here" is an editor operation, and the engine's job is to make it
+// safe to call sixty times a second while a handle is being dragged.
+
+/// How many entities one `physics.overlap_rect` call may return.
+///
+/// A drag-select over a whole level can hit anything, so this is a hint for the
+/// caller to grow its buffer and ask again, not a limit. Silently truncating
+/// would make an editor select "everything that fitted" and report that as the
+/// selection.
+const overlap_capacity: usize = 256;
+
+/// Scratch for the overlap result, kept out of the stack because it is 256
+/// entities and a C binding's frame is the default thread stack.
+var overlap_scratch: [overlap_capacity]context_mod.Entity = undefined;
+
+/// `physics.create_shape(self_entity, kind, half_w, half_h)`
+///
+/// Turns an existing actor into a solid body, or re-shapes one that already is.
+/// The editor spawns an actor first — actors are the document — and then gives
+/// it a shape, which is exactly how a designer thinks: place a sprite, give it a
+/// collider.
+///
+/// `kind` is the same ordinal the component uses: 0 box, 1 circle, 2 capsule,
+/// 3 cylinder, 4 polygon.
+fn lua_physics_create_shape(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+
+    // A body that has never been synced needs creating rather than reshaping.
+    if (ctx.world.get(e, RigidBody2D)) |rb| {
+        if (!rb.isSimulated()) {
+            sys.syncEntity(ctx.world, e);
+        }
+    } else {
+        _ = ctx.world.add(e, RigidBody2D{}) catch return 0;
+        sys.syncEntity(ctx.world, e);
+    }
+
+    sys.reshape(ctx.world, e, @as(u8, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))))), lua.toF32(L, 3), lua.toF32(L, 4));
+    return 0;
+}
+
+/// `physics.reshape(self, kind, half_w, half_h)` — the drag-resize path.
+fn lua_physics_reshape(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    sys.reshape(ctx.world, e, @as(u8, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))))), lua.toF32(L, 3), lua.toF32(L, 4));
+    return 0;
+}
+
+/// `physics.set_material(self, friction, restitution, density)`
+fn lua_physics_set_material(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    sys.setMaterial(ctx.world, e, lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4));
+    return 0;
+}
+
+/// `physics.set_sensor(self, is_sensor)` — a trigger volume with no contact
+/// response. Separate from `reshape` because it is a different KIND of thing,
+/// not a different size, and flipping it should not require re-specifying the
+/// shape.
+fn lua_physics_set_sensor(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    const c = ctx.world.get(e, Collider2D) orelse return 0;
+    const want = lua.toBool(L, 2);
+    if (c.is_sensor == want) return 0;
+    c.is_sensor = want;
+    sys.reshape(ctx.world, e, c.kind, c.size.x, c.size.y);
+    return 0;
+}
+
+/// `physics.set_layers(self, layer_mask, collide_mask)`
+///
+/// Bitmasks, not names: resolving a name to a bit needs the project's layer
+/// table, and a binding that could not find one would have to guess. The editor
+/// holds the table and passes the bits.
+fn lua_physics_set_layers(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    if (ctx.world.get(e, CollisionLayers)) |cl| {
+        cl.layer = @as(u16, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0)))));
+        cl.mask = @as(u16, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 3), 0)))));
+        sys.reapplyFilter(ctx.world, e);
+    } else {
+        _ = ctx.world.add(e, CollisionLayers{
+            .layer = @as(u16, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))))),
+            .mask = @as(u16, @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 3), 0))))),
+        }) catch return 0;
+        sys.reapplyFilter(ctx.world, e);
+    }
+    return 0;
+}
+
+/// `physics.set_body_type(self, kind)` — 0 fixed, 1 kinematic, 2 dynamic.
+fn lua_physics_set_body_type(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    const rb = ctx.world.get(e, RigidBody2D) orelse return 0;
+    const want: u8 = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    if (rb.body_type == want) return 0;
+    rb.body_type = want;
+    sys.setBodyType(ctx.world, e, want);
+    return 0;
+}
+
+/// `physics.set_body_enabled(self, enabled)` — collision on/off without losing
+/// the shape. What an editor's eye toggle calls.
+fn lua_physics_set_body_enabled(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const sys = ctx.physics orelse return 0;
+    sys.setBodyEnabled(ctx.world, e, lua.toBool(L, 2));
+    return 0;
+}
+
+/// `physics.overlap_rect(cx, cy, half_w, half_h) -> count, [entities...]`
+///
+/// The selection query. Returns the entities as varargs rather than a table so
+/// a drag-select does not allocate an array every frame while the mouse moves.
+///
+/// Approximate: a shape is found when a ray crosses it, so a selection smaller
+/// than the ray spacing can miss. See `overlapBox` in the adapter for why this
+/// solver's API forces it.
+fn lua_physics_overlap_rect(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const sys = ctx.physics orelse return 0;
+    const cx = lua.toF32(L, 1);
+    const cy = lua.toF32(L, 2);
+    const hw = @abs(lua.toF32(L, 3));
+    const hh = @abs(lua.toF32(L, 4));
+
+    const box = physics_mod.Aabb.centred(cx, cy, hw, hh);
+    const total = sys.overlapEntities(box, &overlap_scratch);
+
+    // De-duplicate: the ray grid crosses one shape many times, and an editor
+    // selection must not contain the same actor twice.
+    var unique: usize = 0;
+    for (overlap_scratch[0..@min(total, overlap_capacity)]) |candidate| {
+        var dup = false;
+        for (overlap_scratch[0..unique]) |seen| {
+            if (seen.eql(candidate)) dup = true;
+        }
+        if (!dup) {
+            overlap_scratch[unique] = candidate;
+            unique += 1;
+        }
+    }
+
+    // Each entity needs its own table: `stampEntity` writes the handle INTO the
+    // table on top of the stack, so there has to be one. Pushing a bare
+    // light-userdata would leave the caller with a number it cannot call
+    // `actor.get_position` on.
+    for (overlap_scratch[0..unique]) |ent| {
+        lua.lua_createtable(L, 0, 1);
+        stampEntity(L, ent);
+    }
+    // The count goes LAST, which is why it is moved to the top: a caller reads
+    // `local n, a, b = ...` and wants the count first.
+    lua.lua_pushinteger(L, @intCast(unique));
+    lua.lua_insert(L, -@as(c_int, @intCast(unique + 1)));
+    return @intCast(unique + 1);
+}
+
+/// `physics.contains_point(x, y) -> actor|nil`
+///
+/// Click-to-select. A ray cast of zero length is not useful, so this is the
+/// same grid query over a tiny box — small enough that the spacing is below any
+/// shape an editor places.
+fn lua_physics_contains_point(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const sys = ctx.physics orelse return 0;
+    const p = .{ .x = lua.toF32(L, 1), .y = lua.toF32(L, 2) };
+    const box = physics_mod.Aabb.centred(p.x, p.y, 0.5, 0.5);
+    const total = sys.overlapEntities(box, &overlap_scratch);
+    if (total == 0) {
+        lua.lua_pushnil(L);
+        return 1;
+    }
+    lua.lua_createtable(L, 0, 1);
+    stampEntity(L, overlap_scratch[0]);
+    return 1;
+}
+
 const physics_regs = [_]luaL_Reg{
     .{ .name = "cast_ray", .func = lua_physics_cast_ray },
     .{ .name = "line_of_sight", .func = lua_physics_line_of_sight },
     .{ .name = "stats", .func = lua_physics_stats },
     .{ .name = "set_view", .func = lua_physics_set_view },
     .{ .name = "set_focus", .func = lua_physics_set_focus },
+    .{ .name = "create_shape", .func = lua_physics_create_shape },
+    .{ .name = "reshape", .func = lua_physics_reshape },
+    .{ .name = "set_material", .func = lua_physics_set_material },
+    .{ .name = "set_sensor", .func = lua_physics_set_sensor },
+    .{ .name = "set_layers", .func = lua_physics_set_layers },
+    .{ .name = "set_body_type", .func = lua_physics_set_body_type },
+    .{ .name = "set_body_enabled", .func = lua_physics_set_body_enabled },
+    .{ .name = "overlap_rect", .func = lua_physics_overlap_rect },
+    .{ .name = "contains_point", .func = lua_physics_contains_point },
     .{ .name = null, .func = null },
 };
 
@@ -1562,7 +1768,16 @@ pub const registered_names = [_][]const u8{
     "physics.line_of_sight",
     "physics.stats",
     "physics.set_view",
-    "physics.set_focus",     "actor.set_linear_velocity",
+    "physics.set_focus",
+    "physics.create_shape",
+    "physics.reshape",
+    "physics.set_material",
+    "physics.set_sensor",
+    "physics.set_layers",
+    "physics.set_body_type",
+    "physics.set_body_enabled",
+    "physics.overlap_rect",
+    "physics.contains_point",     "actor.set_linear_velocity",
     "actor.get_linear_velocity", "actor.apply_impulse",
     "actor.is_awake",
 };

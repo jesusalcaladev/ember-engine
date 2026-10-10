@@ -39,4 +39,5 @@ test {
     // and keeping it separate makes that boundary the thing under test.
     _ = @import("query_cursor_test.zig");
     _ = @import("collision_layers.zig");
+    _ = @import("components_test.zig");
 }

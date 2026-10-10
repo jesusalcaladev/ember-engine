@@ -152,6 +152,12 @@ pub const System = struct {
     /// at load time, read-only during the frame.
     body_index: std.AutoHashMapUnmanaged(u64, Entity) = .empty,
 
+    /// Shape handle -> body handle, so a query that reports a SHAPE can be
+    /// answered with the ENTITY the editor actually holds. A query returns shape
+    /// ids because that is what the solver knows about; an editor needs to know
+    /// which actor was clicked.
+    shape_index: std.AutoHashMapUnmanaged(u64, physics.BodyId) = .empty,
+
     /// Impulses queued by gameplay for the next step, keyed by entity. Cleared
     /// at the end of every `pushDown`, so an impulse lasts exactly one frame —
     /// a queued impulse that survived would apply again every frame and turn a
@@ -188,6 +194,7 @@ pub const System = struct {
         // during a frame — `put` reallocating on first collision is exactly the
         // allocation spec §3.1 forbids.
         try self_.body_index.ensureTotalCapacity(allocator, 1024);
+        try self_.shape_index.ensureTotalCapacity(allocator, 1024);
         // Same reasoning: `pending` is written by gameplay during the frame and
         // must never reallocate while it is being written.
         try self_.pending.ensureTotalCapacity(allocator, 256);
@@ -198,6 +205,7 @@ pub const System = struct {
         self.grid.deinit(self.allocator);
         self.active.deinit(self.allocator);
         self.body_index.deinit(self.allocator);
+        self.shape_index.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.world.deinit();
     }
@@ -289,6 +297,9 @@ pub const System = struct {
             }
         }
         self.world.destroyBody(.{ .index = body.body, .generation = body.generation });
+        if (world.get(entity, Collider2D)) |cc| {
+            _ = self.shape_index.remove(shapeBits(.{ .index = cc.shape, .generation = cc.generation }));
+        }
         _ = self.body_index.remove(bodyBits(.{
             .index = body.body,
             .generation = body.generation,
@@ -330,6 +341,11 @@ pub const System = struct {
             const shape_id = self.world.createShape(id, filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)), materialFromComponent(c.*)) orelse return;
             c.shape = shape_id.index;
             c.generation = shape_id.generation;
+            self.shape_index.put(
+                self.allocator,
+                shapeBits(shape_id),
+                id,
+            ) catch {};
         }
     }
 
@@ -696,6 +712,186 @@ pub const System = struct {
 
     // ── Queries ──────────────────────────────────────────────────────────────
 
+    // ── Editor surface ─────────────────────────────────────────────────────────
+    //
+    // Everything below exists so an editor can CREATE and MODIFY physics from
+    // outside Zig: place a box, drag a handle to resize it, retune friction,
+    // assign layers, drag a selection box across a level.
+    //
+    // They take an ENTITY rather than a solver handle. The ECS is the document;
+    // the solver is a cache of it. An editor holding solver handles would lose
+    // every edit the moment a body was despawned and respawned, and would have
+    // to understand the pool to undo anything.
+
+    /// Creates the solver body for one entity, if it has none.
+    ///
+    /// The editor's "give this actor a collider" path: an actor exists (it has a
+    /// transform and a sprite) but has never been through a scene load, so
+    /// `syncLoad` has not seen it. Doing this per entity rather than re-running
+    /// the whole load is what makes adding a shape instant instead of a rebuild.
+    pub fn syncEntity(self: *System, world: *World, entity: Entity) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (rb.isSimulated()) return;
+        self.createFor(world, entity) catch {};
+        self.list_dirty = true;
+    }
+
+    /// Rebuilds a body's shape so a new collision filter takes effect.
+    ///
+    /// The filter lives on the SHAPE in every 2D physics API there is, because a
+    /// body routinely has several shapes that answer to different things. So
+    /// changing a body's layers is a shape rebuild, and hiding that behind a
+    /// setter is what stops an editor from having to know it.
+    pub fn reapplyFilter(self: *System, world: *World, entity: Entity) void {
+        const c = world.get(entity, Collider2D) orelse return;
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (!rb.isSimulated() or !c.isLive()) return;
+        const id = physics.BodyId{ .index = rb.body, .generation = rb.generation };
+        const was_active = tierOf(rb).isActive();
+        if (!was_active) self.world.setEnabled(id, true);
+        self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
+        if (self.world.createShape(
+            id,
+            filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)),
+            materialFromComponent(c.*),
+        )) |m| {
+            c.shape = m.index;
+            c.generation = m.generation;
+            _ = self.shape_index.remove(shapeBits(.{ .index = c.shape, .generation = c.generation }));
+            self.shape_index.put(self.allocator, shapeBits(.{ .index = m.index, .generation = m.generation }), id) catch {};
+        }
+        if (!was_active) self.world.setEnabled(id, false);
+    }
+
+    /// Changes a body's simulation type in place.
+    pub fn setBodyType(self: *System, world: *World, entity: Entity, kind: u8) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (!rb.isSimulated()) return;
+        rb.body_type = kind;
+        self.world.setBodyType(
+            .{ .index = rb.body, .generation = rb.generation },
+            bodyTypeFromByte(kind),
+        );
+    }
+
+    /// Turns a body's collision on or off without destroying its shape.
+    ///
+    /// An editor's eye toggle. Deliberately NOT the activity tiers: those are the
+    /// engine's decision about cost, and a designer who hides a wall in the
+    /// editor means "this does not exist", not "this is far away".
+    pub fn setBodyEnabled(self: *System, world: *World, entity: Entity, enabled: bool) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (!rb.isSimulated()) return;
+        self.world.setEnabled(.{ .index = rb.body, .generation = rb.generation }, enabled);
+    }
+
+    /// Replaces a body's shape, in place.
+    ///
+    /// The one an editor leans on hardest: dragging a resize handle fires this
+    /// every frame the mouse moves, so it must not reallocate a body and must
+    /// not lose its velocity, position or tier. The old shape is destroyed and a
+    /// new one made on the same body, which is the only way a solver offers to
+    /// change a shape's dimensions.
+    ///
+    /// The body's ENABLED state is preserved. Reshaping a disabled body would
+    /// otherwise re-enable it, because the solver cannot rebuild a shape that is
+    /// not in the world — and a level designer who hid a trigger volume and then
+    /// nudged its size would find it live again.
+    pub fn reshape(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        kind: u8,
+        half_w: f32,
+        half_h: f32,
+    ) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (!rb.isSimulated()) return;
+        const c = world.get(entity, Collider2D) orelse return;
+        const id = physics.BodyId{ .index = rb.body, .generation = rb.generation };
+
+        const was_active = c.isLive() and tierOf(rb).isActive();
+        if (!was_active) self.world.setEnabled(id, true);
+
+        c.kind = kind;
+        c.size = .{ .x = half_w, .y = half_h };
+        if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
+        if (self.world.createShape(
+            id,
+            filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)),
+            materialFromComponent(c.*),
+        )) |m| {
+            c.shape = m.index;
+            c.generation = m.generation;
+        }
+
+        if (!was_active) self.world.setEnabled(id, false);
+    }
+
+    /// Sets a body's surface material. Like `reshape`, this rebuilds the shape,
+    /// because a solver stores friction and restitution ON the shape.
+    pub fn setMaterial(
+        self: *System,
+        world: *World,
+        entity: Entity,
+        friction: f32,
+        restitution: f32,
+        density: f32,
+    ) void {
+        const rb = world.get(entity, RigidBody2D) orelse return;
+        if (!rb.isSimulated()) return;
+        const c = world.get(entity, Collider2D) orelse return;
+        c.friction = friction;
+        c.restitution = restitution;
+        c.density = density;
+        const id = physics.BodyId{ .index = rb.body, .generation = rb.generation };
+        const was_active = c.isLive() and tierOf(rb).isActive();
+        if (!was_active) self.world.setEnabled(id, true);
+        if (c.isLive()) self.world.destroyShape(.{ .index = c.shape, .generation = c.generation });
+        if (self.world.createShape(
+            id,
+            filterFromComponent(shapeFromComponent(c.*), filterFor(world, entity)),
+            materialFromComponent(c.*),
+        )) |m| {
+            c.shape = m.index;
+            c.generation = m.generation;
+        }
+        if (!was_active) self.world.setEnabled(id, false);
+    }
+
+    /// Every entity whose shape overlaps a world-space box.
+    ///
+    /// The editor's selection primitive, so it is written to be called from a
+    /// drag every frame: no allocation, and `out` is a caller-supplied slice.
+    /// The RETURN is how many overlapped, which may exceed `out.len` — the
+    /// caller grows once and re-queries, rather than the query silently
+    /// truncating and the editor selecting "everything that fitted".
+    pub fn overlapEntities(self: *const System, box: physics.Aabb, out: []Entity) usize {
+        var sink = OverlapSink{ .system = self, .out = out, .count = 0 };
+        self.world.overlapBox(box, .pass_all, visitOverlap, &sink);
+        return sink.count;
+    }
+
+    const OverlapSink = struct {
+        system: *const System,
+        out: []Entity,
+        count: usize,
+    };
+
+    fn visitOverlap(user: *anyopaque, shape: physics.ShapeId) void {
+        const sink: *OverlapSink = @ptrCast(@alignCast(user));
+        const body = sink.system.shapeOwner(shape) orelse return;
+        const entity = sink.system.entityFor(body) orelse return;
+        if (sink.count < sink.out.len) sink.out[sink.count] = entity;
+        sink.count += 1;
+    }
+
+    /// The body that owns a shape, for turning a query result into an entity.
+    pub fn shapeOwner(self: *const System, shape: physics.ShapeId) ?physics.BodyId {
+        if (shape.isNone()) return null;
+        return self.shape_index.get(shapeBits(shape));
+    }
+
     /// The entity behind a solver body, or null when the handle names something
     /// this system never issued (or has already retired).
     pub fn entityFor(self: *const System, body: physics.BodyId) ?Entity {
@@ -744,6 +940,14 @@ pub const System = struct {
 /// bit-identical in the common case. An epsilon here would let a body that
 /// gameplay nudged by less than the epsilon drift silently — a small,
 /// hard-to-find authority bug traded for a few nanoseconds.
+fn shapeBits(id: physics.ShapeId) u64 {
+    return @as(u64, id.index) | (@as(u64, id.generation) << 32);
+}
+
+fn tierOf(rb: *const RigidBody2D) Tier {
+    return @enumFromInt(@min(rb.tier, activity_mod.tier_count - 1));
+}
+
 fn sameVelocity(a: physics.Vec2, b: physics.Vec2) bool {
     return a.x == b.x and a.y == b.y;
 }
