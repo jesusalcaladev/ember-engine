@@ -37,6 +37,7 @@ pub const lexer = highlight;
 pub const parser = @import("lang/lua/parser.zig");
 pub const diagnostics = @import("lang/lua/diagnostics.zig");
 pub const complete = @import("lang/lua/complete.zig");
+pub const help = @import("lang/lua/help.zig");
 
 // Short names for what the UI layer imports constantly. `Token` is a highlighted
 // run; `Span` is a plain byte range, and the two names are kept distinct because

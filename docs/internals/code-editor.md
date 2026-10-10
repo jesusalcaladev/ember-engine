@@ -16,6 +16,7 @@ engine.tokenize Lua -> coloured spans           lang/lua/lexer.zig
 engine.parse      Lua -> tree, with recovery      lang/lua/parser.zig
 engine.diagnostics parse + metadata -> the lens   lang/lua/diagnostics.zig
 engine.complete    what to offer at the caret   lang/lua/complete.zig
+engine.help        hover / Ctrl+Click help      lang/lua/help.zig
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -27,7 +28,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 96 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 101 tests.
 
 ## Where it may allocate
 
@@ -171,10 +172,27 @@ rank is deliberately simple — a local beats the API, an exact prefix beats a f
 one, shorter beats longer — because a scoring function nobody can explain is one
 nobody can tune when it guesses wrong.
 
+## Hover, and what the definition of a word is
+
+ROADMAP M5.5 wants the whole API one Ctrl+Click away. `nameAt` answers "what is
+this name" and the registry answers the rest: a signature, a one-line summary,
+typed parameters with defaults and notes, typed returns, and the runnable example
+that every binding is required to carry — so the panel shows a complete row for
+every entry, never an empty one.
+
+The interesting decision is what a *name* is. `actor.get_position` is one name,
+not three: a click on `position` resolves the whole path, because `position` on
+its own is not a thing that exists. A click right after a dot resolves the name
+being typed to its right, which is empty while nothing has been typed — it says
+nothing rather than offering the table twice. And a click on a local resolves to
+its nearest previous declaration, because a rebind shadows the earlier one and
+the user is asking about the name as it reads there.
+
 ## What is deliberately not here
 
-- **Tabs, split panes, the help panel, Ctrl+Click.** Those are M5.5 UI work and
-  they consume this module rather than extending it.
+- **Tabs, split panes, the help PANEL, Ctrl+Click wiring.** Those are M5.5 UI
+  work and they consume this module rather than extending it; the data they need
+  is here (`hover`, `complete`).
 - **An LSP.** Stubs ship at v1; the LSP is post-1.0 (ROADMAP §Post-1.0).
 
 ## Running it
@@ -191,4 +209,5 @@ zig build test          # the editor suite runs first, in milliseconds
 | `lang/lua/parser.zig` | 16 — recovery, spans, calls, scopes, the depth guard, garbage that cannot loop |
 | `lang/lua/diagnostics.zig` | 13 — every rule, in both directions, at scale |
 | `lang/lua/complete.zig` | 11 — context, scope, ranking, snippets |
+| `lang/lua/help.zig` | 5 — hover from the registry, hover on a local, the path under the caret |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |
