@@ -26,6 +26,11 @@ The API is **unit-agnostic**: positions and distances are in world units (pixels
 
 All `actor` methods take `self` as their first argument — the behavior's `self` table, which carries the entity handle. `self` can also be another actor's `self` table when passing an "other" actor.
 
+> Rigid-body methods — `actor.set_linear_velocity`, `actor.get_linear_velocity`,
+> `actor.apply_impulse`, `actor.is_awake` — are documented with the rest of the
+> physics surface, under [`physics`](#physics), because the rule they share
+> ("write the component, never the solver") only makes sense next to each other.
+
 ### `actor.get_position(self)`
 
 | | |

@@ -46,6 +46,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 - [ECS](reference/ecs-entities.md) — Entities, components, actors, queries
 - [Rendering](reference/render-pipeline.md) — Pipeline, batching, atlas
 - [Scripting](reference/script-behaviors.md) — Behaviors, state machines, hot-reload
+- [Physics](reference/physics-overview.md) — Port, bodies, shapes, the sync contract
 
 ### Level 4 — I want to build real games
 
@@ -53,6 +54,23 @@ New to Ember? Follow this path. Each step builds on the previous one.
 - [First Game](guides/first-game.md) — A complete collector game tutorial
 - [State Machines](reference/script-state-machines.md) — Declarative state management
 - [Steering Behaviors](reference/script-lua-api.md#steer) — AI movement
+- [Collision Layers](reference/ecs-collision-layers.md) — What hits what, by name
+- [Open World Physics](reference/physics-open-world.md) — 200k bodies at 60 Hz
+
+---
+
+## Reference index
+
+| Topic | Document |
+|---|---|
+| Lua bindings (every function) | [script-lua-api](reference/script-lua-api.md) |
+| Physics: port, bodies, sync | [physics-overview](reference/physics-overview.md) |
+| Physics: activity tiers, open world | [physics-open-world](reference/physics-open-world.md) |
+| Collision layers & tuning | [ecs-collision-layers](reference/ecs-collision-layers.md) |
+| Components (all 10) | [ecs-components](reference/ecs-components.md) |
+| Entities, actors, queries, signals, hierarchy, serialization | [ecs-entities](reference/ecs-entities.md) and siblings |
+| Math, random, noise, time | `core-*` |
+| Rendering | `render-*` |
 
 ---
 
@@ -103,6 +121,7 @@ Ember exposes a small set of global tables to Lua scripts:
 | `rand` | Deterministic RNG: seed, float, int, chance, gauss, shuffle |
 | `noise` | Procedural noise: value, perlin, simplex, fbm, ridged |
 | `sm` | Declarative state machines: add_state, add_transition, fire, state |
+| `physics` | Rigid-body queries: cast_ray, line_of_sight, stats, set_view, set_focus |
 | `world` | Spatial queries: `world.nearby` |
 | `steer` | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 
