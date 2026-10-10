@@ -100,6 +100,17 @@ pub fn build(b: *std.Build) void {
     script_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
     script_mod.linkSystemLibrary("luajit-5.1", .{});
 
+    // ── Editor module (M5.5: the non-UI half of the code editor) ─────────────
+    // Depends on nothing. A document, a cursor, a highlighter and a find engine
+    // are pure Zig, which is exactly why they are built and tested here rather
+    // than inside the editor UI: no Dawn, no window, no ImGui. The UI half of
+    // M5.5 consumes this the way the renderer consumes a batcher.
+    const editor_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/editor/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── Engine module (public boundary: core + platform + render) ───────────
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/root.zig"),
@@ -320,6 +331,13 @@ pub fn build(b: *std.Build) void {
 
     // ── Tests ───────────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run the engine core and ECS tests");
+
+    // M5.5: the editor core, before anything else in the list, because it is the
+    // one that has to stay green while the UI is being designed — and because it
+    // runs in milliseconds with no window, so there is no excuse for not running
+    // it on every change.
+    const editor_tests = b.addTest(.{ .root_module = editor_mod });
+    test_step.dependOn(&b.addRunArtifact(editor_tests).step);
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);

@@ -84,8 +84,10 @@ pub const Finder = struct {
     /// would find the same match again, which is why it is exactly one pass.
     pub fn findNext(self: *const Finder, text: []const u8, from: u32) ?Match {
         if (self.needle.len == 0) return null;
-        if (findFrom(text, self.needle, from, self.options)) |m| return m;
-        if (self.options.wrap and from > 0) return findFrom(text, self.needle, 0, self.options);
+        if (findFrom(text, self.needle, from, self.options, .forward, from)) |m| return m;
+        if (self.options.wrap and from > 0) {
+            return findFrom(text, self.needle, 0, self.options, .forward, 0);
+        }
         return null;
     }
 
@@ -94,10 +96,10 @@ pub const Finder = struct {
         if (self.needle.len == 0) return null;
         // A search backwards starts from the last position that could still
         // contain a full match.
-        const start = @min(from, text.len);
+        const start = @min(from, @as(u32, @intCast(text.len)));
         if (findFrom(text, self.needle, 0, self.options, .backward, start)) |m| return m;
         if (self.options.wrap and from < text.len) {
-            return findFrom(text, self.needle, 0, self.options, .backward, text.len);
+            return findFrom(text, self.needle, 0, self.options, .backward, @intCast(text.len));
         }
         return null;
     }
@@ -109,7 +111,7 @@ pub const Finder = struct {
         if (self.needle.len == 0) return out.toOwnedSlice(allocator);
 
         var at: u32 = 0;
-        while (findFrom(text, self.needle, at, self.options)) |m| {
+        while (findFrom(text, self.needle, at, self.options, .forward, at)) |m| {
             try out.append(allocator, m);
             // Step by one byte rather than by the match length, so overlapping
             // matches (`aa` in `aaaa`) are all reported. The highlighter wants
@@ -137,8 +139,8 @@ pub fn replaceAll(
     if (needle.len == 0) return 0;
     const text = buffer.textBytes();
 
-    var finder = Finder{ .needle = needle, .options = options };
-    var matches = try finder.findAll(allocator, text);
+    const finder = Finder{ .needle = needle, .options = options };
+    const matches = try finder.findAll(allocator, text);
     defer allocator.free(matches);
     if (matches.len == 0) return 0;
 
@@ -170,45 +172,74 @@ pub fn replaceAll(
 
 const Direction = enum { forward, backward };
 
-/// The first match at or after `from` (or at or before `until`, backwards),
-/// honouring `whole_word`.
+/// The first match at or after `from` (forward), or the last one at or before
+/// `until` (backward), honouring `whole_word`.
+///
+/// One function for both directions, with the search space narrowing on the way
+/// back. A separate `findPrev` that scanned forwards and kept the last hit would
+/// work, and would be O(n) per call instead of O(remaining) — which is the
+/// difference between a search that feels instant on a 5 000-line file and one
+/// that does not.
 fn findFrom(
     text: []const u8,
     needle: []const u8,
     from: u32,
     options: Options,
-) ?Match {
-    return findFromDir(text, needle, from, options, .forward, from);
-}
-
-fn findFromDir(
-    text: []const u8,
-    needle: []const u8,
-    from: u32,
-    options: Options,
     dir: Direction,
-    until: u32,
+    until_in: u32,
 ) ?Match {
-    if (needle.len > text.len) return null;
+    if (needle.len == 0 or needle.len > text.len) return null;
+    var until = until_in;
     var at: usize = from;
     while (true) {
-        const found = switch (dir) {
-            .forward => std.mem.indexOfPos(u8, text, at, needle),
-            .backward => std.mem.lastIndexOf(u8, text[0..until], needle),
+        const found: ?usize = switch (dir) {
+            .forward => indexOfFolded(text, at, needle, options.case_sensitive),
+            .backward => lastIndexOfFolded(text, until, needle, options.case_sensitive),
         };
-        const at_found = found orelse return null;
-        if (!options.whole_word or wordBoundary(text, at_found, needle.len)) {
-            return .{ .start = @intCast(at_found), .len = @intCast(needle.len) };
+        const hit = found orelse return null;
+        if (!options.whole_word or wordBoundary(text, hit, needle.len)) {
+            return .{ .start = @intCast(hit), .len = @intCast(needle.len) };
         }
-        // Not a word boundary: keep looking. Forward steps past it; backward has
-        // to narrow the search space, because `lastIndexOf` would find the same
-        // non-boundary again.
         switch (dir) {
-            .forward => at = at_found + 1,
-            .backward => return findFromDir(text, needle, 0, options, .backward, at_found),
+            // Forward: step past this non-boundary hit.
+            .forward => {
+                at = hit + 1;
+                if (at + needle.len > text.len) return null;
+            },
+            // Backward: narrow the space, because the same non-boundary hit would
+            // be found again by `lastIndexOf` on the same range.
+            .backward => {
+                if (hit == 0) return null;
+                until = @intCast(hit);
+            },
         }
-        if (at + needle.len > text.len) return null;
     }
+}
+
+/// `indexOfPos` when case-sensitive; a folded scan when not.
+///
+/// The folded path is a plain byte loop rather than a lowercased copy of the
+/// text: allocating a second copy of the file per keystroke is exactly the
+/// allocation an editor should not make, and ASCII folding is enough for the
+/// identifiers people actually search for in code.
+fn indexOfFolded(text: []const u8, from: usize, needle: []const u8, case_sensitive: bool) ?usize {
+    if (case_sensitive) return std.mem.indexOfPos(u8, text, from, needle);
+    var i: usize = from;
+    while (i + needle.len <= text.len) : (i += 1) {
+        if (matchesFolded(text, i, needle)) return i;
+    }
+    return null;
+}
+
+fn lastIndexOfFolded(text: []const u8, until: u32, needle: []const u8, case_sensitive: bool) ?usize {
+    const end = @min(until, @as(u32, @intCast(text.len)));
+    if (case_sensitive) return std.mem.lastIndexOf(u8, text[0..end], needle);
+    var i: usize = end;
+    while (i >= needle.len) : (i -= 1) {
+        const at = i - needle.len;
+        if (matchesFolded(text, at, needle)) return at;
+    }
+    return null;
 }
 
 /// True when the bytes either side of a candidate are not identifier bytes.
@@ -277,14 +308,15 @@ test "find is case-insensitive by default and sensitive on request" {
 }
 
 test "whole word does not match inside a longer identifier" {
-    const text = "max box maxbox x";
-    const insensitive = first(text, "box", 0, .{ .whole_word = true });
-    try testing.expectEqual(@as(u32, 4), insensitive.?.start);
+    // "maxbox" contains "box" at offset 3, so a whole-word search must skip it.
+    const text = "maxbox box maxbox x";
+    const whole = first(text, "box", 0, .{ .whole_word = true });
+    try testing.expectEqual(@as(u32, 7), whole.?.start);
     // Without it, the first hit is inside `maxbox`.
     const any = first(text, "box", 0, .{});
-    try testing.expectEqual(@as(u32, 1), any.?.start);
-    // And a needle at the very start and very end still counts as a word.
-    try testing.expectEqual(@as(u32, 15), first(text, "x", 0, .{ .whole_word = true }).?.start);
+    try testing.expectEqual(@as(u32, 3), any.?.start);
+    // And a needle at the very end still counts as a word.
+    try testing.expectEqual(@as(u32, 18), first(text, "x", 0, .{ .whole_word = true }).?.start);
 }
 
 test "findAll finds every match in order" {
