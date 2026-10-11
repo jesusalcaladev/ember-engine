@@ -1,9 +1,10 @@
 //! `engine.editor` — the in-engine code editor (ROADMAP M5.5).
 //!
 //! Godot writes Lua inside the editor, and this is the part of that which has
-//! nothing to do with a UI: a text document, a cursor, a highlighter and a find
-//! engine. The ImGui half of M5.5 (tabs, popups, the help panel) consumes this
-//! the way the renderer consumes a batcher.
+//! nothing to do with a UI: a text document, a cursor, a highlighter, a Lua
+//! parser, an error lens, completion, hover, an outline, goto-definition and a
+//! find engine. The ImGui half of M5.5 (tabs, popups, the help panel) consumes
+//! this the way the renderer consumes a batcher.
 //!
 //! ## Why the non-UI half is built first
 //!
@@ -26,6 +27,26 @@
 //! freely and says so — what it must not do is allocate per rendered frame for
 //! state that did not change. Every mutation returns the span it touched, so the
 //! UI re-tokenizes one line instead of the whole file when a character is typed.
+//!
+//! ## The map
+//!
+//! ```
+//! doc/       text with no language in it: buffer, cursor, find
+//! lang/lua/  the Lua layer:
+//!   lexer       tokens -> coloured spans
+//!   parser      tokens -> tree, with recovery
+//!   resolve     which declaration is this name naming (shared)
+//!   diagnostics parse + API registry -> the error lens
+//!   complete    what to offer at the caret
+//!   help        hover / Ctrl+Click
+//!   outline     the file as a tree
+//!   goto        definition and references
+//! ```
+//!
+//! The rule that keeps it legible: `doc/` never mentions Lua, and `lang/lua/` is
+//! where a language is allowed to be understood. Everything here speaks byte
+//! offsets, so the UI layer converts once and never thinks about multi-byte
+//! characters again.
 
 const std = @import("std");
 
@@ -38,6 +59,9 @@ pub const parser = @import("lang/lua/parser.zig");
 pub const diagnostics = @import("lang/lua/diagnostics.zig");
 pub const complete = @import("lang/lua/complete.zig");
 pub const help = @import("lang/lua/help.zig");
+pub const resolve = @import("lang/lua/resolve.zig");
+pub const outline = @import("lang/lua/outline.zig");
+pub const goto = @import("lang/lua/goto.zig");
 
 // Short names for what the UI layer imports constantly. `Token` is a highlighted
 // run; `Span` is a plain byte range, and the two names are kept distinct because

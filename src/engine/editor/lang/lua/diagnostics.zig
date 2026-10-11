@@ -37,6 +37,7 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
 const api_meta = @import("api_meta");
+const resolve = @import("resolve.zig");
 
 /// How loud a problem is, in the vocabulary the lens draws with: an error stops
 /// the script, a warning is almost certainly wrong, a hint is worth knowing.
@@ -94,17 +95,13 @@ pub fn analyze(allocator: std.mem.Allocator, src: []const u8, parsed: parser.Res
     // answered by the nearest declaration in an enclosing scope that comes
     // BEFORE it, which is exactly Lua's rule: a local is not in scope before
     // its own declaration, so `print(x); local x = 1` reads a global.
-    var decls: std.ArrayListUnmanaged(Decl) = .empty;
-    defer decls.deinit(allocator);
-    for (parsed.uses) |u| {
-        if (u.kind != .decl) continue;
-        try decls.append(allocator, .{ .start = u.start, .len = u.len, .scope = u.scope });
-    }
+    const decls = try resolve.declarations(allocator, parsed);
+    defer allocator.free(decls);
 
     // ── Names that resolve to nothing ──────────────────────────────────────
     for (parsed.uses) |u| {
         if (u.kind != .read) continue;
-        if (resolve(parsed.scopes, decls.items, u, src)) continue;
+        if (resolve.resolves(parsed.scopes, decls, u, src)) continue;
         const name = src[u.start .. u.start + u.len];
         if (isKnownGlobal(name)) continue;
         try out.append(allocator, .{
@@ -120,7 +117,7 @@ pub fn analyze(allocator: std.mem.Allocator, src: []const u8, parsed: parser.Res
     // passes would build the same table twice.
     for (parsed.symbols) |sym| {
         if (sym.kind != .local) continue;
-        const decl = declOf(decls.items, sym) orelse continue;
+        const decl = resolve.declOf(decls, sym) orelse continue;
         const name = parser.Result.name(src, sym);
         // `_` and `_unused` are the convention for "deliberately not read",
         // and honouring it is what keeps the rule from being noise.
@@ -129,7 +126,7 @@ pub fn analyze(allocator: std.mem.Allocator, src: []const u8, parsed: parser.Res
         var reads: usize = 0;
         for (parsed.uses) |u| {
             if (u.kind != .read) continue;
-            if (!readsLocal(parsed.scopes, u, decl, src)) continue;
+            if (!readsLocal(parsed, u, decl, src)) continue;
             reads += 1;
         }
         if (reads == 0) {
@@ -144,7 +141,7 @@ pub fn analyze(allocator: std.mem.Allocator, src: []const u8, parsed: parser.Res
         // Shadowing is a hint rather than a warning because Lua programmers do
         // it on purpose: `for _, item in ipairs(x)` inside a function that
         // also has an `item` is idiomatic, not a mistake.
-        if (shadowsOuter(parsed.scopes, decls.items, decl, src)) {
+        if (shadowsOuter(parsed.scopes, decls, decl, src)) {
             try out.append(allocator, .{
                 .start = sym.name_start,
                 .len = sym.name_len,
@@ -201,67 +198,29 @@ pub fn analyze(allocator: std.mem.Allocator, src: []const u8, parsed: parser.Res
     return out.toOwnedSlice(allocator);
 }
 
-// ─── Name resolution ──────────────────────────────────────────────────────────
-
-/// Does `use` name a declaration that is in scope, and precedes it?
-fn resolve(scopes: []const parser.Scope, decls: []const Decl, use: parser.Use, src: []const u8) bool {
-    const name = src[use.start .. use.start + use.len];
-    var scope = use.scope;
-    while (true) {
-        for (decls) |d| {
-            if (d.scope != scope) continue;
-            if (d.start >= use.start) continue;
-            if (!std.mem.eql(u8, src[d.start .. d.start + d.len], name)) continue;
-            return true;
-        }
-        const parent = scopes[scope].parent;
-        if (parent == no_scope) return false;
-        scope = parent;
-    }
-}
-
-/// A declaration, in the only form name resolution needs: where the name is,
-/// and which scope it belongs to. Kept as its own list rather than read from
-/// the parse results because `local x` is both a symbol and a use, and the
-/// uses list already has both in one shape.
-const Decl = struct { start: u32, len: u32, scope: u32 };
+// ─── Name resolution, shared with goto and completion ────────────────────────
+// `resolve.resolution` answers "which declaration is this name", and the rules
+// that need the answer live there so they can exist once. What is left here is
+// the one rule that is diagnostics-only: a local is unused when NOTHING reads
+// it, and a read only counts when it actually resolves to THIS declaration.
+// Two locals with the same name in different scopes are two variables, and the
+// first one is still unused if the second one is being read.
 
 const no_scope = parser.no_scope;
 
 /// Does this read resolve to THIS local, and not to some other one? Used to
 /// decide whether the local was ever used.
-fn readsLocal(scopes: []const parser.Scope, use: parser.Use, decl: Decl, src: []const u8) bool {
+fn readsLocal(parsed: parser.Result, use: parser.Use, decl: resolve.Decl, src: []const u8) bool {
     if (!std.mem.eql(u8, src[use.start .. use.start + use.len], src[decl.start .. decl.start + decl.len])) return false;
-    // The read must come after the declaration, and be in it: `local x = 1`
-    // followed by a read of a different `x` in a scope that does not descend
-    // from it is a different variable, and the first one is still unused.
     if (use.start < decl.start) return false;
-    return scopeContains(scopes, use.scope, decl.scope);
-}
-
-/// The declaration that IS this local's name. A local symbol and its `decl` use
-/// carry the same name offset, so the identity is the offset — which is also
-/// the only reason this function is not a lookup by name.
-fn declOf(decls: []const Decl, sym: parser.Symbol) ?Decl {
-    for (decls) |d| {
-        if (d.start == sym.name_start and d.len == sym.name_len) return d;
-    }
-    return null;
-}
-
-/// Is `inner` the same scope as `outer`, or inside it?
-fn scopeContains(scopes: []const parser.Scope, inner: u32, outer: u32) bool {
-    var scope = inner;
-    while (true) {
-        if (scope == outer) return true;
-        const parent = scopes[scope].parent;
-        if (parent == no_scope) return false;
-        scope = parent;
-    }
+    // The read has to sit inside the declaration's scope: a read of a name
+    // spelled the same in an unrelated scope does not count, and counting it
+    // would excuse a genuinely unused local.
+    return resolve.containsScope(parsed.scopes, use.scope, decl.scope);
 }
 
 /// Does an enclosing scope already have this name, declared before this one?
-fn shadowsOuter(scopes: []const parser.Scope, decls: []const Decl, decl: Decl, src: []const u8) bool {
+fn shadowsOuter(scopes: []const parser.Scope, decls: []const resolve.Decl, decl: resolve.Decl, src: []const u8) bool {
     // The search starts one level out: the declaration's own scope is where the
     // name is being introduced, and a redeclaration in the SAME scope is a
     // rebind, not a shadow — Lua programs do that freely.

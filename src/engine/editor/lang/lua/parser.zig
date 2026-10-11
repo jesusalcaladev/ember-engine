@@ -1104,8 +1104,14 @@ const Parser = struct {
         try self.expectOp(")");
         try self.blockIn(params[0..n]);
         try self.closeBlock(body_start);
+        // A parameter's span is its own name, and nothing more. Starting it at
+        // the block would sort it before the function it belongs to (same start
+        // offset, wider span, wrong row order); running it to the end of the
+        // body would make it the parent of everything declared inside, which is
+        // a tree with the parameters at the wrong level. The name is also what
+        // a jump should highlight, so the two requirements agree.
         for (params[0..n]) |t| {
-            try self.recordSymbol(t, body_start, self.prev_end - body_start, .param);
+            try self.recordSymbol(t, t.start, t.len, .param);
         }
     }
 
@@ -1127,10 +1133,12 @@ const Parser = struct {
     /// call. Assignment slips in here because it starts like one.
     fn exprStat(self: *Parser) V {
         var targets: [8]u32 = undefined;
+        var plains: [8]bool = undefined;
         var n_targets: usize = 0;
         const s = try self.suffixedExpr();
         if (s.read_idx) |i| if (n_targets < targets.len) {
             targets[n_targets] = i;
+            plains[n_targets] = s.plain_name;
             n_targets += 1;
         };
         if (self.tokIs(",") or self.tokIs("=")) {
@@ -1141,13 +1149,18 @@ const Parser = struct {
                 if (!lhs.assignable) try self.errAt(.cannot_assign, lhs.start_tok);
                 if (lhs.read_idx) |i| if (n_targets < targets.len) {
                     targets[n_targets] = i;
+                    plains[n_targets] = lhs.plain_name;
                     n_targets += 1;
                 };
             }
-            // Now that the grammar has said this is an assignment, the left
-            // side is being written. Re-labelling is why `recordName` hands
-            // back an index.
-            for (targets[0..n_targets]) |i| self.uses.items[i].kind = .assign;
+            // The grammar has said this is an assignment, and only a bare name
+            // on the left is being WRITTEN: `x = 1` writes x; `x.y = 1` reads x
+            // and writes a field of it. Re-labelling the latter as a write would
+            // exempt every misspelled table from the unknown-global check, which
+            // is why `recordName` hands back an index instead of deciding here.
+            for (targets[0..n_targets], 0..) |i, k| {
+                if (plains[k]) self.uses.items[i].kind = .assign;
+            }
             try self.expectOp("=");
             try self.exprlist();
             return;
@@ -1167,6 +1180,7 @@ const Parser = struct {
         if (self.tok.kind == .name) {
             s.read_idx = try self.recordName(.read);
             s.assignable = true;
+            s.plain_name = true;
             try self.advance();
         } else if (self.tokIs("(")) {
             try self.advance();
@@ -1178,9 +1192,11 @@ const Parser = struct {
         }
         while (true) {
             if (self.tokIs(".")) {
+                s.plain_name = false;
                 try self.advance();
                 try self.expectName();
             } else if (self.tokIs("[")) {
+                s.plain_name = false;
                 try self.advance();
                 try self.expr();
                 try self.expectOp("]");
@@ -1365,6 +1381,11 @@ const Suffixed = struct {
     /// statement that sees the whole expression decides whether that name was
     /// read or written.
     read_idx: ?u32 = null,
+    /// True when the whole expression is one name with no suffixes. `x = 1`
+    /// writes `x`; `x.y = 1` READS `x` and writes a field of it, and marking
+    /// `x` as a write would exempt a misspelled table from the unknown-global
+    /// check.
+    plain_name: bool = false,
 };
 
 fn argKindOf(t: Token, src: []const u8) ArgKind {

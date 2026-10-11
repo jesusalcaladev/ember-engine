@@ -758,7 +758,7 @@ test "the line index survives any sequence of random edits" {
     var step: usize = 0;
     while (step < 400) : (step += 1) {
         const text_len: u32 = @intCast(b.byteLen());
-        switch (rand.enumValue(enum { insert, delete, replace }) ) {
+        switch (rand.enumValue(enum { insert, delete, replace })) {
             .insert => {
                 const pos = rand.intRangeAtMost(u32, 0, text_len);
                 var n = rand.intRangeAtMost(u8, 1, 6);

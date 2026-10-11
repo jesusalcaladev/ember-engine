@@ -16,7 +16,9 @@ engine.tokenize Lua -> coloured spans           lang/lua/lexer.zig
 engine.parse      Lua -> tree, with recovery      lang/lua/parser.zig
 engine.diagnostics parse + metadata -> the lens   lang/lua/diagnostics.zig
 engine.complete    what to offer at the caret   lang/lua/complete.zig
-engine.help        hover / Ctrl+Click help      lang/lua/help.zig
+engine.help         hover / Ctrl+Click         lang/lua/help.zig
+engine.goto         definition + references     lang/lua/goto.zig
+engine.outline      the file as a tree          lang/lua/outline.zig
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -28,7 +30,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 101 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 121 tests.
 
 ## Where it may allocate
 
@@ -188,8 +190,36 @@ nothing rather than offering the table twice. And a click on a local resolves to
 its nearest previous declaration, because a rebind shadows the earlier one and
 the user is asking about the name as it reads there.
 
+## Navigation: one rule, three consumers
+
+"Which declaration is this name naming?" is answered once, in `resolve.zig`, and
+every navigational feature reads the answer from there rather than deriving its
+own. The rule is Lua's: the nearest declaration of that name, in an enclosing
+scope, **declared before the use**. Both halves matter. The "before" is what makes
+`print(x); local x = 1` read a global — a forward reference resolves to nothing
+local, which is exactly correct and exactly what Lua does. The "nearest" is what
+makes a shadowed name resolve to the inner binding, so a file with two locals
+called `x` gets two reference lists rather than one wrong one.
+
+On top of that one rule:
+
+- **Goto-definition** returns one byte range — the whole declaration, because a
+  jump that selects a name is a jump the user then has to scroll out of.
+- **Find-all-references** returns the declaration plus every use that resolves to
+  it, in source order. The difference between "every place this name is used" and
+  "every place this name is spelled" is the resolution step, and it is why a
+  second `x` in an unrelated scope does not show up in the first one's list.
+- **The outline** is a tree built from the same symbols: a row's parent is the
+  shortest declaration strictly containing it. A parameter's span is its own name
+  and nothing more — starting it at the block would sort it above the function it
+  belongs to, and running it to the end of the body would make it the parent of
+  everything declared inside.
+
 ## What is deliberately not here
 
+- **Rename.** It needs the buffer's edit API and a name that resolves, which is
+  the same resolution this module already does; it is the natural next step and
+  it is UI work until then.
 - **Tabs, split panes, the help PANEL, Ctrl+Click wiring.** Those are M5.5 UI
   work and they consume this module rather than extending it; the data they need
   is here (`hover`, `complete`).
@@ -210,4 +240,7 @@ zig build test          # the editor suite runs first, in milliseconds
 | `lang/lua/diagnostics.zig` | 13 — every rule, in both directions, at scale |
 | `lang/lua/complete.zig` | 11 — context, scope, ranking, snippets |
 | `lang/lua/help.zig` | 5 — hover from the registry, hover on a local, the path under the caret |
+| `lang/lua/resolve.zig` | 6 — the rule itself: nearest declaration, before the use, innermost scope first |
+| `lang/lua/outline.zig` | 5 — nesting, the functions-only view, ordering, the empty file |
+| `lang/lua/goto.zig` | 6 — definition, references, shadowing, the names that go nowhere |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |

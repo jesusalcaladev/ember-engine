@@ -409,6 +409,30 @@ test "locals in scope are offered, and locals from other scopes are not" {
     try testing.expect(!has(t, "not_here"));
 }
 
+test "a parameter completes inside its own function" {
+    // The span of a parameter is its own name, so the outline and the scope
+    // agree about which rows are children of which: this is the completion half
+    // of that.
+    const src =
+        \\function wrap(first, second)
+        \\    return seco
+        \\end
+    ;
+    // An empty prefix, so both parameters survive the filter: the question is
+    // whether they are offered at all, not what the ranking does with them.
+    const at: u32 = @intCast(std.mem.indexOf(u8, src, "return seco").? + "return ".len);
+    const t = try completeLabels(src, at);
+    defer freeLabels(t);
+    try testing.expect(has(t, "second"));
+    try testing.expect(has(t, "first"));
+    // And a prefix narrows to the one that matches, which is the half that makes
+    // the empty case useful rather than noisy.
+    const filtered = try completeLabels(src, at + 4);
+    defer freeLabels(filtered);
+    try testing.expect(has(filtered, "second"));
+    try testing.expect(!has(filtered, "first"));
+}
+
 test "a local declared after the caret is not offered" {
     const src = "local x = a\nlocal alias = 1";
     const t = try completeLabels(src, 5);
