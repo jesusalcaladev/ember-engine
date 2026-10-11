@@ -24,6 +24,12 @@
 const std = @import("std");
 const core_math = @import("core").math;
 const entity = @import("entity.zig");
+// Aliases the rest of the engine reads this file through. Added rather than
+// rewriting the six existing call sites: the spelling `ecs.Entity` /
+// `math.Rect2` is what `world.zig` and the rest of the ECS already use, so a
+// file that matched it needed a shim, and a shim is cheaper than churn.
+const ecs = entity;
+const math = core_math;
 
 pub const Entity = entity.Entity;
 pub const SceneId = entity.SceneId;
@@ -100,6 +106,126 @@ pub const Transform = struct {
             .scale = self.prev_scale.lerp(self.scale, alpha),
         };
     }
+};
+
+/// Camera2D: Unity-level 2D camera with follow, zoom, shake, limits, deadzone, look-ahead.
+/// Follows a target entity with configurable damping, supports screen shake (trauma-based),
+/// zoom with min/max and smooth transitions, world limits, deadzone, look-ahead,
+/// area overrides, and pixel-perfect snapping.
+///
+/// All fields are plain data (spec §7). The CameraSystem updates _offset, _velocity,
+/// _target_zoom, _trauma_timer internally each frame.
+pub const Camera2D = struct {
+    /// Entity to follow. invalid = no target.
+    target: ecs.Entity = ecs.NULL_ENTITY,
+    /// Whether to follow the target.
+    follow_enabled: bool = true,
+    /// Deadzone around camera center (in world units). Target must leave this rect
+    /// before camera moves. Negative values = disabled.
+    deadzone: math.Rect2 = math.Rect2{ .min = .{ .x = -1, .y = -1 }, .max = .{ .x = -1, .y = -1 } },
+    /// Follow damping (critically damped spring). Higher = snappier.
+    damping: f32 = 5.0,
+    /// Look-ahead factor (0..1). Anticipates target velocity.
+    look_ahead: f32 = 0.0,
+
+    // Zoom
+    zoom: f32 = 1.0,
+    min_zoom: f32 = 0.1,
+    max_zoom: f32 = 10.0,
+    zoom_damping: f32 = 8.0,
+
+    // Screen shake (trauma-based)
+    trauma: f32 = 0.0,
+    trauma_power: f32 = 2.0,
+    trauma_decay: f32 = 1.0,
+    shake_frequency: f32 = 25.0,
+    shake_amplitude: f32 = 10.0,
+
+    // World limits
+    limits_enabled: bool = false,
+    limits: math.Rect2 = math.Rect2{ .min = .{ .x = -10000, .y = -10000 }, .max = .{ .x = 10000, .y = 10000 } },
+
+    // Area override (set by CameraSystem when entering override area)
+    area_override: ?AreaOverride = null,
+
+    // Pixel perfect
+    pixel_perfect: bool = false,
+
+    // Internal state (updated by CameraSystem each frame)
+    _offset: math.Vec2 = .{ .x = 0, .y = 0 },
+    _velocity: math.Vec2 = .{ .x = 0, .y = 0 },
+    _target_zoom: f32 = 1.0,
+    _trauma_timer: f32 = 0.0,
+
+    // Methods
+    pub fn follow(self: *Camera2D, target: ecs.Entity) void {
+        self.target = target;
+        self.follow_enabled = true;
+    }
+
+    pub fn unfollow(self: *Camera2D) void {
+        self.follow_enabled = false;
+    }
+
+    pub fn add_trauma(self: *Camera2D, amount: f32) void {
+        self.trauma = math.min(self.trauma + amount, 1.0);
+    }
+
+    pub fn set_zoom(self: *Camera2D, zoom: f32) void {
+        self._target_zoom = math.clamp(zoom, self.min_zoom, self.max_zoom);
+        self.zoom = self._target_zoom;
+    }
+
+    pub fn zoom_to(self: *Camera2D, zoom: f32) void {
+        self._target_zoom = math.clamp(zoom, self.min_zoom, self.max_zoom);
+    }
+
+    pub fn set_limits(self: *Camera2D, limits: math.Rect2, enabled: bool) void {
+        self.limits = limits;
+        self.limits_enabled = enabled;
+    }
+
+    pub fn set_deadzone(self: *Camera2D, deadzone: math.Rect2) void {
+        self.deadzone = deadzone;
+    }
+
+    pub fn set_look_ahead(self: *Camera2D, factor: f32) void {
+        self.look_ahead = math.clamp(factor, 0.0, 1.0);
+    }
+
+    pub fn get_world_rect(self: *Camera2D, viewport: math.Vec2) math.Rect2 {
+        const half_w = viewport.x / (2.0 * self.zoom);
+        const half_h = viewport.y / (2.0 * self.zoom);
+        const center = self._offset;
+        return math.Rect2{
+            .min = .{ .x = center.x - half_w, .y = center.y - half_h },
+            .max = .{ .x = center.x + half_w, .y = center.y + half_h },
+        };
+    }
+
+    pub fn screen_to_world(self: *Camera2D, screen: math.Vec2, viewport: math.Vec2) math.Vec2 {
+        const rect = self.get_world_rect(viewport);
+        return math.Vec2{
+            .x = rect.min.x + screen.x / self.zoom,
+            .y = rect.min.y + screen.y / self.zoom,
+        };
+    }
+
+    pub fn world_to_screen(self: *Camera2D, world: math.Vec2, viewport: math.Vec2) math.Vec2 {
+        const rect = self.get_world_rect(viewport);
+        return math.Vec2{
+            .x = (world.x - rect.min.x) * self.zoom,
+            .y = (world.y - rect.min.y) * self.zoom,
+        };
+    }
+};
+
+/// Area override (triggered by entering an Area2D with CameraOverride)
+const AreaOverride = struct {
+    zoom: ?f32 = null,
+    damping: ?f32 = null,
+    limits: ?math.Rect2 = null,
+    priority: i32 = 0,
 };
 
 /// Parent link. The hierarchy itself is derived by `hierarchy` (flat, no
@@ -556,6 +682,53 @@ pub const StateMachine = struct {
     /// transitions it away and back.
     started: bool = false,
 };
+
+/// Timer: one-shot, looping, or during timer (ROADMAP M4.5).
+///
+/// Driven by TimerSystem each frame. Callbacks are stored as function pointers
+/// in the component for zero-allocation dispatch; Lua timers register via the
+/// TimerSystem API which creates the component and sets the callbacks.
+pub const Timer = struct {
+    /// Timer type
+    type: TimerType = .once,
+    /// Total duration
+    duration: f32 = 1.0,
+    /// Elapsed time
+    elapsed: f32 = 0.0,
+    /// Whether paused
+    paused: bool = false,
+    /// Loop count (for loop type, 0 = infinite)
+    loop_count: u32 = 0,
+    /// Current loop iteration
+    current_loop: u32 = 0,
+    /// Callback on each tick (for during)
+    on_tick: ?*const fn (f32) void = null,
+    /// Callback on complete
+    on_complete: ?*const fn () void = null,
+    /// User data
+    user_data: ?*anyopaque = null,
+};
+
+/// Timer type
+pub const TimerType = enum { once, loop, during };
+
+/// Coroutine: Lua coroutine support with wait() (ROADMAP M4.5).
+///
+/// The scheduler runs in the fixed step. Coroutines are tied to entities and
+/// auto-cleanup on entity destruction.
+pub const Coroutine = struct {
+    /// Lua coroutine reference (registry index)
+    lua_ref: i32 = 0,
+    /// Current state
+    state: CoroutineState = .suspended,
+    /// Wait time remaining (for wait())
+    wait_time: f32 = 0.0,
+    /// Error message if dead with error
+    error_msg: []const u8 = "",
+};
+
+/// Coroutine state
+pub const CoroutineState = enum { running, suspended, dead };
 
 /// A rigid body in the physics world (ROADMAP M4).
 ///

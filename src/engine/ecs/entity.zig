@@ -18,6 +18,11 @@ pub const Entity = extern struct {
     /// maximum index can never be a live slot: slots are appended, never
     /// sparse, and the allocator is far from 4G entity ids.
     pub const invalid: Entity = .{ .index = std.math.maxInt(u32), .generation = 0 };
+    /// The same sentinel under the name the rest of the engine spells it. Two
+    /// names for one value is a real cost and it is paid here on purpose: the
+    /// Zig-idiomatic `invalid` and the C-shaped `NULL_ENTITY` are both in use,
+    /// and deleting either means editing call sites in every subsystem.
+    pub const NULL_ENTITY: Entity = invalid;
 
     pub fn isInvalid(self: Entity) bool {
         return self.index == invalid.index;
