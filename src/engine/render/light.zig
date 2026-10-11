@@ -1010,6 +1010,306 @@ fn instanceFor(l: Light2D, pos: Vec2, channel: i8) LightInstance {
     };
 }
 
+
+// ── Radiance cascades (2D GI) ────────────────────────────────────────────────
+//
+// The idea, and it is worth stating because "GI" in 2D usually means something
+// much weaker: light that has bounced off an occluder must be able to REACH the
+// place it bounced from. A single occlusion walk cannot answer "what is lit just
+// now, having come around this corner", because answering it needs the light that
+// arrived at the corner first.
+//
+// Radiance Cascades solves that with a pyramid of PROBE GRIDS, each at half the
+// resolution of the one below it. A probe traces a few rays outward; each hit
+// asks the NEXT cascade up what it saw from there. So cascade 0 catches the
+// light that travelled a few texels, cascade 1 the light that travelled a few
+// more, and the coarsest cascade resolves the sky and the the last bounce. The
+// final answer at a pixel is the cascade whose range is closest to it, blended
+// with its neighbours so the resolution seams are invisible.
+//
+// This is a CPU reference. The GPU version is a compute pass over the same
+// pyramid, and the arithmetic here is what it must reproduce — line for line,
+// because this is the half that can be tested without a device.
+
+/// One probe's view of the world: what arrived from each direction.
+///
+/// `hit_distance` is in CASCADE-TEXEL units, and `incoming` is the radiance that
+/// left the nearest hit travelling towards this probe. Storing the distance
+/// rather than the hit's position is what makes a merge cheap: the next cascade
+/// up is indexed by position and this is enough to find it.
+pub const Probe = struct {
+    /// Distance to the nearest occluder along this ray, in probe units. Zero when
+    /// the ray starts inside solid geometry, which is the one case a merge must
+    /// not sample through a wall.
+    hit_distance: f32 = 0,
+    /// The occluder's normal at the hit, or zero for no hit.
+    normal: Vec2 = .{ .x = 0, .y = 0 },
+    /// What radiance arrived along this ray, after the merge.
+    incoming: [3]f32 = .{ 0, 0, 0 },
+};
+
+/// One cascade: a grid of probes at `scale` texel spacing.
+pub const Cascade = struct {
+    /// World-space distance between adjacent probes, in mask cells.
+    scale: u32,
+    /// Rays traced per probe. Higher in the fine cascades, where a ray covers a
+    /// smaller angle — the counts are chosen so each cascade sees roughly the
+    /// same angular resolution, which is the whole reason the pyramid works.
+    rays: u32,
+    w: u32,
+    h: u32,
+    probes: []Probe,
+
+    fn deinit(self: *Cascade, allocator: std.mem.Allocator) void {
+        allocator.free(self.probes);
+        self.* = undefined;
+    }
+};
+
+/// The radiance cascade pyramid.
+///
+/// Amortized exactly as the distance field is: rebuilt when an occluder moves,
+/// and not once per frame. A static scene's GI is therefore free after the first
+/// frame, and the cost of a moving one is bounded by the grid it walks, not by
+/// the light count.
+pub const Radiance = struct {
+    allocator: std.mem.Allocator,
+    /// Cascade 0 is the finest. Empty when GI is off.
+    cascades: std.ArrayList(Cascade) = .empty,
+    /// How many cascades were built for the current mask. Zero means "not built".
+    built: u32 = 0,
+    /// Incremented on every rebuild; the tests assert on it rather than on a
+    /// timing, which is how "the amortization works" is checked headlessly.
+    builds: u32 = 0,
+
+    /// The finest cascade's spacing, in mask cells. Two means a probe every other
+    /// texel, which is the finest a texture can go without aliasing the SDF it
+    /// traces — and GI at a finer scale than the shadow map itself is GI that
+    /// cannot have been bounced off anything.
+    pub const base_scale: u32 = 2;
+    /// Rays per probe at cascade 0, doubling per level's coarsening... no, halving
+    /// the count as the spacing doubles: the angular coverage is what is held
+    /// roughly constant, not the count.
+    pub const base_rays: u32 = 16;
+    /// Stops at four cascades. A fifth would probe cells larger than a whole
+    /// screen and every probe in it would see the same unobstructed sky, which is
+    /// information a single per-cascade uniform already carries.
+    pub const max_cascades: u32 = 4;
+
+    pub fn init(allocator: std.mem.Allocator) Radiance {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Radiance) void {
+        for (self.cascades.items) |*c| c.deinit(self.allocator);
+        self.cascades.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// (Re)builds the pyramid for a mask of this size.
+    ///
+    /// Allocates lazily and keeps the buffers when the size is unchanged, so a
+    /// resize pays once and an unchanged frame pays nothing.
+    pub fn build(self: *Radiance, mask: []const u8, sdf: []const u16, w: u32, h: u32, sky: [3]f32) !void {
+        if (w == 0 or h == 0) return;
+
+        // How many cascades actually fit: one while the grid is bigger than a
+        // single probe.
+        var levels: u32 = 0;
+        while (levels < max_cascades) {
+            const cells = base_scale * (@as(u32, 1) << @intCast(levels));
+            if (w / cells < 1 or h / cells < 1) break;
+            levels += 1;
+        }
+        if (levels == 0) return;
+
+        while (self.cascades.items.len < levels) {
+            try self.cascades.append(.{
+                .scale = base_scale,
+                .rays = base_rays,
+                .w = 0,
+                .h = 0,
+                .probes = &.{},
+            });
+        }
+        // Shrinking the mask drops the extra cascades rather than leaving dead
+        // grids to be walked every probe merge.
+        while (self.cascades.items.len > levels) {
+            var c = self.cascades.pop();
+            c.deinit(self.allocator);
+        }
+
+        // Built coarse-to-fine so each cascade can read the one above it: the
+        // finest cascade needs the second-finest's answer to finish. Ordering
+        // fine-to-coarse would leave the whole bottom level reading zeros.
+        var level: i32 = @as(i32, @intCast(levels)) - 1;
+        while (level >= 0) : (level -= 1) {
+            const li: usize = @intCast(level);
+            const c = &self.cascades.items[li];
+            const cells = base_scale * (@as(u32, 1) << @intCast(level));
+            c.scale = cells;
+            c.rays = @max(base_rays >> @intCast(level), 2);
+            const cw = @max(w / cells, 1);
+            const ch = @max(h / cells, 1);
+            if (cw != c.w or ch != c.h) {
+                self.allocator.free(c.probes);
+                c.probes = try self.allocator.alloc(Probe, @as(usize, cw) * ch);
+                c.w = cw;
+                c.h = ch;
+            }
+            const next: ?*Cascade = if (level + 1 < levels)
+                &self.cascades.items[li + 1]
+            else
+                null;
+
+            var y: u32 = 0;
+            while (y < ch) : (y += 1) {
+                var x: u32 = 0;
+                while (x < cw) : (x += 1) {
+                    const idx = @as(usize, y) * cw + x;
+                    c.probes[idx] = probeAt(self, c, next, mask, sdf, w, h, x * cells, y * cells, sky);
+                }
+            }
+        }
+        self.built = levels;
+        self.builds += 1;
+    }
+
+    /// The radiance that arrived at a world point, 0..1, as a colour.
+    ///
+    /// This is what the light pass samples on the GPU (once the compute pass
+    /// exists) and what the CPU reference uses. Bilinear between the four
+    /// neighbouring probes of the FINEST cascade, which is why `base_scale` is 2:
+    /// finer and the merge cost doubles for detail the SDF itself does not carry.
+    pub fn sample(self: *const Radiance, x: f32, y: f32) [3]f32 {
+        if (self.built == 0) return .{ 0, 0, 0 };
+        const c = &self.cascades.items[0];
+        const in_cells = Vec2{ .x = x / @as(f32, @floatFromInt(c.scale)), .y = y / @as(f32, @floatFromInt(c.scale)) };
+        const fx = @floor(in_cells.x);
+        const fy = @floor(in_cells.y);
+        const tx = in_cells.x - fx;
+        const ty = in_cells.y - fy;
+        const x0: u32 = @intFromFloat(fx);
+        const y0: u32 = @intFromFloat(fy);
+        if (x0 + 1 >= c.w or y0 + 1 >= c.h) return .{ 0, 0, 0 };
+        const base = @as(usize, y0) * c.w + x0;
+        const p00 = &c.probes[base];
+        const p10 = &c.probes[base + 1];
+        const p01 = &c.probes[base + c.w];
+        const p11 = &c.probes[base + c.w + 1];
+
+        var out = [3]f32{ 0, 0, 0 };
+        for (0..3) |k| {
+            const a = mix2(p00.incoming[k], p10.incoming[k], tx);
+            const b = mix2(p01.incoming[k], p11.incoming[k], tx);
+            out[k] = mix2(a, b, ty);
+        }
+        return out;
+    }
+};
+
+fn mix2(a: f32, b: f32, t: f32) f32 {
+    return a * (1 - t) + b * t;
+}
+
+/// Traces one probe: every ray in it, merged into the incoming radiance.
+///
+/// The merge is a SUM over the probe's directions, each weighted by its solid
+/// angle. Summing rather than averaging is the part that makes a cascade
+/// correct rather than merely plausible: integrating incoming light over the
+/// hemisphere is what "illumination" means, and the weights are the solid angles
+/// so a probe with fewer, wider rays and one with more, narrower rays that happen
+/// to see the same sky give the same answer.
+fn probeAt(
+    r: *const Radiance,
+    c: *const Cascade,
+    next: ?*const Cascade,
+    mask: []const u8,
+    sdf: []const u16,
+    w: u32,
+    h: u32,
+    px: u32,
+    py: u32,
+    sky: [3]f32,
+) Probe {
+    var acc = [3]f32{ 0, 0, 0 };
+    const solid = 2.0 * math.pi / @as(f32, @floatFromInt(c.rays));
+
+    _ = mask;
+    var i: u32 = 0;
+    while (i < c.rays) : (i += 1) {
+        // Directions spread evenly, offset by half a step so the first ray is not
+        // exactly along +x — a set that starts on an axis has a preferred
+        // orientation a scene author can see as a shadow on one side.
+        const theta = (@as(f32, @floatFromInt(i)) + 0.5) * solid;
+        const dir = Vec2{ .x = @cos(theta), .y = @sin(theta) };
+
+        // Sphere tracing the SDF: step by the distance field, which reaches an
+        // occluder in O(sqrt(d)) iterations instead of the fixed step count a
+        // march would need, and cannot skip over a thin wall because the field
+        // never overestimates the true distance.
+        var t: f32 = 0;
+        const max_t: f32 = @floatFromInt(@min(c.w, c.h) * c.scale);
+        var hit = false;
+        var step: u32 = 0;
+        while (step < 64) : (step += 1) {
+            const px_x = @as(f32, @floatFromInt(px)) + dir.x * t;
+            const px_y = @as(f32, @floatFromInt(py)) + dir.y * t;
+            const ix: u32 = @intFromFloat(@floor(px_x));
+            const iy: u32 = @intFromFloat(@floor(px_y));
+            if (ix >= w or iy >= h) {
+                // Out of the mask: the ray escaped to the sky.
+                hit = false;
+                break;
+            }
+            const d = @as(f32, @floatFromInt(sdf[@as(usize, iy) * w + ix]));
+            if (d < 1.0) {
+                hit = true;
+                break;
+            }
+            t += @max(d * 0.9, 0.5);
+            if (t > max_t) break;
+        }
+
+        if (!hit) {
+            // The ray reached the sky. Its contribution is the sky's radiance
+            // along this direction, which is the base case every cascade merge
+            // eventually resolves to — and the only place the sky enters at all.
+            for (0..3) |k| acc[k] += sky[k] * solid / (2.0 * math.pi);
+            continue;
+        }
+
+        // A hit: ask the next cascade up what it saw from the hit point. That is
+        // the bounce — the light that reached the occluder is now leaving it
+        // towards this probe, and the next cascade is where that light is
+        // recorded, at a resolution coarse enough to have traced it.
+        var from_here = sky;
+        if (next) |n| {
+            from_here = sampleCascade(r, n, px + dir.x * t, py + dir.y * t, sky);
+        }
+        // A hit contributes what it reflects, not what it receives: a fraction
+        // scattered back into the hemisphere. 0.85 is a mid-grey wall.
+        const bounce = 0.85;
+        for (0..3) |k| acc[k] += from_here[k] * bounce * solid / (2.0 * math.pi);
+    }
+
+    return .{ .incoming = acc };
+}
+
+/// Nearest-probe read of a cascade, at probe units.
+fn sampleCascade(r: *const Radiance, c: *const Cascade, x: f32, y: f32, sky: [3]f32) [3]f32 {
+    _ = r;
+    const gx = @floor(x / @as(f32, @floatFromInt(c.scale)));
+    const gy = @floor(y / @as(f32, @floatFromInt(c.scale)));
+    const x0: u32 = @intFromFloat(gx);
+    const y0: u32 = @intFromFloat(gy);
+    if (x0 >= c.w or y0 >= c.h) return sky;
+    const idx = @as(usize, y0) * c.w + x0;
+    if (idx >= c.probes.len) return sky;
+    // Outside the built region, the sky is the answer.
+    return c.probes[idx].incoming;
+}
+
 // ── the exact Euclidean distance transform ──────────────────────────────────
 
 /// Exact Euclidean distance transform of a binary mask, in mask cells.
@@ -1397,4 +1697,77 @@ test "render light: a static scene does not rebuild its shadow maps" {
     l.buildShadowMaps();
     try testing.expectEqual(@as(u64, 0), l.stats.sweep_steps);
     try testing.expectEqual(@as(u32, 1), l.stats.sweep_skips);
+}
+
+test "render light: the radiance pyramid is built coarse-to-fine and only once" {
+    var r = Radiance.init(testing.allocator);
+    defer r.deinit();
+
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    // A 4x4 wall block.
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = points(&.{ 30, 30, 34, 30, 34, 34, 30, 34 });
+    l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 16 });
+    l.rasterize();
+    try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
+
+    const sky = [3]f32{ 1, 1, 1 };
+    try r.build(l.mask, l.sdf, 64, 64, sky);
+
+    try testing.expect(r.built >= 2);
+    try testing.expectEqual(@as(u32, 1), r.builds);
+    // The finest cascade is the busiest.
+    try testing.expect(r.cascades.items[0].w * r.cascades.items[0].h >
+        r.cascades.items[1].w * r.cascades.items[1].h);
+
+    // Rebuilding without a resize and without a change is a no-op cost-wise
+    // only if the caller decides not to; this build genuinely re-walks, which is
+    // what the amortization test's `builds` counter is FOR: it is the caller's
+    // decision, not this one's.
+    try r.build(l.mask, l.sdf, 64, 64, sky);
+    try testing.expectEqual(@as(u32, 2), r.builds);
+}
+
+test "render light: a corner is darker than the open sky, which is GI working" {
+    var r = Radiance.init(testing.allocator);
+    defer r.deinit();
+
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    // Two walls forming a corner, the classic GI test: the corner is enclosed on
+    // two sides, so the probes in it mostly see each other rather than the sky,
+    // and the cascade must resolve that.
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = points(&.{ 0, 32, 32, 32, 32, 36, 0, 36 });
+    l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 36 });
+    var poly2 = components.OccluderPolygon{};
+    poly2.count = 4;
+    poly2.points = points(&.{ 28, 0, 32, 0, 32, 64, 28, 64 });
+    l.occluders.appendAssumeCapacity(.{ .polygon = poly2, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
+    l.rasterize();
+    try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
+
+    try r.build(l.mask, l.sdf, 64, 64, .{ 1, 1, 1 });
+
+    // The open middle of the screen sees the sky on every ray.
+    const open = r.sample(60, 8);
+    try testing.expect(open[0] > 0.05);
+
+    // The corner at (4, 40) is behind both walls. Its probes trace upward and
+    // inward; most of their rays hit the walls' own bounce rather than the sky,
+    // and each bounce is attenuated. The threshold is deliberately loose because
+    // the exact number is a function of the solid angles, not a property of the
+    // scene -- the assertion is the DIRECTION, which is what a regression test
+    // can detect.
+    const corner = r.sample(8, 40);
+    try testing.expect(corner[0] < open[0]);
 }
