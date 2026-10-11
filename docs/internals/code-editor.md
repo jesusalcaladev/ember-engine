@@ -19,6 +19,7 @@ engine.complete    what to offer at the caret   lang/lua/complete.zig
 engine.help         hover / Ctrl+Click         lang/lua/help.zig
 engine.goto         definition + references     lang/lua/goto.zig
 engine.outline      the file as a tree          lang/lua/outline.zig
+engine.rename       one variable, every place    lang/lua/rename.zig
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -30,7 +31,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 121 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 132 tests.
 
 ## Where it may allocate
 
@@ -215,11 +216,36 @@ On top of that one rule:
   belongs to, and running it to the end of the body would make it the parent of
   everything declared inside.
 
+## Rename, and the two things it refuses to be
+
+A rename is `goto`'s resolution with a buffer on the end: the same rule decides
+which occurrences are the same variable, so the two operations can never disagree
+about where a name lives. Renaming `speed` does not touch the `speed` in an
+unrelated function, and it does not touch the word `speed` in a string — not
+because a text matcher was made cleverer, but because a string is not a use.
+
+It is applied as ONE `Buffer.replace` over the whole document, exactly as
+`find.replaceAll` does it, so one undo after a rename undoes the rename rather
+than a fifth of it. A test asserts that by undoing and reading the file back.
+
+And it refuses three things, each worth more than the rename it prevents:
+
+- **A name that resolves to nothing local.** Renaming a global would edit every
+  use site of an engine API in the file. That is not a rename, it is damage.
+- **A name that is not an identifier.** A dialog that accepts `not a name`
+  produces a file that no longer parses.
+- **A name already taken where the occurrences live.** `local x = 1; local y = 2`
+  renamed to `y` gives `local y = y` — the initializer reads the very thing it
+  declares. Same-scope and nested-scope collisions are both refused; shadowing an
+  OUTER binding is allowed, because every Lua programmer has written that by hand.
+
+The inverse case is the one worth calling out: a rename that changes what the
+code means is worse than one that fails, and a failure the user sees is a bug
+they can report.
+
 ## What is deliberately not here
 
-- **Rename.** It needs the buffer's edit API and a name that resolves, which is
-  the same resolution this module already does; it is the natural next step and
-  it is UI work until then.
+
 - **Tabs, split panes, the help PANEL, Ctrl+Click wiring.** Those are M5.5 UI
   work and they consume this module rather than extending it; the data they need
   is here (`hover`, `complete`).
@@ -243,4 +269,5 @@ zig build test          # the editor suite runs first, in milliseconds
 | `lang/lua/resolve.zig` | 6 — the rule itself: nearest declaration, before the use, innermost scope first |
 | `lang/lua/outline.zig` | 5 — nesting, the functions-only view, ordering, the empty file |
 | `lang/lua/goto.zig` | 6 — definition, references, shadowing, the names that go nowhere |
+| `lang/lua/rename.zig` | 11 — scope, strings, collisions, one act of undo |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |

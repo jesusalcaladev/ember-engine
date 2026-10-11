@@ -41,6 +41,7 @@
 //!   help        hover / Ctrl+Click
 //!   outline     the file as a tree
 //!   goto        definition and references
+//!   rename      every place one name is named
 //! ```
 //!
 //! The rule that keeps it legible: `doc/` never mentions Lua, and `lang/lua/` is
@@ -62,6 +63,7 @@ pub const help = @import("lang/lua/help.zig");
 pub const resolve = @import("lang/lua/resolve.zig");
 pub const outline = @import("lang/lua/outline.zig");
 pub const goto = @import("lang/lua/goto.zig");
+pub const rename = @import("lang/lua/rename.zig");
 
 // Short names for what the UI layer imports constantly. `Token` is a highlighted
 // run; `Span` is a plain byte range, and the two names are kept distinct because
