@@ -1367,6 +1367,142 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "environment.set_ambient",
+        .module = "environment",
+        .signature = "environment.set_ambient(self, r, g, b, energy)",
+        .summary = "What 'dark' means in this world. One per world, not per actor: a dungeon and a meadow differ in what their shadows are made of.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "energy", .kind = .number, .doc = "multiplier, 0 removes global light" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\environment.set_ambient(self, 0.09, 0.10, 0.14, 1.0)
+        ,
+    },
+    .{
+        .name = "environment.set_clear",
+        .module = "environment",
+        .signature = "environment.set_clear(self, r, g, b)",
+        .summary = "What nothing lights at all resolves to. Separate from the ambient colour: one is what the world does to what it touches, the other is the empty case.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "r", .kind = .number, .doc = "red" },
+            .{ .name = "g", .kind = .number, .doc = "green" },
+            .{ .name = "b", .kind = .number, .doc = "blue" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\environment.set_clear(self, 0.02, 0.02, 0.03)
+        ,
+    },
+    .{
+        .name = "environment.set_bloom",
+        .module = "environment",
+        .signature = "environment.set_bloom(self, threshold)",
+        .summary = "A wash over the whole scene, which is how a bright room stops looking like a dark room with five torches in it. 0 disables it.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "threshold", .kind = .number, .doc = "0..0.2" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\environment.set_bloom(self, 0.8)
+        ,
+    },
+    .{
+        .name = "environment.set_tonemap",
+        .module = "environment",
+        .signature = "environment.set_tonemap(self, enabled)",
+        .summary = "For HDR scenes, where a light at energy 3 otherwise clips to white and a colour ramp nobody chose.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\environment.set_tonemap(self, true)
+        ,
+    },
+    .{
+        .name = "environment.set_fog",
+        .module = "environment",
+        .signature = "environment.set_fog(self, near, far, r, g, b)",
+        .summary = "The cheapest depth cue a 2D game has. `far <= near` disables it, and that is the documented way to remove it rather than a special zero case.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "near", .kind = .number, .doc = "start distance" },
+            .{ .name = "far", .kind = .number, .doc = "end distance; 0 disables" },
+            .{ .name = "r", .kind = .number, .doc = "red" },
+            .{ .name = "g", .kind = .number, .doc = "green" },
+            .{ .name = "b", .kind = .number, .doc = "blue" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\environment.set_fog(self, 300, 900, 0.5, 0.5, 0.55)
+        ,
+    },
+    .{
+        .name = "environment.get_ambient",
+        .module = "environment",
+        .signature = "environment.get_ambient(self) -> number, number, number, number",
+        .summary = "The ambient colour with the energy applied, for the inspector.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "red" },
+            .{ .kind = .number, .doc = "green" },
+            .{ .kind = .number, .doc = "blue" },
+            .{ .kind = .number, .doc = "alpha" },
+        },
+        .example =
+        \\local r, g, b, a = environment.get_ambient(self)
+        ,
+    },
+    .{
+        .name = "environment.get_clear",
+        .module = "environment",
+        .signature = "environment.get_clear(self) -> number, number, number, number",
+        .summary = "The clear colour.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "red" },
+            .{ .kind = .number, .doc = "green" },
+            .{ .kind = .number, .doc = "blue" },
+            .{ .kind = .number, .doc = "alpha" },
+        },
+        .example =
+        \\environment.get_clear(self, 0.02, 0.02, 0.03)
+        ,
+    },
+    .{
+        .name = "environment.get_fog",
+        .module = "environment",
+        .signature = "environment.get_fog(self) -> number, number",
+        .summary = "Fog's near and far.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "near" },
+            .{ .kind = .number, .doc = "far" },
+        },
+        .example =
+        \\local near, far = environment.get_fog(self)
+        ,
+    },
+    .{
         .name = "actor.set_linear_velocity",
         .module = "actor",
         .signature = "actor.set_linear_velocity(self, vx, vy)",

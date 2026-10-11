@@ -1908,6 +1908,111 @@ const occluder_regs = [_]luaL_Reg{
     .{ .name = null, .func = null },
 };
 
+// ── Environment (M7): the world's global lighting ─────────────────────────────
+//
+// One of these per world, not per actor: ambient light is a property of the
+// world, and "change the mood" should be one number rather than a scene-wide
+// edit. Godot calls this `Environment`, so the names match.
+
+const Env = components.Environment;
+
+/// `environment.set_ambient(r, g, b, energy)` — what "dark" means.
+///
+/// Two numbers, not four: energy is a multiplier on the colour and setting one
+/// without the other is how a scene ends up with an ambient of pure white at
+/// zero energy and nobody knows why it is still black.
+fn lua_environment_set_ambient(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.ambient_color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), 1 };
+    env.ambient_energy = @max(lua.toF32(L, 5), 0);
+    return 0;
+}
+
+/// `environment.set_clear(r, g, b)` — what nothing lights at all resolves to.
+///
+/// Separate from the ambient colour, because one is what the world does to what
+/// it touches and the other is the empty case. A scene with a clear of black and
+/// an ambient of black is correctly not a bug; it is a cave.
+fn lua_environment_set_clear(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.clear_color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), 1 };
+    return 0;
+}
+
+/// `environment.set_bloom(threshold)` — 0 disables it.
+fn lua_environment_set_bloom(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.bloom_threshold = @min(@max(lua.toF32(L, 2), 0), 0.2);
+    return 0;
+}
+
+/// `environment.set_tonemap(enabled)`. For HDR scenes, where a light at energy 3
+/// otherwise clips to white and a colour ramp nobody chose.
+fn lua_environment_set_tonemap(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.tonemap = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `environment.set_fog(near, far, r, g, b)` — the cheapest depth cue a 2D game
+/// has. `far <= near` disables it, and that is the documented way to remove it
+/// rather than a special zero case.
+fn lua_environment_set_fog(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    const near = @max(lua.toF32(L, 2), 0);
+    const far = lua.toF32(L, 3);
+    env.fog = .{ near, far };
+    env.fog_color = .{ lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6), 1 };
+    return 0;
+}
+
+fn lua_environment_get_ambient(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    for (env.ambient()) |c| lua.pushF32(L, c);
+    return 4;
+}
+
+fn lua_environment_get_clear(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    for (env.clear_color) |c| lua.pushF32(L, c);
+    return 4;
+}
+
+fn lua_environment_get_fog(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    lua.pushF32(L, env.fog[0]);
+    lua.pushF32(L, env.fog[1]);
+    return 2;
+}
+
+const environment_regs = [_]luaL_Reg{
+    .{ .name = "set_ambient", .func = lua_environment_set_ambient },
+    .{ .name = "set_clear", .func = lua_environment_set_clear },
+    .{ .name = "set_bloom", .func = lua_environment_set_bloom },
+    .{ .name = "set_tonemap", .func = lua_environment_set_tonemap },
+    .{ .name = "set_fog", .func = lua_environment_set_fog },
+    .{ .name = "get_ambient", .func = lua_environment_get_ambient },
+    .{ .name = "get_clear", .func = lua_environment_get_clear },
+    .{ .name = "get_fog", .func = lua_environment_get_fog },
+    .{ .name = null, .func = null },
+};
+
 const material_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_material_new },
     .{ .name = "set_params", .func = lua_material_set_params },
@@ -2469,6 +2574,14 @@ pub const registered_names = [_][]const u8{
     "render.stats",
     "render.set_resident",
     "render.all_resident",
+    "environment.set_ambient",
+    "environment.set_clear",
+    "environment.set_bloom",
+    "environment.set_tonemap",
+    "environment.set_fog",
+    "environment.get_ambient",
+    "environment.get_clear",
+    "environment.get_fog",
     "light.new",
     "light.set_kind",
     "light.set_radius",
@@ -2552,6 +2665,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "material", &material_regs);
     installModule(L, ctx, "light", &light_regs);
     installModule(L, ctx, "occluder", &occluder_regs);
+    installModule(L, ctx, "environment", &environment_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

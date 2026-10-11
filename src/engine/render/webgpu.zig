@@ -66,6 +66,11 @@ pub const CullMode_None: c_uint = 1;
 pub const FrontFace_CCW: c_uint = 1;
 pub const IndexFormat_Uint16: c_uint = 1;
 pub const LoadOp_Clear: c_uint = 2;
+/// The other half of `LoadOp`: keep what is already in the target. Needed by
+/// the M7 light pass, which ADDS to a target the sprite pass already filled,
+/// and whose previous comment ("one clear when the pass begins") was the
+/// reason a light drawn after the sprites used to erase them.
+pub const LoadOp_Load: c_uint = 1;
 pub const StoreOp_Store: c_uint = 1;
 pub const TextureFormat_BGRA8Unorm: c_uint = 0x0000001B;
 pub const TextureFormat_BGRA8UnormSrgb: c_uint = 0x0000001C;

@@ -6,6 +6,7 @@
 //! touching the runtime.
 
 const std = @import("std");
+pub const light_mod = @import("light.zig");
 
 pub const backend_null = @import("backend_null.zig");
 pub const backend_dawn = @import("backend_dawn.zig");
@@ -170,6 +171,19 @@ pub const Renderer = struct {
         /// Submits a batch of sprites, already ordered by the CPU batcher. The
         /// backend issues one instanced draw per (slot, blend) run.
         drawSprites: *const fn (ptr: *anyopaque, instances: []const SpriteInstance, count: usize) void,
+        /// M7: the light pass. One instanced quad per light, sampled against the
+        /// 1D shadow map the CPU built.
+        ///
+        /// `count` is how many instances this call means. The rest of the slice
+        /// belongs to the maximum the buffer is sized for, and uploading all of
+        /// it every frame would upload stale lights too.
+        drawLights: *const fn (ptr: *anyopaque, instances: []const light_mod.LightInstance, count: usize) void,
+        /// M7: the shadow map's texture, `angles` wide by four channels tall.
+        /// Created once and re-uploaded, because spec §3.6 forbids creating GPU
+        /// objects inside a frame.
+        createShadowMap: *const fn (ptr: *anyopaque, angles: u32) ?*anyopaque,
+        /// M7: upload the 1D shadow maps as four rows of `angles` bytes.
+        uploadShadowMap: *const fn (ptr: *anyopaque, data: []const u8) void,
         /// Creates a texture from RGBA8 pixels (atlas upload). Returns an opaque
         /// handle the backend understands in drawSprites (via the vertex's texture index).
         createTexture: *const fn (ptr: *anyopaque, width: u32, height: u32, pixels: []const u8) ?*anyopaque,

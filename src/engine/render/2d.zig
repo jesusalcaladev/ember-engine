@@ -369,6 +369,27 @@ pub const Renderer2D = struct {
         self.stats.draw_calls = @intCast(r.stats().draw_calls);
     }
 
+    /// The M7 light pass, with the shadow map the CPU half built.
+    ///
+    /// Lights are drawn AFTER the sprites and with the load op as Load, so a
+    /// light adds to the scene rather than erasing it — that ordering is the
+    /// whole reason `submitLights` exists as a separate call and is not folded
+    /// into `submit`.
+    ///
+    /// Returns the number of lights drawn, so a caller can tell "no lights in
+    /// the scene" from "the pass was never invoked", which are two very
+    /// different debugging problems.
+    pub fn submitLights(self: *Renderer2D, r: render.Renderer, lights: []const render.light_mod.LightInstance, shadow: []const u8, angles: u32) usize {
+        _ = self;
+        if (lights.len == 0 or angles == 0) return 0;
+        _ = r.createShadowMap(angles);
+        if (shadow.len >= @as(usize, angles) * 4) {
+            r.uploadShadowMap(shadow[0 .. @as(usize, angles) * 4]);
+        }
+        r.drawLights(lights, lights.len);
+        return lights.len;
+    }
+
     /// Draw-call runs of the current frame (diagnostics + tests).
     pub fn drawRuns(self: *const Renderer2D) []const Run {
         return self.runs[0..self.run_count];

@@ -410,6 +410,55 @@ pub const Light2D = struct {
     }
 };
 
+/// The world's global lighting. Godot's `Environment`, and it answers the
+/// question a scene asks when there is no light touching it: what does "dark"
+/// mean here?
+///
+/// One of these per world, not per actor, because ambient light is a property
+/// of the world — a dungeon and a meadow differ in what their shadows are made
+/// of, and putting that on each actor would make "change the mood" a scene-wide
+/// edit for a value that is one number.
+pub const Environment = struct {
+    /// The colour the ambient term tints everything by, before any light.
+    ambient_color: [4]f32 = .{ 0.09, 0.10, 0.14, 1 },
+    /// Global light level, a multiplier on `ambient_color`. 0 is a world with only
+    /// dynamic light, which is what a lighting showcase wants and what a
+    /// night-time scene should set deliberately rather than by deleting every
+    /// torch.
+    ambient_energy: f32 = 1.0,
+    /// The colour a pixel with no light and no ambient resolves to: the clear.
+    /// Separate from `ambient_color` because one is what the world does to what
+    /// it lights and the other is what nothing lights at all.
+    clear_color: [4]f32 = .{ 0.02, 0.02, 0.03, 1 },
+    /// 0..0.2. A wash over the whole scene, which is how a bright room stops
+    /// looking like a dark room with five torches in it. Defaults to zero: it is
+    /// an artistic dial and a scene has to ask for it.
+    bloom_threshold: f32 = 0.0,
+    /// Screen-space tonemap, off by default. On for HDR scenes, where a light
+    /// at energy 3 otherwise clips to white and a colour ramp nobody chose.
+    tonemap: bool = false,
+    /// Fog's near and far in world units, 0 disabling it. A fog over a
+    /// distance is the cheapest depth cue a 2D game has, and it is a property of
+    /// the world rather than of any one light.
+    fog: [2]f32 = .{ 0, 0 },
+    fog_color: [4]f32 = .{ 0.5, 0.5, 0.55, 1 },
+
+    /// Whether fog reaches the given distance.
+    pub fn foggy(self: Environment) bool {
+        return self.fog[1] > self.fog[0];
+    }
+
+    /// The ambient colour as a single colour, energy applied.
+    pub fn ambient(self: Environment) [4]f32 {
+        return .{
+            self.ambient_color[0] * self.ambient_energy,
+            self.ambient_color[1] * self.ambient_energy,
+            self.ambient_color[2] * self.ambient_energy,
+            self.ambient_color[3],
+        };
+    }
+};
+
 /// Something that blocks light.
 ///
 /// Present on an entity as a component, like Godot's `LightOccluder2D`, so the
@@ -673,6 +722,7 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "CollisionLayers", .type = CollisionLayers },
     .{ .name = "Light2D", .type = Light2D },
     .{ .name = "LightOccluder2D", .type = LightOccluder2D },
+    .{ .name = "Environment", .type = Environment },
 };
 
 comptime {

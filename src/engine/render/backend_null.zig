@@ -15,6 +15,12 @@ pub const Backend = struct {
     frames: u64 = 0,
     quads_drawn: u64 = 0,
     sprites_drawn: u64 = 0,
+    /// M7: lights submitted and shadow-map bytes uploaded. Asserted by the
+    /// headless tests, which is the only way the light pass is checked without
+    /// a GPU.
+    lights_drawn: u64 = 0,
+    light_upload_bytes: u64 = 0,
+    shadow_upload_bytes: u64 = 0,
     stats_data: render.FrameStats = .{},
 
     const vtable = render.Renderer.VTable{
@@ -30,6 +36,9 @@ pub const Backend = struct {
         .beginScene = beginScene,
         .endScene = endScene,
         .drawSprites = drawSprites,
+        .drawLights = drawLights,
+        .createShadowMap = createShadowMap,
+        .uploadShadowMap = uploadShadowMap,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
     };
@@ -111,7 +120,26 @@ pub const Backend = struct {
         _ = smaa_quality;
     }
 
-    fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
+    fn drawLights(ptr: *anyopaque, instances: []const render.light_mod.LightInstance, count: usize) void {
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    self.lights_drawn = count;
+    self.light_upload_bytes += instances.len * @sizeOf(render.light_mod.LightInstance);
+}
+
+fn createShadowMap(ptr: *anyopaque, angles: u32) ?*anyopaque {
+    _ = ptr;
+    _ = angles;
+    // The null backend has no textures, so there is nothing to hand out. The
+    // count is what tests assert on; a real backend returns a handle.
+    return null;
+}
+
+fn uploadShadowMap(ptr: *anyopaque, data: []const u8) void {
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    self.shadow_upload_bytes += data.len;
+}
+
+fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
         _ = instances;
         const self: *Backend = @ptrCast(@alignCast(ptr));
         self.sprites_drawn += count;
@@ -173,6 +201,59 @@ test "null backend M2: offscreen target and sprite batch" {
     try std.testing.expectEqual(@as(u64, 1), r.stats().draw_calls);
     // 4 vertices per instance (triangle strip corners).
     try std.testing.expectEqual(@as(u64, 8), r.stats().vertex_count);
+
+    r.endScene(false, render.SMAAQuality.Medium);
+    r.destroyOffscreenTarget(target);
+}
+
+test "render light backend null: the light pass is counted and the shadow map uploaded" {
+    var b = Backend{};
+    const r = b.renderer();
+
+    const target = r.createOffscreenTarget(800, 600);
+    const cam = render.makeCamera(800.0, 600.0);
+    r.beginScene(target, cam);
+
+    // A point light, a spot, and a directional: all three kinds path through
+    // the same call, so a scene mixing them must not be three code paths.
+    const lights = [_]render.light_mod.LightInstance{
+        render.light_mod.Lighting.instanceFor(
+            .{ .kind = .point, .radius = 128 },
+            .{ .x = 100, .y = 100 },
+            0,
+        ),
+        render.light_mod.Lighting.instanceFor(
+            .{ .kind = .spot, .radius = 200, .cone_angle = 1.2 },
+            .{ .x = 200, .y = 100 },
+            -1,
+        ),
+        render.light_mod.Lighting.instanceFor(
+            .{ .kind = .directional, .radius = 1024, .angle = 0.6 },
+            .{ .x = 0, .y = 0 },
+            1,
+        ),
+    };
+    r.drawLights(&lights, lights.len);
+    try std.testing.expectEqual(@as(u64, 3), b.lights_drawn);
+    // 68 bytes per light: three is 204, and none of it is the buffer's padded
+    // capacity.
+    try std.testing.expectEqual(@as(u64, 204), b.light_upload_bytes);
+
+    // The shadow map is `angles` wide and four channels tall, so a valid upload
+    // is `angles * 4` bytes. An upload that is not a multiple of the width is
+    // silently dropped rather than corrupting a row boundary.
+    const angles: u32 = 64;
+    const shadow = [_]u8{0} ** (@as(usize, angles) * 4);
+    r.uploadShadowMap(&shadow, shadow.len);
+    try std.testing.expectEqual(@as(u64, 256), b.shadow_upload_bytes);
+
+    r.uploadShadowMap(&shadow, shadow.len - 1);
+    try std.testing.expectEqual(@as(u64, 256), b.shadow_upload_bytes);
+
+    // A frame with no lights reports zero rather than leaving the previous
+    // count, which is how "no lights" is told apart from "the pass never ran".
+    r.drawLights(&lights, 0);
+    try std.testing.expectEqual(@as(u64, 0), b.lights_drawn);
 
     r.endScene(false, render.SMAAQuality.Medium);
     r.destroyOffscreenTarget(target);

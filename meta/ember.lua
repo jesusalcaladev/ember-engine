@@ -536,6 +536,64 @@ function Actor:get_mask() end
 function Actor:get_polygon() end
 
 
+-- ── environment ──
+---What 'dark' means in this world. One per world, not per actor: a dungeon and a meadow differ in what their shadows are made of.
+---@param self Actor 
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param energy number multiplier, 0 removes global light
+function Actor:set_ambient(r, g, b, energy) end
+
+---What nothing lights at all resolves to. Separate from the ambient colour: one is what the world does to what it touches, the other is the empty case.
+---@param self Actor 
+---@param r number red
+---@param g number green
+---@param b number blue
+function Actor:set_clear(r, g, b) end
+
+---A wash over the whole scene, which is how a bright room stops looking like a dark room with five torches in it. 0 disables it.
+---@param self Actor 
+---@param threshold number 0..0.2
+function Actor:set_bloom(threshold) end
+
+---For HDR scenes, where a light at energy 3 otherwise clips to white and a colour ramp nobody chose.
+---@param self Actor 
+---@param enabled boolean 
+function Actor:set_tonemap(enabled) end
+
+---The cheapest depth cue a 2D game has. `far <= near` disables it, and that is the documented way to remove it rather than a special zero case.
+---@param self Actor 
+---@param near number start distance
+---@param far number end distance; 0 disables
+---@param r number red
+---@param g number green
+---@param b number blue
+function Actor:set_fog(near, far, r, g, b) end
+
+---The ambient colour with the energy applied, for the inspector.
+---@param self Actor 
+---@return number red
+---@return number green
+---@return number blue
+---@return number alpha
+function Actor:get_ambient() end
+
+---The clear colour.
+---@param self Actor 
+---@return number red
+---@return number green
+---@return number blue
+---@return number alpha
+function Actor:get_clear() end
+
+---Fog's near and far.
+---@param self Actor 
+---@return number near
+---@return number far
+function Actor:get_fog() end
+
+
 -- ── math ──
 ---Clamps `v` into the range `[lo, hi]`.
 ---@param v number value to clamp

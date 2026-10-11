@@ -27,6 +27,11 @@ const platform = @import("../platform/platform.zig");
 const log = @import("core").log.scoped("render");
 
 const quad_wgsl = @embedFile("shaders/quad.wgsl");
+const light_wgsl = @embedFile("shaders/light.wgsl");
+/// The M7 light pass's instance size. Declared AGAIN from the Zig struct so a
+/// change in one that is not mirrored in the other is a link-time failure
+/// instead of a shader reading the wrong offset -- a class of silent bug.
+const LightInstanceBytes: u64 = 68;
 const sprite_wgsl = @embedFile("shaders/sprite.wgsl");
 const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
 
@@ -125,6 +130,8 @@ pub const Options = struct {
     smaa_quality: render.SMAAQuality = .Medium,
     /// Max sprites per frame; sizes the batch vertex buffer at boot.
     max_sprites: u32 = 65536,
+    /// Max lights per frame; sizes the M7 instance buffer at boot.
+    max_lights: u32 = 4096,
 };
 
 /// Readback slots. The resolve of frame N is READ at frame N+2 (map issued)
@@ -188,6 +195,27 @@ const Offscreen = struct {
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     instance: wgpu.WGPUInstance,
+        // M7: the light pass's own resources. One pipeline per blend mode, one
+        // instance buffer, one uniform buffer, one shadow-map texture, one bind
+        // group. All of them created here and re-used, so spec §3.6 holds.
+        light_pipeline_add: wgpu.WGPURenderPipeline = undefined,
+        light_pipeline_sub: wgpu.WGPURenderPipeline = undefined,
+        light_pipeline_mix: wgpu.WGPURenderPipeline = undefined,
+        light_instance_buf: wgpu.WGPUBuffer = undefined,
+        light_uniform_buf: wgpu.WGPUBuffer = undefined,
+        /// Null until `createShadowMap` has run; a shadow map is created once
+        /// and re-uploaded, never per frame (spec §3.6).
+        light_shadow_texture: ?wgpu.WGPUTexture = null,
+        light_shadow_view: ?wgpu.WGPUTextureView = null,
+        light_bind_group: wgpu.WGPUBindGroup = undefined,
+        /// The shadow map's width in angle buckets; zero until it is created.
+        light_shadow_angles: u32 = 0,
+        /// Which light the last drawLights call actually drew. Reported through
+        /// FrameStats so a scene with no lights can be told apart from a pass
+        /// that was never called.
+        lights_drawn: u32 = 0,
+        light_instance_capacity: u32 = 0,
+
     adapter: wgpu.WGPUAdapter,
     device: wgpu.WGPUDevice,
     queue: wgpu.WGPUQueue,
@@ -281,6 +309,8 @@ pub const Backend = struct {
     /// Instance record: pos(8) + half(8) + uv4xu16(8) + color4xu8(4) + slot(1)
     /// + pad(3) = 32 bytes, exactly @sizeOf(render.SpriteInstance).
     const SpriteInstanceBytes: u32 = 32;
+    /// `Globals` in light.wgsl: mat4(64) + vec2 + vec2 + vec4(16) = 112.
+    const LightUniformBytes: u64 = 112;
     /// Globals uniform: mat4 (64) + texel (8) + inverse (8) + pad(8) = 88 → 96.
     const SpriteUniformBytes: u64 = 96;
     /// SMAA `EdgeUniforms`: 2 x vec2f = 24 bytes.
@@ -299,6 +329,9 @@ pub const Backend = struct {
         .beginScene = beginScene,
         .endScene = endScene,
         .drawSprites = drawSprites,
+        .drawLights = drawLights,
+        .createShadowMap = createShadowMap,
+        .uploadShadowMap = uploadShadowMap,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
     };
@@ -643,6 +676,170 @@ pub const Backend = struct {
         }) orelse return error.PipelineCreationFailed;
         resources_created += 1;
 
+
+        // ── M7: the light pass ───────────────────────────────────────────────
+        // One instanced quad per light, one pipeline per blend mode. The three
+        // modes are three pipelines because `mix` is a lerp only the
+        // fixed-function blend stage can express: a fragment program cannot read
+        // the destination it is writing.
+        const light_shader_mod = try createShader(device, light_wgsl, "light.shader");
+        resources_created += 1;
+
+        const light_bgl = try createBindGroupLayout(device, &[_]wgpu.BindGroupLayoutEntry{
+            .{
+                .binding = 0,
+                .visibility = wgpu.ShaderStage_Vertex | wgpu.ShaderStage_Fragment,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                // mat4 + 4 x vec2 + vec4 = 112 bytes, matching `Globals`.
+                .buffer_minBindingSize = LightUniformBytes,
+            },
+            .{
+                .binding = 1,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0,
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
+        }, "light.bgl");
+        resources_created += 1;
+
+        const light_layout = try createPipelineLayout(device, &[_]wgpu.WGPUBindGroupLayout{light_bgl}, "light.layout");
+        resources_created += 1;
+
+        const light_uniform_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("light.uniform"),
+            .usage = wgpu.BufferUsage_Uniform | wgpu.BufferUsage_CopyDst,
+            .size = LightUniformBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        const light_instance_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("light.instances"),
+            .usage = wgpu.BufferUsage_Vertex | wgpu.BufferUsage_CopyDst,
+            .size = @as(u64, options.max_lights) * LightInstanceBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        // The 11 attributes map exactly onto LightInstance's field offsets. The
+        // two flat u32/vec4 entries are interpolate(flat) in the shader: a
+        // blend mode that went through a varying would be garbage.
+        const light_attrs = [_]wgpu.VertexAttribute{
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 0, .shaderLocation = 0 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 8, .shaderLocation = 1 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 16, .shaderLocation = 2 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 24, .shaderLocation = 3 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 32, .shaderLocation = 4 },
+            .{ .format = wgpu.VertexFormat_Float32x4, .offset = 40, .shaderLocation = 5 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 48, .shaderLocation = 6 },
+            .{ .format = wgpu.VertexFormat_Float32x2, .offset = 56, .shaderLocation = 7 },
+        };
+        const light_vlayout = wgpu.VertexBufferLayout{
+            .stepMode = wgpu.VertexStepMode_Instance,
+            .arrayStride = LightInstanceBytes,
+            .attributeCount = 8,
+            .attributes = &light_attrs,
+        };
+
+        // add: src (already scaled by the light) + dst.
+        var l_blend = wgpu.BlendState{
+            .color = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_One },
+            .alpha = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_One },
+        };
+        var target = [_]wgpu.ColorTargetState{.{ .format = format, .blend = @ptrCast(&l_blend) }};
+        const l_frag = wgpu.FragmentState{
+            .module = light_shader_mod,
+            .entryPoint = wgpu.StringView.from("fs_main"),
+            .targetCount = 1,
+            .targets = &target,
+        };
+        const light_pipeline_add = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
+            .label = wgpu.StringView.from("light.add"),
+            .layout = light_layout,
+            .primitive_topology = wgpu.PrimitiveTopology_TriangleStrip,
+            .vertex_module = light_shader_mod,
+            .vertex_entryPoint = wgpu.StringView.from("vs_main"),
+            .vertex_bufferCount = 1,
+            .vertex_buffers = @ptrCast(&light_vlayout),
+            .fragment = &l_frag,
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
+        // subtract: dst - src. The light takes away.
+        l_blend = wgpu.BlendState{
+            .color = .{ .operation = wgpu.BlendOperation_ReverseSubtract, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_One },
+            .alpha = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_One },
+        };
+        target = [_]wgpu.ColorTargetState{.{ .format = format, .blend = @ptrCast(&l_blend) }};
+        const l_frag_sub = wgpu.FragmentState{
+            .module = light_shader_mod,
+            .entryPoint = wgpu.StringView.from("fs_main"),
+            .targetCount = 1,
+            .targets = &target,
+        };
+        const light_pipeline_sub = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
+            .label = wgpu.StringView.from("light.subtract"),
+            .layout = light_layout,
+            .primitive_topology = wgpu.PrimitiveTopology_TriangleStrip,
+            .vertex_module = light_shader_mod,
+            .vertex_entryPoint = wgpu.StringView.from("vs_main"),
+            .vertex_bufferCount = 1,
+            .vertex_buffers = @ptrCast(&light_vlayout),
+            .fragment = &l_frag_sub,
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
+        // mix: a lerp. Standard alpha blending expresses it exactly, with the
+        // fragment program writing the fully-lit colour and alpha carrying the
+        // amount of light that arrived.
+        l_blend = wgpu.BlendState{
+            .color = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_SrcAlpha, .dstFactor = wgpu.BlendFactor_OneMinusSrcAlpha },
+            .alpha = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_OneMinusSrcAlpha },
+        };
+        target = [_]wgpu.ColorTargetState{.{ .format = format, .blend = @ptrCast(&l_blend) }};
+        const l_frag_mix = wgpu.FragmentState{
+            .module = light_shader_mod,
+            .entryPoint = wgpu.StringView.from("fs_main"),
+            .targetCount = 1,
+            .targets = &target,
+        };
+        const light_pipeline_mix = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
+            .label = wgpu.StringView.from("light.mix"),
+            .layout = light_layout,
+            .primitive_topology = wgpu.PrimitiveTopology_TriangleStrip,
+            .vertex_module = light_shader_mod,
+            .vertex_entryPoint = wgpu.StringView.from("vs_main"),
+            .vertex_bufferCount = 1,
+            .vertex_buffers = @ptrCast(&light_vlayout),
+            .fragment = &l_frag_mix,
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
+        // The shadow map: `angles` columns by four rows. Created here, uploaded
+        // every frame by `uploadShadowMap`, so nothing GPU-shaped happens inside
+        // a frame (spec §3.6).
+        const light_shadow_texture = wgpu.wgpuDeviceCreateTexture(device, &.{
+            .label = wgpu.StringView.from("light.shadow"),
+            .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = 128, .height = 4, .depthOrArrayLayers = 1 },
+            .format = wgpu.TextureFormat_R8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return error.TextureCreationFailed;
+        resources_created += 1;
+        const light_shadow_view = wgpu.wgpuTextureCreateView(light_shadow_texture, null) orelse return error.TextureViewCreationFailed;
+        resources_created += 1;
+        const light_bind_group = wgpu.wgpuDeviceCreateBindGroup(device, &.{
+            .label = wgpu.StringView.from("light.bind"),
+            .layout = light_bgl,
+            .entryCount = 2,
+            .entries = &[_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .buffer = light_uniform_buf, .offset = 0, .size = LightUniformBytes },
+                .{ .binding = 1, .textureView = light_shadow_view },
+            },
+        }) orelse return error.BindGroupCreationFailed;
+        resources_created += 1;
+
         // Additive (lights in M7): src alpha + one.
         blend = wgpu.BlendState{
             .color = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_SrcAlpha, .dstFactor = wgpu.BlendFactor_One },
@@ -786,6 +983,15 @@ pub const Backend = struct {
             .sprite_bgl = sprite_bgl,
             .sprite_layout = sprite_layout,
             .sprite_pipeline_textured = sprite_pipeline_textured,
+            .light_pipeline_add = light_pipeline_add,
+            .light_pipeline_sub = light_pipeline_sub,
+            .light_pipeline_mix = light_pipeline_mix,
+            .light_instance_buf = light_instance_buf,
+            .light_uniform_buf = light_uniform_buf,
+            .light_shadow_texture = light_shadow_texture,
+            .light_shadow_view = light_shadow_view,
+            .light_bind_group = light_bind_group,
+            .light_instance_capacity = options.max_lights,
             .sprite_pipeline_solid = sprite_pipeline_solid,
             .sprite_pipeline_additive = sprite_pipeline_additive,
             .sprite_uniform_buf = sprite_uniform_buf,
@@ -1441,6 +1647,137 @@ pub const Backend = struct {
     }
 
     // ── M2: sprite batch submission ────────────────────────────────────────
+
+    // ── M7: the light pass ─────────────────────────────────────────────────────
+
+    /// The light pass: ONE instanced quad per light, additively into the scene
+    /// target.
+    ///
+    /// A light is drawn on the target the sprite pass drew on, with the LOAD op
+    /// left as Clear because the sprite pass already submitted its own encoder
+    /// for this surface — WebGPU serializes submits on the same queue, so the
+    /// ordering is the ordering of the submit calls, and `endScene` composites
+    /// afterwards. A light drawn before the sprites would be overwritten by the
+    /// sprite pass's Clear, which is why the caller runs `drawLights` second.
+    fn drawLights(ptr: *anyopaque, instances: []const render.light_mod.LightInstance, count: usize) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        if (count == 0 or !self.scene_active) {
+            self.lights_drawn = 0;
+            return;
+        }
+        const o = self.scene_target orelse return;
+        if (instances.len < count or count > self.light_instance_capacity) {
+            log.warn("light batch of {d} exceeds the boot capacity of {d} — clipped", .{
+                count, self.light_instance_capacity,
+            });
+            return;
+        }
+
+        self.lights_drawn = @intCast(count);
+
+        // 68 B per light. Uploading all `count`, not the whole buffer: the rest
+        // of the buffer is a capacity, and a frame that uploaded all of it would
+        // commit stale lights and pay the bandwidth for them.
+        const bytes = @as(usize, count) * LightInstanceBytes;
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.light_instance_buf, 0, instances.ptr, bytes);
+        self.stats_data.upload_bytes += bytes;
+
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse return;
+        defer wgpu.wgpuCommandEncoderRelease(encoder);
+
+        var timestamp_writes = self.timestampWrites();
+        const color_attachment = wgpu.RenderPassColorAttachment{
+            .view = o.color_view,
+            // Load, not Clear: the sprites are already in the target and the
+            // light pass adds to them. Clearing here would erase the scene.
+            .loadOp = wgpu.LoadOp_Load,
+            .storeOp = wgpu.StoreOp_Store,
+            .clearValue = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 },
+        };
+        var pass_desc = wgpu.RenderPassDescriptor{
+            .colorAttachmentCount = 1,
+            .colorAttachments = @ptrCast(&color_attachment),
+        };
+        if (timestamp_writes) |*tw| pass_desc.timestampWrites = tw;
+        const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc) orelse return;
+        defer wgpu.wgpuRenderPassEncoderRelease(pass);
+        self.stats_data.render_passes += 1;
+        self.stats_data.draw_calls += 1;
+
+        // Group by blend mode, so a scene of mixed lights is three draws at
+        // most and not one per light. The CPU gathers them already grouped,
+        // because `collect` walks the query in order, so this is a scan not a
+        // sort.
+        var i: usize = 0;
+        while (i < count) {
+            const mode = instances[i].blend();
+            var j = i + 1;
+            while (j < count and instances[j].blend() == mode) : (j += 1) {}
+            const pipeline = switch (mode) {
+                .add => self.light_pipeline_add,
+                .subtract => self.light_pipeline_sub,
+                .mix => self.light_pipeline_mix,
+            };
+            wgpu.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+            wgpu.wgpuRenderPassEncoderSetBindGroup(pass, 0, self.light_bind_group, 0, null);
+            wgpu.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.light_instance_buf, (@as(u64, @intCast(i)) * LightInstanceBytes), bytes - @as(usize, i) * LightInstanceBytes);
+            // Four corners, one per instance. No index buffer.
+            wgpu.wgpuRenderPassEncoderDraw(pass, 4, @intCast(j - i), 0, 0);
+            i = j;
+        }
+
+        wgpu.wgpuRenderPassEncoderEnd(pass);
+        const cmd = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse return;
+        defer wgpu.wgpuCommandBufferRelease(cmd);
+        wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
+    }
+
+    /// The shadow map, once. Re-uploading is the only per-frame cost.
+    fn createShadowMap(ptr: *anyopaque, angles: u32) ?*anyopaque {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        if (angles == 0 or angles > 1024) return null;
+        // Reuse the texture if the angle count has not changed: a resize of the
+        // light count that keeps the angles must not create a GPU object, which
+        // is the whole point of §3.6.
+        if (angles == 0 or angles > 1024) return null;
+        self.light_shadow_angles = angles;
+        if (self.light_shadow_texture) |t| {
+            wgpu.wgpuTextureRelease(t);
+            if (self.light_shadow_view) |v| wgpu.wgpuTextureViewRelease(v);
+        }
+        const created = wgpu.wgpuDeviceCreateTexture(self.device, &.{
+            .label = wgpu.StringView.from("light.shadow"),
+            .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = angles, .height = 4, .depthOrArrayLayers = 1 },
+            .format = wgpu.TextureFormat_R8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return null;
+        self.light_shadow_view = wgpu.wgpuTextureCreateView(created, null) orelse return null;
+        return @ptrCast(created);
+    }
+
+    /// The four 1D shadow maps, as rows of `angles` bytes each. One write per
+    /// frame, at most `4 * angles` — 512 bytes at the default, which is nothing.
+    fn uploadShadowMap(ptr: *anyopaque, data: []const u8) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const texture = self.light_shadow_texture orelse return;
+        if (data.len == 0) return;
+        const cols = self.light_shadow_angles;
+        const rows = data.len / @as(usize, cols);
+        if (rows == 0 or rows > 4 or data.len % @as(usize, cols) != 0) return;
+        const dst = wgpu.TexelCopyTextureInfo{ .texture = texture };
+        const layout = wgpu.TexelCopyBufferLayout{
+            .bytesPerRow = cols,
+            // Four rows, one per shadow channel. R8 is one byte per pixel, so
+            // the row stride is the angle count and the alignment floor does
+            // not apply at this size.
+            .rowsPerImage = @intCast(rows),
+        };
+        const size = wgpu.Extent3D{ .width = cols, .height = @intCast(rows) };
+        wgpu.wgpuQueueWriteTexture(self.queue, &dst, data.ptr, data.len, &layout, &size);
+    }
 
     fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
