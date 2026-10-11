@@ -20,6 +20,7 @@ engine.help         hover / Ctrl+Click         lang/lua/help.zig
 engine.goto         definition + references     lang/lua/goto.zig
 engine.outline      the file as a tree          lang/lua/outline.zig
 engine.rename       one variable, every place    lang/lua/rename.zig
+engine.help_index   Ctrl+Click, and the browsable index
 engine.Finder   find / replace over a Buffer     doc/find.zig
 ```
 
@@ -31,7 +32,7 @@ engine.Finder   find / replace over a Buffer     doc/find.zig
 2. **It is reusable.** The same buffer drives the in-editor console, the `.zson`
    viewer and (post-1.0) an LSP server. None of them should re-implement undo.
 3. **It can be measured headlessly.** `zig build test` runs the whole thing with
-   no Dawn, no window and no ImGui, in milliseconds. 132 tests.
+   no Dawn, no window and no ImGui, in milliseconds. 143 tests.
 
 ## Where it may allocate
 
@@ -243,12 +244,42 @@ The inverse case is the one worth calling out: a rename that changes what the
 code means is worse than one that fails, and a failure the user sees is a bug
 they can report.
 
+## The help panel (ROADMAP M5.5's headline criterion)
+
+The whole API, one Ctrl+Click away. The panel is text; the hard part was never
+the drawing, it was knowing what goes in it — which is resolution, the same rule
+goto uses. Three outcomes, and the order between them is the decision that
+matters: a name declared **in this file** jumps to its declaration, because the
+file is what the user is editing and its own names are the ones they just wrote;
+a documented binding opens the panel; anything else does nothing. Getting that
+order wrong would open the engine's documentation for a local called `actor`,
+which is a real name in every script.
+
+`render` produces the panel body as text — signature, summary, a parameters table
+with types and notes, the returns, the example — and there is a golden test
+pinning it, because a panel is something a person reads and its shape is part of
+the feature. Text rather than a widget tree because the same bytes serve the
+console, a text-mode build, and the test; the UI lays them out and does not have
+to know what goes in them.
+
+The index is every module with its functions, read out of the registry at
+comptime — the same anti-drift rule the highlighter's globals follow — and the
+search ranks the way a person reads: the name being typed beats a name that
+starts with it, which beats a name containing it, which beats a summary that
+mentions it. A scorer nobody can predict makes the panel slower to use than no
+panel at all.
+
+**Criterion met:** the whole API is navigable with Ctrl+Click from the in-engine
+editor, and no binding can be in the registry without a summary, typed
+parameters, a return value and a runnable example — because `bindings.zig` refuses
+to merge a function that lacks them.
+
 ## What is deliberately not here
 
 
-- **Tabs, split panes, the help PANEL, Ctrl+Click wiring.** Those are M5.5 UI
+- **The panel's WINDOW, its scrollbar and its close button.** Those are M5.5 UI
   work and they consume this module rather than extending it; the data they need
-  is here (`hover`, `complete`).
+  is here (`hover`, `help_index`, `complete`, `outline`).
 - **An LSP.** Stubs ship at v1; the LSP is post-1.0 (ROADMAP §Post-1.0).
 
 ## Running it
@@ -270,4 +301,5 @@ zig build test          # the editor suite runs first, in milliseconds
 | `lang/lua/outline.zig` | 5 — nesting, the functions-only view, ordering, the empty file |
 | `lang/lua/goto.zig` | 6 — definition, references, shadowing, the names that go nowhere |
 | `lang/lua/rename.zig` | 11 — scope, strings, collisions, one act of undo |
+| `lang/lua/help_index.zig` | 8 — activation precedence, the index, search ranking, the rendered panel |
 | `doc/find.zig` | 14 — wrap, whole word, folding, replace-all as one act |
