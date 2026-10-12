@@ -720,7 +720,20 @@ pub const Stats = struct {
     /// someone happens to move the sun.
     shadow_denied: u32 = 0,
     occluders: u32 = 0,
+    /// Occluders written into the mask THIS FRAME.
+    ///
+    /// A per-frame work counter, so it is zero on a frame where the mask was
+    /// already up to date — which means zero is ambiguous on its own: it reads
+    /// the same for "the scene has no occluders" and "none needed redrawing".
+    /// `raster_skipped` is what separates them, and any panel showing this
+    /// number should show that one next to it rather than leave the reader to
+    /// guess which world they are in.
     occluders_rasterized: u32 = 0,
+    /// Frames where the mask was already current and the rasterizer was skipped.
+    /// The counterpart to `sweep_skips` for the occluder pass, and the number
+    /// that makes "the mask is amortized" checkable the way `gi_skipped` makes it
+    /// for the distance field.
+    raster_skipped: u32 = 0,
     /// Automatic occluders that used the sprite's alpha coverage rather than its
     /// bounding box. Zero means every automatic occluder in the scene is a
     /// RECTANGLE, which is worth knowing before someone reports a shadow that is
@@ -744,6 +757,14 @@ pub const Stats = struct {
     mask_h: u32 = 0,
     /// Fraction of the mask that is occluder. Above ~0.6 the level is a solid
     /// maze and shadows stop being informative.
+    ///
+    /// This is a property of the MASK, not of the frame, so it survives
+    /// `beginFrame`. It used to be cleared every frame, which made an idle scene
+    /// — a level whose walls have not moved — report a mask that is 0% full,
+    /// because nothing rasterized this frame. The mask was still there. The
+    /// editor's stats panel showed an empty level because the number describing
+    /// it had been reset by the act of looking at it. Work counters next to it
+    /// are per-frame and do clear; this one is state.
     mask_fill: f32 = 0,
 
     /// Ray steps taken by all the angular sweeps. The cost driver, and it is
@@ -765,8 +786,45 @@ pub const Stats = struct {
     /// How many times the distance field was rebuilt this session. One per
     /// occluder move is the target; one per frame means something is dirtying it
     /// that should not be.
+    ///
+    /// Session counters, so they survive `beginFrame`. They said "this session"
+    /// while being cleared every frame, which is the kind of sentence that stops
+    /// being true without anything failing: a test that builds the field once
+    /// per frame saw `1` and passed, and a reader watching the editor's panel
+    /// saw a number that never grew past one and had no way to know it was not
+    /// supposed to.
     sdf_builds: u32 = 0,
     sdf_skipped: u32 = 0,
+
+    /// Clears the PER-FRAME fields, and only those.
+    ///
+    /// The split matters. `lights`, `sweep_steps`, `occluders_rasterized` and the
+    /// `*_ns` timings describe work done between two frames, so zeroing them is
+    /// correct and is what makes them readable. `mask_fill`, `sdf_builds` and
+    /// `sdf_skipped` describe the state of the engine rather than the work, so
+    /// zeroing them reports a scene as empty for the duration of the frame in
+    /// which anybody looked at it. A stats panel that lies on an idle scene is
+    /// worse than no panel: the numbers look like a measurement, and the only
+    /// way to notice they are wrong is to already know what right looks like.
+    pub fn beginFrame(self: *Stats) void {
+        self.lights = 0;
+        self.shadow_lights = 0;
+        self.shadow_denied = 0;
+        self.occluders = 0;
+        self.occluders_rasterized = 0;
+        self.raster_skipped = 0;
+        self.coverage_used = 0;
+        self.coverage_dropped = 0;
+        self.gi_not_prepared = 0;
+        self.gi_skipped = 0;
+        self.sweep_steps = 0;
+        self.sweep_skips = 0;
+        self.raster_cells = 0;
+        self.collect_ns = 0;
+        self.raster_ns = 0;
+        self.sweep_ns = 0;
+        self.sdf_ns = 0;
+    }
 };
 
 /// A shadow candidate and the index of the light it came from, for ranking.
@@ -1147,7 +1205,7 @@ pub const Lighting = struct {
         self.owner_of.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
         self.occluders.clearRetainingCapacity();
-        self.stats = .{};
+        self.stats.beginFrame();
     }
 
     pub fn unlock(self: *Lighting) void {
@@ -1394,6 +1452,11 @@ pub const Lighting = struct {
             // leaves the mask valid, which lets the angular sweep skip, which is
             // what makes a resting scene cost nothing rather than cost "everything
             // again, invisibly".
+            //
+            // `raster_skipped` says so out loud. Without it this frame's
+            // `occluders_rasterized` is zero, which reads exactly like a scene
+            // with no walls — and the mask behind it is full of them.
+            self.stats.raster_skipped = 1;
             return;
         }
 
@@ -4562,4 +4625,101 @@ test "render light: the distance transform's scratch is reused, and is exact" {
     // mask -- which would make the transform return without doing anything.
     try l.resize(32, 32);
     try testing.expect(l.edt.sq.len >= 32 * 32);
+}
+
+test "render light: an idle scene still reports a full mask, not an empty one" {
+    // The stats panel lies when nobody is moving.
+    //
+    // `mask_fill` describes the MASK, not the frame. It used to be cleared by
+    // `lock()` along with the per-frame work counters, so on the second and
+    // every later frame of a scene whose walls had not moved it read 0.0 — a
+    // level that is 30% occluder reported itself as empty, and the only way to
+    // tell the panel was lying was to already know the level had walls. The
+    // work counters SHOULD read zero on an idle frame; the state should not.
+    var l = try Lighting.init(testing.allocator, .low);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(16, 16, 48, 48) },
+        components.PointLight2D{ .radius = 200 },
+    });
+
+    // Frame 1: the mask is built, so the work counters have something to say.
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    l.unlock();
+    const filled = l.stats.mask_fill;
+    try testing.expect(filled > 0);
+    try testing.expectEqual(@as(u32, 1), l.stats.occluders_rasterized);
+    try testing.expectEqual(@as(u32, 0), l.stats.raster_skipped);
+
+    // Frame 2, and every frame after: nothing moved, so nothing is redrawn.
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    l.unlock();
+
+    // The work did not happen, and the counters say so.
+    try testing.expectEqual(@as(u32, 0), l.stats.occluders_rasterized);
+    try testing.expectEqual(@as(u32, 1), l.stats.raster_skipped);
+    // The mask is still there.
+    try testing.expectEqual(filled, l.stats.mask_fill);
+    try testing.expect(l.stats.mask_fill > 0);
+}
+
+test "render light: the distance field's session counters survive a frame boundary" {
+    // `sdf_builds` is documented as "this session" and was cleared by `lock()`
+    // every frame. A test that built it once saw `1` and passed, and a reader
+    // watching the editor saw a number that never grew past one. The counters
+    // describe the session; only the per-frame timings are per-frame.
+    //
+    // `.medium`, not `.low`: `updateSdf` declines outright when the tier has GI
+    // off, which is correct behaviour and the reason a `.low` fixture here would
+    // measure a counter that never moves for a reason that has nothing to do
+    // with frames.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    try l.resize(32, 32);
+    try l.reserve(2, 2);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(8, 8, 24, 24) },
+    });
+
+    // The clock has to actually advance: `.medium` amortizes the field to ten
+    // rebuilds a second, and `updateSdf` at `now = 0` with `last = 0` correctly
+    // declines — the interval has not elapsed. A test that wanted a build had to
+    // ask for one.
+    const second: i128 = std.time.ns_per_ms * 100;
+
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.dirty = true;
+    _ = l.updateSdf(second);
+    l.unlock();
+    try testing.expectEqual(@as(u32, 1), l.stats.sdf_builds);
+
+    // A second frame that does nothing must not erase the history.
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    _ = l.updateSdf(second + 1);
+    l.unlock();
+    try testing.expectEqual(@as(u32, 1), l.stats.sdf_builds);
+    // ...but it must have been counted as a skip, because that is what happened.
+    try testing.expect(l.stats.sdf_skipped >= 1);
 }
