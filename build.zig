@@ -150,7 +150,6 @@ pub fn build(b: *std.Build) void {
     // M3: the LuaJIT scripting layer. It links LuaJIT but NOT Dawn, so the
     // scripting tests and the M3 bench run headless like the ECS ones do.
     engine_mod.addImport("script", script_mod);
-    engine_mod.addImport("project", project_mod);
 
     // The render module declares extern Dawn procs, so anything that links the
     // engine whole (the runtime, the render tests) needs the libraries. They are
@@ -406,6 +405,7 @@ pub fn build(b: *std.Build) void {
         "src/engine/render/shaders/smaa.wgsl",
         "src/engine/render/shaders/light.wgsl",
         "src/engine/render/shaders/radiance.wgsl",
+        "src/engine/render/shaders/post.wgsl",
     }) |rel| {
         const run = b.addSystemCommand(&.{
             b.path("libs/dawn/build/tint").getPath(b),
@@ -435,8 +435,6 @@ pub fn build(b: *std.Build) void {
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 
-    const project_tests = b.addTest(.{ .root_module = project_mod });
-    test_step.dependOn(&b.addRunArtifact(project_tests).step);
 
     const physics_tests = b.addTest(.{ .root_module = physics_mod });
     test_step.dependOn(&b.addRunArtifact(physics_tests).step);

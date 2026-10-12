@@ -107,6 +107,14 @@ pub const FrameStats = struct {
     /// GPU frame time from timestamp queries, 0 when unavailable.
     gpu_ns: u64 = 0,
     gpu_passes: u32 = 0,
+    /// M7: post-processing passes this frame — 0 for a scene with nothing
+    /// enabled, 1 for fog or tonemap, 4 for bloom.
+    ///
+    /// Reported separately from `render_passes` because it is the number a
+    /// quality dial is judged on: bloom is four passes at half resolution plus
+    /// one full-screen composite, and a scene that turned it on without knowing
+    /// should be able to find out what it cost.
+    post_passes: u32 = 0,
     /// GPU objects created since boot.
     resources_created_total: u64 = 0,
     /// GPU objects created in the CURRENT frame (must be 0: spec §3.6).
@@ -148,6 +156,30 @@ pub const SceneEnvironment = struct {
     /// How much of what arrives at an occluder is reflected back. 0.85 is a
     /// mid-grey wall; 0.2 is velvet.
     albedo: f32 = 0.85,
+
+    /// Fog's near and far distance from the centre of the screen, 0 disabling.
+    ///
+    /// RADIAL, and that is a limitation rather than a choice: Godot's fog reads
+    /// a depth buffer, and a 2D scene has none because every pixel is at the
+    /// same depth by construction. Distance from what the camera is looking at
+    /// is the closest honest substitute, and it reads as depth at the screen
+    /// edges. It is named `fog` and not `fog_depth` so nothing downstream
+    /// assumes it is a z.
+    fog: [2]f32 = .{ 0, 0 },
+    fog_color: [4]f32 = .{ 0.5, 0.5, 0.55, 1 },
+
+    /// Screen-space tonemap (ACES). Off by default: it is for an HDR scene where
+    /// a light at energy 3 otherwise clips to white and a colour ramp nobody
+    /// chose, and applying it to an LDR scene desaturates it for nothing.
+    tonemap: bool = false,
+
+    /// How much bloom is added, 0..1. Zero disables the chain ENTIRELY — the
+    /// four passes are skipped, not run with a zero multiplier — because a scene
+    /// that has never enabled bloom should not be paying for a half-resolution
+    /// blur every frame.
+    bloom_intensity: f32 = 0,
+    /// Luminance above which a pixel contributes to the bloom, 0..1.
+    bloom_threshold: f32 = 1,
 };
 
 /// M7: the GI cascade, as the backend receives it.

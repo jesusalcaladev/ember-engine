@@ -30,6 +30,8 @@ pub const Backend = struct {
     gi_height: u32 = 0,
     gi_uploads: u64 = 0,
     gi_upload_bytes: u64 = 0,
+    /// M7: post passes the last `endScene` modelled. See `endScene`.
+    post_passes: u32 = 0,
     stats_data: render.FrameStats = .{},
 
     const vtable = render.Renderer.VTable{
@@ -125,12 +127,6 @@ pub const Backend = struct {
         _ = camera;
     }
 
-    fn endScene(ptr: *anyopaque, enable_smaa: bool, smaa_quality: render.SMAAQuality) void {
-        _ = ptr;
-        _ = enable_smaa;
-        _ = smaa_quality;
-    }
-
     fn drawLights(ptr: *anyopaque, instances: []const render.light_mod.LightInstance, count: usize) void {
     const self: *Backend = @ptrCast(@alignCast(ptr));
     self.lights_drawn = count;
@@ -154,6 +150,22 @@ fn uploadShadowMap(ptr: *anyopaque, data: []const u8) void {
 /// measurable without a GPU, and "how many bytes of GI did the scene decide to
 /// send" is one of the numbers a frame budget is argued with — so it records it
 /// rather than ignoring it.
+/// Models the post pass's DECISION without running it, because a headless CI
+/// run reporting a frame cost nothing while the real one costs four passes is a
+/// measurement that is actively misleading.
+fn endScene(ptr: *anyopaque, enable_smaa: bool, smaa_quality: render.SMAAQuality) void {
+    _ = smaa_quality;
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    const e = self.environment;
+    const bloom = e.bloom_intensity > 0;
+    const active = e.tonemap or bloom or e.fog[1] > e.fog[0];
+    self.post_passes = if (!active) 0 else if (bloom) 4 else 1;
+    self.stats_data.post_passes = self.post_passes;
+    self.stats_data.render_passes += self.post_passes;
+    self.stats_data.draw_calls += self.post_passes;
+    _ = enable_smaa;
+}
+
 fn setEnvironment(ptr: *anyopaque, env: render.SceneEnvironment) void {
     const self: *Backend = @ptrCast(@alignCast(ptr));
     self.environment = env;
@@ -354,4 +366,50 @@ test "render light backend null: the environment and the GI cascade reach the ba
     try std.testing.expectEqual(before, b.gi_uploads);
     r.uploadGi(.{ .width = 0, .height = 0, .pixels = &pixels });
     try std.testing.expectEqual(before, b.gi_uploads);
+}
+
+test "render post: the frame cost is four passes for bloom, one for fog, none for neither" {
+    // Measured rather than asserted about the shader: the null backend models
+    // the same DECISION the Dawn backend makes, so a CI run with no GPU reports
+    // what a frame will cost instead of reporting nothing and letting someone
+    // turn bloom on by accident.
+    var b = Backend{};
+    const r = b.renderer();
+    const target = r.createOffscreenTarget(64, 64);
+    r.beginScene(target, render.makeCamera(64.0, 64.0));
+
+    // Nothing enabled: a scene that never asked for post must not pay for it.
+    r.setEnvironment(.{});
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 0), r.stats().post_passes);
+
+    // Fog alone is ONE full-screen pass: no bloom chain, no half-res round trip.
+    r.setEnvironment(.{ .fog = .{ 0.5, 1.5 } });
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 1), r.stats().post_passes);
+
+    // Tonemap alone: also one. It is a per-pixel curve on the final image.
+    r.setEnvironment(.{ .tonemap = true });
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 1), r.stats().post_passes);
+
+    // Bloom is four: threshold, blur H, blur V, and the composite that adds it.
+    r.setEnvironment(.{ .bloom_intensity = 0.5, .bloom_threshold = 0.8 });
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 4), r.stats().post_passes);
+
+    // A threshold and an intensity of ZERO is not bloom. `bloom_intensity` is
+    // the gate, so a scene that has a configured threshold but no glow asked for
+    // does not run the chain.
+    r.setEnvironment(.{ .bloom_threshold = 0.8 });
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 0), r.stats().post_passes);
+
+    // Fog with far <= near is fog that reaches nothing, and reaches nothing for
+    // one less reason than "it is off".
+    r.setEnvironment(.{ .fog = .{ 2.0, 2.0 } });
+    r.endScene(false, render.SMAAQuality.Medium);
+    try std.testing.expectEqual(@as(u32, 0), r.stats().post_passes);
+
+    r.destroyOffscreenTarget(target);
 }

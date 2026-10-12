@@ -30,6 +30,7 @@ const quad_wgsl = @embedFile("shaders/quad.wgsl");
 const light_wgsl = @embedFile("shaders/light.wgsl");
 const sprite_wgsl = @embedFile("shaders/sprite.wgsl");
 const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
+const post_wgsl = @embedFile("shaders/post.wgsl");
 
 // Dawn ships the C API as a dispatch table (libdawn_proc) whose default
 // procs are null stubs; the real implementation lives in libdawn_native.
@@ -182,10 +183,34 @@ const Offscreen = struct {
     /// SMAA pass 2 output (blend weights), half resolution.
     weights: wgpu.WGPUTexture = undefined,
     weights_view: wgpu.WGPUTextureView = undefined,
+    /// The post pass's output, full resolution.
+    ///
+    /// A separate texture rather than an in-place pass because a post pass reads
+    /// the frame it is modifying, and reading and writing one texture in a
+    /// single pass is undefined rather than merely slow. When the post pass is
+    /// off this is never written, and SMAA reads `color` instead.
+    post: wgpu.WGPUTexture = undefined,
+    post_view: wgpu.WGPUTextureView = undefined,
+    /// Bloom's two half-resolution ping-pong buffers.
+    bloom_a: wgpu.WGPUTexture = undefined,
+    bloom_a_view: wgpu.WGPUTextureView = undefined,
+    bloom_b: wgpu.WGPUTexture = undefined,
+    bloom_b_view: wgpu.WGPUTextureView = undefined,
     /// Bind groups that reference the views (recreated with the target).
     smaa_edge_bind: wgpu.WGPUBindGroup = undefined,
     smaa_weights_bind: wgpu.WGPUBindGroup = undefined,
     smaa_blend_bind: wgpu.WGPUBindGroup = undefined,
+    /// M7: one per post pipeline. All five share a bind group LAYOUT but bind
+    /// different textures, so a pass that does not read `bloom_tex` still has to
+    /// name something for it.
+    post_bright_bind: wgpu.WGPUBindGroup = undefined,
+    post_blur_h_bind: wgpu.WGPUBindGroup = undefined,
+    post_blur_v_bind: wgpu.WGPUBindGroup = undefined,
+    post_composite_bind: wgpu.WGPUBindGroup = undefined,
+    /// SMAA's groups rebuilt against the POST output, created on first use and
+    /// released with the rest. Null until a frame actually needs them.
+    smaa_post_edge_bind: ?wgpu.WGPUBindGroup = null,
+    smaa_post_blend_bind: ?wgpu.WGPUBindGroup = null,
 };
 
 pub const Backend = struct {
@@ -213,6 +238,20 @@ pub const Backend = struct {
         light_gi_view: wgpu.WGPUTextureView = undefined,
         light_gi_sampler: wgpu.WGPUSampler = undefined,
         light_gi_bgl: wgpu.WGPUBindGroupLayout = undefined,
+        /// M7: the post pass's resources. Five pipelines off one module, one
+        /// bind group LAYOUT, and four bind groups that live on the Offscreen
+        /// because they name its textures.
+        post_bgl: wgpu.WGPUBindGroupLayout = undefined,
+        post_pipeline_bright: wgpu.WGPURenderPipeline = undefined,
+        post_pipeline_blur_h: wgpu.WGPURenderPipeline = undefined,
+        post_pipeline_blur_v: wgpu.WGPURenderPipeline = undefined,
+        post_pipeline_composite: wgpu.WGPURenderPipeline = undefined,
+        post_pipeline_copy: wgpu.WGPURenderPipeline = undefined,
+        post_uniform_buf: wgpu.WGPUBuffer = undefined,
+        /// How many post passes the last frame ran. Zero for a scene that has not
+        /// enabled anything, and the number a profile is read against: four for
+        /// bloom, one for fog or tonemap alone.
+        post_passes: u32 = 0,
         light_gi_w: u32 = 1,
         light_gi_h: u32 = 1,
         /// The cascade's world-space rectangle, republished into the uniform on
@@ -336,6 +375,9 @@ pub const Backend = struct {
     const SpriteUniformBytes: u64 = 96;
     /// SMAA `EdgeUniforms`: 2 x vec2f = 24 bytes.
     const SmaaUniformBytes: u64 = 24;
+    /// `PostParams`: texel(8) + inv(8) + bloom_texel(8) + exposure(4) +
+    /// fog(8) + fog_color(16) + flags(16) + focus(8) + pad(8) = 96 bytes.
+    const PostUniformBytes: u64 = 96;
 
     const vtable = render.Renderer.VTable{
         .beginFrame = beginFrame,
@@ -1001,6 +1043,91 @@ pub const Backend = struct {
         }, "smaa.bgl");
         resources_created += 1;
 
+        // ── M7: the post pass ─────────────────────────────────────────────────
+        //
+        // ONE bind group layout for all four pipelines, matching post.wgsl's
+        // single `@group(0)` block. The alternative — a layout per pipeline — is
+        // four layouts and four chances to bind a view that is also a render
+        // attachment, which is the mistake that actually breaks.
+        const post_bgl = try createBindGroupLayout(device, &[_]wgpu.BindGroupLayoutEntry{
+            .{
+                .binding = 0,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                .buffer_minBindingSize = PostUniformBytes,
+            },
+            .{
+                .binding = 1,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0,
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
+            .{
+                .binding = 2,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .sampler_type = wgpu.SamplerBindingType_Filtering,
+            },
+            .{
+                .binding = 3,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0,
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
+        }, "post.bgl");
+        resources_created += 1;
+
+        const post_layout = try createPipelineLayout(device, &[_]wgpu.WGPUBindGroupLayout{post_bgl}, "post.layout");
+        resources_created += 1;
+
+        const post_uniform_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("post.uniforms"),
+            .usage = wgpu.BufferUsage_Uniform | wgpu.BufferUsage_CopyDst,
+            .size = PostUniformBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        const post_shader = try createShader(device, post_wgsl, "post.wgsl");
+        resources_created += 1;
+
+        // Five pipelines off ONE module: bright, blur H, blur V, composite, and
+        // the copy used when post is off. No vertex buffers at all — the
+        // fullscreen triangle comes from the vertex index, so `vertex_bufferCount`
+        // is zero and there is nothing to bind.
+        var post_pipelines: [5]wgpu.WGPURenderPipeline = undefined;
+        const post_entries = [_][]const u8{
+            "fs_bright",
+            "fs_blur_h",
+            "fs_blur_v",
+            "fs_composite",
+            "fs_copy",
+        };
+        const post_labels = [_][]const u8{
+            "post.bright",
+            "post.blur.h",
+            "post.blur.v",
+            "post.composite",
+            "post.copy",
+        };
+        for (post_entries, 0..) |entry, i| {
+            post_pipelines[i] = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
+                .label = wgpu.StringView.from(post_labels[i]),
+                .layout = post_layout,
+                .primitive_topology = wgpu.PrimitiveTopology_TriangleList,
+                .vertex_module = post_shader,
+                .vertex_entryPoint = wgpu.StringView.from("vs_fullscreen"),
+                .vertex_bufferCount = 0,
+                .fragment = &wgpu.FragmentState{
+                    .module = post_shader,
+                    .entryPoint = wgpu.StringView.from(entry),
+                    .targetCount = 1,
+                    .targets = &[_]wgpu.ColorTargetState{.{ .format = format }},
+                },
+            }) orelse return error.PipelineCreationFailed;
+            resources_created += 1;
+        }
+
         const smaa_layout = try createPipelineLayout(device, &[_]wgpu.WGPUBindGroupLayout{smaa_bgl}, "smaa.layout");
         resources_created += 1;
 
@@ -1107,6 +1234,13 @@ pub const Backend = struct {
             .atlas_allocator = allocator,
             .smaa_shader = smaa_shader,
             .smaa_bgl = smaa_bgl,
+            .post_bgl = post_bgl,
+            .post_pipeline_bright = post_pipelines[0],
+            .post_pipeline_blur_h = post_pipelines[1],
+            .post_pipeline_blur_v = post_pipelines[2],
+            .post_pipeline_composite = post_pipelines[3],
+            .post_pipeline_copy = post_pipelines[4],
+            .post_uniform_buf = post_uniform_buf,
             .smaa_layout = smaa_layout,
             .smaa_pipeline_edge = smaa_pipeline_edge,
             .smaa_pipeline_weights = smaa_pipeline_weights,
@@ -1464,6 +1598,12 @@ pub const Backend = struct {
         wgpu.wgpuBindGroupRelease(o.smaa_edge_bind);
         wgpu.wgpuBindGroupRelease(o.smaa_weights_bind);
         wgpu.wgpuBindGroupRelease(o.smaa_blend_bind);
+        wgpu.wgpuBindGroupRelease(o.post_bright_bind);
+        wgpu.wgpuBindGroupRelease(o.post_blur_h_bind);
+        wgpu.wgpuBindGroupRelease(o.post_blur_v_bind);
+        wgpu.wgpuBindGroupRelease(o.post_composite_bind);
+        if (o.smaa_post_edge_bind) |b| wgpu.wgpuBindGroupRelease(b);
+        if (o.smaa_post_blend_bind) |b| wgpu.wgpuBindGroupRelease(b);
         wgpu.wgpuTextureViewRelease(o.color_view);
         wgpu.wgpuTextureRelease(o.color);
         wgpu.wgpuTextureViewRelease(o.depth_view);
@@ -1472,6 +1612,12 @@ pub const Backend = struct {
         wgpu.wgpuTextureRelease(o.edge);
         wgpu.wgpuTextureViewRelease(o.weights_view);
         wgpu.wgpuTextureRelease(o.weights);
+        wgpu.wgpuTextureViewRelease(o.post_view);
+        wgpu.wgpuTextureRelease(o.post);
+        wgpu.wgpuTextureViewRelease(o.bloom_a_view);
+        wgpu.wgpuTextureRelease(o.bloom_a);
+        wgpu.wgpuTextureViewRelease(o.bloom_b_view);
+        wgpu.wgpuTextureRelease(o.bloom_b);
         self.allocator.destroy(o);
     }
 
@@ -1545,6 +1691,97 @@ pub const Backend = struct {
             .format = self.format,
         }).?;
         o.weights_view = wgpu.wgpuTextureCreateView(o.weights, null).?;
+
+        // ── M7: the post pass's targets ───────────────────────────────────
+        //
+        // `post` is full resolution; the two bloom buffers are HALF. Half is
+        // not a saving, it is the point: bloom is a low-frequency effect, and
+        // running it at a quarter of the pixels is indistinguishable once the
+        // composite blurs it back up. It is also what makes the four-pass chain
+        // affordable at all -- a full-resolution separable blur is five times
+        // the bandwidth of this one.
+        o.post = wgpu.wgpuDeviceCreateTexture(self.device, &.{
+            .label = wgpu.StringView.from("offscreen.post"),
+            .usage = wgpu.TextureUsage_RenderAttachment | wgpu.TextureUsage_TextureBinding,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = w, .height = h },
+            .format = self.format,
+        }) orelse {
+            self.destroyOffscreen(o);
+            return no_target;
+        };
+        o.post_view = wgpu.wgpuTextureCreateView(o.post, null).?;
+
+        const bw = @max(1, w / 2);
+        const bh = @max(1, h / 2);
+        inline for (.{ "a", "b" }) |which| {
+            const tex = wgpu.wgpuDeviceCreateTexture(self.device, &.{
+                .label = if (comptime std.mem.eql(u8, which, "a"))
+                    wgpu.StringView.from("offscreen.bloom.a")
+                else
+                    wgpu.StringView.from("offscreen.bloom.b"),
+                .usage = wgpu.TextureUsage_RenderAttachment | wgpu.TextureUsage_TextureBinding,
+                .dimension = wgpu.TextureDimension_2D,
+                .size = .{ .width = bw, .height = bh },
+                .format = self.format,
+            }) orelse {
+                self.destroyOffscreen(o);
+                return no_target;
+            };
+            const view = wgpu.wgpuTextureCreateView(tex, null).?;
+            if (comptime std.mem.eql(u8, which, "a")) {
+                o.bloom_a = tex;
+                o.bloom_a_view = view;
+            } else {
+                o.bloom_b = tex;
+                o.bloom_b_view = view;
+            }
+        }
+
+        // The four post bind groups. Every one binds the SAME layout, and each
+        // names a `bloom_tex` even where the shader does not read it -- a layout
+        // that made that slot conditional would need four layouts and four
+        // pipelines' worth of state for no benefit.
+        //
+        // The rule each one obeys: never bind a view that is also the pass's
+        // render attachment. Getting that wrong is not a validation error on
+        // every backend, it is undefined behaviour and a frame of garbage.
+        o.post_bright_bind = createBindGroup(self.device, self.post_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = self.post_uniform_buf, .offset = 0, .size = PostUniformBytes },
+            .{ .binding = 1, .textureView = o.color_view },
+            .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 3, .textureView = o.bloom_a_view },
+        }, "post.bright.bg") catch {
+            self.destroyOffscreen(o);
+            return no_target;
+        };
+        o.post_blur_h_bind = createBindGroup(self.device, self.post_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = self.post_uniform_buf, .offset = 0, .size = PostUniformBytes },
+            .{ .binding = 1, .textureView = o.bloom_a_view },
+            .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 3, .textureView = o.bloom_b_view },
+        }, "post.blur.h.bg") catch {
+            self.destroyOffscreen(o);
+            return no_target;
+        };
+        o.post_blur_v_bind = createBindGroup(self.device, self.post_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = self.post_uniform_buf, .offset = 0, .size = PostUniformBytes },
+            .{ .binding = 1, .textureView = o.bloom_b_view },
+            .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 3, .textureView = o.bloom_a_view },
+        }, "post.blur.v.bg") catch {
+            self.destroyOffscreen(o);
+            return no_target;
+        };
+        o.post_composite_bind = createBindGroup(self.device, self.post_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = self.post_uniform_buf, .offset = 0, .size = PostUniformBytes },
+            .{ .binding = 1, .textureView = o.color_view },
+            .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 3, .textureView = o.bloom_a_view },
+        }, "post.composite.bg") catch {
+            self.destroyOffscreen(o);
+            return no_target;
+        };
 
         // Bind groups for the three SMAA passes. Same layout shape for all
         // three; only the views differ. Created once with the target, never
@@ -1633,6 +1870,64 @@ pub const Backend = struct {
         // rectangle and the sky), and a combined buffer would need an offset
         // that is one more number to keep correct.
         self.writeLightUniform(camera.vp, o.width, o.height);
+        self.writePostUniform(o.width, o.height);
+    }
+
+    /// Writes `PostParams`. 96 bytes, fixed, every `beginScene`.
+    ///
+    /// The texel sizes live here rather than in the pipelines because the four
+    /// passes disagree about what a texel IS — the bloom taps are half
+    /// resolution — and baking either one into the shader would be a constant
+    /// that is right for three passes and wrong for one.
+    fn writePostUniform(self: *Backend, w: u32, h: u32) void {
+        const fw: f32 = @floatFromInt(@max(1, w));
+        const fh: f32 = @floatFromInt(@max(1, h));
+        const bw: f32 = @floatFromInt(@max(1, w / 2));
+        const bh: f32 = @floatFromInt(@max(1, h / 2));
+        const env = self.environment;
+        // 24 floats = 96 bytes, matching `PostParams` field for field.
+        var p: [24]f32 = undefined;
+        p[0] = 1.0 / fw;
+        p[1] = 1.0 / fh;
+        p[2] = fw;
+        p[3] = fh;
+        p[4] = 1.0 / bw;
+        p[5] = 1.0 / bh;
+        p[6] = 1.0;
+        p[7] = env.fog[0];
+        p[8] = env.fog[1];
+        p[9] = env.fog_color[0];
+        p[10] = env.fog_color[1];
+        p[11] = env.fog_color[2];
+        p[12] = env.fog_color[3];
+        p[13] = @intFromBool(env.tonemap);
+        p[14] = env.bloom_intensity;
+        p[15] = env.bloom_threshold;
+        // The bloom chain's own on/off, which is NOT the same question as
+        // whether bloom is configured. An Environment can carry a threshold and
+        // an intensity and still not want the four passes run, and the flag is
+        // what keeps a scene that never enabled bloom off paying for them.
+        p[16] = @intFromBool(env.bloom_intensity > 0);
+        p[17] = 0;
+        p[18] = 0;
+        p[19] = 0;
+        p[20] = 0;
+        p[21] = 0;
+        p[22] = 0;
+        p[23] = 0;
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.post_uniform_buf, 0, &p, PostUniformBytes);
+        self.stats_data.upload_bytes += PostUniformBytes;
+    }
+
+    /// Whether the post pass has anything to do this frame.
+    ///
+    /// One predicate for four pipelines. A scene with no fog, no tonemap and no
+    /// bloom must not pay for a full-screen copy, and that is the whole reason
+    /// this returns a bool instead of the pass running and testing three flags
+    /// per pixel.
+    fn postActive(self: *const Backend) bool {
+        const e = self.environment;
+        return e.tonemap or e.bloom_intensity > 0 or e.fog[1] > e.fog[0];
     }
 
     /// Writes the light pass's `Globals`. 128 bytes, fixed, every `beginScene`.
@@ -1672,13 +1967,26 @@ pub const Backend = struct {
         const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse return;
         defer wgpu.wgpuCommandEncoderRelease(encoder);
 
-        if (enable_smaa and self.smaa_enabled) {
-            self.runSmaa(encoder, o, surface_view, &texture);
-        } else {
-            // Direct blit: scene color → swapchain.
-            self.blitColor(encoder, o.color_view, surface_view, &texture);
-        }
+        // Post BEFORE the resolve, not after it. Antialiasing then runs on the
+        // final image rather than on an image that is about to be bloomed and
+        // fogged, which is the only order in which the edge filter sees the
+        // edges the viewer actually sees.
+        //
+        // And it decides what SMAA reads: with post on, the composite's output
+        // is the frame, not `color`. Getting that backwards is not a crash —
+        // it is bloom and fog that render perfectly and are then thrown away
+        // by a resolve that copied the pre-post image to the screen.
+        const source_view = if (self.postActive())
+            (self.runPost(encoder, o) orelse o.color_view)
+        else
+            o.color_view;
 
+        if (enable_smaa and self.smaa_enabled) {
+            self.runSmaa(encoder, o, surface_view, &texture, source_view);
+        } else {
+            // Direct blit: the frame → swapchain.
+            self.blitColor(encoder, source_view, surface_view, &texture);
+        }
         const cmd = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse return;
         defer wgpu.wgpuCommandBufferRelease(cmd);
         wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
@@ -1688,8 +1996,14 @@ pub const Backend = struct {
 
     /// Runs the 3 SMAA passes. Edge and weights go to the half-res scratch
     /// targets; the neighborhood blend writes the swapchain.
-    fn runSmaa(self: *Backend, encoder: wgpu.WGPUCommandEncoder, o: *Offscreen, dst_view: wgpu.WGPUTextureView, dst_texture: *const wgpu.WGPUTexture) void {
+    fn runSmaa(self: *Backend, encoder: wgpu.WGPUCommandEncoder, o: *Offscreen, dst_view: wgpu.WGPUTextureView, dst_texture: *const wgpu.WGPUTexture, src_view: wgpu.WGPUTextureView) void {
         _ = dst_texture;
+        // The source may be the post pass's output rather than the raw scene.
+        // `smaa_edge_bind` and `smaa_blend_bind` name `o.color_view` at slot 0,
+        // so a run against the post output needs its own groups -- see
+        // `smaaBindFor`, which picks between them by view identity.
+        const edge_bind = self.smaaBindFor(o, o.smaa_edge_bind, o.color_view, src_view);
+        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind, o.color_view, src_view);
         const threshold: f32 = switch (self.smaa_quality) {
             .Low => 0.05,
             .Medium => 0.10,
@@ -1724,11 +2038,109 @@ pub const Backend = struct {
         wgpu.wgpuQueueWriteBuffer(self.queue, self.smaa_blend_uniform_buf, 0, &p, SmaaUniformBytes);
 
         // Pass 1: edge detection (full-res src → half-res edge).
-        self.smaaPass(encoder, self.smaa_pipeline_edge, o.smaa_edge_bind, o.edge_view, 0);
+        self.smaaPass(encoder, self.smaa_pipeline_edge, edge_bind, o.edge_view, 0);
         // Pass 2: blend weights (edge → weights).
         self.smaaPass(encoder, self.smaa_pipeline_weights, o.smaa_weights_bind, o.weights_view, 1);
         // Pass 3: neighborhood blend (color + weights → swapchain).
-        self.smaaPass(encoder, self.smaa_pipeline_blend, o.smaa_blend_bind, dst_view, 2);
+        self.smaaPass(encoder, self.smaa_pipeline_blend, blend_bind, dst_view, 2);
+    }
+
+    /// The bind group a SMAA pass should use for `src_view`.
+    ///
+    /// The two groups created with the target both name `o.color_view` at slot
+    /// 0, so they are correct and complete only for the raw scene. After the
+    /// post pass the frame lives in `o.post_view`, and reusing those groups
+    /// would antialias an image the viewer never sees.
+    ///
+    /// Cached rather than created per frame: the choice depends only on which
+    /// view the post pass produced, which is once per frame at most, and a
+    /// `createBindGroup` inside a frame violates spec §3.6.
+    fn smaaBindFor(
+        self: *Backend,
+        o: *Offscreen,
+        scene_bind: wgpu.WGPUBindGroup,
+        scene_view: wgpu.WGPUTextureView,
+        src_view: wgpu.WGPUTextureView,
+    ) wgpu.WGPUBindGroup {
+        if (src_view == scene_view) return scene_bind;
+        const uniform = if (o.smaa_blend_bind == scene_bind)
+            self.smaa_blend_uniform_buf
+        else
+            self.smaa_uniform_buf;
+        const cached = if (o.smaa_blend_bind == scene_bind) &o.smaa_post_blend_bind else &o.smaa_post_edge_bind;
+        if (cached.* == null) {
+            cached.* = createBindGroup(self.device, self.smaa_bgl, &[_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .textureView = src_view },
+                .{ .binding = 1, .sampler = @ptrCast(self.sampler) },
+                .{ .binding = 2, .buffer = uniform, .offset = 0, .size = SmaaUniformBytes },
+                .{ .binding = 3, .textureView = o.weights_view },
+            }, "smaa.post.bg") catch return scene_bind;
+        }
+        return cached.*;
+    }
+
+    /// M7: the post chain. `color -> bloom_a -> bloom_b -> bloom_a -> post`.
+    ///
+    /// Returns the view holding the finished frame, or null on failure — in
+    /// which case `endScene` falls back to the raw scene, so a post pass that
+    /// cannot run degrades to "no post" rather than to a black screen.
+    ///
+    /// The chain's order is not arbitrary: bloom is a LOW-frequency effect, so
+    /// blurring before compositing is both cheaper and better-looking than
+    /// blurring after. Compositing first would also need a second full-res blur.
+    fn runPost(self: *Backend, encoder: wgpu.WGPUCommandEncoder, o: *Offscreen) ?wgpu.WGPUTextureView {
+        const bloom_on = self.environment.bloom_intensity > 0;
+        var timestamp_writes = self.timestampWrites();
+        var attachment = [_]wgpu.RenderPassColorAttachment{undefined} ** 4;
+        var i: usize = 0;
+        while (i < attachment.len) : (i += 1) {
+            attachment[i] = .{
+                .view = undefined,
+                .loadOp = wgpu.LoadOp_Clear,
+                .storeOp = wgpu.StoreOp_Store,
+                .clearValue = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 },
+            };
+        }
+
+        const runs = if (bloom_on)
+            [_]struct { pipeline: wgpu.WGPURenderPipeline, bind: wgpu.WGPUBindGroup, view: wgpu.WGPUTextureView }{
+                .{ .pipeline = self.post_pipeline_bright, .bind = o.post_bright_bind, .view = o.bloom_a_view },
+                .{ .pipeline = self.post_pipeline_blur_h, .bind = o.post_blur_h_bind, .view = o.bloom_b_view },
+                .{ .pipeline = self.post_pipeline_blur_v, .bind = o.post_blur_v_bind, .view = o.bloom_a_view },
+                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
+            }
+        else
+            [_]struct { pipeline: wgpu.WGPURenderPipeline, bind: wgpu.WGPUBindGroup, view: wgpu.WGPUTextureView }{
+                // Fog and tonemap alone: one pass, no bloom, no half-res round
+                // trip. This is the common case and it costs one full-screen
+                // read and one write.
+                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
+            };
+
+        for (runs, 0..) |run, n| {
+            attachment[0].view = run.view;
+            var desc = wgpu.RenderPassDescriptor{
+                .colorAttachmentCount = 1,
+                .colorAttachments = @ptrCast(&attachment[0]),
+            };
+            if (timestamp_writes) |*tw| {
+                tw.beginning_of_pass_write_index = self.ts_cursor + n * 2;
+                tw.end_of_pass_write_index = self.ts_cursor + n * 2 + 1;
+                desc.timestampWrites = tw;
+            }
+            const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse return null;
+            defer wgpu.wgpuRenderPassEncoderRelease(pass);
+            wgpu.wgpuRenderPassEncoderSetPipeline(pass, run.pipeline);
+            wgpu.wgpuRenderPassEncoderSetBindGroup(pass, 0, run.bind, 0, null);
+            wgpu.wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpu.wgpuRenderPassEncoderEnd(pass);
+            self.stats_data.render_passes += 1;
+            self.stats_data.draw_calls += 1;
+        }
+        if (timestamp_writes != null) self.ts_cursor += runs.len * 2;
+        self.post_passes += runs.len;
+        self.stats_data.post_passes = self.post_passes;
+        return o.post_view;
     }
 
     fn smaaPass(
@@ -1783,9 +2195,11 @@ pub const Backend = struct {
         };
         wgpu.wgpuQueueWriteBuffer(self.queue, self.smaa_uniform_buf, 0, &t, SmaaUniformBytes);
 
-        _ = src_view;
-        // The blend bind group already binds the offscreen color at slot 0.
-        self.smaaPass(encoder, self.smaa_pipeline_copy, o.smaa_blend_bind, dst_view, 0);
+        // The blit reads whichever view the post pass produced. Binding the raw
+        // scene unconditionally is the bug that makes bloom and fog render
+        // correctly into a texture nobody ever looks at.
+        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind, o.color_view, src_view);
+        self.smaaPass(encoder, self.smaa_pipeline_copy, blend_bind, dst_view, 0);
     }
 
     // ── M2: sprite batch submission ────────────────────────────────────────
