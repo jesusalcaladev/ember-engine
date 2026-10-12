@@ -37,6 +37,13 @@
 //! — inotify, GLFW, X11 — which is edited far more often than the renderer, and
 //! a subsystem's tests should not stop running because an unrelated file does not
 //! compile. The Dawn path is covered by `zig build` and by the acceptance runner.
+//!
+//! `atlas_bridge` IS referenced, and it widens this module's dependency set by
+//! one: it imports `assets`. That is a trade, and it is taken deliberately — the
+//! test that proves automatic-occluder coverage is reachable has to go through a
+//! real atlas upload, because the whole defect being fixed was that coverage was
+//! reachable from nowhere. A test that stopped one layer short would have passed
+//! while the game still cast rectangles.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -47,6 +54,7 @@ pub const two_d = @import("2d.zig");
 pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
 pub const backend_null = @import("backend_null.zig");
+pub const atlas_bridge = @import("atlas_bridge.zig");
 
 test {
     _ = batcher;
@@ -55,6 +63,7 @@ test {
     _ = light;
     _ = lighting_driver;
     _ = backend_null;
+    _ = atlas_bridge;
 
     // `refAllDecls` on the root as well, deliberately. The explicit references
     // above are what pull each file's own top-level tests in; this is cheap

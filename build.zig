@@ -612,6 +612,12 @@ render_mod.addImport("assets", assets_mod);
     const assets_tests = b.addTest(.{ .root_module = assets_mod });
     test_step.dependOn(&b.addRunArtifact(assets_tests).step);
 
+    // M8 asset hot-reload: the inotify watchers. The directory watch is the
+    // shape the audio bank's `reload` is driven from, so its events and its
+    // (Linux-only) read path are tested rather than assumed.
+    const platform_tests = b.addTest(.{ .root_module = platform_mod });
+    test_step.dependOn(&b.addRunArtifact(platform_tests).step);
+
     // The project.config → engine glue (`project_hook.zig`): the section is
     // validated before it is half-applied, and the mixer is rebuilt only when
     // the audio section actually changed.
@@ -762,6 +768,16 @@ render_mod.addImport("assets", assets_mod);
     });
     render_test_mod.addImport("core", core_mod);
     render_test_mod.addImport("ecs", ecs_mod);
+    // `assets` because `atlas_bridge` imports it, and `atlas_bridge` is in the
+    // suite because it is where the automatic-occluder coverage path is actually
+    // wired -- the test that proves coverage is reachable goes through a real
+    // atlas upload. This is a deliberate widening of the isolation the comment
+    // below describes, and it is worth naming the trade: the render suite now
+    // stops compiling if `assets` stops compiling. `assets` is a plain module
+    // with no host coupling, which is the line this draws; `backend_dawn` is
+    // excluded because it pulls in GLFW, X11 and inotify, and those are edited
+    // far more often than the renderer is.
+    render_test_mod.addImport("assets", assets_mod);
 
     const render_only_tests = b.addTest(.{
         .root_module = render_test_mod,

@@ -39,6 +39,7 @@ const std = @import("std");
 const light_mod = @import("light.zig");
 const render_mod = @import("render.zig");
 const two_d = @import("2d.zig");
+const atlas_bridge = @import("atlas_bridge.zig");
 const Renderer2D = two_d.Renderer2D;
 const ecs = @import("ecs");
 const core = @import("core");
@@ -101,6 +102,21 @@ pub const Driver = struct {
     /// quality change can tell `submitLights` to re-create rather than relying on
     /// the backend's cache to notice on its own.
     shadow_angles: u32 = 0,
+
+    /// The scene this driver last saw.
+    ///
+    /// Borrowed, and only between an `update` and the next one — the same
+    /// lifetime the engine's other subsystems hold, and deliberately NOT the
+    /// pattern `masks` uses. `masks` is data the driver produced and must own;
+    /// this is a pointer to somebody else's world, and pretending otherwise
+    /// would invite a call after that world was destroyed.
+    ///
+    /// It exists for `registerCoverageForPage`, which the atlas calls when a page
+    /// uploads and which therefore cannot be handed a world by the caller. Set
+    /// by `update`, so it is null only in the window between `init` and the
+    /// first frame — and an upload landing there is a no-op, because there is no
+    /// scene to register coverage against yet.
+    world: ?*ecs.World = null,
 
     pub fn init(allocator: std.mem.Allocator, tier: light_mod.Quality) !Driver {
         var l = try Lighting.init(allocator, tier);
@@ -169,6 +185,41 @@ pub const Driver = struct {
         return light_mod.registerAtlasCoverage(&self.masks, world, pixels, page_w, page_h, .{});
     }
 
+    /// Adapts this driver to `atlas_bridge`'s page-uploaded hook.
+    ///
+    /// The half of the wiring that is easy to leave out. `registerAtlasCoverage`
+    /// above is a correct, tested, benchmarked function that nothing called, so
+    /// every automatic occluder in every real build cast its sprite's rectangle
+    /// and `coverage_used` never left zero. This is the piece that makes the
+    /// upload path call it: `uploadAtlas` owns the moment a page's pixels become
+    /// authoritative and knows nothing about sprites, so the knowledge crosses
+    /// over as a function pointer rather than as a dependency.
+    ///
+    /// Install it with `atlas_mgr.onPageUploaded(driver, Driver.registerCoverageForPage)`.
+    /// The `ctx` is the driver; the `world` comes from `self.world`, which
+    /// `init` installs, so the caller does not have to hand the scene in twice.
+    ///
+    /// Errors are swallowed on purpose, and that deserves an explanation: the hook
+    /// runs inside `uploadAtlas`, which has no way to report "the lighting system
+    /// was short on memory" to whoever asked for the atlas. Failing the upload
+    /// would turn a shadow that is the wrong SHAPE into a frame that does not
+    /// draw. So the page uploads, and the reason is counted where it can be seen
+    /// — `coverage_dropped` is the number to watch, and a scene where it climbs
+    /// is a scene with rectangle shadows and no explanation for them.
+    pub fn registerCoverageForPage(
+        ctx: *anyopaque,
+        pixels: []const u8,
+        page_w: u32,
+        page_h: u32,
+    ) anyerror!void {
+        const self: *Driver = @ptrCast(@alignCast(ctx));
+        const world = self.world orelse return;
+        _ = self.registerAtlasCoverage(world, pixels, page_w, page_h) catch {
+            self.lighting.stats.coverage_dropped += 1;
+            return;
+        };
+    }
+
     /// The coverage store this driver owns. Public so a tool can inspect what a
     /// page registered, and so an editor can tell an author why a sprite's shadow
     /// is a rectangle: it registered nothing, because the sprite is opaque and for
@@ -231,6 +282,10 @@ pub const Driver = struct {
     /// all.
     pub fn update(self: *Driver, world: *ecs.World, now_ns: i128) void {
         const l = &self.lighting;
+        // Remembered for `registerCoverageForPage`, which the atlas calls without
+        // a world. Recorded first so that a hook firing during this same update
+        // sees the scene it is being asked about.
+        self.world = world;
         l.collect(world, l.rect);
 
         // The mask is only rasterized when it would come out different. A
@@ -758,4 +813,124 @@ test "render light driver: the store outlives a reload, because the driver owns 
     d.update(&world, 0);
     try testing.expectEqual(@as(u32, 1), d.lighting.stats.coverage_used);
     try testing.expect(d.lighting.coverage_store != null);
+}
+
+test "render light driver: the atlas upload hook is what makes coverage reachable" {
+    // The gap this closes, stated as a test.
+    //
+    // `registerAtlasCoverage` was correct, tested and benchmarked, and called
+    // from nowhere in the engine. Automatic occluders therefore cast rectangles
+    // in every real build, `coverage_used` was a permanent zero, and nothing
+    // reported it: the ROADMAP line "alpha threshold, zero dev action" was true
+    // of the unit test above it and false of the game.
+    //
+    // The unit test directly above proves the driver can do it when asked. This
+    // one proves something is actually ASKING — that the atlas's upload path
+    // reaches the driver on its own, which is the difference between a feature
+    // that works and a feature that can work.
+    //
+    // Both halves are real: a real `AtlasManager`, a real page with a real hole
+    // in it, and the real `uploadAtlas`. Only the GPU call is stubbed, because
+    // that is the one thing a headless test cannot have.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    try d.lighting.resize(32, 32);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    // The page is BIGGER than the sprite, on purpose. `spriteRect` skips a rect
+    // that covers its whole page -- a full-page sprite's coverage would be the
+    // page, so cropping it would be copying a megabyte to learn nothing. A
+    // fixture where the sprite fills the page therefore registers nothing, and
+    // for a reason that has nothing to do with the hook: a test shaped like that
+    // would pass or fail for the wrong reason.
+    const page_side: u32 = 64;
+    const spr: u32 = 32;
+    var mgr = try atlas_bridge.AtlasManager.init(testing.allocator, page_side, page_side, 0);
+    defer mgr.deinit(testing.allocator);
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+
+    // One sprite with a hole punched in the middle. A fully opaque sprite's
+    // rectangle IS its silhouette, so a fixture with no hole would pass with
+    // coverage disabled and prove nothing at all.
+    var pixels: [spr * spr * 4]u8 = undefined;
+    for (0..spr) |y| {
+        for (0..spr) |x| {
+            const inside = x >= 12 and x < 20 and y >= 12 and y < 20;
+            const off = (y * spr + x) * 4;
+            pixels[off + 0] = 255;
+            pixels[off + 1] = 255;
+            pixels[off + 2] = 255;
+            pixels[off + 3] = if (inside) 0 else 255;
+        }
+    }
+
+    const sprite_e = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.Sprite{ .uv = .{ 0, 0, 1, 1 }, .layer = 0 },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+        components.PointLight2D{ .radius = 64 },
+    });
+
+    // The wiring. Nothing else in the engine does this, which is the point.
+    // `Image` is `assets`', re-exported by `atlas_bridge` -- the same type the
+    // asset pipeline hands the atlas, which is the point of the seam existing at
+    // all rather than being a test-only path.
+    const Image = atlas_bridge.Image;
+    const image = Image{
+        .width = spr,
+        .height = spr,
+        .channels = 4,
+        .pixels = &pixels,
+    };
+    _ = try mgr.addImage(testing.allocator, "sprite.png", image);
+
+    // The sprite's rect comes from the atlas rather than being assumed, so the
+    // test cannot pass because the two happened to agree.
+    const placed = mgr.entries.get("sprite.png").?;
+    world.get(sprite_e, components.Sprite).?.uv = placed.uv;
+
+    mgr.onPageUploaded(&d, Driver.registerCoverageForPage);
+
+    // One frame before the upload, which is the order the engine is in: the
+    // driver learns the world on its first `update`, and atlas pages upload
+    // afterwards. Without this the hook no-ops -- which is correct, and is the
+    // subject of the test below -- and this test would fail for a reason that has
+    // nothing to do with the wiring it is checking.
+    d.update(&world, 0);
+
+    const Upload = struct {
+        fn create(_: *anyopaque, _: u32, _: u32, _: []const u8) ?*anyopaque {
+            // A non-null handle, because `uploadAtlas` treats null as failure and
+            // would return before the hook -- which would make this test pass for
+            // the wrong reason, and quietly.
+            return @ptrFromInt(0x1000);
+        }
+    };
+    _ = try atlas_bridge.uploadAtlas(@ptrFromInt(0x2000), &mgr, Upload.create);
+
+    // The hook ran, and it ran on the driver's own store.
+    try testing.expectEqual(@as(usize, 1), d.coverage().count());
+
+    // And the silhouette reaches the occluder, which is the part the ROADMAP
+    // actually promises.
+    d.update(&world, 0);
+    try testing.expectEqual(@as(u32, 1), d.lighting.stats.coverage_used);
+}
+
+test "render light driver: a coverage hook with no world is a no-op, not a crash" {
+    // The hook's `ctx` is installed before the driver has a world, because that
+    // is the order the engine uses: the atlas manager is built with the renderer,
+    // and the driver is handed the scene a moment later. An upload landing in that
+    // window must not dereference a null world — and must not count a drop either,
+    // since nothing failed; there was simply no scene yet to register against.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+
+    try testing.expect(d.world == null);
+    try Driver.registerCoverageForPage(&d, &[_]u8{ 255, 255, 255, 255 }, 1, 1);
+    try testing.expectEqual(@as(usize, 0), d.coverage().count());
+    try testing.expectEqual(@as(u32, 0), d.lighting.stats.coverage_dropped);
 }
