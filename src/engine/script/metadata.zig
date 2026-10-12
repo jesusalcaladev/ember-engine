@@ -1521,6 +1521,86 @@ pub const bindings = [_]Binding{
         ,
     },
     // ── M4.5: camera ────────────────────────────────────────────────────────
+    // ── M7: the light set the acceptance test and the inspector use ─────────
+    .{
+        .name = "light.new",
+        .module = "light",
+        .signature = "light.new(self, kind, radius, r, g, b, energy)",
+        .summary = "Adds a light of `kind` (0 point, 1 spot, 2 directional, 3 ambient) with its colour, radius and energy in one call.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "kind", .kind = .number, .doc = "0 point, 1 spot, 2 directional, 3 ambient" },
+            .{ .name = "radius", .kind = .number, .doc = "reach; ignored by directional and ambient" },
+            .{ .name = "r", .kind = .number, .doc = "red" },
+            .{ .name = "g", .kind = .number, .doc = "green" },
+            .{ .name = "b", .kind = .number, .doc = "blue" },
+            .{ .name = "energy", .kind = .number, .doc = "brightness multiplier" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- a warm torch
+        \\light.new(self, 0, 192, 1.0, 0.69, 0.41, 1)
+        ,
+    },
+    .{
+        .name = "light.set_cone",
+        .module = "light",
+        .signature = "light.set_cone(self, degrees, penumbra)",
+        .summary = "A spotlight's opening and soft edge. Degrees in, because that is how a cone is authored; the penumbra is 0..1.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "degrees", .kind = .number, .doc = "full opening angle" },
+            .{ .name = "penumbra", .kind = .number, .doc = "0..1; 0.2 is a typical flashlight" },
+        },
+        .returns = &.{},
+        .example =
+        \\light.set_cone(self, 45, 0.25)
+        ,
+    },
+    .{
+        .name = "light.get_radius",
+        .module = "light",
+        .signature = "light.get_radius(self) -> number",
+        .summary = "How far the light reaches. 0 for a directional or ambient light, which reach everywhere.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "radius in world units" },
+        },
+        .example =
+        \\-- a torch that dims as it runs out
+        \\light.set_energy(self, light.get_radius(self) / 192)
+        ,
+    },
+    .{
+        .name = "light.get_cone",
+        .module = "light",
+        .signature = "light.get_cone(self) -> number, number",
+        .summary = "A spotlight's opening in degrees and its penumbra, for the inspector.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "opening in degrees" },
+            .{ .kind = .number, .doc = "penumbra 0..1" },
+        },
+        .example =
+        \\local degs, pen = light.get_cone(self)
+        ,
+    },
+    .{
+        .name = "light.get_shadow",
+        .module = "light",
+        .signature = "light.get_shadow(self) -> boolean, number, number",
+        .summary = "Whether this light casts shadows, the filter step and its smoothness — in the order `light.set_shadow` takes them.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "casts shadows" },
+            .{ .kind = .number, .doc = "filter: 0 off, 1 pcf3, 2 pcf5, 3 soft" },
+            .{ .kind = .number, .doc = "smoothness in texels" },
+        },
+        .example =
+        \\local casts, filter, smooth = light.get_shadow(self)
+        ,
+    },
+    // ── M4.5: camera ────────────────────────────────────────────────────────
     .{
         .name = "camera.new",
         .module = "camera",

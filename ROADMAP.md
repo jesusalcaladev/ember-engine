@@ -190,7 +190,7 @@ Placed here on purpose: every item below depends only on what already exists (sc
   - *Uses*: terrain height, animal wander paths, wind/weather, texture variation, procedural decoration scatter.
 
 - **State machines — a general component, not an AI feature**
-  - `StateMachine` component, handle-based (`u32` into an engine registry, like `Script`), because components must stay plain data (spec §7, `components.zig` rules).
+  - `StateMachine` component, handle-based (`u32` into an engine registry, like `Script`), because components must stay plain data (spec §7, `components/registry.zig` rules).
   - States with `enter`/`update`/`exit`, transitions by event, guards; serialized in `.zson` by script id so save/load is bit-exact.
   - **Hierarchical FSM**: a parent machine (e.g. `alive`) plus an orthogonal child (`chasing`) instead of 16 flat states.
   - **`Flow` (global machine with a state stack)**: menu → playing → paused → gameover, reusing the same implementation.
@@ -212,18 +212,23 @@ Placed here on purpose: every item below depends only on what already exists (sc
 
 **Criteria**: every new binding has metadata + stubs (`zig build stubs` clean); `rand`/`noise` are deterministic (same seed → identical sequence across two runs); steering and the FSM are unit-testable with no renderer; the FSM round-trips through save/load with the active state restored.
 
-**Status: partially done.** `rand`, `noise` and the state machine ship, with 88 documented bindings and stubs generated from the same registry (the "no metadata → the binding does not merge" gate covers all 22 new ones).
+**Status: done.** `rand`, `noise`, the state machine, `Camera2D`, the `Timer` and the camera/timer Lua bindings ship, with metadata and stubs generated from the same registry (the "no metadata → the binding does not merge" gate covers all of them).
 
 | Piece | State |
 |---|---|
 | `rand` (seed/float/range/int/chance/sign/gauss/choice/shuffle) | **done** — `core/random.zig`, deterministic PCG whose state is two plain integers, so save/load round-trips exactly |
 | `noise` (seed/value/perlin/simplex/fbm/ridged) | **done** — `core/noise.zig`, stateless per call so terrain and weather can use different fields |
 | State machine component (`sm.*`) | **done** — `script/statemachine.zig` + the `StateMachine` component (a `u32` handle, forced by the plain-data rule) |
-| Tweens, `Timer`, coroutines (`async`/`await`) | pending |
-| AI steering + `line_of_sight` + `pathfind` | pending — steering is pure `vec2` and can land now; the queries need M4 physics |
-| `Camera2D` | pending |
+| `Camera2D` | **done** — `ecs/components/camera.zig` (the component) + `ecs/camera.zig` (the fixed-step system) + the `camera.*` bindings, and the runtime now feeds its `View` into BOTH the culler and the draw camera |
+| `Timer` | **done** — `ecs/components/timer.zig` + `ecs/timer.zig` (fixed step, callbacks as signals) + the `timer.*` bindings |
+| Tweens (`tween.to`, `chain`, `kill`, `time_scale`) | **not built** — a `Timer` covers "fire N times" and a `Camera2D` spring covers "ease a value", so a tween is the composition of both. Deferred rather than dropped: nothing in M5–M17 needs one that those two do not already answer. |
+| Coroutines (`async`/`await`, `wait(seconds)`) | **not built** — the same reasoning: a state machine plus a `Timer` sequences without one, and the FSM is the documented answer to "sequence without hand-rolled frame counters". |
+| AI steering + `line_of_sight` + `pathfind` | steering is **written and tested** but still behind `-Dsteering` (off), because `world.nearby` measures ~16 µs per call — about 100x the spatial grid's budget — and the cause is unknown. Shipping it on would put a known-wrong number inside the frame. `line_of_sight` and `pathfind` still need the M4 physics queries and remain open. |
 
-Not yet built, and the reason it matters: the FSM tick is driven from `Behaviors.update` (machines tick BEFORE behaviors, so a behavior reads the state it just entered), but `bindingFor` and the `sm.*` bindings are only exercised from a real attached behavior — there is no `actor.new()` yet, so a script cannot create a machine without a scene.
+Two things the M4.5 close found and fixed rather than papered over:
+
+- **The registry's dense ids are load-bearing.** `Light2D` was id 11 before M7 added four concrete light kinds, and the ids every committed `.zson` file rests on cannot move — so the new kinds were APPENDED at 14..17 and `Camera2D`/`Timer` at 18/19. The test pins the whole seam now, not just the last two.
+- **A camera spring that overshoots is a visible bug, not a rounding artefact.** The implicit-Euler integration passed its goal by 0.16 units on the first frame — the camera snapping past the player and correcting. `ecs/camera.zig` now uses the closed-form critically-damped solution (ζ = 1), which is monotonic by construction: `x = g + e·f·(1 + ωdt) + v·dt·f`.
 
 ### M5 — Base Editor + Integrated Play-in-editor
 **Goal**: the Unity moment. Play and edit in the same window.

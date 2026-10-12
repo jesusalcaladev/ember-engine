@@ -357,6 +357,68 @@ function Actor:get_size() end
 function Actor:get_tint() end
 
 
+-- ── point ──
+---Adds a PointLight2D: a lamp, torch or candle. Falls off in every direction.
+---@param self Actor 
+---@param radius number reach in world units
+function Actor:new(radius) end
+
+---How far the light reaches. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff, not a hard edge.
+---@param self Actor 
+---@param radius number reach
+function Actor:set_radius(radius) end
+
+
+-- ── spot ──
+---Adds a SpotLight2D: a cone with a soft edge.
+---@param self Actor 
+---@param radius number beam reach
+function Actor:new(radius) end
+
+---How far the beam reaches.
+---@param self Actor 
+---@param radius number reach
+function Actor:set_radius(radius) end
+
+---The cone's opening and its soft edge. Two numbers in one call because nothing ever sets one without the other, and a spotlight whose opening moved but whose soft edge did not is a mis-configured light nobody can explain.
+---@param self Actor 
+---@param degrees number full opening
+---@param penumbra number 0..1 soft-edge fraction
+function Actor:set_cone(degrees, penumbra) end
+
+---The direction the cone points.
+---@param self Actor 
+---@param radians number angle
+function Actor:set_angle(radians) end
+
+
+-- ── directional ──
+---Adds a DirectionalLight2D: the sun. No falloff at all, which is why it exists -- a point light at 4000 units is dark at the far end of the screen because its falloff is measured from where it IS, and a sun is not anywhere.
+---@param self Actor 
+function Actor:new() end
+
+---The direction the light TRAVELS, not the direction it points. A sun at 0 shines to the right, which makes shadows run to the left of every object.
+---@param self Actor 
+---@param radians number angle
+function Actor:set_angle(radians) end
+
+---0..1. How high above the scene the light sits, which scales shadow LENGTH. A 2D scene needs a z coordinate for exactly this.
+---@param self Actor 
+---@param h number 0..1
+function Actor:set_height(h) end
+
+
+-- ── ambient ──
+---Adds an AmbientLight2D. Its own type rather than one number on the Environment, because a scene often wants TWO ambients -- a sky colour and a ground bounce.
+---@param self Actor 
+function Actor:new() end
+
+---A local ambient. 0 restores the scene-wide kind. A lantern's pool of warm air differs from the night around it, and one number cannot hold both.
+---@param self Actor 
+---@param distance number reach; 0 for scene-wide
+function Actor:set_local(distance) end
+
+
 -- ── material ──
 ---Attaches a shader material to an actor. Shader 0 is the stock sprite shader.
 ---@param self Actor 
@@ -386,26 +448,6 @@ function Actor:get_shader() end
 
 
 -- ── light ──
----Adds a light to an actor. Position and direction come from its Transform.
----@param self Actor 
----@param kind integer 0 point, 1 spot, 2 directional
----@param radius number reach in world units
----@param r number red 0..1
----@param g number green 0..1
----@param b number blue 0..1
----@param energy number brightness multiplier
-function Actor:new(kind, radius, r, g, b, energy) end
-
----0 point, 1 spot, 2 directional.
----@param self Actor 
----@param kind integer 0 point, 1 spot, 2 directional
-function Actor:set_kind(kind) end
-
----The light's reach in world units. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff.
----@param self Actor 
----@param radius number reach
-function Actor:set_radius(radius) end
-
 ---Colour. Alpha is the light's opacity, so a light fades out by its alpha and not a separate field.
 ---@param self Actor 
 ---@param r number red
@@ -418,11 +460,6 @@ function Actor:set_color(r, g, b, a) end
 ---@param self Actor 
 ---@param e number multiplier
 function Actor:set_energy(e) end
-
----Direction for a spot, or the direction it travels for a directional light. Unused by a point light.
----@param self Actor 
----@param radians number angle
-function Actor:set_angle(radians) end
 
 ---A spot's opening and its soft edge. The penumbra is the fraction of the cone given over to a fade: 0.2 means full strength to 80% and a fade over the last 20%.
 ---@param self Actor 
@@ -454,38 +491,41 @@ function Actor:set_mask(bitmask) end
 
 ---The inspector reads as well as writes, and its field list is generated from this same registry.
 ---@param self Actor 
----@return integer 0 point, 1 spot, 2 directional
-function Actor:get_kind() end
-
----The inspector reads as well as writes, and its field list is generated from this same registry.
----@param self Actor 
----@return number reach
-function Actor:get_radius() end
-
----The inspector reads as well as writes, and its field list is generated from this same registry.
----@param self Actor 
----@return number red
----@return number green
----@return number blue
----@return number alpha
-function Actor:get_color() end
-
----The inspector reads as well as writes, and its field list is generated from this same registry.
----@param self Actor 
 ---@return number brightness multiplier
 function Actor:get_energy() end
 
----The inspector reads as well as writes, and its field list is generated from this same registry.
+---Adds a light of `kind` (0 point, 1 spot, 2 directional, 3 ambient) with its colour, radius and energy in one call.
+---@param self Actor 
+---@param kind number 0 point, 1 spot, 2 directional, 3 ambient
+---@param radius number reach; ignored by directional and ambient
+---@param r number red
+---@param g number green
+---@param b number blue
+---@param energy number brightness multiplier
+function Actor:new(kind, radius, r, g, b, energy) end
+
+---A spotlight's opening and soft edge. Degrees in, because that is how a cone is authored; the penumbra is 0..1.
+---@param self Actor 
+---@param degrees number full opening angle
+---@param penumbra number 0..1; 0.2 is a typical flashlight
+function Actor:set_cone(degrees, penumbra) end
+
+---How far the light reaches. 0 for a directional or ambient light, which reach everywhere.
+---@param self Actor 
+---@return number radius in world units
+function Actor:get_radius() end
+
+---A spotlight's opening in degrees and its penumbra, for the inspector.
 ---@param self Actor 
 ---@return number opening in degrees
 ---@return number penumbra 0..1
 function Actor:get_cone() end
 
----The inspector reads as well as writes, and its field list is generated from this same registry.
+---Whether this light casts shadows, the filter step and its smoothness — in the order `light.set_shadow` takes them.
 ---@param self Actor 
 ---@return boolean casts shadows
----@return integer filter
----@return number smoothness
+---@return number filter: 0 off, 1 pcf3, 2 pcf5, 3 soft
+---@return number smoothness in texels
 function Actor:get_shadow() end
 
 
@@ -592,6 +632,78 @@ function Actor:get_clear() end
 ---@return number near
 ---@return number far
 function Actor:get_fog() end
+
+
+-- ── camera ──
+---Adds a Camera2D to this actor. The FIRST enabled camera in the world is the one that renders, so a second one is a cut waiting to happen.
+---@param self Actor 
+function Actor:new() end
+
+---Makes this camera follow another actor. Passing an actor rather than a position means it stays correct without being told again every frame.
+---@param self Actor 
+---@param other Actor the actor to follow
+function Actor:follow(other) end
+
+---The zoom the camera eases toward. 2 shows half the world at twice the detail; it is reached through a spring, not snapped.
+---@param self Actor 
+---@param zoom number target zoom, > 0
+function Actor:zoom_to(zoom) end
+
+---Adds screen shake. Trauma accumulates and then decays, so repeated hits build on each other instead of restarting.
+---@param self Actor 
+---@param trauma number 0..1; 1 is a hard hit
+function Actor:shake(trauma) end
+
+---The rectangle the camera may not leave — how a level stops you from seeing past its own edges. A zero width or height disables the limits.
+---@param self Actor 
+---@param x number left edge
+---@param y number top edge
+---@param w number width; 0 disables
+---@param h number height; 0 disables
+function Actor:set_limits(x, y, w, h) end
+
+---How lazily the camera chases its target. 0 welds it (a fixed-view platformer); higher trails behind.
+---@param self Actor 
+---@param damping number 0 = instant, ~8 = smooth
+function Actor:set_damping(damping) end
+
+---Where the camera is, in world units — the same number the renderer uses.
+---@param self Actor 
+---@return number centre x
+---@return number centre y
+function Actor:get_centre() end
+
+
+-- ── timer ──
+---A timer as a COMPONENT: kind 0 once, 1 loop, 2 during. It declares signal names instead of a closure, so it survives save/load and hot-reload.
+---@param self Actor 
+---@param seconds number cycle length
+---@param kind number 0 once, 1 loop, 2 during
+function Actor:new(seconds, kind) end
+
+---The signals this timer fires. `on_done` runs at the end of each cycle; `on_tick` runs every tick and only matters for kind 2 (during).
+---@param self Actor 
+---@param on_tick string empty fires nothing
+---@param on_done string empty fires nothing
+function Actor:set_signals(on_tick, on_done) end
+
+---Starts the timer from zero. 0 loops means forever.
+---@param self Actor 
+---@param loops number 0 = infinite
+function Actor:start(loops) end
+
+---Pauses the timer WITHOUT losing its progress, so starting again resumes where it was. `timer.kill` ends it for good.
+---@param self Actor 
+function Actor:stop() end
+
+---Finishes the timer: no more signals, ever.
+---@param self Actor 
+function Actor:kill() end
+
+---How far through the current cycle, 0..1 — what a cooldown bar draws.
+---@param self Actor 
+---@return number 0 at the start, 1 at the end of the cycle
+function Actor:progress() end
 
 
 -- ── math ──

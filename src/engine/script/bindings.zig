@@ -1874,14 +1874,123 @@ fn lua_ambient_set_local(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// `light.new(self, kind, radius, r, g, b, energy)` — adds whichever of the four
+/// concrete lights `kind` selects (0 point, 1 spot, 2 directional, 3 ambient),
+/// with its colour, radius and energy in ONE call.
+///
+/// One call rather than `point.new` plus four setters because a light is never
+/// authored one field at a time: a scene file, a prefab and a script all arrive
+/// with a whole light. It is also the only way `radius` is settable for a
+/// directional light, which has none — the argument is simply ignored there.
+fn lua_light_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const kind: u8 = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    const radius = @max(lua.toF32(L, 3), 1);
+    const color = [4]f32{ lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6), 1 };
+    const energy = lua.toF32(L, 7);
+    switch (kind) {
+        1 => _ = ctx.world.add(e, SpotLight{ .radius = radius }) catch return 0,
+        2 => _ = ctx.world.add(e, DirLight{}) catch return 0,
+        3 => _ = ctx.world.add(e, AmbientLight{}) catch return 0,
+        else => _ = ctx.world.add(e, PointLight{ .radius = radius }) catch return 0,
+    }
+    // The shared fields are written through the same helpers the setters use, so
+    // `light.new` and `light.set_*` can never disagree about how a field maps.
+    if (ctx.world.get(e, PointLight)) |l| {
+        setColor(&l.base, color);
+        setEnergy(&l.base, energy);
+    }
+    if (ctx.world.get(e, SpotLight)) |l| {
+        setColor(&l.base, color);
+        setEnergy(&l.base, energy);
+    }
+    if (ctx.world.get(e, DirLight)) |l| {
+        setColor(&l.base, color);
+        setEnergy(&l.base, energy);
+    }
+    if (ctx.world.get(e, AmbientLight)) |l| {
+        setColor(&l.base, color);
+        setEnergy(&l.base, energy);
+    }
+    return 0;
+}
+
+/// `light.get_radius(self) -> number` — how far the light reaches.
+fn lua_light_get_radius(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, PointLight)) |l| lua.pushF32(L, l.radius);
+    if (ctx.world.get(e, SpotLight)) |l| lua.pushF32(L, l.radius);
+    // A directional light and an ambient light have no radius: they reach
+    // everywhere. Returning 0 rather than nil keeps the return type stable, so a
+    // generic inspector does not need a per-kind branch.
+    return 1;
+}
+
+/// `light.set_cone(self, degrees, penumbra)` — spot only. Read back through
+/// `light.get_cone`, which is what the acceptance test and the inspector do.
+///
+/// Degrees in, radians stored. The component stores radians because the shader
+/// wants a dot-product threshold, and the binding takes degrees because that is
+/// how a cone is authored.
+fn lua_light_set_cone(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight)) |l| {
+        l.cone_angle = lua.toF32(L, 2) * (core_math.pi / 180.0);
+        l.penumbra = core_math.clampf(lua.toF32(L, 3), 0, 1);
+    }
+    return 0;
+}
+
+/// `light.get_cone(self) -> degrees, penumbra`.
+fn lua_light_get_cone(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight)) |l| {
+        lua.pushF32(L, l.cone_angle * (180.0 / core_math.pi));
+        lua.pushF32(L, l.penumbra);
+        return 2;
+    }
+    lua.pushF32(L, 0);
+    lua.pushF32(L, 0);
+    return 2;
+}
+
+/// `light.get_shadow(self) -> casts, filter, smoothness` — the inspector's three
+/// shadow knobs in the order the setter takes them.
+fn lua_light_get_shadow(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    // One pointer into whichever light is present, so the three reads below are
+    // written once instead of once per kind. This is also why a light added by
+    // any of the four modules reports the same shape here.
+    var base: ?*const components.LightBase = null;
+    if (ctx.world.get(e, PointLight)) |l| base = &l.base;
+    if (ctx.world.get(e, SpotLight)) |l| base = &l.base;
+    if (ctx.world.get(e, DirLight)) |l| base = &l.base;
+    if (ctx.world.get(e, AmbientLight)) |l| base = &l.base;
+    const b = base orelse return 0;
+    lua.lua_pushboolean(L, @intFromBool(b.cast_shadows));
+    lua.pushF32(L, @floatFromInt(@intFromEnum(b.shadow_filter)));
+    lua.pushF32(L, b.shadow_filter_smooth);
+    return 3;
+}
+
 const light_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_light_new },
     .{ .name = "set_color", .func = lua_light_set_color },
     .{ .name = "set_energy", .func = lua_light_set_energy },
     .{ .name = "set_blend", .func = lua_light_set_blend },
     .{ .name = "set_shadow", .func = lua_light_set_shadow },
     .{ .name = "set_gi", .func = lua_light_set_gi },
     .{ .name = "set_mask", .func = lua_light_set_mask },
+    .{ .name = "set_cone", .func = lua_light_set_cone },
     .{ .name = "get_energy", .func = lua_light_get_energy },
+    .{ .name = "get_radius", .func = lua_light_get_radius },
+    .{ .name = "get_cone", .func = lua_light_get_cone },
+    .{ .name = "get_shadow", .func = lua_light_get_shadow },
     .{ .name = null, .func = null },
 };
 
@@ -2924,6 +3033,13 @@ pub const registered_names = [_][]const u8{
     "light.set_gi",
     "light.set_mask",
     "light.get_energy",
+    // The M7 set: `light.new` is what a scene file and the acceptance test use,
+    // and the three getters are what the inspector reads back.
+    "light.new",
+    "light.set_cone",
+    "light.get_radius",
+    "light.get_cone",
+    "light.get_shadow",
     "point.new",
     "point.set_radius",
     "spot.new",

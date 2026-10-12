@@ -281,13 +281,21 @@ test "component ids resolved at comptime" {
     try testing.expectEqual(@as(?ComponentId, null), idOfName("Nope"));
 }
 
-test "the M4.5 components were APPENDED, not inserted" {
+test "the components were APPENDED, not inserted" {
     // Dense ids are part of the `.zson` contract: an inserted component would
-    // silently renumber every document ever written. Pin the seam.
+    // silently renumber every document ever written. Pin the seam — and pin the
+    // M1/M2/M4 fourteen hardest, because those are the ids every committed scene
+    // already on disk was written against.
+    try testing.expectEqual(@as(ComponentId, 0), componentId(Name));
+    try testing.expectEqual(@as(ComponentId, 4), componentId(Sprite));
     try testing.expectEqual(@as(ComponentId, 13), componentId(Environment));
-    try testing.expectEqual(@as(ComponentId, 14), componentId(Camera2D));
-    try testing.expectEqual(@as(ComponentId, 15), componentId(Timer));
-    try testing.expectEqual(@as(usize, 16), entries.len);
+    // Everything past the M1/M2/M4 fourteen is what later milestones appended,
+    // in the order they landed: M7's four lights, then M4.5's camera and timer.
+    try testing.expectEqual(@as(ComponentId, 14), componentId(PointLight2D));
+    try testing.expectEqual(@as(ComponentId, 17), componentId(AmbientLight2D));
+    try testing.expectEqual(@as(ComponentId, 18), componentId(Camera2D));
+    try testing.expectEqual(@as(ComponentId, 19), componentId(Timer));
+    try testing.expectEqual(@as(usize, 20), entries.len);
 }
 
 test "default baseline bytes match a default value" {

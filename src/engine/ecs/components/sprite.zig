@@ -1,0 +1,81 @@
+//! Sprite components — `Blend`, `SpriteShape` and `Sprite` (M2, split out of
+//! components.zig).
+
+const core_math = @import("core").math;
+const transform_mod = @import("transform.zig");
+
+pub const Vec2 = core_math.Vec2;
+const unit = transform_mod.unit;
+
+/// How a sprite is composited. Plain enum, so the ECS stores it as 1 byte and
+/// `.zson` writes the name.
+pub const Blend = enum(u8) {
+    /// No blending: the fragment overwrites the target. Cheapest, and the only
+    /// correct choice for solid geometry (it can also use early-Z).
+    /// Named `solid`, not `opaque`: that is a Zig primitive type name.
+    solid = 0,
+    /// Standard source-over: the painter's algorithm for sprites.
+    alpha = 1,
+    /// Source + destination: lights and glows (M7).
+    additive = 2,
+};
+
+/// How a sprite's quad is masked.
+///
+/// Godot can draw a rectangle, a circle, a line and a polygon with no texture at
+/// all, and that is what makes "grey boxes" a legitimate first step rather than a
+/// placeholder you have to go back and replace. `quad` and `circle` are the two
+/// that carry a prototype; both cost one quad and one comparison in the shader.
+pub const SpriteShape = enum(u8) {
+    quad = 0,
+    circle = 1,
+};
+
+/// What to draw for an entity, and how. This is the whole render surface of an
+/// actor: position comes from `Transform`, the appearance from here.
+///
+/// Everything is plain data with defaults, which is what lets `.zson` describe
+/// a sprite prefab and lets the editor override a single field (patch mode).
+pub const Sprite = struct {
+    /// Atlas slot (index into the renderer's texture table). Slot 0 is the
+    /// fallback white texture, so a sprite with no atlas still draws.
+    atlas: u8 = 0,
+    /// Render layer. Lower draws first (painter's order); the renderer sorts by
+    /// it and the batcher groups equal values into one draw call.
+    layer: u16 = 0,
+    /// Size in world units (the Transform's scale multiplies this).
+    size: Vec2 = unit,
+    /// How the quad is masked. `quad` is the default so an existing sprite is
+    /// unchanged, and so a prototype drawn with `sprite.circle` and then given
+    /// real art is one line, not a rewrite.
+    shape: SpriteShape = .quad,
+    /// Atlas rect, normalized: (u0, v0, u1, v1).
+    uv: [4]f32 = .{ 0, 0, 1, 1 },
+    /// Tint, multiplied with the texel.
+    tint: [4]f32 = .{ 1, 1, 1, 1 },
+    /// Stable tie-break inside a layer, so the order is deterministic (spec §6).
+    order: i32 = 0,
+    blend: Blend = .alpha,
+    /// Draw nothing for this entity without despawning it (editor gizmos, cut
+    /// scenes). Cheaper and safer than a structural change during the frame.
+    visible: bool = true,
+};
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+const std = @import("std");
+const testing = std.testing;
+
+test "Sprite is POD with sane defaults (the .zson baseline)" {
+    const s = Sprite{};
+    try testing.expectEqual(@as(u8, 0), s.atlas);
+    try testing.expectEqual(@as(u16, 0), s.layer);
+    try testing.expectEqual(@as(f32, 1), s.size.x);
+    try testing.expectEqual(@as(f32, 1), s.uv[2]);
+    try testing.expectEqual(Blend.alpha, s.blend);
+    try testing.expect(s.visible);
+    // Kept small on purpose: the 50k canonical scene multiplies this by 50000,
+    // so 52 B/sprite is 2.6 MB of column data (spec §5 allows it, but it is
+    // pure cache pressure in the render walk).
+    try testing.expectEqual(@as(usize, 52), @sizeOf(Sprite));
+}

@@ -3,13 +3,15 @@
 //!
 //! Layer map:
 //! - `entity`: 64-bit handles with generation (no use-after-free).
-//! - `components`: the registry (ids, layout, plain-data rules).
+//! - `components`: the facade over `components/` (ids, layout, plain-data rules).
 //! - `archetype`: SoA tables; rows move with `memcpy`.
 //! - `world`: slots, archetype index, spawn/add/remove/get, growth locking.
 //! - `query`: typed iteration, batch-first (systems) and per-entity (actors).
 //! - `hierarchy`: flat (no recursion) parent-chain resolution.
 //! - `zson`: bit-exact text format + prefab overrides.
 //! - `signals`: typed events, stable order by spawn, drained once per frame.
+//! - `timer`: the fixed-step Timer system (M4.5).
+//! - `camera`: the fixed-step Camera2D system (M4.5).
 //! - `actor`: the facade the runtime and Lua bindings talk to.
 
 pub const entity = @import("entity.zig");
@@ -21,6 +23,8 @@ pub const hierarchy = @import("hierarchy.zig");
 pub const zson = @import("zson.zig");
 pub const signals = @import("signals.zig");
 pub const collision_layers = @import("collision_layers.zig");
+pub const timer = @import("timer.zig");
+pub const camera = @import("camera.zig");
 pub const actor = @import("actor.zig");
 
 // Short names for what the runtime and the actor code import constantly.
@@ -40,4 +44,8 @@ test {
     _ = @import("query_cursor_test.zig");
     _ = @import("collision_layers.zig");
     _ = @import("components_test.zig");
+    // M4.5 systems: reachable only through this root, so name them here to
+    // keep their tests in the suite.
+    _ = @import("timer.zig");
+    _ = @import("camera.zig");
 }
