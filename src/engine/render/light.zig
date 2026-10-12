@@ -34,7 +34,6 @@ const ecs = @import("ecs");
 const components = ecs.components;
 
 const Vec2 = components.Vec2;
-const Light2D = components.Light2D;
 const LightOccluder2D = components.LightOccluder2D;
 const World = ecs.World;
 
@@ -112,39 +111,75 @@ pub const MaskRect = struct {
 /// field being reordered or a `bool` sneaking in as a byte is a wire-format bug
 /// that a shader reading the wrong offset would turn into garbage geometry.
 pub const LightInstance = extern struct {
-    /// World-space centre, including the component's offset.
+    // The field ORDER is not free. `backend_dawn.zig` declares vertex
+    // attributes at 0/8/16/24/32/40/48/56 and `light.wgsl`'s `LightIn` reads the
+    // same offsets, so this layout is a three-way contract: change one and the
+    // other two must change with it, or the GPU reads a light whose half extents
+    // are actually its colour.
+    //
+    // Each pair is padded to 8 bytes so a vec2 attribute never straddles two
+    // fields, which is why `radius` sits alone next to `shadow_ratio` rather
+    // than beside `angle`.
+
+    /// Byte 0. World-space centre, including the component's offset. For a
+    /// directional light and a scene-wide ambient this is the VIEW's centre, not
+    /// the actor's — see `descFor`.
     pos: [2]f32,
-    /// World-space reach. The 1D shadow map is normalized by this.
+    /// Byte 8. World-space reach: what `1 - d/radius` falls off over.
     radius: f32,
-    /// Half-extents of the quad this light draws as.
+    /// Byte 12. Shadow reach as a FRACTION of `radius`, not as a distance.
+    ///
+    /// A ratio because the slot had to stay inside the vec2 that `radius`
+    /// already occupies, and because the one light that needs them to differ is
+    /// the directional one: its falloff is set by how far the view reaches, and
+    /// its shadow length by the sun's elevation, and those are two different
+    /// dials that a single `radius` cannot be at once.
+    shadow_ratio: f32,
+    /// Byte 16. Half-extents of the quad this light draws as.
     half: [2]f32,
-    /// Direction in radians (`spot`, `directional`).
+    /// Byte 24. Direction in radians (`spot`, `directional`).
     angle: f32,
-    /// `cos` of the cone's half-angle, and of the fully-lit inner cone. Two
-    /// cosines rather than two angles because that is what the cone test needs,
-    /// and a `cos` per vertex of a quad is not a rounding error anyone can see.
+    /// Byte 28. `cos` of the cone's half-angle. A cosine rather than an angle
+    /// because that is what the cone test needs, and a `cos` per vertex of a
+    /// quad is not a rounding error anyone can see.
     cos_outer: f32,
+    /// Byte 32. `cos` of the fully-lit inner cone: the outer cone shrunk by the
+    /// penumbra.
     cos_inner: f32,
-    color: [4]f32,
+    /// Byte 36. Brightness multiplier.
     energy: f32,
+    /// Byte 40. rgb + opacity. Alpha IS the light's opacity — a light fades out
+    /// by its alpha rather than by a separate field, so fading needs no extra
+    /// attribute and no extra blend mode.
+    color: [4]f32,
+    /// Byte 56. Falloff exponent.
     attenuation: f32,
-    /// Softness multiplier for the penumbra, in normalized units.
+    /// Byte 60. Softness multiplier for the penumbra, in normalized units.
     softness: f32,
-    /// How much this light contributes to the GI term. 0 by default: GI is an
-    /// explicit opt-in per light, not something that happens to everyone.
+    /// Byte 64. How much this light contributes to the GI term. 0 by default: GI
+    /// is an explicit opt-in per light, not something that happens to everyone.
     gi: f32,
-    /// kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7.
+    /// Byte 68. kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7.
     /// Named `flags` and not `packed`: `packed` is a Zig keyword, and a field
     /// called after a keyword is a compile error dressed up as a typo.
     flags: u32,
 
     comptime {
-        // 68 bytes, not 64. The last four would have to be a quantised
-        // attenuation exponent or a half-precision softness, and a light whose
-        // falloff is off by rounding is a light a user reports as "this one
-        // looks different" with no way to find out why. Four bytes per light is
-        // not worth a rounding error nobody can locate.
-        if (@sizeOf(LightInstance) != 68) @compileError("LightInstance must stay 68 bytes");
+        // 72 bytes, and every offset above is asserted rather than trusted. A
+        // struct whose layout drifts from the shader's is not a wrong light, it
+        // is garbage that renders as *something* — the failure mode is a scene
+        // that looks lit but has never been correct, which nobody reports.
+        if (@sizeOf(LightInstance) != 72) @compileError("LightInstance must stay 72 bytes");
+        if (@offsetOf(LightInstance, "half") != 16) @compileError("half must sit at byte 16");
+        if (@offsetOf(LightInstance, "color") != 40) @compileError("color must sit at byte 40");
+        if (@offsetOf(LightInstance, "gi") != 64) @compileError("gi must sit at byte 64");
+    }
+
+    /// How far the shadow sweep for this light traces, in world units. A
+    /// convenience over `radius * shadow_ratio` that keeps the ratio's meaning
+    /// in one place.
+    pub fn shadowReach(self: LightInstance) f32 {
+        return self.radius * self.shadow_ratio;
     }
 
     pub fn kind(self: LightInstance) components.LightKind {
@@ -274,6 +309,11 @@ pub const Lighting = struct {
     lights: std.ArrayList(LightInstance) = .empty,
     /// Parallel to `lights.items`: the shadow channel each light got, or -1.
     channel_of: std.ArrayList(i8) = .empty,
+    /// Parallel to `lights.items`: how far each light's shadow sweep traces, in
+    /// world units. A separate list rather than `radius * shadow_ratio` read
+    /// back at grant time because the sweep needs the reach as a distance, and
+    /// recomputing the product in two places is how the two places stop agreeing.
+    reach_of: std.ArrayList(f32) = .empty,
     /// Scratch for ranking shadow candidates by area.
     scratch: std.ArrayList(AreaRank) = .empty,
     occluders: std.ArrayList(Occluder) = .empty,
@@ -332,6 +372,7 @@ pub const Lighting = struct {
         self.allocator.free(self.sdf);
         self.lights.deinit(self.allocator);
         self.channel_of.deinit(self.allocator);
+        self.reach_of.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.occluders.deinit(self.allocator);
         self.* = undefined;
@@ -384,6 +425,7 @@ pub const Lighting = struct {
     pub fn reserve(self: *Lighting, lights: usize, occluders: usize) !void {
         try self.lights.ensureUnusedCapacity(self.allocator, lights);
         try self.channel_of.ensureUnusedCapacity(self.allocator, lights);
+        try self.reach_of.ensureUnusedCapacity(self.allocator, lights);
         try self.scratch.ensureUnusedCapacity(self.allocator, lights);
         try self.occluders.ensureUnusedCapacity(self.allocator, occluders);
     }
@@ -393,6 +435,7 @@ pub const Lighting = struct {
     pub fn lock(self: *Lighting) void {
         self.lights.clearRetainingCapacity();
         self.channel_of.clearRetainingCapacity();
+        self.reach_of.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
         self.occluders.clearRetainingCapacity();
         self.stats = .{};
@@ -420,6 +463,7 @@ pub const Lighting = struct {
         const t0 = self.tick();
         self.lights.clearRetainingCapacity();
         self.channel_of.clearRetainingCapacity();
+        self.reach_of.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
         self.occluders.clearRetainingCapacity();
 
@@ -430,23 +474,19 @@ pub const Lighting = struct {
         // same place as the light that owned the slot last frame.
         self.channel_built = [_]bool{false} ** 4;
 
-        // Lights. The row already holds an archetype pointer, so `Row.get` is a
-        // cell index rather than `world.get`'s slot lookup plus archetype walk —
-        // about 141 ns per light, which a 200-light scene pays 200 times.
-        var iter = world.query(.{components.Light2D});
-        var entry = iter.next();
-        while (entry) |e| : (entry = iter.next()) {
-            const l: *const Light2D = e.get(Light2D);
-            if (!l.enabled) continue;
-            const t: ?*const components.Transform = world.get(e.entity(), components.Transform);
-            const pos = lightPos(t, l);
-            if (view) |v| {
-                if (!lightReaches(l.kind, pos, l.radius, v)) continue;
-            }
-
-            self.lights.appendAssumeCapacity(instanceFor(l.*, pos, -1));
-            self.channel_of.appendAssumeCapacity(if (l.cast_shadows) -2 else -1);
-        }
+        // Lights. Four components, one code path: `gather` is generic over the
+        // component type and `descFor` is the only place that knows a
+        // SpotLight2D has a cone. Writing four loops here would work until
+        // somebody fixed a bug in three of them, and the fourth would be a light
+        // that behaves differently in a way nobody can point at.
+        //
+        // The row already holds an archetype pointer, so `Row.get` is a cell
+        // index rather than `world.get`'s slot lookup plus archetype walk — about
+        // 141 ns per light, which a 200-light scene pays 200 times.
+        gather(components.PointLight2D, self, world, view);
+        gather(components.SpotLight2D, self, world, view);
+        gather(components.DirectionalLight2D, self, world, view);
+        gather(components.AmbientLight2D, self, world, view);
 
         // Occluders.
         var h: u64 = 0;
@@ -525,7 +565,7 @@ pub const Lighting = struct {
             self.lights.items[cand.index] = base;
             const slot: usize = @intCast(granted);
             self.channel_pos[slot] = .{ .x = inst.pos[0], .y = inst.pos[1] };
-            self.channel_radius[slot] = inst.radius;
+            self.channel_radius[slot] = self.reach_of.items[cand.index];
         }
         self.stats.shadow_lights = granted;
         self.stats.shadow_denied = @as(u32, @intCast(self.scratch.items.len)) - granted;
@@ -779,6 +819,14 @@ pub const Lighting = struct {
         var falloff: f32 = 0;
         switch (li_.kind()) {
             .point => falloff = 1 - @min(rec01, 1),
+            // An ambient is NOT a point light at a large radius. Its whole
+            // purpose is to not dim as you walk away from it, so its curve is
+            // FLAT across 80% of its reach and soft over the last 20% — and a
+            // scene-wide ambient is sized so that flat part covers the view.
+            // Using the point curve here would make a global ambient brightest
+            // in one spot on screen, which is a bug a user files as "my ambient
+            // light is in the wrong place".
+            .ambient => falloff = 1 - smoothstep(0.8, 1.0, rec01),
             .spot, .directional => {
                 const dir = Vec2{ .x = @cos(li_.angle), .y = @sin(li_.angle) };
                 var to = Vec2{ .x = x - pos.x, .y = y - pos.y };
@@ -810,24 +858,30 @@ pub const Lighting = struct {
             var idx: u32 = @intFromFloat(theta * @as(f32, @floatFromInt(self.angles)) * inv);
             idx = @min(idx, self.angles - 1);
             const occ = @as(f32, @floatFromInt(self.shadow[base + idx])) / 255.0;
+            // Normalized by the SHADOW reach, not by the light's. The map holds
+            // `1 - t/shadow_reach` because the sweep traced that far, so the
+            // pixel has to be measured in the same units or the two sides of the
+            // comparison mean different things — which is a shadow that is
+            // subtly, invisibly the wrong length.
             const w = @max(li_.softness * rec01, 1e-4);
-            vis = smoothstep(occ - w, occ, 1.0 - rec01);
+            const here = 1.0 - @min(rec01 / @max(li_.shadow_ratio, 1e-4), 1.0);
+            vis = smoothstep(occ - w, occ, here);
             // A filter is an average of neighbours, not a single sample.
             switch (li_.filter()) {
                 .off => {},
-                .pcf1 => vis = averageMask(occ, li_, rec01),
-                .pcf3 => vis = 0.5 * vis + 0.5 * averageMask(occ, li_, rec01),
-                .pcf5 => vis = 0.25 * vis + 0.5 * averageMask(occ, li_, rec01) +
-                    0.25 * averageMask(occ, li_, rec01),
+                .pcf1 => vis = averageMask(occ, li_, here),
+                .pcf3 => vis = 0.5 * vis + 0.5 * averageMask(occ, li_, here),
+                .pcf5 => vis = 0.25 * vis + 0.5 * averageMask(occ, li_, here) +
+                    0.25 * averageMask(occ, li_, here),
             }
         }
         return falloff * vis * li_.energy * li_.color[3];
     }
 
     /// The neighbourhood average for a filter tap.
-    fn averageMask(occ: f32, li: LightInstance, rec01: f32) f32 {
-        const w = @max(li.softness * rec01, 1e-4);
-        return smoothstep(occ - w, occ, 1.0 - rec01);
+    fn averageMask(occ: f32, li: LightInstance, here: f32) f32 {
+        const w = @max(li.softness * here, 1e-4);
+        return smoothstep(occ - w, occ, here);
     }
 
     /// The combined colour for a pixel, including the blend mode. This is what
@@ -960,9 +1014,11 @@ fn cmpAreaDesc(context: void, a: AreaRank, b: AreaRank) bool {
     return a.area > b.area;
 }
 
-/// Whether a light's reach intersects the view rectangle. A directional light has
-/// no falloff, so only its aim matters — and an aim that misses the view means
-/// the light provably contributes nothing to it.
+/// Whether a light's reach intersects the view rectangle.
+///
+/// A directional light has no falloff and a scene-wide ambient covers everything,
+/// so neither can be culled: both would intersect every rectangle and the test
+/// would be paying for an answer that is always yes.
 fn lightReaches(kind: components.LightKind, pos: Vec2, radius: f32, v: MaskRect) bool {
     if (kind == .directional) return true;
     const cx = @min(@max(pos.x, v.min.x), v.max.x);
@@ -972,39 +1028,239 @@ fn lightReaches(kind: components.LightKind, pos: Vec2, radius: f32, v: MaskRect)
     return dx * dx + dy * dy <= radius * radius;
 }
 
-fn lightPos(t: ?*const components.Transform, l: *const Light2D) Vec2 {
-    const base: Vec2 = if (t) |tt| tt.position else .{ .x = 0, .y = 0 };
-    if (l.offset.x == 0 and l.offset.y == 0) return base;
-    const a = l.angle;
-    const c = @cos(a);
-    const s = @sin(a);
+/// Everything about a light that is NOT in `LightBase`, flattened into one shape.
+///
+/// This exists so `collect` has a single code path for four component types. It
+/// is also the honest description of how much the four kinds actually differ:
+/// a spot has a cone and a directional light does not, and apart from that the
+/// difference is which numbers exist at all.
+const LightShape = struct {
+    /// Offset from the Transform, in the Transform's own frame.
+    offset: Vec2 = .{ .x = 0, .y = 0 },
+    angle: f32 = 0,
+    radius: f32 = 0,
+    attenuation: f32 = 1,
+    /// Full cone opening in radians. Null means "this light has no cone", which
+    /// is a different answer from "a cone of zero width" — a zero-width cone is
+    /// a degenerate spotlight, and one of them is a bug the other is a fact.
+    cone: ?f32 = null,
+    penumbra: f32 = 0.2,
+    /// How far the shadow sweep traces. Zero means "the same as `radius`", which
+    /// is true for every light but the sun.
+    shadow_reach: f32 = 0,
+    /// Drawn centred on the view rather than on its own actor. True for a
+    /// directional light and for a scene-wide ambient, and false for everything
+    /// else: a point light is somewhere and its quad must be around THAT.
+    view_centred: bool = false,
+    /// Directional only. See `shadowReachForHeight` for what this does.
+    height: f32 = 0.5,
+    /// Whether this light can cast a shadow at all. An ambient light cannot: it
+    /// has no position to trace from, and a shadow of nothing is not a soft
+    /// shadow, it is an artifact.
+    can_shadow: bool = true,
+};
+
+/// A light of any kind, in the shape `collect` consumes.
+const LightDesc = struct {
+    base: components.LightBase,
+    shape: LightShape,
+    kind: components.LightKind,
+};
+
+/// How far a sun's shadows reach, as a multiple of the view.
+///
+/// The dial is `height`, Godot's 0..1, and the mapping is `view / height`
+/// clamped: 1 is straight overhead (shadows hug their casters) and small values
+/// are a sun on the horizon (shadows many times the screen). It is inverse
+/// because that is what elevation does — the same logic as `tan`, and the same
+/// reason a real engine's shadows lengthen as the sun sets.
+///
+/// The honest limitation, stated rather than hidden: 2D has no object height, so
+/// this scales the sweep's reach and not any individual cast shadow's length. It
+/// is a dial with the right direction and the right zero, which is what an author
+/// means by it, and it is NOT a substitute for a projected-height system.
+fn shadowReachForHeight(height: f32, view_diag: f32) f32 {
+    const h = @min(@max(height, 0.125), 1);
+    return @min(view_diag / h, view_diag * 8);
+}
+
+/// Flattens one of the four light components into a `LightDesc`.
+///
+/// A `switch` on the TYPE, which Zig evaluates at comptime, so each arm is
+/// checked against its real component and a renamed field is a compile error
+/// rather than a silent zero.
+fn descFor(comptime C: type, c: C, view_diag: f32) LightDesc {
+    return switch (C) {
+        components.PointLight2D => .{
+            .base = c.base,
+            .kind = .point,
+            .shape = .{ .offset = c.offset, .radius = c.radius, .attenuation = c.attenuation },
+        },
+        components.SpotLight2D => .{
+            .base = c.base,
+            .kind = .spot,
+            .shape = .{
+                .offset = c.offset,
+                .radius = c.radius,
+                .attenuation = c.attenuation,
+                .cone = @abs(c.cone_angle),
+                .penumbra = @min(@max(c.penumbra, 0), 1),
+            },
+        },
+        components.DirectionalLight2D => blk: {
+            // A sun does not dim at the edge of the screen, so with no
+            // `max_distance` its falloff reach is the view's. That is a
+            // deliberate asymmetry with a point light at the same distance, and
+            // it is the entire reason this component exists.
+            const reach = if (c.max_distance > 0) c.max_distance else view_diag;
+            break :blk .{
+                .base = c.base,
+                .kind = .directional,
+                .shape = .{
+                    .angle = c.angle,
+                    .radius = reach,
+                    // A directional light has no cone, so both cosines are 1 —
+                    // which is what makes the shader's `c >= cos_inner` branch
+                    // true for every direction. The cone test then costs one dot
+                    // product and rejects nothing, which is the correct cost for
+                    // "no cone".
+                    .cone = null,
+                    .shadow_reach = shadowReachForHeight(c.height, view_diag),
+                    .view_centred = true,
+                    .height = c.height,
+                },
+            };
+        },
+        components.AmbientLight2D => blk: {
+            // A scene-wide ambient has to cover the view, and it must not fall
+            // off across it: `radius` is 1.25x the diagonal so `rec01` stays
+            // under 0.8 everywhere on screen, which is the flat part of the
+            // ambient falloff curve.
+            const reach = if (c.global) view_diag * 1.25 else @max(c.max_distance, 1);
+            break :blk .{
+                .base = c.base,
+                .kind = .ambient,
+                .shape = .{
+                    .radius = reach,
+                    .view_centred = c.global,
+                    .can_shadow = false,
+                },
+            };
+        },
+        else => @compileError("not a light component: " ++ @typeName(C)),
+    };
+}
+
+/// Walks every entity carrying one of the four light components.
+///
+/// Generic over the component type so the loop exists once. `descFor` is the
+/// only thing that varies, and it is a comptime switch.
+fn gather(comptime C: type, l: *Lighting, world: *World, view: ?MaskRect) void {
+    // Without a view there is nothing to size a directional or scene-wide light
+    // against. 2048 is a documented fallback, not a guess dressed as a
+    // measurement: a caller that omits the view is a caller asking for the
+    // lights to be gathered without knowing the screen, and the only wrong
+    // answers are the ones where that light should have been culled anyway.
+    const view_diag: f32 = if (view) |v|
+        @max(distance(v.min, v.max), 1)
+    else
+        2048;
+
+    var iter = world.query(.{C});
+    var entry = iter.next();
+    while (entry) |e| : (entry = iter.next()) {
+        const c: *const C = e.get(C);
+        if (!c.base.enabled) continue;
+
+        const d = descFor(C, c.*, view_diag);
+        const t: ?*const components.Transform = world.get(e.entity(), components.Transform);
+        const actor: Vec2 = if (t) |tt| tt.position else .{ .x = 0, .y = 0 };
+
+        // A view-centred light is drawn around the view, and a local one around
+        // its own actor with the hotspot offset in the Transform's frame.
+        const pos: Vec2 = if (d.shape.view_centred)
+            (if (view) |v|
+                .{ .x = (v.min.x + v.max.x) * 0.5, .y = (v.min.y + v.max.y) * 0.5 }
+            else
+                actor)
+        else
+            lightPos(actor, d.shape);
+
+        if (view) |v| {
+            if (!lightReaches(d.kind, pos, d.shape.radius, v)) continue;
+        }
+
+        l.lights.appendAssumeCapacity(instanceFor(d, pos, -1));
+        l.channel_of.appendAssumeCapacity(if (d.shape.can_shadow and d.base.cast_shadows) -2 else -1);
+        l.reach_of.appendAssumeCapacity(if (d.shape.shadow_reach > 0) d.shape.shadow_reach else d.shape.radius);
+    }
+}
+
+/// A point light's `LightDesc`, for the tests that place a light without a World.
+///
+/// It goes through `descFor` rather than building the struct by hand so a test
+/// cannot pass by describing a light the real collector would never produce.
+fn pointDesc(base: components.LightBase, radius: f32) LightDesc {
+    return descFor(components.PointLight2D, pointComp(base, radius), 0);
+}
+
+/// The `PointLight2D` a `pointDesc` describes. The two exist as a pair because
+/// the tests that check the COLLECTOR need the component and the tests that
+/// check the SAMPLER need the instance, and neither should be a second hand-
+/// written description of the same light.
+fn pointComp(base: components.LightBase, radius: f32) components.PointLight2D {
+    return .{ .base = base, .radius = radius };
+}
+
+/// A spotlight's `LightDesc`, same reasoning as `pointDesc`.
+fn spotDesc(base: components.LightBase, radius: f32, angle: f32, cone: f32, penumbra: f32) LightDesc {
+    return descFor(components.SpotLight2D, .{
+        .base = base,
+        .radius = radius,
+        .angle = angle,
+        .cone_angle = cone,
+        .penumbra = penumbra,
+    }, 0);
+}
+
+fn lightPos(base: Vec2, s: LightShape) Vec2 {    if (s.offset.x == 0 and s.offset.y == 0) return base;
+    const c = @cos(s.angle);
+    const sn = @sin(s.angle);
     return .{
-        .x = base.x + l.offset.x * c - l.offset.y * s,
-        .y = base.y + l.offset.x * s + l.offset.y * c,
+        .x = base.x + s.offset.x * c - s.offset.y * sn,
+        .y = base.y + s.offset.x * sn + s.offset.y * c,
     };
 }
 
 /// The wire form of a light at a position. `channel` is -1 when the light casts
 /// no shadow, and the bit that says so is part of `flags` precisely because a
 /// shader that has to test it per pixel should not have to read a second byte.
-fn instanceFor(l: Light2D, pos: Vec2, channel: i8) LightInstance {
+fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
+    const s = d.shape;
+    // No cone means a cone that includes every direction, which is what cos(0)
+    // is. Clamping the half-angle keeps a zero-width cone from becoming a full
+    // circle and a negative one from inverting.
+    const half_cone = if (s.cone) |c| @min(@abs(c) * 0.5, std.math.pi) else 0;
+    const reach = if (s.shadow_reach > 0) s.shadow_reach else s.radius;
+
     return .{
         .pos = .{ pos.x, pos.y },
-        .radius = l.radius,
-        .half = .{ l.radius, l.radius },
-        .angle = l.angle,
+        .radius = s.radius,
+        .shadow_ratio = reach / @max(s.radius, 1e-4),
+        .half = .{ s.radius, s.radius },
+        .angle = s.angle,
         // The inner cosine is the cone shrunk by the penumbra. Clamped so a
         // penumbra of 1 (all softness, no hard core) does not invert it.
-        .cos_outer = @cos(l.halfCone()),
-        .cos_inner = @cos(l.halfCone() * @max(0, 1 - l.penumbra)),
-        .color = l.color,
-        .energy = l.energy,
-        .attenuation = l.attenuation,
-        .softness = @max(l.shadow_filter_smooth, 0) * 0.02,
-        .gi = l.gi_contribution,
-        .flags = @as(u32, @intFromEnum(l.kind)) |
-            (@as(u32, @intFromEnum(l.blend)) << 3) |
-            (@as(u32, @intFromEnum(l.shadow_filter)) << 5) |
+        .cos_outer = @cos(half_cone),
+        .cos_inner = @cos(half_cone * @max(0, 1 - s.penumbra)),
+        .color = d.base.color,
+        .energy = d.base.energy,
+        .attenuation = s.attenuation,
+        .softness = @max(d.base.shadow_filter_smooth, 0) * 0.02,
+        .gi = d.base.gi_contribution,
+        .flags = @as(u32, @intFromEnum(d.kind)) |
+            (@as(u32, @intFromEnum(d.base.blend)) << 3) |
+            (@as(u32, @intFromEnum(d.base.shadow_filter)) << 5) |
             (@as(u32, if (channel >= 0) 1 else 0) << 7) |
             (@as(u32, @intCast(channel & 0xf)) << 8),
     };
@@ -1124,7 +1380,7 @@ pub const Radiance = struct {
         if (levels == 0) return;
 
         while (self.cascades.items.len < levels) {
-            try self.cascades.append(.{
+            try self.cascades.append(self.allocator, .{
                 .scale = base_scale,
                 .rays = base_rays,
                 .w = 0,
@@ -1135,8 +1391,9 @@ pub const Radiance = struct {
         // Shrinking the mask drops the extra cascades rather than leaving dead
         // grids to be walked every probe merge.
         while (self.cascades.items.len > levels) {
-            var c = self.cascades.pop();
-            c.deinit(self.allocator);
+            const c = self.cascades.pop() orelse unreachable; // len > levels
+            var owned = c;
+            owned.deinit(self.allocator);
         }
 
         // Built coarse-to-fine so each cascade can read the one above it: the
@@ -1255,13 +1512,21 @@ fn probeAt(
         while (step < 64) : (step += 1) {
             const px_x = @as(f32, @floatFromInt(px)) + dir.x * t;
             const px_y = @as(f32, @floatFromInt(py)) + dir.y * t;
-            const ix: u32 = @intFromFloat(@floor(px_x));
-            const iy: u32 = @intFromFloat(@floor(px_y));
-            if (ix >= w or iy >= h) {
+            // The bounds test is in FLOATING POINT and comes before the integer
+            // conversion, because the conversion is the part that panics. A ray
+            // leaving the mask on the low side goes negative, and
+            // `@intFromFloat` of a negative float is a runtime trap — so a test
+            // written the other way round turns "the ray escaped to the sky"
+            // into "the process died", which is how a GI crash report reads.
+            if (px_x < 0 or px_y < 0 or px_x >= @as(f32, @floatFromInt(w)) or
+                px_y >= @as(f32, @floatFromInt(h)))
+            {
                 // Out of the mask: the ray escaped to the sky.
                 hit = false;
                 break;
             }
+            const ix: u32 = @intFromFloat(@floor(px_x));
+            const iy: u32 = @intFromFloat(@floor(px_y));
             const d = @as(f32, @floatFromInt(sdf[@as(usize, iy) * w + ix]));
             if (d < 1.0) {
                 hit = true;
@@ -1285,7 +1550,9 @@ fn probeAt(
         // recorded, at a resolution coarse enough to have traced it.
         var from_here = sky;
         if (next) |n| {
-            from_here = sampleCascade(r, n, px + dir.x * t, py + dir.y * t, sky);
+            const hx = @as(f32, @floatFromInt(px)) + dir.x * t;
+            const hy = @as(f32, @floatFromInt(py)) + dir.y * t;
+            from_here = sampleCascade(r, n, hx, hy, sky);
         }
         // A hit contributes what it reflects, not what it receives: a fraction
         // scattered back into the hemisphere. 0.85 is a mid-grey wall.
@@ -1490,8 +1757,9 @@ test "render light: a wall between a light and a point leaves that point dark" {
     l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
     l.rasterize();
 
-    const light = components.Light2D{ .radius = 64, .kind = .point, .cast_shadows = true };
+    const light = pointDesc(.{ .cast_shadows = true }, 64);
     l.lights.appendAssumeCapacity(instanceFor(light, .{ .x = 8, .y = 32 }, 0));
+    l.reach_of.appendAssumeCapacity(64);
     l.channel_pos[0] = .{ .x = 8, .y = 32 };
     l.channel_radius[0] = 64;
     l.buildShadowMaps();
@@ -1519,10 +1787,11 @@ test "render light: the shadow edge is soft and deepens into the shadow" {
     l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
     l.rasterize();
     l.lights.appendAssumeCapacity(instanceFor(
-        .{ .radius = 64, .shadow_filter_smooth = 8 },
+        pointDesc(.{ .shadow_filter_smooth = 8 }, 64),
         .{ .x = 0, .y = 0 },
         0,
     ));
+    l.reach_of.appendAssumeCapacity(64);
     l.channel_pos[0] = .{ .x = 0, .y = 0 };
     l.channel_radius[0] = 64;
     l.buildShadowMaps();
@@ -1543,14 +1812,7 @@ test "render light: a spot light's cone falls off smoothly across its penumbra" 
     try l.reserve(16, 16);
     l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 128, .y = 128 } };
     l.lights.appendAssumeCapacity(instanceFor(
-        .{
-            .kind = .spot,
-            .radius = 256,
-            .angle = 0,
-            .cone_angle = 1.5707963268, // 90 degrees
-            .penumbra = 0.5,
-            .cast_shadows = false,
-        },
+        spotDesc(.{}, 256, 0, 1.5707963268, 0.5), // 90 degrees
         .{ .x = 64, .y = 64 },
         -1,
     ));
@@ -1574,11 +1836,11 @@ test "render light: the three blend modes do three different things" {
     try l.reserve(16, 16);
     l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
 
-    const add = components.Light2D{ .radius = 64, .color = .{ 0.5, 0.5, 0.5, 1 } };
+    const add = pointDesc(.{ .color = .{ 0.5, 0.5, 0.5, 1 } }, 64);
     var sub = add;
-    sub.blend = .subtract;
+    sub.base.blend = .subtract;
     var mix = add;
-    mix.blend = .mix;
+    mix.base.blend = .mix;
 
     l.lights.appendAssumeCapacity(instanceFor(add, .{ .x = 0, .y = 0 }, -1));
     l.lights.appendAssumeCapacity(instanceFor(sub, .{ .x = 0, .y = 0 }, -1));
@@ -1655,7 +1917,7 @@ test "render light: four lights get shadow channels and the rest still light" {
     while (i < 8) : (i += 1) {
         _ = try world.spawn(.{
             components.Transform{ .position = .{ .x = @as(f32, @floatFromInt(i % 4)) * 8, .y = 32 } },
-            components.Light2D{ .radius = 32, .cast_shadows = true },
+            pointComp(.{ .cast_shadows = true }, 32),
         });
     }
     l.collect(&world, l.rect);
@@ -1686,7 +1948,7 @@ test "render light: a static scene does not rebuild its shadow maps" {
     l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
     l.rasterize();
     l.dirty = false;
-    l.lights.appendAssumeCapacity(instanceFor(components.Light2D{ .radius = 64 }, .{ .x = 8, .y = 32 }, 0));
+    l.lights.appendAssumeCapacity(instanceFor(pointDesc(.{}, 64), .{ .x = 8, .y = 32 }, 0));
     l.channel_pos[0] = .{ .x = 8, .y = 32 };
     l.channel_radius[0] = 64;
     l.buildShadowMaps();
@@ -1770,4 +2032,204 @@ test "render light: a corner is darker than the open sky, which is GI working" {
     // can detect.
     const corner = r.sample(8, 40);
     try testing.expect(corner[0] < open[0]);
+}
+
+// ── the four components, end to end ─────────────────────────────────────────
+//
+// Each of these spawns a REAL component into a REAL world and lets `collect`
+// find it. That is the point: a test that builds a `LightInstance` by hand
+// proves the sampler works, and says nothing about whether the component a
+// scene author adds reaches it.
+
+/// A world with one of each light kind, and the mask the collector culls against.
+fn fourLightWorld(l: *Lighting, world: *World) !void {
+    try l.resize(64, 64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 32, .y = 32 } },
+        components.PointLight2D{ .radius = 40 },
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 8, .y = 8 } },
+        components.SpotLight2D{ .radius = 40, .angle = 0.5 },
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.DirectionalLight2D{},
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.AmbientLight2D{},
+    });
+}
+
+test "render light: collect finds all four component kinds and keeps their kinds" {
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    try fourLightWorld(&l, &world);
+    l.collect(&world, l.rect);
+
+    try testing.expectEqual(@as(u32, 4), l.stats.lights);
+    var seen = [_]bool{false} ** 4;
+    for (l.lights.items) |inst| {
+        const k: usize = @intFromEnum(inst.kind());
+        try testing.expect(k < 4);
+        seen[k] = true;
+    }
+    for (seen, 0..) |was, i| {
+        if (!was) {
+            const names = [_][]const u8{ "point", "spot", "directional", "ambient" };
+            std.debug.print("collect missed a {s} light\n", .{names[i]});
+            return error.MissingLightKind;
+        }
+    }
+}
+
+test "render light: an ambient light is flat, which is what makes it ambient" {
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.AmbientLight2D{ .base = .{ .color = .{ 1, 1, 1, 1 }, .energy = 1 } },
+    });
+    l.collect(&world, l.rect);
+
+    // The assertion is the SHAPE of the curve, not one value: an ambient that
+    // dims with distance is a point light with a large radius, and the bug it
+    // causes is a scene whose ambient is visibly "in" one spot.
+    const corner = l.sampleLight(0, 1, 1)[0];
+    const middle = l.sampleLight(0, 32, 32)[0];
+    const far = l.sampleLight(0, 61, 61)[0];
+    try testing.expectApproxEqAbs(middle, corner, 0.001);
+    try testing.expectApproxEqAbs(middle, far, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1), middle, 0.001);
+}
+
+test "render light: a directional light's height sets its shadow length, and only that" {
+    var high = try Lighting.init(testing.allocator, .high);
+    defer high.deinit();
+    var low = try Lighting.init(testing.allocator, .high);
+    defer low.deinit();
+    for ([_]*Lighting{ &high, &low }) |l| {
+        try l.resize(64, 64);
+        try l.reserve(4, 4);
+        l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    }
+    // Two worlds, not one with two lights in it: the point of the comparison is
+    // one variable, and a shared world would also let the second light be
+    // ranked, culled, or sorted into a different slot.
+    var world_h = World.init(testing.allocator);
+    defer world_h.deinit();
+    var world_l = World.init(testing.allocator);
+    defer world_l.deinit();
+    _ = try world_h.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.DirectionalLight2D{ .height = 1.0 },
+    });
+    _ = try world_l.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.DirectionalLight2D{ .height = 0.25 },
+    });
+    high.collect(&world_h, high.rect);
+    low.collect(&world_l, low.rect);
+    try testing.expectEqual(@as(u32, 1), high.stats.lights);
+    try testing.expectEqual(@as(u32, 1), low.stats.lights);
+
+    const a = high.reach_of.items[0];
+    const b = low.reach_of.items[0];
+    // A sun near the horizon throws shadows several times longer. The direction
+    // is the assertion; the exact multiple is `view / height` clamped, which is
+    // stated in `shadowReachForHeight` and not re-derived here.
+    try testing.expect(b > a);
+    try testing.expectApproxEqAbs(@as(f32, 4), b / a, 0.001);
+
+    // And the falloff reach did NOT follow: that is the whole reason the two
+    // numbers are separate. A sun does not dim at the edge of the screen.
+    try testing.expectApproxEqAbs(high.lights.items[0].radius, low.lights.items[0].radius, 0.001);
+}
+
+test "render light: an ambient light can never be given a shadow channel" {
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    // `cast_shadows = true` on an ambient: a scene author can ask for it through
+    // the shared LightBase, and the collector has to decline.
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.AmbientLight2D{ .base = .{ .cast_shadows = true } },
+    });
+    l.collect(&world, l.rect);
+    try testing.expectEqual(@as(u32, 1), l.stats.lights);
+    try testing.expectEqual(@as(i8, -1), l.channel_of.items[0]);
+    try testing.expect(!l.lights.items[0].castsShadows());
+}
+
+test "render light: a point light's instance is laid out where the shader reads it" {
+    // The backend declares attributes at 0/8/16/24/32/40/48/56 and light.wgsl's
+    // LightIn reads the same. A struct that drifts from that is not a wrong
+    // light, it is garbage that still renders — so the layout is asserted here,
+    // where a change to it is a change to a test rather than to a scene.
+    const i = instanceFor(pointDesc(.{}, 100), .{ .x = 5, .y = 6 }, 3);
+    try testing.expectEqual(@as(u32, 72), @sizeOf(LightInstance));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(LightInstance, "pos"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(LightInstance, "radius"));
+    try testing.expectEqual(@as(usize, 12), @offsetOf(LightInstance, "shadow_ratio"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(LightInstance, "half"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(LightInstance, "angle"));
+    try testing.expectEqual(@as(usize, 28), @offsetOf(LightInstance, "cos_outer"));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(LightInstance, "cos_inner"));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(LightInstance, "color"));
+    try testing.expectEqual(@as(usize, 56), @offsetOf(LightInstance, "attenuation"));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(LightInstance, "gi"));
+
+    // And the values land where they are supposed to: the point of the
+    // assertion above is that these do not quietly mean something else.
+    try testing.expectEqual(@as(f32, 100), i.radius);
+    try testing.expectEqual(@as(f32, 100), i.half[0]);
+    try testing.expectApproxEqAbs(@as(f32, 1), i.shadow_ratio, 0.0001);
+    try testing.expectEqual(@as(i8, 3), i.shadowChannel());
+}
+
+test "render light: energy and the colour's alpha scale what arrives" {
+    // The shader multiplies both and the CPU reference multiplies both; a
+    // regression in either is a light that ignores the one dial every scene has.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    const bright = instanceFor(pointDesc(.{ .energy = 1 }, 64), .{ .x = 32, .y = 32 }, -1);
+    const dim = instanceFor(pointDesc(.{ .energy = 0.5 }, 64), .{ .x = 32, .y = 32 }, -1);
+    const half_alpha = instanceFor(
+        pointDesc(.{ .color = .{ 1, 1, 1, 0.5 } }, 64),
+        .{ .x = 32, .y = 32 },
+        -1,
+    );
+
+    l.lights.appendAssumeCapacity(bright);
+    l.channel_of.appendAssumeCapacity(-1);
+    l.reach_of.appendAssumeCapacity(64);
+    const at_center = l.sampleLight(0, 32, 32)[0];
+
+    l.lights.items[0] = dim;
+    const at_half_energy = l.sampleLight(0, 32, 32)[0];
+
+    l.lights.items[0] = half_alpha;
+    const at_half_alpha = l.sampleLight(0, 32, 32)[0];
+
+    try testing.expectApproxEqAbs(at_center * 0.5, at_half_energy, 0.0001);
+    try testing.expectApproxEqAbs(at_center * 0.5, at_half_alpha, 0.0001);
 }

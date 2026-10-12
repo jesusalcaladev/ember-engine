@@ -4,10 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Where `bash libs/bootstrap.sh` installed Box2D. Absolute because the
-    // library lives outside the build root; the same convention LuaJIT's
-    // headers already use in this file.
-    const box2d_prefix = "/home/jesusalcala/Projects/z-engine/libs/box2d/install";
+    // Where `bash libs/bootstrap.sh` installed Box2D: inside THIS repository's
+    // `libs/`, reached with `b.path` so the build is relocatable. (It used to be
+    // an absolute path into a sibling project — a time bomb that only defused
+    // because that project happened to exist on the same machine.)
 
     // ── Feature flags ───────────────────────────────────────────────────────
     // `-Dsteering` publishes the M4.5 steering accumulator and the `world`
@@ -64,9 +64,10 @@ pub fn build(b: *std.Build) void {
     // the other way round: the ECS components are plain data and name no
     // solver, which is what keeps the port replaceable.
     physics_mod.addImport("ecs", ecs_mod);
-    // Box2D's headers, mirroring how LuaJIT's are reached: an absolute path
-    // outside the build root, so `cwd_relative`.
-    physics_mod.addIncludePath(.{ .cwd_relative = box2d_prefix ++ "/include" });
+    // Box2D's headers and static library, installed by `libs/bootstrap.sh`
+    // into this repo's `libs/box2d/install`. `b.path` keeps the build
+    // relocatable, unlike the absolute path this used to carry.
+    physics_mod.addIncludePath(b.path("libs/box2d/install/include"));
 
     // An absolute -L as well as the library name: this version of Zig has no
     // per-library search path option, and `addLibraryPath` is module-wide.
@@ -92,39 +93,13 @@ pub fn build(b: *std.Build) void {
     // changes, so a stale build can never disagree with what was asked for.
     script_mod.addOptions("options", options);
 
-    physics_mod.addLibraryPath(.{ .cwd_relative = box2d_prefix ++ "/lib" });
+    physics_mod.addLibraryPath(b.path("libs/box2d/install/lib"));
     physics_mod.linkSystemLibrary("box2d", .{ .preferred_link_mode = .static });
     // LuaJIT 2.1 (Lua 5.1 API) from the system. The include path is where the
     // distro headers live; the linker resolves `-lluajit-5.1`. `cwd_relative`
     // because it is an absolute path outside the build root.
     script_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
     script_mod.linkSystemLibrary("luajit-5.1", .{});
-
-    // ── Asset module (M6: the pipeline, the VFS and the importers) ───────────
-    // Depends on `core` for allocators and profiling, `ecs` for the Sprite
-    // component the resolved sprites fill, and `render` for the atlas packer
-    // (the importer hands it raw pixels and gets back a rect + UVs). Zero new
-    // external dependency: the PNG codec is pure Zig on top of
-    // std.compress.flate, and the WAV path parses RIFF by hand, so an importer
-    // crash is ours to debug and not a C library's.
-    const asset_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/asset/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    asset_mod.addImport("core", core_mod);
-    asset_mod.addImport("ecs", ecs_mod);
-    // The atlas packer is the one part of the renderer the importers need:
-    // sprites go in as pixels and come out as a rect plus UVs. It is exposed as
-    // its own module rather than pulling the whole renderer in, because
-    // render.zig's own imports reach ../platform and would drag the window
-    // layer into a dependency that only packs rectangles.
-    const atlas_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/render/atlas.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    asset_mod.addImport("atlas", atlas_mod);
 
     // ── Editor module (M5.5: the non-UI half of the code editor) ─────────────
     // Depends on nothing but itself. A document, a cursor, a highlighter, a
@@ -397,7 +372,43 @@ pub fn build(b: *std.Build) void {
     profile_step.dependOn(&profile_cmd.step);
 
     // ── Tests ───────────────────────────────────────────────────────────────
+    // ── WGSL validation: every shader, every build ─────────────────────────────
+    //
+    // Dawn ships tint (C++) and this repo vendors it, so there is no reason to
+    // write shaders against a spec and hope. A WGSL file that does not compile
+    // is a runtime validation failure -- a blank screen with nothing in the log
+    // to explain it -- so `zig build test` runs tint over every shader below,
+    // and a new file has to be added to this list to be built at all. That is
+    // the guard: an unlisted shader is not silently unchecked, it is absent.
+    //
+    // tint and not a Rust tool: the engine is heading for console exports, and a
+    // C/C++ validator is one less foreign dependency to port. It has already
+    // caught bugs in this repo's own shaders -- a `vec2f(vec3u)` that is not a
+    // conversion, an `and` that is not `&&`, a fragment stage reading a bare
+    // `shape` instead of `in.shape` -- all of which would have been blank
+    // screens with nothing in the log.
+    const shaders_step = b.step("shaders", "Validate every WGSL shader with Dawn's tint");
+    inline for (.{
+        "src/engine/render/shaders/quad.wgsl",
+        "src/engine/render/shaders/sprite.wgsl",
+        "src/engine/render/shaders/smaa.wgsl",
+        "src/engine/render/shaders/light.wgsl",
+        "src/engine/render/shaders/radiance.wgsl",
+    }) |rel| {
+        const run = b.addSystemCommand(&.{
+            b.path("libs/dawn/build/tint").getPath(b),
+            b.path(rel).getPath(b),
+        });
+        run.expectExitCode(0);
+        shaders_step.dependOn(&run.step);
+    }
+
+
     const test_step = b.step("test", "Run the engine core and ECS tests");
+    // Every shader is validated before the tests run: a WGSL file that does not
+    // compile is a runtime validation failure, which is a blank screen with
+    // nothing in the log to explain it, so this is not optional.
+    test_step.dependOn(shaders_step);
 
     // M5.5: the editor core, before anything else in the list, because it is the
     // one that has to stay green while the UI is being designed — and because it
@@ -405,12 +416,6 @@ pub fn build(b: *std.Build) void {
     // it on every change.
     const editor_tests = b.addTest(.{ .root_module = editor_mod });
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
-
-    // M6 asset tests: the PNG codec, the VFS/pak, the GUIDs and the cache.
-    // They link no library and read no window, so they are the cheapest
-    // evidence in the suite.
-    const asset_tests = b.addTest(.{ .root_module = asset_mod });
-    test_step.dependOn(&b.addRunArtifact(asset_tests).step);
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
@@ -497,4 +502,11 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "render", "light" },
     });
     test_step.dependOn(&b.addRunArtifact(render_tests).step);
+
+    // The same tests, alone. They are the ones this milestone owns, and they run
+    // in milliseconds with no window and no GPU, so there is no excuse for
+    // waiting on the rest of the suite to find out whether a light still works.
+    const light_only_step = b.step("test-light", "Run only the lighting tests");
+    light_only_step.dependOn(&b.addRunArtifact(render_tests).step);
+    light_only_step.dependOn(shaders_step);
 }

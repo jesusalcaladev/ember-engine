@@ -894,6 +894,170 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "point.new",
+        .module = "point",
+        .signature = "point.new(self, radius)",
+        .summary = "Adds a PointLight2D: a lamp, torch or candle. Falls off in every direction.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radius", .kind = .number, .doc = "reach in world units" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\point.new(self, 192)
+        ,
+    },
+    .{
+        .name = "point.set_radius",
+        .module = "point",
+        .signature = "point.set_radius(self, radius)",
+        .summary = "How far the light reaches. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff, not a hard edge.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radius", .kind = .number, .doc = "reach" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\point.set_radius(self, 256)
+        ,
+    },
+    .{
+        .name = "spot.new",
+        .module = "spot",
+        .signature = "spot.new(self, radius)",
+        .summary = "Adds a SpotLight2D: a cone with a soft edge.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radius", .kind = .number, .doc = "beam reach" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\spot.new(self, 300)
+        ,
+    },
+    .{
+        .name = "spot.set_radius",
+        .module = "spot",
+        .signature = "spot.set_radius(self, radius)",
+        .summary = "How far the beam reaches.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radius", .kind = .number, .doc = "reach" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\spot.set_radius(self, 300)
+        ,
+    },
+    .{
+        .name = "spot.set_cone",
+        .module = "spot",
+        .signature = "spot.set_cone(self, degrees, penumbra)",
+        .summary = "The cone's opening and its soft edge. Two numbers in one call because nothing ever sets one without the other, and a spotlight whose opening moved but whose soft edge did not is a mis-configured light nobody can explain.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "degrees", .kind = .number, .doc = "full opening" },
+            .{ .name = "penumbra", .kind = .number, .doc = "0..1 soft-edge fraction" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\spot.set_cone(self, 45, 0.2)
+        ,
+    },
+    .{
+        .name = "spot.set_angle",
+        .module = "spot",
+        .signature = "spot.set_angle(self, radians)",
+        .summary = "The direction the cone points.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radians", .kind = .number, .doc = "angle" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\spot.set_angle(self, 0.6)
+        ,
+    },
+    .{
+        .name = "directional.new",
+        .module = "directional",
+        .signature = "directional.new(self)",
+        .summary = "Adds a DirectionalLight2D: the sun. No falloff at all, which is why it exists -- a point light at 4000 units is dark at the far end of the screen because its falloff is measured from where it IS, and a sun is not anywhere.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\directional.new(self)
+        ,
+    },
+    .{
+        .name = "directional.set_angle",
+        .module = "directional",
+        .signature = "directional.set_angle(self, radians)",
+        .summary = "The direction the light TRAVELS, not the direction it points. A sun at 0 shines to the right, which makes shadows run to the left of every object.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "radians", .kind = .number, .doc = "angle" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\directional.set_angle(self, 0.4)
+        ,
+    },
+    .{
+        .name = "directional.set_height",
+        .module = "directional",
+        .signature = "directional.set_height(self, h)",
+        .summary = "0..1. How high above the scene the light sits, which scales shadow LENGTH. A 2D scene needs a z coordinate for exactly this.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "h", .kind = .number, .doc = "0..1" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\directional.set_height(self, 0.5)
+        ,
+    },
+    .{
+        .name = "ambient.new",
+        .module = "ambient",
+        .signature = "ambient.new(self)",
+        .summary = "Adds an AmbientLight2D. Its own type rather than one number on the Environment, because a scene often wants TWO ambients -- a sky colour and a ground bounce.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\ambient.new(self)
+        ,
+    },
+    .{
+        .name = "ambient.set_local",
+        .module = "ambient",
+        .signature = "ambient.set_local(self, distance)",
+        .summary = "A local ambient. 0 restores the scene-wide kind. A lantern's pool of warm air differs from the night around it, and one number cannot hold both.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "distance", .kind = .number, .doc = "reach; 0 for scene-wide" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\ambient.set_local(self, 0)
+        ,
+    },
+    .{
         .name = "material.new",
         .module = "material",
         .signature = "material.new(self, shader)",
@@ -960,56 +1124,6 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
-        .name = "light.new",
-        .module = "light",
-        .signature = "light.new(self, kind, radius, r, g, b, energy)",
-        .summary = "Adds a light to an actor. Position and direction come from its Transform.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "kind", .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
-            .{ .name = "radius", .kind = .number, .doc = "reach in world units" },
-            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
-            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
-            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
-            .{ .name = "energy", .kind = .number, .doc = "brightness multiplier" },
-        },
-        .returns = &.{
-        },
-        .example =
-        \\light.new(self, 0, 192, 1.0, 0.69, 0.41, 1)
-        ,
-    },
-    .{
-        .name = "light.set_kind",
-        .module = "light",
-        .signature = "light.set_kind(self, kind)",
-        .summary = "0 point, 1 spot, 2 directional.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "kind", .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
-        },
-        .returns = &.{
-        },
-        .example =
-        \\light.set_kind(self, 1)
-        ,
-    },
-    .{
-        .name = "light.set_radius",
-        .module = "light",
-        .signature = "light.set_radius(self, radius)",
-        .summary = "The light's reach in world units. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "radius", .kind = .number, .doc = "reach" },
-        },
-        .returns = &.{
-        },
-        .example =
-        \\light.set_radius(self, 256)
-        ,
-    },
-    .{
         .name = "light.set_color",
         .module = "light",
         .signature = "light.set_color(self, r, g, b, a)",
@@ -1040,21 +1154,6 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\light.set_energy(self, 2.4)
-        ,
-    },
-    .{
-        .name = "light.set_angle",
-        .module = "light",
-        .signature = "light.set_angle(self, radians)",
-        .summary = "Direction for a spot, or the direction it travels for a directional light. Unused by a point light.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "radians", .kind = .number, .doc = "angle" },
-        },
-        .returns = &.{
-        },
-        .example =
-        \\light.set_angle(self, math.rad_to_deg(0.7854))
         ,
     },
     .{
@@ -1136,54 +1235,6 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
-        .name = "light.get_kind",
-        .module = "light",
-        .signature = "light.get_kind(self) -> integer",
-        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-        },
-        .returns = &.{
-            .{ .kind = .integer, .doc = "0 point, 1 spot, 2 directional" },
-        },
-        .example =
-        \\local k = light.get_kind(self)
-        ,
-    },
-    .{
-        .name = "light.get_radius",
-        .module = "light",
-        .signature = "light.get_radius(self) -> number",
-        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-        },
-        .returns = &.{
-            .{ .kind = .number, .doc = "reach" },
-        },
-        .example =
-        \\local k = light.get_radius(self)
-        ,
-    },
-    .{
-        .name = "light.get_color",
-        .module = "light",
-        .signature = "light.get_color(self) -> number, number, number, number",
-        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-        },
-        .returns = &.{
-            .{ .kind = .number, .doc = "red" },
-            .{ .kind = .number, .doc = "green" },
-            .{ .kind = .number, .doc = "blue" },
-            .{ .kind = .number, .doc = "alpha" },
-        },
-        .example =
-        \\local k = light.get_color(self)
-        ,
-    },
-    .{
         .name = "light.get_energy",
         .module = "light",
         .signature = "light.get_energy(self) -> number",
@@ -1196,39 +1247,6 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\local k = light.get_energy(self)
-        ,
-    },
-    .{
-        .name = "light.get_cone",
-        .module = "light",
-        .signature = "light.get_cone(self) -> number, number",
-        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-        },
-        .returns = &.{
-            .{ .kind = .number, .doc = "opening in degrees" },
-            .{ .kind = .number, .doc = "penumbra 0..1" },
-        },
-        .example =
-        \\local k = light.get_cone(self)
-        ,
-    },
-    .{
-        .name = "light.get_shadow",
-        .module = "light",
-        .signature = "light.get_shadow(self) -> boolean, integer, number",
-        .summary = "The inspector reads as well as writes, and its field list is generated from this same registry.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-        },
-        .returns = &.{
-            .{ .kind = .boolean, .doc = "casts shadows" },
-            .{ .kind = .integer, .doc = "filter" },
-            .{ .kind = .number, .doc = "smoothness" },
-        },
-        .example =
-        \\local k = light.get_shadow(self)
         ,
     },
     .{
@@ -1500,6 +1518,200 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\local near, far = environment.get_fog(self)
+        ,
+    },
+    // ── M4.5: camera ────────────────────────────────────────────────────────
+    .{
+        .name = "camera.new",
+        .module = "camera",
+        .signature = "camera.new(self)",
+        .summary = "Adds a Camera2D to this actor. The FIRST enabled camera in the world is the one that renders, so a second one is a cut waiting to happen.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\camera.new(self)
+        \\camera.follow(self, player)
+        ,
+    },
+    .{
+        .name = "camera.follow",
+        .module = "camera",
+        .signature = "camera.follow(self, other)",
+        .summary = "Makes this camera follow another actor. Passing an actor rather than a position means it stays correct without being told again every frame.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "other", .kind = .actor, .doc = "the actor to follow" },
+        },
+        .returns = &.{},
+        .example =
+        \\function M:start()
+        \\  camera.follow(self, actor.get_player(self))
+        \\end
+        ,
+    },
+    .{
+        .name = "camera.zoom_to",
+        .module = "camera",
+        .signature = "camera.zoom_to(self, zoom)",
+        .summary = "The zoom the camera eases toward. 2 shows half the world at twice the detail; it is reached through a spring, not snapped.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "zoom", .kind = .number, .doc = "target zoom, > 0" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- a sniper scope: hold aim to zoom in
+        \\if input.is_action_down("aim") then
+        \\  camera.zoom_to(self, 3.0)
+        \\end
+        ,
+    },
+    .{
+        .name = "camera.shake",
+        .module = "camera",
+        .signature = "camera.shake(self, trauma)",
+        .summary = "Adds screen shake. Trauma accumulates and then decays, so repeated hits build on each other instead of restarting.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "trauma", .kind = .number, .doc = "0..1; 1 is a hard hit" },
+        },
+        .returns = &.{},
+        .example =
+        \\function M:on_signal(name)
+        \\  if name == "explosion" then camera.shake(self, 0.6) end
+        \\end
+        ,
+    },
+    .{
+        .name = "camera.set_limits",
+        .module = "camera",
+        .signature = "camera.set_limits(self, x, y, w, h)",
+        .summary = "The rectangle the camera may not leave — how a level stops you from seeing past its own edges. A zero width or height disables the limits.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x", .kind = .number, .doc = "left edge" },
+            .{ .name = "y", .kind = .number, .doc = "top edge" },
+            .{ .name = "w", .kind = .number, .doc = "width; 0 disables" },
+            .{ .name = "h", .kind = .number, .doc = "height; 0 disables" },
+        },
+        .returns = &.{},
+        .example =
+        \\camera.set_limits(self, 0, 0, 4000, 2000)
+        ,
+    },
+    .{
+        .name = "camera.set_damping",
+        .module = "camera",
+        .signature = "camera.set_damping(self, damping)",
+        .summary = "How lazily the camera chases its target. 0 welds it (a fixed-view platformer); higher trails behind.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "damping", .kind = .number, .doc = "0 = instant, ~8 = smooth" },
+        },
+        .returns = &.{},
+        .example =
+        \\camera.set_damping(self, 6)
+        ,
+    },
+    .{
+        .name = "camera.get_centre",
+        .module = "camera",
+        .signature = "camera.get_centre(self) -> number, number",
+        .summary = "Where the camera is, in world units — the same number the renderer uses.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "centre x" },
+            .{ .kind = .number, .doc = "centre y" },
+        },
+        .example =
+        \\local cx, cy = camera.get_centre(self)
+        \\-- spawn just off the right edge of the screen
+        \\actor.set_position(self, cx + 700, cy)
+        ,
+    },
+    // ── M4.5: timer ─────────────────────────────────────────────────────────
+    .{
+        .name = "timer.new",
+        .module = "timer",
+        .signature = "timer.new(self, seconds, kind)",
+        .summary = "A timer as a COMPONENT: kind 0 once, 1 loop, 2 during. It declares signal names instead of a closure, so it survives save/load and hot-reload.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "seconds", .kind = .number, .doc = "cycle length" },
+            .{ .name = "kind", .kind = .number, .doc = "0 once, 1 loop, 2 during" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.new(self, 1.5, 1)      -- every 1.5s, forever
+        \\timer.set_signals(self, "", "spawn_wave")
+        ,
+    },
+    .{
+        .name = "timer.set_signals",
+        .module = "timer",
+        .signature = "timer.set_signals(self, on_tick, on_done)",
+        .summary = "The signals this timer fires. `on_done` runs at the end of each cycle; `on_tick` runs every tick and only matters for kind 2 (during).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "on_tick", .kind = .string, .doc = "empty fires nothing" },
+            .{ .name = "on_done", .kind = .string, .doc = "empty fires nothing" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.set_signals(self, "", "respawn")
+        \\function M:on_signal(name)
+        \\  if name == "respawn" then actor.set_position(self, 0, 0) end
+        \\end
+        ,
+    },
+    .{
+        .name = "timer.start",
+        .module = "timer",
+        .signature = "timer.start(self, loops)",
+        .summary = "Starts the timer from zero. 0 loops means forever.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "loops", .kind = .number, .doc = "0 = infinite" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.start(self, 3)   -- three cycles, then stop
+        ,
+    },
+    .{
+        .name = "timer.stop",
+        .module = "timer",
+        .signature = "timer.stop(self)",
+        .summary = "Pauses the timer WITHOUT losing its progress, so starting again resumes where it was. `timer.kill` ends it for good.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\-- pause the spawner while the player reads a menu
+        \\timer.stop(self)
+        ,
+    },
+    .{
+        .name = "timer.kill",
+        .module = "timer",
+        .signature = "timer.kill(self)",
+        .summary = "Finishes the timer: no more signals, ever.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\timer.kill(self)
+        ,
+    },
+    .{
+        .name = "timer.progress",
+        .module = "timer",
+        .signature = "timer.progress(self) -> number",
+        .summary = "How far through the current cycle, 0..1 — what a cooldown bar draws.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "0 at the start, 1 at the end of the cycle" },
+        },
+        .example =
+        \\sprite.set_size(self, 40 * timer.progress(self), 8)
         ,
     },
     .{

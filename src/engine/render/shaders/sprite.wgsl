@@ -37,7 +37,10 @@ struct VSOut {
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
     @location(2) local: vec2f,    // -1..1 across the quad, for the mask
-    @location(3) shape: u32,      // which mask to apply
+    // `flat`, and not decoration: WGSL requires it on every integral output, and
+    // tint rejects the file without it. It is also correct — the shape is a
+    // property of the sprite, not of the pixel.
+    @location(3) @interpolate(flat) shape: u32, // which mask to apply
 };
 
 /// Triangle-strip corners from the vertex index: (0,0) (1,0) (0,1) (1,1).
@@ -87,7 +90,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     // discard rather than an alpha ramp: a faded edge on a prototype circle
     // looks like a bug, and `discard` costs nothing here because the sprite is
     // already blended.
-    if (shape == 1u) {
+    if (in.shape == 1u) {
         if (dot(in.local, in.local) > 1.0) {
             discard;
         }

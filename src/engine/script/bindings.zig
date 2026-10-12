@@ -39,6 +39,7 @@ const Transform = context_mod.Transform;
 /// extents of what is drawn).
 const Sprite = context_mod.components.Sprite;
 const components = context_mod.components;
+const core_math = @import("core").math;
 const ShaderMaterial = context_mod.components.ShaderMaterial;
 
 // ── self <-> entity bridge ───────────────────────────────────────────────────
@@ -1624,149 +1625,299 @@ fn lua_render_all_resident(L: ?*lua_State) callconv(.c) c_int {
 // the header so this layer stays self-contained.
 const TTable: c_int = 5;
 
-const Light = components.Light2D;
+// Godot has PointLight2D, SpotLight2D, DirectionalLight2D and AmbientLight2D,
+// and the reason to use the same names is not familiarity alone: a scene
+// ported from Godot means what it says here, and an inspector shows one panel
+// per node.
+//
+// The shared properties live in `LightBase`, which Zig embeds, so the setters
+// below reach into `base` and the four call sites are three words each rather
+// than a copy-pasted block that a fix to the shadow filter would miss.
+
+const PointLight = components.PointLight2D;
+const SpotLight = components.SpotLight2D;
+const DirLight = components.DirectionalLight2D;
+const AmbientLight = components.AmbientLight2D;
+// M4.5: the camera, aliased for the same reason the lights are — the module is
+// named `camera` and the component is named `Camera2D`, and writing the long
+// name at every call site is noise.
+const Camera2D = components.Camera2D;
 const Occluder = components.LightOccluder2D;
 
-fn lightOf(L: ?*lua_State) ?*Light {
-    const ctx = ctxOf(L);
-    const e = entityOf(L, 1) orelse return null;
-    return ctx.world.get(e, Light);
+// ── the shared properties, written once ─────────────────────────────────────
+
+fn setColor(base: *components.LightBase, c: [4]f32) void {
+    base.color = c;
+}
+fn setEnergy(base: *components.LightBase, v: f32) void {
+    base.energy = v;
+}
+fn setBlend(base: *components.LightBase, k: u8) void {
+    base.blend = @enumFromInt(k);
+}
+fn setShadow(base: *components.LightBase, enabled: bool, f: u8, smooth: f32) void {
+    base.cast_shadows = enabled;
+    base.shadow_filter = @enumFromInt(f);
+    base.shadow_filter_smooth = smooth;
+}
+fn setGi(base: *components.LightBase, v: f32) void {
+    base.gi_contribution = v;
+}
+fn setMask(base: *components.LightBase, v: u32) void {
+    base.item_cull_mask = v;
 }
 
-/// `light.new(self, kind, radius, r, g, b, energy)` — adds the component.
-fn lua_light_new(L: ?*lua_State) callconv(.c) c_int {
+/// `light.set_color(self, r, g, b, a)` — works on whichever of the four is
+/// present. Alpha is the light's opacity, so a light fades out by its alpha.
+fn lua_light_set_color(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
-    if (ctx.world.get(e, Light) == null) {
-        _ = ctx.world.add(e, Light{
-            .kind = @enumFromInt(@as(u8, @intFromFloat(@max(lua.toF32(L, 2), 0)))),
-            .radius = @max(lua.toF32(L, 3), 1),
-            .color = .{ lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6), lua.toF32(L, 7) },
-            .energy = lua.toF32(L, 8),
-        }) catch return 0;
-    }
-    return 0;
-}
-
-fn lua_light_set_kind(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    const k: u8 = @intFromFloat(@max(lua.toF32(L, 2), 0));
-    l.kind = @enumFromInt(k);
-    return 0;
-}
-
-fn lua_light_set_radius(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    // A zero radius is not a hard edge, it is a divide-by-zero in every
-    // falloff, so it is clamped at load rather than caught at draw time.
-    l.radius = @max(lua.toF32(L, 2), 1);
-    return 0;
-}
-
-fn lua_light_set_color(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    const c = [4]f32{ lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5), lua.toF32(L, 6) };
+    if (ctx.world.get(e, PointLight)) |l| setColor(&l.base, c);
+    if (ctx.world.get(e, SpotLight)) |l| setColor(&l.base, c);
+    if (ctx.world.get(e, DirLight)) |l| setColor(&l.base, c);
+    if (ctx.world.get(e, AmbientLight)) |l| setColor(&l.base, c);
     return 0;
 }
 
 fn lua_light_set_energy(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.energy = lua.toF32(L, 2);
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const v = lua.toF32(L, 3);
+    if (ctx.world.get(e, PointLight)) |l| setEnergy(&l.base, v);
+    if (ctx.world.get(e, SpotLight)) |l| setEnergy(&l.base, v);
+    if (ctx.world.get(e, DirLight)) |l| setEnergy(&l.base, v);
+    if (ctx.world.get(e, AmbientLight)) |l| setEnergy(&l.base, v);
     return 0;
 }
 
-fn lua_light_set_angle(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.angle = lua.toF32(L, 2);
-    return 0;
-}
-
-/// `light.set_cone(self, degrees, penumbra)` — the spot's opening and its soft
-/// edge. Two numbers rather than two calls because nothing ever sets one
-/// without the other.
-fn lua_light_set_cone(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.cone_angle = m.degToRad(@max(lua.toF32(L, 2), 0));
-    l.penumbra = @min(@max(lua.toF32(L, 3), 0), 1);
-    return 0;
-}
-
+/// `light.set_blend(self, kind)` — 0 add, 1 subtract, 2 mix. `mix` is the
+/// energy-conserving one: a white surface under it stays white instead of
+/// blowing out, which is why it exists.
 fn lua_light_set_blend(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    const k: u8 = @intFromFloat(@max(lua.toF32(L, 2), 0));
-    l.blend = @enumFromInt(k);
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const k: u8 = @intFromFloat(@max(lua.toF32(L, 3), 0));
+    if (ctx.world.get(e, PointLight)) |l| setBlend(&l.base, k);
+    if (ctx.world.get(e, SpotLight)) |l| setBlend(&l.base, k);
+    if (ctx.world.get(e, DirLight)) |l| setBlend(&l.base, k);
+    if (ctx.world.get(e, AmbientLight)) |l| setBlend(&l.base, k);
     return 0;
 }
 
-/// `light.set_shadow(self, enabled, filter, smoothness)`.
-///
-/// `filter` is 0 off / 1 one tap / 2 three / 3 five. Exposed as the raw number
-/// because it is a quality dial, and a string per draw call is a lookup in the
-/// middle of a frame for nothing.
+/// `light.set_shadow(self, enabled, filter, smoothness)` — filter is 0 off,
+/// 1 one tap, 2 three, 3 five. The raw number because it is a quality dial and
+/// a string per draw call is a lookup in the middle of a frame for nothing.
 fn lua_light_set_shadow(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.cast_shadows = lua.toBool(L, 2);
-    const f: u8 = @intFromFloat(@max(lua.toF32(L, 3), 0));
-    l.shadow_filter = @enumFromInt(f);
-    l.shadow_filter_smooth = @max(lua.toF32(L, 4), 0);
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const enabled = lua.toBool(L, 3);
+    const f: u8 = @intFromFloat(@max(lua.toF32(L, 4), 0));
+    const smooth = @max(lua.toF32(L, 5), 0);
+    // An ambient light never casts a shadow: it has no direction to trace from,
+    // and one that tried would be a shadow of nothing.
+    if (ctx.world.get(e, PointLight)) |l| setShadow(&l.base, enabled, f, smooth);
+    if (ctx.world.get(e, SpotLight)) |l| setShadow(&l.base, enabled, f, smooth);
+    if (ctx.world.get(e, DirLight)) |l| setShadow(&l.base, enabled, f, smooth);
     return 0;
 }
 
 /// `light.set_gi(self, contribution)` — how much of the global-illumination
-/// enclosure term this light applies. Zero by default, because a scene that did
-/// not ask for bounce should not have it.
+/// enclosure term this light applies. Zero by default: a scene that did not
+/// ask for bounce should not have it.
 fn lua_light_set_gi(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.gi_contribution = @min(@max(lua.toF32(L, 2), 0), 1);
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const v = @min(@max(lua.toF32(L, 3), 0), 1);
+    if (ctx.world.get(e, PointLight)) |l| setGi(&l.base, v);
+    if (ctx.world.get(e, SpotLight)) |l| setGi(&l.base, v);
+    if (ctx.world.get(e, DirLight)) |l| setGi(&l.base, v);
     return 0;
 }
 
+/// `light.set_mask(self, bitmask)` — which sprite layers this light affects, as a
+/// bitmask of `Sprite.layer`. A light on layer 2 lights only layer 2, which is
+/// how a scene gets a lamp that does not brighten its own interface.
 fn lua_light_set_mask(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    l.item_cull_mask = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const v: u32 = @intFromFloat(@max(lua.toF32(L, 3), 0));
+    if (ctx.world.get(e, PointLight)) |l| setMask(&l.base, v);
+    if (ctx.world.get(e, SpotLight)) |l| setMask(&l.base, v);
+    if (ctx.world.get(e, DirLight)) |l| setMask(&l.base, v);
+    if (ctx.world.get(e, AmbientLight)) |l| setMask(&l.base, v);
     return 0;
-}
-
-/// `light.get_kind(self)`, `light.get_radius(self)`, ... — the inspector reads
-/// as well as writes, and it is generated from the same registry as these docs.
-fn lua_light_get_kind(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    lua.pushF32(L, @floatFromInt(@intFromEnum(l.kind)));
-    return 1;
-}
-
-fn lua_light_get_radius(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    lua.pushF32(L, l.radius);
-    return 1;
-}
-
-fn lua_light_get_color(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    for (l.color) |c| lua.pushF32(L, c);
-    return 4;
 }
 
 fn lua_light_get_energy(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    lua.pushF32(L, l.energy);
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, PointLight)) |l| lua.pushF32(L, l.base.energy);
+    if (ctx.world.get(e, SpotLight)) |l| lua.pushF32(L, l.base.energy);
+    if (ctx.world.get(e, DirLight)) |l| lua.pushF32(L, l.base.energy);
+    if (ctx.world.get(e, AmbientLight)) |l| lua.pushF32(L, l.base.energy);
     return 1;
 }
 
-fn lua_light_get_cone(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    lua.pushF32(L, m.radToDeg(l.cone_angle));
-    lua.pushF32(L, l.penumbra);
-    return 2;
+// ── PointLight2D: the one most scenes are made of ───────────────────────────
+
+/// `point.new(self, radius)` — adds a PointLight2D. A zero radius is clamped
+/// rather than rejected: it is not a hard edge, it is a divide-by-zero in every
+/// falloff, and a scene that asks for one means "a small light", not "error me".
+fn lua_point_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, PointLight) == null) {
+        _ = ctx.world.add(e, PointLight{ .radius = @max(lua.toF32(L, 3), 1) }) catch return 0;
+    }
+    return 0;
 }
 
-fn lua_light_get_shadow(L: ?*lua_State) callconv(.c) c_int {
-    const l = lightOf(L) orelse return 0;
-    lua.lua_pushboolean(L, @intFromBool(l.cast_shadows));
-    lua.pushF32(L, @floatFromInt(@intFromEnum(l.shadow_filter)));
-    lua.pushF32(L, l.shadow_filter_smooth);
-    return 3;
+fn lua_point_set_radius(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, PointLight)) |l| l.radius = @max(lua.toF32(L, 3), 1);
+    return 0;
 }
+
+// ── SpotLight2D ─────────────────────────────────────────────────────────────
+
+fn lua_spot_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight) == null) {
+        _ = ctx.world.add(e, SpotLight{ .radius = @max(lua.toF32(L, 3), 1) }) catch return 0;
+    }
+    return 0;
+}
+
+fn lua_spot_set_radius(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight)) |l| l.radius = @max(lua.toF32(L, 3), 1);
+    return 0;
+}
+
+/// `spot.set_cone(self, degrees, penumbra)` — two numbers in one call because
+/// nothing ever sets one without the other, and a spotlight whose opening moved
+/// but whose soft edge did not is a mis-configured light nobody can explain.
+fn lua_spot_set_cone(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight)) |l| {
+        l.cone_angle = core_math.degToRad(@max(lua.toF32(L, 3), 0));
+        l.penumbra = @min(@max(lua.toF32(L, 4), 0), 1);
+    }
+    return 0;
+}
+
+fn lua_spot_set_angle(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, SpotLight)) |l| l.angle = lua.toF32(L, 3);
+    return 0;
+}
+
+// ── DirectionalLight2D: the sun ──────────────────────────────────────────────
+
+fn lua_directional_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, DirLight) == null) {
+        _ = ctx.world.add(e, DirLight{}) catch return 0;
+    }
+    return 0;
+}
+
+/// `directional.set_angle(self, radians)` — the direction the light TRAVELS,
+/// not the direction it points. A sun at 0 shines to the right, which makes
+/// shadows run to the left of every object.
+fn lua_directional_set_angle(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, DirLight)) |l| l.angle = lua.toF32(L, 3);
+    return 0;
+}
+
+/// `directional.set_height(self, h)` — 0..1. How high above the scene the light
+/// sits, which scales shadow LENGTH. A 2D scene needs a z coordinate for exactly
+/// this, and Godot's 0..1 dial is what a scene author means by it.
+fn lua_directional_set_height(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, DirLight)) |l| l.height = @min(@max(lua.toF32(L, 3), 0), 1);
+    return 0;
+}
+
+// ── AmbientLight2D ──────────────────────────────────────────────────────────
+
+fn lua_ambient_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, AmbientLight) == null) {
+        _ = ctx.world.add(e, AmbientLight{}) catch return 0;
+    }
+    return 0;
+}
+
+/// `ambient.set_local(self, distance)` — a local ambient. 0 restores the
+/// scene-wide kind. A lantern's pool of warm air differs from the night around
+/// it, and one number cannot hold both.
+fn lua_ambient_set_local(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, AmbientLight)) |l| {
+        const d = @max(lua.toF32(L, 3), 0);
+        l.global = d <= 0;
+        l.max_distance = d;
+    }
+    return 0;
+}
+
+const light_regs = [_]luaL_Reg{
+    .{ .name = "set_color", .func = lua_light_set_color },
+    .{ .name = "set_energy", .func = lua_light_set_energy },
+    .{ .name = "set_blend", .func = lua_light_set_blend },
+    .{ .name = "set_shadow", .func = lua_light_set_shadow },
+    .{ .name = "set_gi", .func = lua_light_set_gi },
+    .{ .name = "set_mask", .func = lua_light_set_mask },
+    .{ .name = "get_energy", .func = lua_light_get_energy },
+    .{ .name = null, .func = null },
+};
+
+const point_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_point_new },
+    .{ .name = "set_radius", .func = lua_point_set_radius },
+    .{ .name = null, .func = null },
+};
+
+const spot_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_spot_new },
+    .{ .name = "set_radius", .func = lua_spot_set_radius },
+    .{ .name = "set_cone", .func = lua_spot_set_cone },
+    .{ .name = "set_angle", .func = lua_spot_set_angle },
+    .{ .name = null, .func = null },
+};
+
+const directional_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_directional_new },
+    .{ .name = "set_angle", .func = lua_directional_set_angle },
+    .{ .name = "set_height", .func = lua_directional_set_height },
+    .{ .name = null, .func = null },
+};
+
+const ambient_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_ambient_new },
+    .{ .name = "set_local", .func = lua_ambient_set_local },
+    .{ .name = null, .func = null },
+};
+
+// ── LightOccluder2D ─────────────────────────────────────────────────────────
+//
+// Three modes, because a sprite that looks like it occludes must be able to say
+// that it must NOT: a fog card, a UI panel. `none` is why the mode exists at
+// all; the alternative is deleting the component and re-adding it without it,
+// which is what you do when the only escape hatch is deletion.
 
 fn occluderOf(L: ?*lua_State) ?*Occluder {
     const ctx = ctxOf(L);
@@ -1774,8 +1925,6 @@ fn occluderOf(L: ?*lua_State) ?*Occluder {
     return ctx.world.get(e, Occluder);
 }
 
-/// `occluder.new(self, mode)` — adds the component. Mode 0 auto-from-sprite,
-/// 1 manual polygon, 2 none.
 fn lua_occluder_new(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
@@ -1787,9 +1936,6 @@ fn lua_occluder_new(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `occluder.set_mode(self, mode)` — 0 auto (the alpha-derived shape, with no
-/// authoring), 1 manual, 2 none. `none` is how a sprite that looks like it
-/// occludes says that it must not: a fog card, a UI panel.
 fn lua_occluder_set_mode(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     o.mode = @enumFromInt(@as(u8, @intFromFloat(@max(lua.toF32(L, 2), 0))));
@@ -1797,30 +1943,25 @@ fn lua_occluder_set_mode(L: ?*lua_State) callconv(.c) c_int {
 }
 
 /// `occluder.set_threshold(self, alpha)` — where the automatic shape draws its
-/// own edge. 0.5 is what a human means by "the shape", and raising it is the fix
-/// for most "my sprite has a fringe of shadow" reports.
+/// own edge. Raising it is the fix for most "my sprite has a fringe of shadow"
+/// reports, and a fix that cannot be reached from Lua is not a fix.
 fn lua_occluder_set_threshold(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     o.alpha_threshold = @min(@max(lua.toF32(L, 2), 0), 1);
     return 0;
 }
 
-/// `occluder.set_mask(self, bitmask)` — which lights this occluder blocks.
-/// 0 (all) is what a wall wants; a one-way occluder, like a pane that blocks the
-/// sun but not the lamps, sets it.
 fn lua_occluder_set_mask(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     o.cull_mask = @intFromFloat(@max(lua.toF32(L, 2), 0));
     return 0;
 }
 
-/// `occluder.set_polygon(self, {x0,y0, x1,y1, ...})` — the manual shape.
+/// `occluder.set_polygon(self, {x0, y0, ...})` — the manual shape.
 ///
-/// Read as a table of numbers rather than eight positional arguments, because a
-/// shape with eight coordinates is unreadable as a flat list and an editor that
-/// lets a user drag vertices produces them as a list anyway. The table is
-/// optional too: a call that clears the polygon turns the occluder back into
-/// whatever its automatic shape is.
+/// Read from a table rather than eight positional arguments, because a shape
+/// with eight coordinates is unreadable as a flat list and an editor that lets
+/// a user drag vertices produces a list anyway.
 fn lua_occluder_set_polygon(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     if (lua.lua_type(L, 2) != TTable) return 0;
@@ -1829,9 +1970,6 @@ fn lua_occluder_set_polygon(L: ?*lua_State) callconv(.c) c_int {
     const n: usize = @intCast(lua.lua_objlen(L, 2));
     var i: usize = 0;
     while (i < n and i < poly.points.len) : (i += 1) {
-        // t[i] by pushing the index and calling gettable, then dropping both
-        // with settop: this layer has no , and  is the
-        // same thing with one fewer dependency on the Lua ABI.
         lua.lua_pushinteger(L, @intCast(i + 1));
         lua.lua_gettable(L, 2);
         poly.points[i] = lua.toF32(L, -1);
@@ -1842,8 +1980,6 @@ fn lua_occluder_set_polygon(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `occluder.get_mode(self)`, `occluder.get_threshold(self)`,
-/// `occluder.get_polygon(self) -> table` — the inspector's half of the surface.
 fn lua_occluder_get_mode(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     lua.pushF32(L, @floatFromInt(@intFromEnum(o.mode)));
@@ -1862,38 +1998,23 @@ fn lua_occluder_get_mask(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// `occluder.get_polygon(self) -> table` — the manual shape as a flat list. An
+/// editor that lets a user drag vertices reads this back to draw them.
+///
+/// `createtable` with the SECOND argument asks for the array part, which is
+/// what makes `#pts` and `ipairs` work. Without it the table is hash-only,
+/// `lua_objlen` returns zero, and an editor dragging vertices sees an empty
+/// shape — a bug invisible until someone tries to iterate.
 fn lua_occluder_get_polygon(L: ?*lua_State) callconv(.c) c_int {
     const o = occluderOf(L) orelse return 0;
     lua.lua_createtable(L, @intCast(o.polygon.count), 0);
-    const n = o.polygon.count;
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    while (i < o.polygon.count) : (i += 1) {
         lua.pushF32(L, o.polygon.points[i]);
         lua.lua_rawseti(L, -2, @intCast(i + 1));
     }
     return 1;
 }
-
-const light_regs = [_]luaL_Reg{
-    .{ .name = "new", .func = lua_light_new },
-    .{ .name = "set_kind", .func = lua_light_set_kind },
-    .{ .name = "set_radius", .func = lua_light_set_radius },
-    .{ .name = "set_color", .func = lua_light_set_color },
-    .{ .name = "set_energy", .func = lua_light_set_energy },
-    .{ .name = "set_angle", .func = lua_light_set_angle },
-    .{ .name = "set_cone", .func = lua_light_set_cone },
-    .{ .name = "set_blend", .func = lua_light_set_blend },
-    .{ .name = "set_shadow", .func = lua_light_set_shadow },
-    .{ .name = "set_gi", .func = lua_light_set_gi },
-    .{ .name = "set_mask", .func = lua_light_set_mask },
-    .{ .name = "get_kind", .func = lua_light_get_kind },
-    .{ .name = "get_radius", .func = lua_light_get_radius },
-    .{ .name = "get_color", .func = lua_light_get_color },
-    .{ .name = "get_energy", .func = lua_light_get_energy },
-    .{ .name = "get_cone", .func = lua_light_get_cone },
-    .{ .name = "get_shadow", .func = lua_light_get_shadow },
-    .{ .name = null, .func = null },
-};
 
 const occluder_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_occluder_new },
@@ -2010,6 +2131,221 @@ const environment_regs = [_]luaL_Reg{
     .{ .name = "get_ambient", .func = lua_environment_get_ambient },
     .{ .name = "get_clear", .func = lua_environment_get_clear },
     .{ .name = "get_fog", .func = lua_environment_get_fog },
+    .{ .name = null, .func = null },
+};
+
+// ── Camera2D (M4.5) ──────────────────────────────────────────────────────────
+//
+// The camera bindings act on THIS actor's `Camera2D`. That is the same choice
+// every other module here makes (`point.new(self, ...)`, `sprite.set_size`) and
+// it is what makes a camera authorable from the behavior attached to it: the
+// script that owns the camera is the script on the camera's own actor.
+//
+// The system that ADVANCES these fields lives in `ecs/camera.zig` and runs on
+// the fixed step, outside Lua entirely. Nothing here moves the camera: these
+// are the knobs, and the tick is what turns them. That split is why a camera
+// behaves identically whether it was authored in a scene file or driven from a
+// script.
+
+/// `camera.new(self)` — adds a Camera2D to this actor. Adding is explicit rather
+/// than implicit in `follow`, because a camera is a scene-level decision and a
+/// behavior that tried to move a camera it does not own would silently do
+/// nothing.
+fn lua_camera_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Camera2D) == null) {
+        _ = ctx.world.add(e, Camera2D{}) catch return 0;
+    }
+    return 0;
+}
+
+/// `camera.follow(self, other)` — where the camera looks.
+///
+/// Takes another actor rather than coordinates, because a camera that follows a
+/// POSITION has to be told again every frame and a camera that follows an ACTOR
+/// is correct for as long as that actor lives. The target is an `Entity`, so a
+/// despawned target degrades to "no target" (the camera holds its last centre)
+/// rather than following freed memory.
+fn lua_camera_follow(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const target = entityOf(L, 2) orelse return 0;
+    if (ctx.world.get(e, Camera2D)) |c| c.follow(target);
+    return 0;
+}
+
+/// `camera.zoom_to(self, zoom)` — the target zoom. Reached through a spring, so
+/// this is where the camera is HEADING, not where it is; that is what makes a
+/// pinch-to-zoom or a sniper scope feel like motion rather than a cut.
+fn lua_camera_zoom_to(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Camera2D)) |c| c.zoom_to(@max(lua.toF32(L, 2), 0.001));
+    return 0;
+}
+
+/// `camera.shake(self, trauma)` — adds trauma, which then decays.
+///
+/// Trauma, not amplitude: the caller says how hard it was hit and the camera
+/// decides how long the screen keeps moving. A second hit while the first is
+/// still decaying ADDS, which is what makes a long barrage feel cumulative
+/// instead of restarting.
+fn lua_camera_shake(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Camera2D)) |c| c.add_trauma(@max(lua.toF32(L, 2), 0));
+    return 0;
+}
+
+/// `camera.set_limits(self, x, y, w, h)` — the rectangle the camera may not
+/// leave. A zero width or height disables it, which is what a level with no
+/// bounds and what a test both want.
+fn lua_camera_set_limits(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const w = lua.toF32(L, 4);
+    const h = lua.toF32(L, 5);
+    if (ctx.world.get(e, Camera2D)) |c| {
+        c.set_limits(.{
+            .position = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) },
+            .size = .{ .x = w, .y = h },
+        }, w > 0 and h > 0);
+    }
+    return 0;
+}
+
+/// `camera.set_damping(self, damping)` — 0 is a camera welded to its target
+/// (what a platformer with a fixed view wants); higher is a lazier one. It is
+/// one number because a critically-damped spring needs one number.
+fn lua_camera_set_damping(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Camera2D)) |c| c.damping = @max(lua.toF32(L, 2), 0);
+    return 0;
+}
+
+/// `camera.get_centre(self) -> x, y` — where the camera is, in world units.
+///
+/// Returned because a behavior that aims, spawns off-screen or asks "is the
+/// player near the edge" needs the same number the renderer uses, and computing
+/// it again in Lua would drift from it.
+fn lua_camera_get_centre(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const c = ctx.world.get(e, Camera2D) orelse return 0;
+    lua.pushF32(L, c._offset.x);
+    lua.pushF32(L, c._offset.y);
+    return 2;
+}
+
+const camera_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_camera_new },
+    .{ .name = "follow", .func = lua_camera_follow },
+    .{ .name = "zoom_to", .func = lua_camera_zoom_to },
+    .{ .name = "shake", .func = lua_camera_shake },
+    .{ .name = "set_limits", .func = lua_camera_set_limits },
+    .{ .name = "set_damping", .func = lua_camera_set_damping },
+    .{ .name = "get_centre", .func = lua_camera_get_centre },
+    .{ .name = null, .func = null },
+};
+
+// ── Timer (M4.5) ─────────────────────────────────────────────────────────────
+//
+// A timer is a component, not a Lua closure, which is the whole reason it can be
+// authored in a scene file, saved and restored bit-exactly, and survive a
+// hot-reload. The callback is a SIGNAL NAME: the tick queues it on the world bus
+// and forwards it to every `on_signal`, so a timer and a collision arrive in the
+// same handler the same way.
+
+/// `timer.new(self, seconds, kind)` — kind 0 once, 1 loop, 2 during (fires the
+/// tick signal every tick and the done signal every cycle).
+fn lua_timer_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const kind: u8 = @intFromFloat(@max(lua.toF32(L, 3), 0));
+    var t = components.Timer{ .duration = @max(lua.toF32(L, 2), 0) };
+    t.kind = switch (kind) {
+        1 => .loop,
+        2 => .during,
+        else => .once,
+    };
+    if (ctx.world.get(e, components.Timer) == null) {
+        _ = ctx.world.add(e, t) catch return 0;
+    }
+    return 0;
+}
+
+/// `timer.set_signals(self, on_tick, on_done)` — an empty name fires nothing,
+/// which is how a timer becomes a silent metronome that only `progress` reads.
+fn lua_timer_set_signals(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    // `toString` returns "" for a non-string or a nil, and an empty signal name
+    // means "fire nothing", so "" is exactly the case that needs no write. One
+    // read per argument: calling it twice to test and then to copy would read the
+    // Lua stack twice for the same value.
+    const tick = lua.toString(L, 2);
+    const done = lua.toString(L, 3);
+    if (tick.len > 0) t.tick_signal.set(tick);
+    if (done.len > 0) t.done_signal.set(done);
+    return 0;
+}
+
+/// `timer.start(self, loops)` — 0 loops means forever. Autostart is a field on
+/// the component, so a timer declared in a scene file runs without any script.
+fn lua_timer_start(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    t.paused = false;
+    t.finished = false;
+    t.current_loop = 0;
+    t.elapsed = 0;
+    t.loop_count = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    return 0;
+}
+
+/// `timer.stop(self)` — pauses WITHOUT losing `elapsed`, so starting again
+/// resumes where it was rather than restarting. Stopping for good is
+/// `timer.kill`.
+fn lua_timer_stop(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.Timer)) |t| t.paused = true;
+    return 0;
+}
+
+/// `timer.kill(self)` — finishes it: no more signals ever, and `finished` is
+/// what the system checks, so this takes effect on the very next tick.
+fn lua_timer_kill(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.Timer)) |t| t.finished = true;
+    return 0;
+}
+
+/// `timer.progress(self) -> 0..1` — how far through the current cycle.
+///
+/// The one timer value a UI needs: a cooldown swipe, a reload bar. It is derived
+/// from the component's own state, so a bar and the signal that ends it can never
+/// disagree about when the timer is done.
+fn lua_timer_progress(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    lua.pushF32(L, t.progress());
+    return 1;
+}
+
+const timer_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_timer_new },
+    .{ .name = "set_signals", .func = lua_timer_set_signals },
+    .{ .name = "start", .func = lua_timer_start },
+    .{ .name = "stop", .func = lua_timer_stop },
+    .{ .name = "kill", .func = lua_timer_kill },
+    .{ .name = "progress", .func = lua_timer_progress },
     .{ .name = null, .func = null },
 };
 
@@ -2495,7 +2831,6 @@ fn lua_vec2_clamped(L: ?*lua_State) callconv(.c) c_int {
     return lua_vec2_clamp_length(L);
 }
 
-const core_math = @import("core").math;
 
 /// Installs every binding into `L`, closing each C function over `ctx` (a stable
 /// pointer the caller owns). Builds the `actor`, `input` and `log` global tables
@@ -2582,23 +2917,24 @@ pub const registered_names = [_][]const u8{
     "environment.get_ambient",
     "environment.get_clear",
     "environment.get_fog",
-    "light.new",
-    "light.set_kind",
-    "light.set_radius",
     "light.set_color",
     "light.set_energy",
-    "light.set_angle",
-    "light.set_cone",
     "light.set_blend",
     "light.set_shadow",
     "light.set_gi",
     "light.set_mask",
-    "light.get_kind",
-    "light.get_radius",
-    "light.get_color",
     "light.get_energy",
-    "light.get_cone",
-    "light.get_shadow",
+    "point.new",
+    "point.set_radius",
+    "spot.new",
+    "spot.set_radius",
+    "spot.set_cone",
+    "spot.set_angle",
+    "directional.new",
+    "directional.set_angle",
+    "directional.set_height",
+    "ambient.new",
+    "ambient.set_local",
     "occluder.new",
     "occluder.set_mode",
     "occluder.set_threshold",
@@ -2639,6 +2975,22 @@ pub const registered_names = [_][]const u8{
     "physics.contains_point",     "actor.set_linear_velocity",
     "actor.get_linear_velocity", "actor.apply_impulse",
     "actor.is_awake",
+    // M4.5 — every one of these needs a `metadata.bindings` entry or
+    // `assertAllDocumented` above fails to compile, which is the gate that keeps
+    // the stubs, the help panel and the API from drifting apart.
+    "camera.new",
+    "camera.follow",
+    "camera.zoom_to",
+    "camera.shake",
+    "camera.set_limits",
+    "camera.set_damping",
+    "camera.get_centre",
+    "timer.new",
+    "timer.set_signals",
+    "timer.start",
+    "timer.stop",
+    "timer.kill",
+    "timer.progress",
 };
 
 pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
@@ -2664,8 +3016,17 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "sprite", &sprite_regs);
     installModule(L, ctx, "material", &material_regs);
     installModule(L, ctx, "light", &light_regs);
+    installModule(L, ctx, "point", &point_regs);
+    installModule(L, ctx, "spot", &spot_regs);
+    installModule(L, ctx, "directional", &directional_regs);
+    installModule(L, ctx, "ambient", &ambient_regs);
     installModule(L, ctx, "occluder", &occluder_regs);
     installModule(L, ctx, "environment", &environment_regs);
+    // M4.5: the camera is driven from the script on its OWN actor, and the
+    // timer is a component that declares signal names. Neither needs a system
+    // call per frame — the fixed step advances them.
+    installModule(L, ctx, "camera", &camera_regs);
+    installModule(L, ctx, "timer", &timer_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

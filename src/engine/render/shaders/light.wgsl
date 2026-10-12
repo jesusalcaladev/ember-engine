@@ -50,6 +50,10 @@ const KIND_MASK: u32 = 7u;
 const KIND_POINT: u32 = 0u;
 const KIND_SPOT: u32 = 1u;
 const KIND_DIRECTIONAL: u32 = 2u;
+// An ambient is not a point light at a large radius: its curve is FLAT across
+// 80% of its reach, because the whole point of an ambient is that it does not
+// dim as you walk away from it.
+const KIND_AMBIENT: u32 = 3u;
 const HAS_SHADOW_SHIFT: u32 = 7u;
 const CHANNEL_SHIFT: u32 = 8u;
 const CHANNEL_MASK: u32 = 15u;
@@ -61,6 +65,14 @@ struct Globals {
     inv_screen: vec2f,
     // Ambient colour and the global light energy: the Environment (M7).
     ambient: vec4f,
+    // The GI cascade's world-space rectangle, so a lookup can turn a world
+    // position into a texel. `xy` is the min corner and `zw` the max.
+    mask_rect: vec4f,
+    // Sky colour and the bounce albedo, matching `CascadeParams` in
+    // radiance.wgsl. The two shaders read the same numbers because they are
+    // solving the same problem; a divergence here shows up as bounce light that
+    // changes colour when the GI cascades are rebuilt.
+    sky: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -70,6 +82,19 @@ struct Globals {
 // not a coordinate: a filtered sample would blend two directions and produce a
 // shadow that leaks on one side and darkens the other.
 @group(0) @binding(1) var shadow_map: texture_2d<f32>;
+
+// The GI cascade: a pyramid of probe grids, each half the resolution of the one
+// below. SAMPLED WITH A SAMPLER rather than texelFetch, and that is the
+// opposite decision from the shadow map one line up, on purpose.
+//
+// A shadow map is indexed by an ANGLE BUCKET, which is not a position: a
+// filtered sample blends two directions and leaks on one side while darkening
+// the other. The cascade is indexed by a POSITION, a grid at `base_scale`
+// spacing, so it is exactly the case filtering is for — and a probe grid
+// sampled with texelFetch looks like a grid of hard squares, which is the thing
+// GI must never look like.
+@group(0) @binding(2) var gi_tex: texture_2d<f32>;
+@group(0) @binding(3) var gi_smp: sampler;
 
 struct VSOut {
     @builtin(position) clip: vec4f,
@@ -85,12 +110,14 @@ struct VSOut {
     @location(7) si_cos_inner: f32,
     @location(8) si_angle: f32,
     @location(9) si_gi: f32,
-    @location(10) @interpolate(flat) si_flags: u32,
-    @location(11) @interpolate(flat) si_color: vec4f,
+    @location(10) si_shadow_ratio: f32,
+    @location(11) @interpolate(flat) si_flags: u32,
+    @location(12) @interpolate(flat) si_filter: u32,
+    @location(13) @interpolate(flat) si_color: vec4f,
 };
 
 @vertex
-fn vs_main(vi: u32, in: LightIn) -> VSOut {
+fn vs_main(@builtin(vertex_index) vi: u32, in: LightIn) -> VSOut {
     // The four corners of a triangle strip, in the light's own rectangle. No
     // vertex buffer beyond the instance stream, which is the same trick the
     // sprite shader uses.
@@ -104,6 +131,7 @@ fn vs_main(vi: u32, in: LightIn) -> VSOut {
     out.light_pos = in.pos;
     out.world = in.pos + corner * in.half;
     out.si_radius = in.radius_extent.x;
+    out.si_shadow_ratio = in.radius_extent.y;
     out.si_energy = in.cos_inner_energy.y;
     out.si_atten = in.atten_soft.x;
     out.si_softness = in.atten_soft.y;
@@ -112,6 +140,7 @@ fn vs_main(vi: u32, in: LightIn) -> VSOut {
     out.si_angle = in.angle_cos.x;
     out.si_gi = in.gi_flags.x;
     out.si_flags = flags;
+    out.si_filter = (flags >> 5) & 3u;
     out.si_color = in.color;
     return out;
 }
@@ -127,12 +156,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     let rec01 = dist / radius;
 
     var falloff: f32 = 0.0;
-    if (kind == KIND_POINT) {
+    if (kind == KIND_AMBIENT) {
+        // Flat, then a soft edge over the last fifth of the reach. A scene-wide
+        // ambient is sized by the CPU so that `rec01` never exceeds 0.8 on
+        // screen, which lands entirely in the flat part.
+        falloff = 1.0 - smoothstep(0.8, 1.0, rec01);
+    } else if (kind == KIND_POINT) {
         falloff = 1.0 - min(rec01, 1.0);
     } else {
         // A spot or a directional light: how much the direction to the pixel
         // agrees with the light's own direction. ONE `dot` of two unit-ish
-        // vectors, and it is the whole cone test.
+        // vectors, and it is the whole cone test. A directional light carries
+        // both cosines as 1, so this costs a multiply and rejects nothing —
+        // which is the right price for "has no cone".
         let light_dir = vec2f(cos(in.si_angle), sin(in.si_angle));
         let pixel_dir = to_pixel / max(dist, 1e-6);
         let c = dot(light_dir, pixel_dir);
@@ -156,7 +192,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     // SHADOWS. The 1D shadow map is indexed by the pixel's ANGLE from the
     // light, in the light's own row — one texel fetch for the whole test.
     //
-    // The value is blocker PROXIMITY (`1 - distance/radius`), so the pixel is lit
+    // The value is blocker PROXIMITY (`1 - distance/reach`), so the pixel is lit
     // when it is nearer the light than the blocker is. Averaging those values
     // over filter taps widens the penumbra; averaging two boolean masks would
     // give you a boolean mask with greyer corners.
@@ -167,26 +203,80 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         if (theta < 0.0) {
             theta = theta + 6.283185307179586;
         }
-        let angles = f32(textureDimensions(shadow_map).x);
-        var idx = u32(theta / 6.283185307179586 * angles);
-        idx = min(idx, u32(angles) - 1u);
-        let occ = textureLoad(shadow_map, vec2u(idx, channel), 0).r;
+        let n_angles = u32(textureDimensions(shadow_map).x);
+        let turn = 6.283185307179586 / f32(n_angles);
+        let idx = min(u32(theta / turn), n_angles - 1u);
 
-        let width = max(in.si_softness * rec01, 1e-4);
-        vis = smoothstep(occ - width, occ, 1.0 - rec01);
+        // Normalized by the SHADOW reach, not by the light's radius. The map
+        // holds `1 - t/reach` because the sweep traced that far, and the
+        // directional light's reach is its shadow length rather than its
+        // falloff — so the two sides of the comparison have to be in the same
+        // units or the shadow is silently the wrong length.
+        let ratio = max(in.si_shadow_ratio, 1e-4);
+        let here = 1.0 - min(rec01 / ratio, 1.0);
+        let w = max(in.si_softness * rec01, 1e-4);
+
+        let o0 = textureLoad(shadow_map, vec2u(idx, channel), 0).r;
+        vis = smoothstep(o0 - w, o0, here);
+
+        // The filter is an average of NEIGHBOURS, which is what makes a shadow
+        // edge soft rather than blocky. Weights sum to 1 and the centre tap
+        // always counts, so `off` and the highest filter cannot differ in
+        // brightness — only in how hard the edge is.
+        if (in.si_filter != 0u) {
+            let om = smoothstep(o0 - w, o0, here);
+            let op = textureLoad(shadow_map, vec2u((idx + n_angles - 1u) % n_angles, channel), 0).r;
+            let on = textureLoad(shadow_map, vec2u((idx + 1u) % n_angles, channel), 0).r;
+            let vp = smoothstep(op - w, op, here);
+            let vn = smoothstep(on - w, on, here);
+            if (in.si_filter == 1u) {
+                vis = om;
+            } else if (in.si_filter == 2u) {
+                vis = 0.5 * vis + 0.5 * om;
+            } else {
+                vis = 0.25 * vis + 0.5 * om + 0.25 * vp * vn;
+            }
+        }
     }
 
-    // GI is NOT sampled here. The enclosure term lives in the CPU's distance
-    // field, and reading it in a fragment program means uploading that field as
-    // a texture and binding it — a piece of work that is deliberately not in
-    // this commit, which is why `si_gi` is carried but unused. A light whose GI
-    // is meant to darken an enclosed room therefore lights that room at full
-    // strength on the GPU while the CPU reference says otherwise, and the CPU
-    // reference is the one that is tested. This is a real gap and it is stated
-    // rather than papered over with a constant that looks like an answer.
-    let rgb = color.rgb * falloff * vis;
-    let alpha = color.a;
-    return vec4f(rgb, rgb);
+    // GI. The cascade's alpha channel is the ENCLOSURE term — how much of the
+    // hemisphere this point can see — and `si_gi` is how much of it this light
+    // is allowed to apply.
+    //
+    // `si_gi` defaults to zero, and that default is the whole design: a scene
+    // that never asked for bounce must not get it, even though the texture is
+    // bound and the sampler is bound and the code is right here. A GI term that
+    // arrives unasked for darkens every enclosed room in every project that
+    // added the subsystem, and the report is always "my lights look wrong" with
+    // no way to point at the cause.
+    var gi: f32 = 1.0;
+    if (in.si_gi > 0.0) {
+        let size = vec2f(textureDimensions(gi_tex));
+        let span = max(globals.mask_rect.zw - globals.mask_rect.xy, vec2f(1e-4));
+        // Outside the cascade's rectangle there is no enclosure data, and the
+        // honest answer for "how enclosed is somewhere we never measured" is
+        // zero: unenclosed. Guessing anything else makes the border of a
+        // measured region pop, which is worse than having no GI there.
+        let uv = (in.world - globals.mask_rect.xy) / span;
+        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+            // `textureSampleLevel`, not `textureSample`: the branch is keyed on
+            // a per-instance value, so it is not uniform control flow and the
+            // implicit-derivative form is illegal here. Level 0 is not a
+            // downgrade — the cascade is a probe grid with no mip chain, so
+            // there is no other level to take and the derivative would only
+            // have picked 0 anyway.
+            gi = 1.0 - in.si_gi * (1.0 - textureSampleLevel(gi_tex, gi_smp, uv, 0.0).a);
+        } else {
+            gi = 1.0 - in.si_gi;
+        }
+    }
+
+    // `energy` and the colour's alpha BOTH scale what arrives. Alpha is the
+    // light's opacity, which is why fading a light needs no extra attribute and
+    // no extra blend mode — and why `mix` can lerp by the amount that arrives
+    // rather than by the colour.
+    let a = falloff * vis * in.si_energy * color.a * gi;
+    return vec4f(color.rgb * a, a);
 }
 
 /// A smoothstep, mirroring `light.zig`'s.
