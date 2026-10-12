@@ -59,6 +59,36 @@ pub const Sprite = struct {
     /// Draw nothing for this entity without despawning it (editor gizmos, cut
     /// scenes). Cheaper and safer than a structural change during the frame.
     visible: bool = true,
+
+    /// M7: index into the lighting system's coverage store, or -1 for none.
+    ///
+    /// An INDEX and not a pointer because the component registry forbids
+    /// pointers and slices in components — they are plain data, for the SoA
+    /// tables and for the `.zson` encoding, and a `[]const u8` in a component is
+    /// both. The pixels therefore live in a store that lighting owns and the
+    /// asset pipeline fills, and the component carries only the number.
+    ///
+    /// ## What it is for
+    ///
+    /// An automatic `LightOccluder2D` promises that adding a sprite makes it
+    /// occlude, with no author action. The rectangle fails that promise: a
+    /// character's silhouette is not its bounding box, and the difference is a
+    /// rectangle of shadow hanging in the air beside it. With this set, the
+    /// occluder is the sprite's actual shape and `alpha_threshold` decides where
+    /// its edge is drawn.
+    ///
+    /// ## Why it lives on the Sprite and not on the occluder
+    ///
+    /// Because it is a property of the ASSET, not of any one occluder. Two actors
+    /// sharing a texture share the coverage, and an occluder carrying its own copy
+    /// would be a copy per occluder of data that does not change.
+    ///
+    /// ## Who fills it in
+    ///
+    /// M6 (the asset pipeline) registers the coverage and sets this index. Until
+    /// then it is -1 and automatic occluders fall back to their rectangle — the
+    /// current behaviour, unchanged, and the reason -1 is not a regression.
+    coverage_index: i32 = -1,
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

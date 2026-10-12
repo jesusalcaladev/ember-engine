@@ -21,6 +21,10 @@ pub const Backend = struct {
     lights_drawn: u64 = 0,
     light_upload_bytes: u64 = 0,
     shadow_upload_bytes: u64 = 0,
+    /// M7: shadow-map textures actually built. The null backend models the same
+    /// cache Dawn does, so a headless run can prove "created once" without a GPU.
+    shadow_map_creations: u64 = 0,
+    shadow_map_angles: u32 = 0,
     /// M7: the environment the scene published, and the last GI cascade it sent.
     /// Kept so a headless test can assert the scene asked for bounce rather than
     /// only that it drew some lights.
@@ -134,10 +138,16 @@ pub const Backend = struct {
 }
 
 fn createShadowMap(ptr: *anyopaque, angles: u32) ?*anyopaque {
-    _ = ptr;
-    _ = angles;
-    // The null backend has no textures, so there is nothing to hand out. The
-    // count is what tests assert on; a real backend returns a handle.
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    if (angles == 0 or angles > 1024) return null;
+    // The same cache Dawn keeps, and the same counter. A contract that only one
+    // backend honours is not a contract, it is a hope — and this one was false
+    // for exactly that reason.
+    if (self.shadow_map_angles == angles) return null;
+    self.shadow_map_angles = angles;
+    self.shadow_map_creations += 1;
+    // No textures here, so there is nothing to hand out. The counter is what
+    // tests assert on.
     return null;
 }
 
@@ -412,4 +422,35 @@ test "render post: the frame cost is four passes for bloom, one for fog, none fo
     try std.testing.expectEqual(@as(u32, 0), r.stats().post_passes);
 
     r.destroyOffscreenTarget(target);
+}
+
+test "render light backend null: the shadow map is built once, not once per frame" {
+    // `submitLights` calls `createShadowMap` EVERY frame. The Dawn backend used
+    // to destroy and recreate the texture on every call — a spec §3.6 violation,
+    // and worse, it never stored the new view or rebuilt the bind group, so from
+    // the second frame on every shadow lookup read a released texture view.
+    //
+    // Asserted through a counter rather than through the absence of a crash,
+    // because "it did not crash" and "it allocated once" are different claims
+    // and only one of them is the property.
+    var b = Backend{};
+    const r = b.renderer();
+
+    var f: usize = 0;
+    while (f < 60) : (f += 1) _ = r.createShadowMap(128);
+    try std.testing.expectEqual(@as(u64, 1), b.shadow_map_creations);
+
+    // Asking for the SAME width again, which is what every subsequent frame
+    // does, stays at one.
+    _ = r.createShadowMap(128);
+    try std.testing.expectEqual(@as(u64, 1), b.shadow_map_creations);
+
+    // A DIFFERENT width is a real change — a quality switch — and does rebuild.
+    _ = r.createShadowMap(256);
+    try std.testing.expectEqual(@as(u64, 2), b.shadow_map_creations);
+
+    // And a nonsense width is declined rather than allocated.
+    _ = r.createShadowMap(0);
+    _ = r.createShadowMap(4096);
+    try std.testing.expectEqual(@as(u64, 2), b.shadow_map_creations);
 }

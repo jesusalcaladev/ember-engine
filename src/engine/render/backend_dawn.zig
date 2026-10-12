@@ -231,6 +231,14 @@ pub const Backend = struct {
         light_bind_group: wgpu.WGPUBindGroup = undefined,
         /// The shadow map's width in angle buckets; zero until it is created.
         light_shadow_angles: u32 = 0,
+        /// How many shadow-map textures this backend has actually built.
+        ///
+        /// A counter and not a comment, because "it is created once" is exactly
+        /// the kind of claim that was false for a long time and looked fine: the
+        /// function was called every frame and created a texture every frame,
+        /// right underneath a comment saying it did not. Spec §3.6 says nothing
+        /// may be created inside a frame, so the number is the check.
+        shadow_map_creations: u64 = 0,
         /// The GI cascade. Starts as the 1x1 opaque-black placeholder created at
         /// boot, and is REPLACED when the pyramid's dimensions change -- which is
         /// why the bind group is rebuilt alongside it and not once at boot.
@@ -2327,19 +2335,42 @@ pub const Backend = struct {
         wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
     }
 
-    /// The shadow map, once. Re-uploading is the only per-frame cost.
+    /// The shadow map, ONCE. `submitLights` calls this every frame, so the whole
+    /// function is a cache lookup in the steady state.
+    ///
+    /// It used to destroy and recreate the texture on every call, immediately
+    /// above a comment saying it reuses it. Two consequences, and the second is
+    /// the one that matters:
+    ///
+    ///   - a `createTexture` + a `release` per frame, which spec §3.6 forbids
+    ///     and which stalls the driver;
+    ///   - the new VIEW was never stored in `light_shadow_texture` and the
+    ///     light pass's BIND GROUP was never rebuilt, so it kept pointing at the
+    ///     view that had just been released. From the second frame on, every
+    ///     shadow lookup read freed memory.
+    ///
+    /// A use-after-free that only shows up once the scene has shadows in it, and
+    /// a null texture field that made `destroyOffscreen`'s cleanup a no-op.
     fn createShadowMap(ptr: *anyopaque, angles: u32) ?*anyopaque {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (angles == 0 or angles > 1024) return null;
-        // Reuse the texture if the angle count has not changed: a resize of the
-        // light count that keeps the angles must not create a GPU object, which
-        // is the whole point of §3.6.
-        if (angles == 0 or angles > 1024) return null;
-        self.light_shadow_angles = angles;
-        if (self.light_shadow_texture) |t| {
-            wgpu.wgpuTextureRelease(t);
-            if (self.light_shadow_view) |v| wgpu.wgpuTextureViewRelease(v);
+
+        // The steady state. One branch, no GPU object, no bind group.
+        if (self.light_shadow_angles == angles) {
+            if (self.light_shadow_texture) |t| return @ptrCast(t);
+            return null;
         }
+
+        // Changing the ANGLE COUNT genuinely needs a new texture, a new view and
+        // a new bind group — the bind group holds the view, so replacing the view
+        // without replacing the group is what made the old code read freed
+        // memory. This is the only path that creates anything, and a quality
+        // change is what reaches it.
+        if (self.light_shadow_texture) |t| wgpu.wgpuTextureRelease(t);
+        if (self.light_shadow_view) |v| wgpu.wgpuTextureViewRelease(v);
+        self.light_shadow_texture = null;
+        self.light_shadow_view = null;
+
         const created = wgpu.wgpuDeviceCreateTexture(self.device, &.{
             .label = wgpu.StringView.from("light.shadow"),
             .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
@@ -2349,8 +2380,34 @@ pub const Backend = struct {
             .mipLevelCount = 1,
             .sampleCount = 1,
         }) orelse return null;
-        self.light_shadow_view = wgpu.wgpuTextureCreateView(created, null) orelse return null;
+        const view = wgpu.wgpuTextureCreateView(created, null) orelse {
+            wgpu.wgpuTextureRelease(created);
+            return null;
+        };
+
+        self.light_shadow_texture = created;
+        self.light_shadow_view = view;
+        self.light_shadow_angles = angles;
+        self.shadow_map_creations += 1;
+        self.rebuildLightBindGroup() catch return null;
         return @ptrCast(created);
+    }
+
+    /// Rebuilds the light pass's bind group from the CURRENT shadow and GI views.
+    ///
+    /// One function, because both views can change and getting the pairing wrong
+    /// in either direction is the same bug: a bind group naming a released view
+    /// (a use-after-free) or one naming the 1x1 GI placeholder forever (GI that
+    /// silently never arrives).
+    fn rebuildLightBindGroup(self: *Backend) !void {
+        const shadow = self.light_shadow_view orelse return error.NoShadowMap;
+        wgpu.wgpuBindGroupRelease(self.light_bind_group);
+        self.light_bind_group = try createBindGroup(self.device, self.light_gi_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = self.light_uniform_buf, .offset = 0, .size = LightUniformBytes },
+            .{ .binding = 1, .textureView = shadow },
+            .{ .binding = 2, .textureView = self.light_gi_view },
+            .{ .binding = 3, .sampler = self.light_gi_sampler },
+        }, "light.bind");
     }
 
     /// The four 1D shadow maps, as rows of `angles` bytes each. One write per
@@ -2420,16 +2477,14 @@ pub const Backend = struct {
                 wgpu.wgpuTextureCreateView(self.light_gi_texture, null) orelse return;
 
             // The bind group holds a texture view, so a new view means a new
-            // bind group. Forgetting this is not a crash: the old group keeps
-            // the 1x1 placeholder and the scene renders with GI silently
-            // disabled, which is the hardest version of this bug to report.
-            wgpu.wgpuBindGroupRelease(self.light_bind_group);
-            self.light_bind_group = createBindGroup(self.device, self.light_gi_bgl, &[_]wgpu.BindGroupEntry{
-                .{ .binding = 0, .buffer = self.light_uniform_buf, .offset = 0, .size = LightUniformBytes },
-                .{ .binding = 1, .textureView = self.light_shadow_view orelse return },
-                .{ .binding = 2, .textureView = self.light_gi_view },
-                .{ .binding = 3, .sampler = self.light_gi_sampler },
-            }, "light.bind") catch return;
+            // bind group — and the shadow map may not exist yet on the very
+            // first frame, which is why this is a helper that can decline rather
+            // than a call site that reads as unconditional.
+            //
+            // Forgetting this is not a crash: the old group keeps the 1x1
+            // placeholder and the scene renders with GI silently disabled, which
+            // is the hardest version of this bug to report.
+            self.rebuildLightBindGroup() catch {};
         }
 
         const dst = wgpu.TexelCopyTextureInfo{ .texture = self.light_gi_texture };

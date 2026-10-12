@@ -218,7 +218,178 @@ pub const Occluder = struct {
     extent: f32,
     circle: bool = false,
     radius: f32 = 0,
+    /// Half extents of the automatic fallback RECTANGLE, or null for a shape
+    /// that is drawn from something else.
+    ///
+    /// This exists because an automatic occluder with no coverage data used to
+    /// draw NOTHING at all: `collect` set `extent` from the sprite's size and
+    /// left `polygon` empty, and the rasterizer skipped any occluder with fewer
+    /// than three vertices. So `mode = auto_sdf` — the DEFAULT, and the one the
+    /// component's own documentation describes — produced no shadow whatsoever,
+    /// and the only reason it went unnoticed is that every test used a manual
+    /// polygon and the demo scenes are not run headless.
+    ///
+    /// The rectangle is the fallback's shape, and a wrong one: it is what an
+    /// automatic occluder looks like before the asset pipeline supplies
+    /// coverage. It is stated as a fallback everywhere it appears rather than as
+    /// the feature, because the feature is the silhouette.
+    rect_half: ?Vec2 = null,
     cull_mask: u32 = 0xffff_ffff,
+
+    /// The sprite's coverage, 0..255 per texel, when the asset pipeline has
+    /// produced one. Null means "no coverage data", and the rasterizer falls back
+    /// to the rectangle.
+    ///
+    /// ## Why this is a seam and not a feature
+    ///
+    /// An automatic occluder's whole promise is that importing a sprite makes it
+    /// occlude, with no author action — and a RECTANGLE is the one shape that
+    /// promise cannot keep, because a character's silhouette is not its bounding
+    /// box and the difference is a rectangle of shadow where there is no sprite.
+    ///
+    /// The data itself comes from M6 (the asset pipeline), which is why this is
+    /// null today. What is NOT deferred is the half that belongs to lighting: the
+    /// threshold test, the rasterizer that reads a coverage mask instead of a
+    /// polygon, and the tests for both. They run now against a synthetic mask, so
+    /// when M6 hands over real coverage there is a seam to cut and not a feature
+    /// to write.
+    coverage: ?*const CoverageMask = null,
+    /// Alpha at or above which a texel counts as solid. From
+    /// `LightOccluder2D.alpha_threshold`.
+    alpha_threshold: f32 = 0.5,
+};
+
+/// Resolves a sprite's asset-pipeline coverage into a pool slot, or null.
+///
+/// Null when there is no coverage, when it is empty, or when the pool has run
+/// out of slots -- and all three mean the same thing to the rasterizer: use the
+/// shape. A sprite whose actor grew past the occluder budget loses its automatic
+/// shape rather than crashing, and the drop is counted so the scene is not
+/// quietly worse than it looks.
+fn resolveCoverage(
+    self: *Lighting,
+    sp: *const components.Sprite,
+    world_w: f32,
+    world_h: f32,
+) ?*const CoverageMask {
+    const store = self.coverage_store orelse return null;
+    const cov = store.get(sp.coverage_index) orelse return null;
+    if (cov.w == 0 or cov.h == 0 or cov.pixels.len < @as(usize, cov.w) * cov.h) return null;
+    if (world_w <= 0 or world_h <= 0) return null;
+    if (self.occluders.items.len > self.coverage_pool.len) {
+        self.stats.coverage_dropped += 1;
+        return null;
+    }
+
+    // The mask is authored at the sprite's texel resolution and covers the
+    // sprite's world size, so one texel's world size is the ratio. The caller has
+    // already applied the actor's scale to the world size, which is what makes a
+    // scaled actor occlude with a scaled silhouette rather than the same one
+    // stretched into place.
+    const slot = &self.coverage_pool[self.occluders.items.len];
+    slot.* = .{
+        .pixels = cov.pixels,
+        .w = cov.w,
+        .h = cov.h,
+        .cell = .{
+            .x = world_w / @as(f32, @floatFromInt(cov.w)),
+            .y = world_h / @as(f32, @floatFromInt(cov.h)),
+        },
+    };
+    self.stats.coverage_used += 1;
+    return slot;
+}
+
+/// One sprite's coverage, as the rasterizer reads it.
+///
+/// The pixel data is NOT copied into the occluder. The store owns the pixels and
+/// this struct is a descriptor pointing at them, so two actors sharing a texture
+/// share one buffer -- which is the whole reason coverage is indexed off the
+/// Sprite rather than carried by the occluder.
+pub const CoverageMask = struct {
+    /// `w * h` bytes, 0..255, row-major with no padding. Points into the store's
+    /// own allocation; never written to after `add`.
+    pixels: []const u8 = &.{},
+    w: u32 = 0,
+    h: u32 = 0,
+    /// World size one texel of `pixels` covers.
+    ///
+    /// Per occluder and not per store, because the same imported mask can cover
+    /// two sprites of different sizes, and the mapping from texel to world cell
+    /// is a property of the OCCLUDER's actor. Derived at gather time from that
+    /// actor's scale, which is what makes a scaled actor occlude with a scaled
+    /// silhouette rather than the same one stretched into place.
+    cell: Vec2 = .{ .x = 1, .y = 1 },
+};
+
+/// The coverage masks the lighting system rasterizes from, filled by the asset
+/// pipeline.
+///
+/// ## Why lighting owns this and not the asset pipeline
+///
+/// Because the CONSUMER owns the lifetime. The importer may unload a texture; the
+/// occluder rasterizer needs a pointer that stays valid for exactly as long as a
+/// scene holds an actor using it, and it needs to know when a mask has gone. A
+/// store the consumer owns answers both, and a plain `i32` in the component is
+/// the only way a component can point into it.
+///
+/// ## Not frame work
+///
+/// `add` copies and allocates, so it may not be called inside a frame -- the same
+/// rule the rest of the engine follows.
+pub const CoverageStore = struct {
+    allocator: std.mem.Allocator,
+    masks: std.ArrayList(CoverageMask) = .empty,
+    /// Parallel to `masks`: the allocations to free. A separate list because each
+    /// mask's `pixels` is a slice pointing AT one of these, and freeing through
+    /// the mask list would leave a dangling slice for any occluder still gathered.
+    owned: std.ArrayList([]u8) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) CoverageStore {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CoverageStore) void {
+        for (self.owned.items) |p| self.allocator.free(p);
+        self.owned.deinit(self.allocator);
+        self.masks.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Registers a coverage mask; returns its index for `Sprite.coverage_index`.
+    ///
+    /// The pixels are COPIED. They come out of an importer's scratch buffer, and
+    /// storing a pointer to that would make the lighting system's correctness
+    /// depend on an unrelated subsystem's allocation lifetime.
+    ///
+    /// Returns -1 for an empty or malformed mask, which the component reads as
+    /// "no coverage" -- so a bad import produces the rectangle rather than a
+    /// crash, and the caller can see that it did not register.
+    pub fn add(self: *CoverageStore, pixels: []const u8, w: u32, h: u32) !i32 {
+        if (w == 0 or h == 0) return -1;
+        const n = @as(usize, w) * h;
+        if (pixels.len < n) return -1;
+        const copy = try self.allocator.dupe(u8, pixels[0..n]);
+        errdefer self.allocator.free(copy);
+        try self.masks.append(self.allocator, .{ .pixels = copy, .w = w, .h = h });
+        errdefer _ = self.masks.pop();
+        try self.owned.append(self.allocator, copy);
+        return @intCast(self.masks.items.len - 1);
+    }
+
+    /// The mask at `index`, or null for -1 or an index this store never issued.
+    ///
+    /// Null and not a panic, because the index lives in a component a `.zson`
+    /// file can set to anything: a scene that loads with a stale coverage index
+    /// must fall back to the rectangle rather than take the process down.
+    pub fn get(self: *const CoverageStore, index: i32) ?CoverageMask {
+        if (index < 0 or @as(usize, @intCast(index)) >= self.masks.items.len) return null;
+        return self.masks.items[@intCast(index)];
+    }
+
+    pub fn count(self: *const CoverageStore) usize {
+        return self.masks.items.len;
+    }
 };
 
 /// Timings and counts. Everything here is a real measurement: the sweep and the
@@ -236,6 +407,14 @@ pub const Stats = struct {
     shadow_denied: u32 = 0,
     occluders: u32 = 0,
     occluders_rasterized: u32 = 0,
+    /// Automatic occluders that used the sprite's alpha coverage rather than its
+    /// bounding box. Zero means every automatic occluder in the scene is a
+    /// RECTANGLE, which is worth knowing before someone reports a shadow that is
+    /// the wrong shape.
+    coverage_used: u32 = 0,
+    /// Automatic occluders that wanted coverage but could not get it -- past the
+    /// occluder budget, or with an empty mask. Non-zero is a budget problem.
+    coverage_dropped: u32 = 0,
 
     mask_w: u32 = 0,
     mask_h: u32 = 0,
@@ -342,6 +521,20 @@ pub const Lighting = struct {
     /// is what decides whether its map can be reused, and a frame that knows the
     /// light moved has to have remembered WHICH light.
     owner_of: std.ArrayList(u64) = .empty,
+
+    /// Where automatic occluders look up their sprite's coverage. Null means no
+    /// asset pipeline has registered anything, every automatic occluder is a
+    /// rectangle, and `coverage_used` is zero — which is the honest report for
+    /// the current state of M6.
+    coverage_store: ?*const CoverageStore = null,
+
+    /// One slot per occluder for its resolved `CoverageMask`, grown in `reserve`.
+    ///
+    /// A pool and not a per-occluder allocation because `collect` runs inside the
+    /// frame and spec §3.1 forbids allocating there. The pixels themselves point
+    /// at the asset pipeline's immutable buffer; only this four-field descriptor
+    /// is per-occluder state.
+    coverage_pool: []CoverageMask = &.{},
     /// Scratch for ranking shadow candidates by area.
     scratch: std.ArrayList(AreaRank) = .empty,
     occluders: std.ArrayList(Occluder) = .empty,
@@ -409,6 +602,7 @@ pub const Lighting = struct {
         self.allocator.free(self.shadow);
         self.allocator.free(self.sdf);
         self.allocator.free(self.gi_pixels);
+        self.allocator.free(self.coverage_pool);
         if (self.radiance) |r| {
             r.deinit();
             self.allocator.destroy(r);
@@ -447,6 +641,7 @@ pub const Lighting = struct {
         // `encodeGi` because that call is inside a frame, and spec §3.1 does not
         // allow allocating once the frame has started.
         self.allocator.free(self.gi_pixels);
+        self.allocator.free(self.coverage_pool);
         self.gi_pixels = try self.allocator.alloc(u8, @as(usize, aw) * ah * 4);
         @memset(self.gi_pixels, 0);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
@@ -477,6 +672,12 @@ pub const Lighting = struct {
         try self.channel_of.ensureUnusedCapacity(self.allocator, lights);
         try self.reach_of.ensureUnusedCapacity(self.allocator, lights);
         try self.owner_of.ensureUnusedCapacity(self.allocator, lights);
+        // One coverage descriptor per possible occluder. Freed and regrown only
+        // when the budget grows, which is a scene change and not a frame.
+        if (self.coverage_pool.len < occluders) {
+            self.allocator.free(self.coverage_pool);
+            self.coverage_pool = try self.allocator.alloc(CoverageMask, occluders);
+        }
         try self.scratch.ensureUnusedCapacity(self.allocator, lights);
         try self.occluders.ensureUnusedCapacity(self.allocator, occluders);
     }
@@ -560,18 +761,37 @@ pub const Lighting = struct {
             const pos: Vec2 = if (t) |tt| tt.position else .{ .x = 0, .y = 0 };
             const sprite = world.get(e.entity(), components.Sprite);
 
-            var out = Occluder{ .polygon = oc.polygon, .pos = pos, .extent = 0 };
-            // An automatic occluder needs a shape. Until the asset pipeline (M6)
-            // imports alpha-derived distance fields, the sprite's own shape is
-            // what it has, and `rasterize` is the seam where that swaps in: M6
-            // replaces this branch and nothing else in the lighting path changes.
+            var out = Occluder{
+                .polygon = oc.polygon,
+                .pos = pos,
+                .extent = 0,
+                .cull_mask = oc.cull_mask,
+                .alpha_threshold = oc.alpha_threshold,
+            };
             if (oc.mode == .auto_sdf) {
                 const sp = sprite orelse continue;
                 const sx = if (t) |tt| tt.scale.x else 1;
+                const sy = if (t) |tt| tt.scale.y else 1;
+                // The coverage mask, when one exists. It takes priority over the
+                // shape below, so a sprite that ships coverage occludes by its
+                // silhouette and not by its rectangle — and `alpha_threshold`
+                // becomes a dial that does something instead of a field that is
+                // set and ignored.
+                //
+                // Scaled by the actor's transform because the mask is authored at
+                // the sprite's own size: a scaled actor occludes with a scaled
+                // silhouette, not the same one stretched into place.
+                out.coverage = resolveCoverage(self, sp, sp.size.x * sx, sp.size.y * sy);
                 if (sp.shape == .circle) {
                     out.circle = true;
                     out.radius = @abs(sp.size.x * sx) * 0.5;
                 } else {
+                    // The rectangle fallback. Both halves, because a sprite is not
+                    // square -- see `rasterRect`.
+                    out.rect_half = .{
+                        .x = @abs(sp.size.x * sx) * 0.5,
+                        .y = @abs(sp.size.y * sy) * 0.5,
+                    };
                     out.extent = @abs(sp.size.x * sx) * 0.5;
                 }
             } else {
@@ -581,16 +801,33 @@ pub const Lighting = struct {
             }
             self.occluders.appendAssumeCapacity(out);
             self.stats.occluders += 1;
-            // Fingerprint the occluder: position, size, and whether it is the
-            // circle path. A handful of multiplies and folds per occluder,
-            // against a whole grid rasterization when something moved.
+            // Fingerprint the occluder: everything that can change WHAT the mask
+            // looks like. A handful of multiplies and folds per occluder, against
+            // a whole grid rasterization when something moved.
+            //
+            // `alpha_threshold` and the presence of coverage were both missing
+            // from this hash, and both belong in it: an author dragging the
+            // threshold slider, or an asset pipeline that registers a mask after
+            // the scene is already loaded, changed the occluder's SHAPE and the
+            // hash said nothing happened — so `rasterize` returned early and the
+            // new edge was never drawn. The symptom is a slider that does
+            // nothing, which is indistinguishable from a broken binding.
             const px: u64 = @as(u32, @bitCast(pos.x));
             const py: u64 = @as(u32, @bitCast(pos.y));
             const pex: u64 = @as(u32, @bitCast(out.extent));
             const prad: u64 = @as(u32, @bitCast(out.radius));
+            const pthr: u64 = @as(u32, @bitCast(out.alpha_threshold));
+            const pcov: u64 = if (out.coverage) |c| (@as(u64, c.w) << 32) | c.h else 0;
+            // The rectangle's two halves, not the single `extent`: a sprite that
+            // changes from square to wide changes its shadow with no movement.
+            const prx: u64 = if (out.rect_half) |v| @as(u32, @bitCast(v.x)) else 0;
+            const pry: u64 = if (out.rect_half) |v| @as(u32, @bitCast(v.y)) else 0;
             h ^= px *% 65599 +% py *% 65599 +% 1;
             h ^= pex *% 7 +% prad *% 11;
             h ^= if (out.circle) 1 else 0;
+            h ^= pthr *% 13 +% 1;
+            h ^= pcov *% 17;
+            h ^= prx *% 19 +% pry *% 23;
         }
         const changed = h != self.occluder_hash;
         self.occluder_hash = h;
@@ -678,8 +915,26 @@ pub const Lighting = struct {
         var drawn: u32 = 0;
 
         for (self.occluders.items) |oc| {
+            // A coverage mask, when the asset pipeline supplied one, REPLACES the
+            // shape entirely. It is not intersected with the rectangle: the
+            // rectangle is the fallback, and intersecting would keep the exact
+            // edges the mask exists to remove.
+            if (oc.coverage) |cov| {
+                written += rasterCoverage(self, oc, cov.*, cell);
+                drawn += 1;
+                continue;
+            }
             if (oc.circle) {
                 written += rasterCircle(self, oc.pos, oc.radius, cell);
+                drawn += 1;
+                continue;
+            }
+            // The rectangle fallback, for an automatic occluder whose asset has no
+            // coverage yet. Tested before the polygon so a manual occluder that
+            // ALSO set `rect_half` -- which cannot happen today, and would be a
+            // bug rather than a choice -- takes the manual path.
+            if (oc.rect_half) |half| {
+                written += rasterRect(self, oc.pos, half, cell);
                 drawn += 1;
                 continue;
             }
@@ -729,6 +984,92 @@ pub const Lighting = struct {
         self.dirty = true;
         self.mask_changed = false;
         self.stats.raster_ns = self.tick() - t0;
+    }
+
+    /// Rasterizes an axis-aligned rectangle, the automatic occluder's fallback.
+    ///
+    /// Separate from `rasterCircle` rather than reusing it because a sprite is
+    /// not square and a square approximation of a 64x16 crate is a shadow twice
+    /// as wide as the crate on one side — which is a bug that looks like the
+    /// light being in the wrong place.
+    fn rasterRect(self: *Lighting, pos: Vec2, half: Vec2, cell: Vec2) u64 {
+        const hx = @abs(half.x);
+        const hy = @abs(half.y);
+        if (hx <= 0 or hy <= 0) return 0;
+        const lo = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{ .x = pos.x - hx, .y = pos.y - hy });
+        const hi = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{ .x = pos.x + hx, .y = pos.y + hy });
+        const x0: u32 = @intCast(@max(lo[0], 0));
+        const y0: u32 = @intCast(@max(lo[1], 0));
+        const x1: u32 = @intCast(@min(hi[0], self.alloc_w));
+        const y1: u32 = @intCast(@min(hi[1], self.alloc_h));
+        if (x1 <= x0 or y1 <= y0) return 0;
+
+        var written: u64 = 0;
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            @memset(self.mask[@as(usize, y) * self.alloc_w + x0 ..][0 .. (x1 - x0)], 255);
+            written += x1 - x0;
+        }
+        _ = cell;
+        return written;
+    }
+
+    /// Rasterizes a sprite's coverage mask into the occupancy grid.
+    ///
+    /// Nearest-neighbour, not bilinear: a coverage mask is a DECISION (is this
+    /// texel solid or not) and smoothing it would make the threshold produce a
+    /// grey edge, which is a shadow with a halo around every soft sprite. The
+    /// threshold is applied to the source texel, not to an average of neighbours,
+    /// so `alpha_threshold` means one number.
+    ///
+    /// The threshold is compared against `alpha_threshold * 255` and the test is
+    /// `>=`, so a threshold of 0 makes EVERY texel solid — including fully
+    /// transparent ones. That is what "no threshold" should mean: the author said
+    /// the sprite occludes, so it occludes.
+    fn rasterCoverage(self: *Lighting, oc: Occluder, cov: CoverageMask, cell: Vec2) u64 {
+        if (cov.w == 0 or cov.h == 0) return 0;
+        const cut: u8 = @intFromFloat(@min(@max(oc.alpha_threshold, 0), 1) * 255.0);
+
+        // The mask's world rectangle, centred on the actor exactly as the polygon
+        // path does — so an author switching a sprite between automatic and
+        // manual sees the same frame move, not the whole occluder jump.
+        const half_x = cov.cell.x * @as(f32, @floatFromInt(cov.w)) * 0.5;
+        const half_y = cov.cell.y * @as(f32, @floatFromInt(cov.h)) * 0.5;
+        const lo = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{
+            .x = oc.pos.x - half_x,
+            .y = oc.pos.y - half_y,
+        });
+        const hi = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{
+            .x = oc.pos.x + half_x,
+            .y = oc.pos.y + half_y,
+        });
+        const x0: u32 = @intCast(@max(lo[0], 0));
+        const y0: u32 = @intCast(@max(lo[1], 0));
+        const x1: u32 = @intCast(@min(hi[0], self.alloc_w));
+        const y1: u32 = @intCast(@min(hi[1], self.alloc_h));
+        if (x1 <= x0 or y1 <= y0) return 0;
+
+        // The scale from mask cells to coverage texels. Computed once and applied
+        // as a multiply, because this is the inner loop of a pass that runs over
+        // every visible texel of every automatic occluder.
+        const sx = @as(f32, @floatFromInt(cov.w)) / (@as(f32, @floatFromInt(x1 - x0)) * cell.x);
+        const sy = @as(f32, @floatFromInt(cov.h)) / (@as(f32, @floatFromInt(y1 - y0)) * cell.y);
+
+        var written: u64 = 0;
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var ty: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(y - y0)) * sy));
+            ty = @min(ty, cov.h - 1);
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                var tx: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(x - x0)) * sx));
+                tx = @min(tx, cov.w - 1);
+                if (cov.pixels[@as(usize, ty) * cov.w + tx] < cut) continue;
+                self.mask[@as(usize, y) * self.alloc_w + x] = 255;
+                written += 1;
+            }
+        }
+        return written;
     }
 
     /// A circle occluder is squared-distance-tested per cell over its bounding
@@ -2517,4 +2858,204 @@ test "render light: a different light in a channel rebuilds it even at the same 
     try testing.expect(l.stats.sweep_skips < 4);
     try testing.expect(l.stats.sweep_steps > 0);
     try testing.expect(l.shadow[0] != before);
+}
+
+test "render light: alpha_threshold draws the edge of an automatic occluder, because it is read" {
+    // `occluder.set_threshold` used to write a field that appeared NOWHERE in the
+    // render path. It is the documented fix for "my sprite has a fringe of
+    // shadow", and it fixed nothing.
+    //
+    // The mechanism: a 16x16 coverage mask with a soft edge — 0 in the middle,
+    // ramping to 255 at the border. One threshold rasterizes the ramp's middle
+    // and the other its outer edge, so the filled area differs by a measurable
+    // amount. That difference IS the feature.
+    var store = CoverageStore.init(testing.allocator);
+    defer store.deinit();
+
+    const w: u32 = 16;
+    const h: u32 = 16;
+    var pixels: [w * h]u8 = undefined;
+    for (0..h) |y| {
+        for (0..w) |x| {
+            // A ring: solid centre, fading to nothing at the border.
+            const d = @as(f32, @floatFromInt(@min(x, y))) / 7.0;
+            pixels[y * w + x] = clampByte(d);
+        }
+    }
+    const idx = try store.add(&pixels, w, h);
+
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(32, 32);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+    l.coverage_store = &store;
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+
+    // The sprite is 16x16 world units centred at (16,16), so one coverage texel
+    // is one mask cell and the shapes line up.
+    var sprite = components.Sprite{ .size = .{ .x = 16, .y = 16 }, .coverage_index = idx };
+    sprite.uv = .{ 0, 0, 1, 1 };
+
+    // Two gathers over the same coverage with two different thresholds. Done
+    // through real components, because the field that did nothing used to be
+    // reachable only through a component.
+    const e1 = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        sprite,
+        components.LightOccluder2D{ .mode = .auto_sdf, .alpha_threshold = 0.1 },
+    });
+    // `lock` before every gather, exactly as the driver does: it resets `stats`,
+    // and without that reset the per-frame counters ACCUMULATE and an assertion
+    // on `coverage_used` reads the sum of every gather so far.
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    const low = l.stats.raster_cells;
+    try testing.expect(l.stats.coverage_used == 1);
+    try testing.expect(l.stats.coverage_dropped == 0);
+
+    // Raise the threshold past the ramp and the same coverage must fill LESS.
+    if (world.get(e1, components.LightOccluder2D)) |occ| occ.alpha_threshold = 0.9;
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    const high = l.stats.raster_cells;
+
+    try testing.expect(high < low);
+
+    // And no coverage at all is the rectangle, which for a 16x16 sprite in a
+    // 32x32 mask is the largest of the three. This is the fallback M6's absence
+    // leaves, and it is the reason the count matters.
+    l.coverage_store = null;
+    l.lock();
+    l.collect(&world, l.rect);
+    l.rasterize();
+    try testing.expect(l.stats.coverage_used == 0);
+    try testing.expect(l.stats.raster_cells > low);
+}
+
+test "render light: the coverage store owns its pixels and declines a bad registration" {
+    var store = CoverageStore.init(testing.allocator);
+    defer store.deinit();
+
+    // A malformed mask is -1, not a crash: the importer calls this and a bad
+    // texture should cost a rectangle, not the process.
+    try testing.expectEqual(@as(i32, -1), try store.add(&.{}, 0, 0));
+    try testing.expectEqual(@as(i32, -1), try store.add(&.{ 1, 2, 3 }, 2, 2)); // too short
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // The pixels are COPIED, so the caller's scratch buffer may go away.
+    var scratch: [4]u8 = .{ 10, 20, 30, 40 };
+    const idx = try store.add(&scratch, 2, 2);
+    scratch = .{ 0, 0, 0, 0 };
+    const got = store.get(idx).?;
+    try testing.expectEqual(@as(u8, 10), got.pixels[0]);
+    try testing.expectEqual(@as(u8, 40), got.pixels[3]);
+
+    // An index a `.zson` file invented is null, not a panic. A scene that loads
+    // with a stale coverage index must fall back to the rectangle.
+    try testing.expect(store.get(-1) == null);
+    try testing.expect(store.get(99) == null);
+}
+
+test "render light: an automatic occluder with no coverage casts the sprite's RECTANGLE" {
+    // `mode = auto_sdf` is the DEFAULT, and the component's own documentation
+    // describes it as "no dev action: the sprite occludes". It cast NOTHING:
+    // `collect` set `extent` from the sprite's size and left `polygon` empty, and
+    // the rasterizer skips any occluder with fewer than three vertices.
+    //
+    // Every test in this file used a manual polygon, so the default path was
+    // never exercised. A rectangle is a poor shape for a character, but it is a
+    // shadow, and "poor shape" is a fixable problem while "no shadow" is not.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(32, 32);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        // 16x16 world units, no coverage registered: the fallback case.
+        components.Sprite{ .size = .{ .x = 16, .y = 16 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+    l.collect(&world, l.rect);
+    l.rasterize();
+
+    try testing.expectEqual(@as(u32, 1), l.stats.occluders_rasterized);
+    try testing.expect(l.stats.raster_cells > 0);
+    try testing.expectEqual(@as(u32, 0), l.stats.coverage_used);
+
+    // The centre is solid...
+    try testing.expectEqual(@as(u8, 255), l.mask[16 * 32 + 16]);
+    // ...and the corner of the sprite's box is too, which is the whole reason
+    // this shape is called a fallback.
+    try testing.expectEqual(@as(u8, 255), l.mask[8 * 32 + 8]);
+    // ...and outside it is not.
+    try testing.expectEqual(@as(u8, 0), l.mask[2 * 32 + 2]);
+}
+
+test "render light: a non-square sprite falls back to a non-square rectangle" {
+    // A square approximation of a 64x16 crate is a shadow twice as wide on one
+    // side, which reads as the light being in the wrong place rather than as a
+    // shape being approximated.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 32);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 32 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 32, .y = 16 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 8 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+    l.collect(&world, l.rect);
+    l.rasterize();
+
+    // Middle of the long axis: solid. The sprite is 32 wide centred at x=32, so
+    // it spans columns 16..47 -- the right end is 47, not 63, and a test that
+    // asserts on 60 is testing the empty mask next to the occluder.
+    try testing.expectEqual(@as(u8, 255), l.mask[16 * 64 + 16]);
+    try testing.expectEqual(@as(u8, 255), l.mask[16 * 64 + 47]);
+    // Above and below the short axis, at the same x: NOT solid. A square
+    // fallback would have covered these.
+    try testing.expectEqual(@as(u8, 0), l.mask[4 * 64 + 16]);
+    try testing.expectEqual(@as(u8, 0), l.mask[28 * 64 + 16]);
+}
+
+test "render light: a scaled actor occludes with a scaled rectangle" {
+    // The fallback has to follow the Transform's scale, or a character that
+    // grows keeps its original shadow — which is the same class of bug as an
+    // offset that ignores the transform.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{
+            .position = .{ .x = 32, .y = 32 },
+            .scale = .{ .x = 2, .y = 2 },
+        },
+        components.Sprite{ .size = .{ .x = 8, .y = 8 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+    l.collect(&world, l.rect);
+    l.rasterize();
+
+    // 8x8 at scale 2 is 16x16, so the cell at 4 units from the centre is inside
+    // and the one at 20 is not.
+    try testing.expectEqual(@as(u8, 255), l.mask[28 * 64 + 28]);
+    try testing.expectEqual(@as(u8, 0), l.mask[12 * 64 + 12]);
 }
