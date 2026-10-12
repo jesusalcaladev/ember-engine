@@ -24,6 +24,9 @@ const backend_null = engine.render.backend_null;
 const backend_dawn = engine.render.backend_dawn;
 const ecs = engine.ecs;
 const script = engine.script;
+const project = engine.project;
+/// M-project → M8: the one file that can see `project.config` AND `audio`.
+const project_hook = @import("project_hook.zig");
 const components = ecs.components;
 const log = core.log.scoped("runtime");
 
@@ -158,6 +161,41 @@ fn sceneCamera(view: ?ecs.camera.View, width: u32, height: u32) render.Camera {
     );
 }
 
+// ── Project config apply callbacks ──────────────────────────────────────
+// These are called by `project.runtime.apply` to push config values into
+// engine subsystems. Kept here so the runtime owns the engine objects.
+
+fn applyDisplay(_: *anyopaque, d: *const project.config.Display) void {
+    // Window size/title changes would require GLFW API additions (not yet exposed)
+    // For now, log what would change.
+    // TODO: window.resize(d.width, d.height); window.setTitle(d.name);
+    //       window.setFullscreen(d.fullscreen); window.setVsync(d.vsync);
+    _ = d;
+}
+
+fn applyRendering(_: *anyopaque, r: *const project.config.Rendering) void {
+    // Renderer sort mode and max_sprites are boot-time only (need re-create).
+    // SMAA quality is per-frame via renderer.endScene().
+    _ = r;
+}
+
+fn applyPhysics(_: *anyopaque, p: *const project.config.Physics) void {
+    // Physics gravity and solver settings are creation-time in current engine.
+    // Would need physics.setGravity() and physics.setSolverIterations().
+    _ = p;
+}
+
+fn applyLayers(_: *anyopaque, l: *const project.config.Layers) void {
+    // Collision layer names would need ecs.collision_layers.Registry integration.
+    _ = l;
+}
+
+fn applyInputMap(_: *anyopaque, actions: []const project.config.InputAction) void {
+    // Input bindings would need to be resolved and pushed to script.Input.
+    // Currently: input_state.set(action_name, key_down, key_pressed)
+    _ = actions;
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(init);
 
@@ -230,7 +268,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     input_state.define("jump");
 
     var behaviors: script.Behaviors = undefined;
-    try behaviors.init(boot_alloc, &world, &input_state);
+    // The scripting layer gets an allocator OUTSIDE the frame guard.
+    //
+    // The tracker's rule (spec §3.1) is that the frame allocates nothing: every
+    // transient byte comes from the frame arena. The Lua heap is not transient
+    // engine memory — it has its own budget (spec §3.2: the incremental GC step
+    // is ≤ 0.4 ms/frame) and its own accounting (`vm.heapStats()`), and LuaJIT
+    // legitimately allocates from a script's very first update onward. Charging
+    // it to the frame guard aborts every scripted frame, which is a false alarm
+    // about the engine wrapped around a real one about the wiring.
+    const script_alloc = std.heap.c_allocator;
+    try behaviors.init(script_alloc, &world, &input_state);
     defer behaviors.deinit();
     try behaviors.reserve(args.sprites);
     behaviors.lock();
@@ -315,6 +363,116 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // quality in its first tick gets a real answer rather than -1.
     lighting_hooks.ctx = &lighting;
     behaviors.ctx.lighting = &lighting_hooks;
+
+    // ── Project config hot-reload ────────────────────────────────────────
+    // Load project.config, apply it to engine subsystems, and watch for changes.
+    var project_config = project.config.Config{};
+    var config_watcher: ?platform.FileWatcher = null;
+    // The apply callbacks all share ONE context pointer, and for audio that
+    // context is the hook itself: it stores the section, and `create` below
+    // turns it into a running mixer.
+    var audio_hook = project_hook.AudioHook{};
+    defer audio_hook.destroy();
+    if (!args.headless) {
+        // Load config (or defaults if file doesn't exist)
+        const loaded = project.config.load(boot_alloc, project.config.default_path);
+        if (loaded) |cfg| {
+            project_config = cfg.*;
+            log.info("loaded project.config: {s}", .{project_config.project});
+        } else |err| {
+            log.info("no project.config found ({s}), using defaults", .{@errorName(err)});
+        }
+
+        // Apply config to engine subsystems
+        project.runtime.apply(&project_config, .{
+            .ctx = &audio_hook,
+            .display = applyDisplay,
+            .rendering = applyRendering,
+            .physics = applyPhysics,
+            .layers = applyLayers,
+            .audio = project_hook.AudioHook.apply,
+            .input_map = applyInputMap,
+        }) catch |err| {
+            log.warn("project.config apply failed: {s}", .{@errorName(err)});
+        };
+
+        // Start file watcher for hot-reload
+        const watcher_result = platform.watchFile(boot_alloc, project.config.default_path);
+        if (watcher_result) |w| {
+            config_watcher = w;
+            log.info("watching project.config for hot-reload", .{});
+        } else |err| {
+            log.warn("file watcher failed: {s}", .{@errorName(err)});
+        }
+    }
+    defer {
+        if (config_watcher) |*w| w.deinit();
+        project_config.deinit();
+    }
+
+    // ── M8: the mixer ────────────────────────────────────────────────────
+    // Built AFTER the section is applied, because the section decides the
+    // backend, the pool size, the PCM budget and the bus map. In headless mode
+    // nothing was applied, so the defaults stand and the NULL backend is forced:
+    // CI has no sound card and must not need one to exercise the mixer.
+    if (args.headless) audio_hook.section.backend = .@"null";
+    var audio_system: ?*engine.audio.Audio = audio_hook.create(boot_alloc) catch |err| blk: {
+        // No device, no mixer: the engine keeps running silent (spec: a missing
+        // sound card must not stop a game) and the log says which it was.
+        log.warn("audio unavailable: {s} — running silent", .{@errorName(err)});
+        break :blk null;
+    };
+    if (audio_system) |sys| {
+        log.info("audio: {s} backend, {d} Hz, {d} frames ({d:.1} ms), {d} voices, {d} MiB PCM budget", .{
+            sys.device.name,
+            sys.stats().sample_rate,
+            sys.stats().period_frames,
+            sys.stats().latencyMs(),
+            sys.pool.slotCount(),
+            sys.bank.stats().budget_bytes / (1 << 20),
+        });
+    }
+    // Published before the first script runs, so an `audio.*` call in a
+    // behavior's `start()` sees the real system rather than null.
+    behaviors.ctx.audio = audio_system;
+
+    // ── M8: sound events → Signals (ROADMAP M8, spec §6) ─────────────────────
+    // The device thread learns that a voice started or ended; only the MAIN
+    // thread may touch the ECS or the signal bus, so the event ring is where the
+    // two meet and this is the drain. Both names are interned at boot: `emit`
+    // panics on a name it has never seen (it would allocate), by design.
+    if (audio_system != null) {
+        for ([_][]const u8{ "sound_started", "sound_finished" }) |name| {
+            world.signals.preintern(name) catch |err| {
+                log.warn("could not reserve the '{s}' signal: {s}", .{ name, @errorName(err) });
+            };
+        }
+    }
+
+    const AudioSignals = struct {
+        world: *ecs.World,
+        behaviors: *script.Behaviors,
+
+        fn fire(ctx: ?*anyopaque, kind: engine.audio.EventKind, value: engine.audio.SoundSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const name = engine.audio.soundSignalName(kind);
+            // The typed bus first: an ECS listener sees the event whether or not
+            // any script is interested.
+            self.world.signals.emit(engine.audio.SoundSignal, name, value);
+            // Then Lua, as a table. `path` is deliberately not a field — a
+            // signal payload crosses the bus as POD bytes, so a listener that
+            // wants the name asks the bank, which is what owns it.
+            const fields = [_]script.Behaviors.PayloadField{
+                .{ .name = "slot", .value = .{ .integer = value.bank_slot } },
+                .{ .name = "voice", .value = .{ .integer = value.voice_index } },
+                .{ .name = "generation", .value = .{ .integer = value.voice_generation } },
+                .{ .name = "tick", .value = .{ .integer = @intCast(value.tick) } },
+            };
+            self.behaviors.dispatchSignalPayload(name, &fields);
+        }
+    };
+    var audio_signals = AudioSignals{ .world = &world, .behaviors = &behaviors };
+
     // A budget rather than a count taken from the world: `collect` appends
     // without capacity checks, and a scene that grows past this CLIPS rather
     // than allocating in the middle of a frame. Reported, not silent.
@@ -371,6 +529,71 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
+        // ── Project config hot-reload: poll file watcher
+        if (config_watcher) |*w| {
+            if (w.poll()) |changed| {
+                if (changed) {
+                    log.info("project.config changed, reloading...", .{});
+                    project_config.reload(boot_alloc, project.config.default_path) catch |err| {
+                        log.err("project.config reload failed: {s}", .{@errorName(err)});
+                        return;
+                    };
+                    // Re-apply config after reload
+                    project.runtime.apply(&project_config, .{
+                        .ctx = &audio_hook,
+                        .display = applyDisplay,
+                        .rendering = applyRendering,
+                        .physics = applyPhysics,
+                        .layers = applyLayers,
+                        .audio = project_hook.AudioHook.apply,
+                        .input_map = applyInputMap,
+                    }) catch |err| {
+                        log.warn("project.config re-apply failed: {s}", .{@errorName(err)});
+                    };
+                    // M8: the audio section is boot-time only (the device, the
+                    // pool and the budget cannot be resized in place), so a
+                    // change to it REBUILDS the mixer — and a change to any
+                    // OTHER section does not, which is what `sync` decides. An
+                    // edit to `display.width` restarting the mixer would drop
+                    // every voice and glitch the device for no reason.
+                    audio_system = audio_hook.sync(boot_alloc) catch |err| blk: {
+                        log.warn("audio reload failed: {s} — running silent", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    behaviors.ctx.audio = audio_system;
+                }
+            } else |err| {
+                log.warn("file watcher error: {s}", .{@errorName(err)});
+            }
+        }
+
+        // ── M7: the lighting mask is sized HERE, before the allocation guard is
+        // armed, and not in the render section below where it used to live.
+        //
+        // `Lighting.resize` and `reserve` allocate — the GI pixel buffer, the
+        // mask, the SDF, the EDT scratch, the gather arrays. `tracker.beginFrame`
+        // (three lines down) panics on any allocation outside the frame arena,
+        // which is the spec §3.1 invariant being *verified* rather than hoped
+        // for. Putting the call inside the frame meant the very first frame
+        // panicked on an 8 MiB `gi_pixels`, and no camera zoom or window drag
+        // would have been able to resize again either: the call could only ever
+        // run in the zone where it is forbidden.
+        //
+        // The mask follows the camera, and `camera_view` is updated further down
+        // inside the frame — so this sizes to LAST frame's view. That one frame
+        // of latency on a resize is deliberate and costs nothing: the mask is
+        // already a power of two wider than the view, and `resize` is a no-op
+        // until the view actually changes shape. When it does, the buffer is
+        // ready one frame before the first frame that needs the new size.
+        const fb_w: u32 = if (has_window) window.framebufferSize().w else view_w;
+        const fb_h: u32 = if (has_window) window.framebufferSize().h else view_h;
+        lighting.resize(lighting_driver.Driver.viewFor(camera_view, fb_w, fb_h)) catch |err| log.warn("lighting mask resize failed: {s}", .{@errorName(err)});
+        if (lighting.needs_resize) {
+            // A precondition, not a hint: `collect` appends without capacity
+            // checks because allocating mid-frame is forbidden (spec §3.1).
+            lighting.lighting.reserve(lighting_budget.lights, lighting_budget.occluders) catch {};
+        }
+
         prof.beginFrame(frame_count >= args.warmup);
         var z = prof.zone("frame_total");
         tracker.beginFrame(); // from here on: no allocations outside the arena
@@ -383,6 +606,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (window.shouldClose()) break;
         }
         z_input.end();
+
+        // ── M8: the mixer's frame boundary. One call, BEFORE the gameplay that
+        // may play something: it advances the bank's clock (so a sound's tick is
+        // the frame it started in) and folds the listener in from the camera.
+        // It allocates nothing — the audio path is command-ring pushes only, and
+        // the frame's allocation guard is armed from `tracker.beginFrame` above.
+        if (audio_system) |sys| {
+            sys.beginFrame(@intCast(frame_index));
+            // Rotation 0: the runtime ears face +x. A game that wants the ears
+            // to turn with an actor calls `audio.set_listener(x, y, rot)`.
+            if (camera_view) |v| sys.setListener(v.cx, v.cy, 0);
+        }
 
         // Fixed-timestep simulation
         const now_ns = core.time.monotonicNs();
@@ -424,6 +659,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         behaviors.update(real_dt);
         behaviors.sweepDestroyed();
         behaviors.vm.gcStep();
+
+        // ── The frame's signal drain (spec §6).
+        // Audio events first: they were produced on the device thread during the
+        // last buffer and have been waiting for the main thread since. Then the
+        // typed bus fires everything queued THIS frame, in emission order, so a
+        // `sound_finished` a script emitted into Lua is also visible to any ECS
+        // listener, in the same frame, without a second drain point.
+        if (audio_system) |sys| sys.drainEvents(.{ .ctx = &audio_signals, .fire = AudioSignals.fire });
+        world.signals.drain();
         z_script.end();
 
         // ── M2: ECS → GPU instances via render2d.
@@ -462,30 +706,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         lighting_env = lighting_driver.Driver.environmentOf(&world, .{});
         lighting.sky = lighting_env.sky;
 
-        // ── M7: the lighting driver. One owner, one call, one place.
-        //
-        // The driver is what makes a `PointLight2D` in a scene actually light
-        // that scene: it owns the `Lighting`, sizes its mask to the view, gathers
-        // the lights, rasterizes the occluders, sweeps the shadow channels,
-        // rebuilds the GI pyramid when the field moved, and hands the lot to the
-        // renderer. Every one of those steps existed and none of them was called.
-        //
-        // `resize` is here rather than in the setup because the mask follows the
-        // view, and the view follows the camera. It is a no-op when the view has
-        // not changed, and it only reports `needs_resize` on the frame it did.
-        // Two integers rather than a struct. Zig's anonymous struct types are
-        // NOMINAL: `Window.framebufferSize`'s result is a different type from an
-        // equally-shaped literal, so an `if` that produced one or the other does
-        // not type-check however alike they look. Two scalars are the shape that
-        // a conditional expression can actually produce.
-        const fb_w: u32 = if (has_window) window.framebufferSize().w else view_w;
-        const fb_h: u32 = if (has_window) window.framebufferSize().h else view_h;
-        lighting.resize(lighting_driver.Driver.viewFor(camera_view, fb_w, fb_h)) catch |err| log.warn("lighting mask resize failed: {s}", .{@errorName(err)});
-        if (lighting.needs_resize) {
-            // A precondition, not a hint: `collect` appends without capacity
-            // checks because allocating mid-frame is forbidden (spec §3.1).
-            lighting.lighting.reserve(lighting_budget.lights, lighting_budget.occluders) catch {};
-        }
+        // The mask is already sized by `sync_lighting_buffers` above, OUTSIDE
+        // the tracker guard, because `resize` allocates and `Lighting.resize`
+        // says so in its own docs. Everything from here to the end of the frame
+        // reads buffers that already exist.
 
         if (has_window) {
             const fb = window.framebufferSize();
@@ -545,6 +769,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         lighting.lighting.cfg.shadowLights(),
         lighting.lighting.stats.sweep_steps,
     });
+    // M8: the audio numbers, next to the renderer's. A mixer reporting xruns or
+    // dropped commands is the one failure mode audio has — it does not crash, it
+    // crackles — so the counters are printed where a run's report already is.
+    if (audio_system) |sys| {
+        const a = sys.stats();
+        core.log.info("audio: {d} voices active (peak {d}), {d} xruns, {d} commands dropped, {d:.1} ms latency", .{
+            a.voices_active,
+            a.voices_peak,
+            a.xruns,
+            a.commands_dropped,
+            a.latencyMs(),
+        });
+        const bs = sys.bankStats();
+        core.log.info("audio bank: {d} sounds resident, {d} B used of {d} B budget", .{
+            bs.slots_used, bs.bytes_used, bs.budget_bytes,
+        });
+    }
     core.log.info("gpu upload: {d} B/frame (budget 2097152, spec §4)", .{st.upload_bytes});
     if (st.upload_bytes > 2 * 1024 * 1024) {
         core.log.warn("staging upload {d} B/frame exceeds the spec §4 ceiling (2 MB)", .{st.upload_bytes});

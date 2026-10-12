@@ -729,6 +729,11 @@ pub const Stats = struct {
     /// Automatic occluders that wanted coverage but could not get it -- past the
     /// occluder budget, or with an empty mask. Non-zero is a budget problem.
     coverage_dropped: u32 = 0,
+    /// Frames where the GI pyramid was asked to rebuild before it had been
+    /// prepared for the current mask size, so the bounce light was skipped. Any
+    /// non-zero value is a bug report in the engine, not a scene setting: it
+    /// means `Radiance.prepare` and `Lighting.resize` have drifted apart.
+    gi_not_prepared: u32 = 0,
 
     mask_w: u32 = 0,
     mask_h: u32 = 0,
@@ -1054,6 +1059,10 @@ pub const Lighting = struct {
         // down -- which is a crash in the cleanup path of a routine resize.
         try self.edt.resize(aw, ah);
         self.sdf = try self.allocator.alloc(u16, @as(usize, aw) * ah);
+        // The GI probe grids are sized here for the same reason the mask is:
+        // `Radiance.build` is called from inside the frame (an occluder moved)
+        // and must not allocate when it runs.
+        if (self.radiance) |r| try r.prepare(aw, ah);
         @memset(self.mask, 0);
         self.alloc_w = aw;
         self.alloc_h = ah;
@@ -2457,25 +2466,43 @@ pub const Radiance = struct {
         self.* = undefined;
     }
 
-    /// (Re)builds the pyramid for a mask of this size.
-    ///
-    /// Allocates lazily and keeps the buffers when the size is unchanged, so a
-    /// resize pays once and an unchanged frame pays nothing.
-    pub fn build(self: *Radiance, mask: []const u8, sdf: []const u16, w: u32, h: u32, sky: [3]f32) !void {
-        if (w == 0 or h == 0) return;
-
-        // How many cascades actually fit: one while the grid is bigger than a
-        // single probe.
+    /// How many cascades fit a mask of this size. Pure arithmetic on the mask
+    /// dimensions — no allocation, no state — so `prepare` and `build` agree on
+    /// the answer by construction instead of by two copies of the same loop.
+    pub fn levelsFor(w: u32, h: u32) u32 {
+        if (w == 0 or h == 0) return 0;
         var levels: u32 = 0;
         while (levels < max_cascades) {
             const cells = base_scale * (@as(u32, 1) << @intCast(levels));
             if (w / cells < 1 or h / cells < 1) break;
             levels += 1;
         }
+        return levels;
+    }
+
+    /// Allocates everything `build` will write, for a mask of this size.
+    ///
+    /// SEPARATE FROM `build` ON PURPOSE, and this is the second place the same
+    /// mistake was made (the first was `Lighting.resize` being called inside the
+    /// frame): the pyramid is rebuilt whenever an occluder moves, which is
+    /// gameplay's decision and can happen on any frame, while allocating inside
+    /// a frame is forbidden by spec §3.1 — `TrackedAllocator` panics on it
+    /// rather than letting it slide. Growing `cascades` or reallocating a probe
+    /// grid from `build` therefore took the whole process down on the first
+    /// GI-active frame that moved an occluder.
+    ///
+    /// Idempotent and cheap when the size is unchanged, so the caller can run it
+    /// unconditionally alongside `resize`. Everything `build` needs is derived
+    /// from the mask dimensions and nothing else, so preparing once per resize
+    /// is what it takes for `build` to be allocation-free for the rest of the
+    /// mask's life.
+    pub fn prepare(self: *Radiance, w: u32, h: u32) !void {
+        const levels = levelsFor(w, h);
         if (levels == 0) return;
 
+        try self.cascades.ensureUnusedCapacity(self.allocator, levels);
         while (self.cascades.items.len < levels) {
-            try self.cascades.append(self.allocator, .{
+            self.cascades.appendAssumeCapacity(.{
                 .scale = base_scale,
                 .rays = base_rays,
                 .w = 0,
@@ -2486,10 +2513,45 @@ pub const Radiance = struct {
         // Shrinking the mask drops the extra cascades rather than leaving dead
         // grids to be walked every probe merge.
         while (self.cascades.items.len > levels) {
-            const c = self.cascades.pop() orelse unreachable; // len > levels
+            const c = self.cascades.pop().?;
             var owned = c;
             owned.deinit(self.allocator);
         }
+
+        for (0..levels) |li| {
+            const level: u32 = @intCast(li);
+            const cells = base_scale * (@as(u32, 1) << @intCast(level));
+            const cw = @max(w / cells, 1);
+            const ch = @max(h / cells, 1);
+            const c = &self.cascades.items[li];
+            c.scale = cells;
+            c.rays = @max(base_rays >> @intCast(level), 2);
+            if (cw == c.w and ch == c.h) continue;
+            const grown = try self.allocator.alloc(Probe, @as(usize, cw) * ch);
+            self.allocator.free(c.probes);
+            c.probes = grown;
+            c.w = cw;
+            c.h = ch;
+        }
+    }
+
+    /// (Re)builds the pyramid for a mask of this size.
+    ///
+    /// ALLOCATES NOTHING. `prepare` must have been run for this mask size first;
+    /// if it was not, this returns `error.NotPrepared` rather than quietly
+    /// allocating inside the frame. The runtime runs `prepare` from
+    /// `Lighting.resize`, which is itself documented as the before-the-frame
+    /// site, so the path that reaches here is allocation-free by construction.
+    ///
+    /// Still amortized exactly as the distance field is: rebuilt when an occluder
+    /// moves, and not once per frame. A static scene's GI is therefore free after
+    /// the first frame, and the cost of a moving one is bounded by the grid it
+    /// walks, not by the light count.
+    pub fn build(self: *Radiance, mask: []const u8, sdf: []const u16, w: u32, h: u32, sky: [3]f32) !void {
+        if (w == 0 or h == 0) return;
+        const levels = levelsFor(w, h);
+        if (levels == 0) return;
+        if (self.cascades.items.len != levels) return error.NotPrepared;
 
         // Built coarse-to-fine so each cascade can read the one above it: the
         // finest cascade needs the second-finest's answer to finish. Ordering
@@ -2498,17 +2560,9 @@ pub const Radiance = struct {
         while (level >= 0) : (level -= 1) {
             const li: usize = @intCast(level);
             const c = &self.cascades.items[li];
-            const cells = base_scale * (@as(u32, 1) << @intCast(level));
-            c.scale = cells;
-            c.rays = @max(base_rays >> @intCast(level), 2);
-            const cw = @max(w / cells, 1);
-            const ch = @max(h / cells, 1);
-            if (cw != c.w or ch != c.h) {
-                self.allocator.free(c.probes);
-                c.probes = try self.allocator.alloc(Probe, @as(usize, cw) * ch);
-                c.w = cw;
-                c.h = ch;
-            }
+            const cw = c.w;
+            const ch = c.h;
+            if (cw == 0 or ch == 0) return error.NotPrepared;
             const next: ?*Cascade = if (level + 1 < levels)
                 &self.cascades.items[li + 1]
             else
@@ -2519,7 +2573,10 @@ pub const Radiance = struct {
                 var x: u32 = 0;
                 while (x < cw) : (x += 1) {
                     const idx = @as(usize, y) * cw + x;
-                    c.probes[idx] = probeAt(self, c, next, mask, sdf, w, h, x * cells, y * cells, sky);
+                    // `c.scale` is the probe spacing, set by `prepare` for this
+                    // level. Reading it here rather than recomputing `cells` keeps
+                    // the grid and the probe lookup from ever disagreeing.
+                    c.probes[idx] = probeAt(self, c, next, mask, sdf, w, h, x * c.scale, y * c.scale, sky);
                 }
             }
         }
@@ -3194,6 +3251,7 @@ test "render light: the radiance pyramid is built coarse-to-fine and only once" 
     try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
 
     const sky = [3]f32{ 1, 1, 1 };
+    try r.prepare(64, 64);
     try r.build(l.mask, l.sdf, 64, 64, sky);
 
     try testing.expect(r.built >= 2);
@@ -3206,6 +3264,7 @@ test "render light: the radiance pyramid is built coarse-to-fine and only once" 
     // only if the caller decides not to; this build genuinely re-walks, which is
     // what the amortization test's `builds` counter is FOR: it is the caller's
     // decision, not this one's.
+    try r.prepare(64, 64);
     try r.build(l.mask, l.sdf, 64, 64, sky);
     try testing.expectEqual(@as(u32, 2), r.builds);
 }
@@ -3233,6 +3292,7 @@ test "render light: a corner is darker than the open sky, which is GI working" {
     l.rasterize();
     try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
 
+    try r.prepare(64, 64);
     try r.build(l.mask, l.sdf, 64, 64, .{ 1, 1, 1 });
 
     // The open middle of the screen sees the sky on every ray.

@@ -227,7 +227,13 @@ pub const Driver = struct {
             // amortization claim that is asserted instead of counted is a claim
             // about the code, not about the runtime.
             const before = r.builds;
-            r.build(l.mask, l.sdf, l.alloc_w, l.alloc_h, self.sky) catch return;
+            // `NotPrepared` is counted, not swallowed: it means the pyramid was
+            // never sized for this mask, and silently skipping the bounce light
+            // would look exactly like GI that is simply too dark to notice.
+            r.build(l.mask, l.sdf, l.alloc_w, l.alloc_h, self.sky) catch |err| switch (err) {
+                error.NotPrepared => l.stats.gi_not_prepared += 1,
+                else => return,
+            };
             if (r.builds != before) self.gi_dirty = true;
         }
     }
