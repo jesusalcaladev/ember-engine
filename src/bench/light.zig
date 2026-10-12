@@ -97,30 +97,56 @@ fn measure(lights: u16, shadowed: u8, occluders_n: u16) !void {
     // Lights: `shadowed` of them cast, the rest are fill. Every one is inside the
     // mask, so every one of them actually costs a sweep rather than being culled
     // and making the number meaningless.
+    //
+    // FOUR kinds, not just point, because a benchmark that measures only the kind
+    // a scene is most often made of is measuring the easy path and reporting it
+    // as the cost of lighting. Every third is the legacy `Light2D`, because it is
+    // still registered and scenes committed before the four kinds existed carry
+    // it — a bench that only spawns the new types would not notice if gathering
+    // the legacy shape regressed.
     {
         var i: u16 = 0;
         while (i < lights) : (i += 1) {
             const col: u16 = @intCast(i % 5);
             const row: u16 = @intCast(i / 5);
-            _ = try world.spawn(.{
-                components.Transform{
-                    .position = .{
-                        .x = @as(f32, @floatFromInt(col)) * 128 + 64,
-                        .y = @as(f32, @floatFromInt(row)) * 128 + 64,
+            const x: f32 = @as(f32, @floatFromInt(col)) * 128 + 64;
+            const y: f32 = @as(f32, @floatFromInt(row)) * 128 + 64;
+            const xf = components.Transform{ .position = .{ .x = x, .y = y } };
+            const casts = i < shadowed;
+
+            switch (i % 4) {
+                0 => _ = try world.spawn(.{
+                    xf,
+                    components.PointLight2D{ .radius = 192, .base = .{ .cast_shadows = casts, .gi_contribution = 0.2 } },
+                }),
+                1 => _ = try world.spawn(.{
+                    xf,
+                    components.SpotLight2D{
+                        .radius = 192,
+                        .cone_angle = 1.2,
+                        .penumbra = 0.25,
+                        .base = .{ .cast_shadows = casts, .gi_contribution = 0.2 },
                     },
-                },
-                components.Light2D{
-                    .radius = 192,
-                    .energy = 1,
-                    .cast_shadows = i < shadowed,
-                    // Every second light is a spot, so the cone path is measured
-                    // alongside the point path rather than assumed.
-                    .kind = if (i % 2 == 0) .point else .spot,
-                    .cone_angle = 1.2,
-                    .penumbra = 0.25,
-                    .gi_contribution = 0.2,
-                },
-            });
+                }),
+                2 => _ = try world.spawn(.{
+                    // The legacy single-component shape: same fields, one
+                    // discriminant, still registered with a stable dense id.
+                    components.Light2D{
+                        .kind = if (i % 2 == 0) .point else .spot,
+                        .radius = 192,
+                        .cone_angle = 1.2,
+                        .penumbra = 0.25,
+                        .cast_shadows = casts,
+                        .gi_contribution = 0.2,
+                    },
+                }),
+                else => _ = try world.spawn(.{
+                    xf,
+                    // Directional lights are unbounded and cover the whole view,
+                    // so including one keeps the cone-less path measured.
+                    components.DirectionalLight2D{ .height = 0.5, .base = .{ .cast_shadows = casts } },
+                }),
+            }
         }
     }
 
@@ -180,17 +206,27 @@ fn measure(lights: u16, shadowed: u8, occluders_n: u16) !void {
                 }
                 k += 1;
             }
-            var it = world.query(.{components.Light2D});
-            var e = it.next();
-            var i: u32 = 0;
-            while (e) |en| : (e = it.next()) {
-                const t = world.get(en.entity(), components.Transform).?;
-                t.position.x += 0.5;
-                if (i % 3 == 0) {
-                    const lt = en.get(components.Light2D);
-                    lt.angle += 0.01;
+            // Every light kind, moved. Only moving the legacy shape would leave
+            // the four new ones stationary, and stationary lights are skipped by
+            // the sweep -- so the benchmark would report an amortization win that
+            // is really just four lights that never moved.
+            inline for (.{
+                components.PointLight2D,
+                components.SpotLight2D,
+                components.Light2D,
+                components.DirectionalLight2D,
+            }) |C| {
+                var it = world.query(.{C, components.Transform});
+                var e = it.next();
+                var i: u32 = 0;
+                while (e) |en| : (e = it.next()) {
+                    const t = en.get(components.Transform);
+                    t.position.x += 0.5;
+                    if (i % 3 == 0 and @hasField(C, "angle")) {
+                        en.get(C).angle += 0.01;
+                    }
+                    i += 1;
                 }
-                i += 1;
             }
         }
 

@@ -300,6 +300,19 @@ pub const Lighting = struct {
     /// identical to one that was never swept, and treating that as "already
     /// done" leaves the whole 1D map uninitialised.
     channel_built: [4]bool = [_]bool{false} ** 4,
+    /// Which light each channel belongs to, as the entity handle's bits.
+    ///
+    /// This is what makes the amortization WORK, and getting it wrong is
+    /// invisible. `collect` used to clear `channel_built` every frame, on the
+    /// reasoning that the maps are redistributed each frame and none of the
+    /// previous ones can be trusted — but "cannot be trusted" and "is not
+    /// trusted" are different: the map for a light that has not moved and whose
+    /// mask has not changed is still exactly right. Clearing the flag made every
+    /// frame rebuild every channel, and the bench measured it at 3.1 ms for four
+    /// shadowed lights, which is the cost the design was supposed to avoid.
+    ///
+    /// So the flag is now cleared per channel, when the light BEHIND it changes.
+    channel_owner: [4]u64 = [_]u64{0} ** 4,
 
     /// Euclidean distance field of the occluder mask, in mask cells, clamped to
     /// 65535. Solid cells are 0; a free cell holds its distance to the nearest
@@ -325,6 +338,10 @@ pub const Lighting = struct {
     /// back at grant time because the sweep needs the reach as a distance, and
     /// recomputing the product in two places is how the two places stop agreeing.
     reach_of: std.ArrayList(f32) = .empty,
+    /// Parallel to `lights.items`: which entity each light is. A channel's owner
+    /// is what decides whether its map can be reused, and a frame that knows the
+    /// light moved has to have remembered WHICH light.
+    owner_of: std.ArrayList(u64) = .empty,
     /// Scratch for ranking shadow candidates by area.
     scratch: std.ArrayList(AreaRank) = .empty,
     occluders: std.ArrayList(Occluder) = .empty,
@@ -399,6 +416,7 @@ pub const Lighting = struct {
         self.lights.deinit(self.allocator);
         self.channel_of.deinit(self.allocator);
         self.reach_of.deinit(self.allocator);
+        self.owner_of.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.occluders.deinit(self.allocator);
         self.* = undefined;
@@ -458,6 +476,7 @@ pub const Lighting = struct {
         try self.lights.ensureUnusedCapacity(self.allocator, lights);
         try self.channel_of.ensureUnusedCapacity(self.allocator, lights);
         try self.reach_of.ensureUnusedCapacity(self.allocator, lights);
+        try self.owner_of.ensureUnusedCapacity(self.allocator, lights);
         try self.scratch.ensureUnusedCapacity(self.allocator, lights);
         try self.occluders.ensureUnusedCapacity(self.allocator, occluders);
     }
@@ -468,6 +487,7 @@ pub const Lighting = struct {
         self.lights.clearRetainingCapacity();
         self.channel_of.clearRetainingCapacity();
         self.reach_of.clearRetainingCapacity();
+        self.owner_of.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
         self.occluders.clearRetainingCapacity();
         self.stats = .{};
@@ -496,15 +516,17 @@ pub const Lighting = struct {
         self.lights.clearRetainingCapacity();
         self.channel_of.clearRetainingCapacity();
         self.reach_of.clearRetainingCapacity();
+        self.owner_of.clearRetainingCapacity();
         self.scratch.clearRetainingCapacity();
         self.occluders.clearRetainingCapacity();
 
         const want_shadow = self.cfg.shadowLights();
         self.stats.occluders = 0;
-        // Every channel is redistributed this frame, so none of the previous
-        // maps can be trusted -- including one whose light happens to be at the
-        // same place as the light that owned the slot last frame.
-        self.channel_built = [_]bool{false} ** 4;
+        // NOT cleared here. A channel's map is a function of the light behind it
+        // and the mask; when neither has changed the previous map is still exactly
+        // right, and clearing this made every frame rebuild every channel. The
+        // flag is cleared per channel below, when the light BEHIND it changes --
+        // which is the only thing that can invalidate a map.
 
         // Lights. Four components, one code path: `gather` is generic over the
         // component type and `descFor` is the only place that knows a
@@ -519,6 +541,13 @@ pub const Lighting = struct {
         gather(components.SpotLight2D, self, world, view);
         gather(components.DirectionalLight2D, self, world, view);
         gather(components.AmbientLight2D, self, world, view);
+        // The legacy single-component light, gathered too. It is still a
+        // REGISTERED component with a dense id, and a dense id is the `.zson`
+        // encoding -- so scenes committed before the four kinds existed carry it,
+        // and a renderer that stopped gathering it would turn every one of them
+        // into an unlit scene. It costs one more query and it keeps those scenes
+        // working.
+        gather(components.Light2D, self, world, view);
 
         // Occluders.
         var h: u64 = 0;
@@ -596,6 +625,14 @@ pub const Lighting = struct {
             const base = inst.withChannel(ch);
             self.lights.items[cand.index] = base;
             const slot: usize = @intCast(granted);
+            const owner = self.owner_of.items[cand.index];
+            // A different light in the same slot means the map describes
+            // something else now, even if that light happens to stand at the same
+            // point. Position alone cannot tell those two cases apart.
+            if (self.channel_owner[slot] != owner) {
+                self.channel_built[slot] = false;
+                self.channel_owner[slot] = owner;
+            }
             self.channel_pos[slot] = .{ .x = inst.pos[0], .y = inst.pos[1] };
             self.channel_radius[slot] = self.reach_of.items[cand.index];
         }
@@ -774,6 +811,8 @@ pub const Lighting = struct {
             // meant a slow GI cadence silently made every shadow map rebuild
             // every frame, and a profile would have shown it as "shadows".
             const moved = distance(self.channel_pos[ch], self.channel_pos_prev[ch]);
+            // `channel_built` is now per-owner rather than per-frame, so this is
+            // false for a scene at rest and the sweep is genuinely skipped.
             const stale = !self.channel_built[ch] or moved * moved >= 0.0001;
             if (!self.mask_changed and !stale) {
                 skips += 1;
@@ -1244,10 +1283,34 @@ pub fn descFor(comptime C: type, c: C, view_diag: f32) LightDesc {
                 },
             };
         },
+        components.Light2D => .{
+            // The legacy shape carries the shared fields flat rather than in a
+            // `LightBase`, so it is assembled into one here. That is the whole
+            // cost of keeping it: eight field reads in one arm, and every
+            // downstream function sees the same descriptor either way.
+            .base = .{
+                .color = c.color,
+                .energy = c.energy,
+                .blend = c.blend,
+                .cast_shadows = c.cast_shadows,
+                .shadow_filter = c.shadow_filter,
+                .shadow_filter_smooth = c.shadow_filter_smooth,
+                .gi_contribution = c.gi_contribution,
+                .item_cull_mask = c.item_cull_mask,
+            },
+            .kind = c.kind,
+            .shape = .{
+                .offset = c.offset,
+                .angle = c.angle,
+                .radius = c.radius,
+                .attenuation = c.attenuation,
+                .cone = if (c.kind == .point) null else @abs(c.cone_angle),
+                .penumbra = c.penumbra,
+            },
+        },
         else => @compileError("not a light component: " ++ @typeName(C)),
     };
 }
-
 /// Walks every entity carrying one of the four light components.
 ///
 /// Generic over the component type so the loop exists once. `descFor` is the
@@ -1267,7 +1330,12 @@ fn gather(comptime C: type, l: *Lighting, world: *World, view: ?MaskRect) void {
     var entry = iter.next();
     while (entry) |e| : (entry = iter.next()) {
         const c: *const C = e.get(C);
-        if (!c.base.enabled) continue;
+        // `Light2D` predates `LightBase` and has no `enabled`; it is on by
+        // definition. `@hasField` rather than a `descFor` arm because this is the
+        // ONE question `descFor` is not asked -- the descriptor is built after
+        // this test, and an arm for it would be a second answer to a question the
+        // switch below already answers.
+        if (@hasField(C, "base") and !c.base.enabled) continue;
 
         const d = descFor(C, c.*, view_diag);
         const t: ?*const components.Transform = world.get(e.entity(), components.Transform);
@@ -1290,6 +1358,7 @@ fn gather(comptime C: type, l: *Lighting, world: *World, view: ?MaskRect) void {
         l.lights.appendAssumeCapacity(instanceFor(d, pos, -1));
         l.channel_of.appendAssumeCapacity(if (d.shape.can_shadow and d.base.cast_shadows) -2 else -1);
         l.reach_of.appendAssumeCapacity(if (d.shape.shadow_reach > 0) d.shape.shadow_reach else d.shape.radius);
+        l.owner_of.appendAssumeCapacity(@bitCast(e.entity()));
     }
 }
 
@@ -2333,4 +2402,119 @@ test "render light: energy and the colour's alpha scale what arrives" {
 
     try testing.expectApproxEqAbs(at_center * 0.5, at_half_energy, 0.0001);
     try testing.expectApproxEqAbs(at_center * 0.5, at_half_alpha, 0.0001);
+}
+
+test "render light: a still scene skips every channel, and a moved light rebuilds only its own" {
+    // This is the amortization the subsystem exists for, and it regressed
+    // silently: `collect` cleared every channel's "built" flag on every frame,
+    // on the reasoning that the channels are redistributed each frame. The flag
+    // was therefore never true and NO frame was ever skipped -- which the
+    // benchmark caught at 3.1 ms for four shadowed lights, a cost the design is
+    // supposed to avoid.
+    //
+    // The assertion is per channel rather than "some frames skip", because the
+    // bug it guards against is a global reset and a per-channel statement is the
+    // one that fails if the reset comes back.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(128, 128);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 128, .y = 128 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    // Four shadowed lights, all with the same reach so a channel swap is only
+    // detectable through the OWNER and not through the radius.
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = @as(f32, @floatFromInt(i)) * 16 + 16, .y = 64 } },
+            pointComp(.{ .cast_shadows = true }, 96),
+        });
+    }
+
+    // Frame 1: everything builds.
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    try testing.expectEqual(@as(u32, 0), l.stats.sweep_skips);
+    try testing.expectEqual(@as(u32, 4), l.stats.shadow_lights);
+
+    // Frame 2, nothing moved: four skips and zero steps.
+    l.collect(&world, l.rect);
+    l.buildShadowMaps();
+    try testing.expectEqual(@as(u32, 4), l.stats.sweep_skips);
+    try testing.expectEqual(@as(u64, 0), l.stats.sweep_steps);
+
+    // Frame 3, one light moved: exactly one channel rebuilds.
+    var it = world.query(.{components.PointLight2D, components.Transform});
+    var e = it.next();
+    var k: usize = 0;
+    while (e) |row| : (e = it.next()) {
+        if (k == 0) row.get(components.Transform).position.x += 4;
+        k += 1;
+    }
+    l.collect(&world, l.rect);
+    l.buildShadowMaps();
+    try testing.expectEqual(@as(u32, 3), l.stats.sweep_skips);
+    try testing.expect(l.stats.sweep_steps > 0);
+
+    // Frame 4, still again: back to skipping everything, which is the part that
+    // proves the skip is not a one-shot and that `collect` is not clearing the
+    // flags behind `buildShadowMaps`' back.
+    l.collect(&world, l.rect);
+    l.buildShadowMaps();
+    try testing.expectEqual(@as(u32, 4), l.stats.sweep_skips);
+    try testing.expectEqual(@as(u64, 0), l.stats.sweep_steps);
+}
+
+test "render light: a different light in a channel rebuilds it even at the same position" {
+    // Position alone cannot tell "this light did not move" from "a different
+    // light now stands where it used to be", and the second case reuses a map
+    // that describes something else. The owner is what distinguishes them.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(128, 128);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 128, .y = 128 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    const a = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 64, .y = 64 } },
+        pointComp(.{ .cast_shadows = true }, 96),
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        pointComp(.{ .cast_shadows = true }, 96),
+    });
+    // A wall only `a` can see, so the two lights' maps genuinely differ.
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = .{ 70, 0, 74, 0, 74, 128, 70, 128, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+    });
+
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    const before = l.shadow[0];
+
+    // Swap them: the light at the origin becomes the one at (64,64) and the
+    // other disappears. Channel 0 keeps its position and its reach, so only the
+    // owner differs.
+    world.get(a, components.Transform).?.position.x = 0;
+    l.collect(&world, l.rect);
+    l.buildShadowMaps();
+
+    // The map changed, which is the point: a channel rebuilt because its OWNER
+    // changed, not because anything moved. "Less than four skipped" rather than
+    // "zero skipped" because only one of the two channels changed hands -- the
+    // other light is untouched and its map is still correct, so skipping it is
+    // the behaviour being defended.
+    try testing.expect(l.stats.sweep_skips < 4);
+    try testing.expect(l.stats.sweep_steps > 0);
+    try testing.expect(l.shadow[0] != before);
 }

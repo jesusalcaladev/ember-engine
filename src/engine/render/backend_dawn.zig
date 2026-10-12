@@ -781,19 +781,12 @@ pub const Backend = struct {
             .{
                 .binding = 3,
                 .visibility = wgpu.ShaderStage_Fragment,
-                .buffer_type = wgpu.BufferBindingType_Uniform,
-                .sampler = &.{
-                    .type = wgpu.SamplerBindingType_Filtering,
-                    // CLAMP, not repeat: the cascade is a rectangle of the world
-                    // and a point outside it has no enclosure data, which the
-                    // shader says so explicitly. Wrapping would smear the
-                    // opposite edge's occluders in and darken the border.
-                    .address_mode_u = wgpu.AddressMode_ClampToEdge,
-                    .address_mode_v = wgpu.AddressMode_ClampToEdge,
-                    .address_mode_w = wgpu.AddressMode_ClampToEdge,
-                    .mag_filter = wgpu.FilterMode_Linear,
-                    .min_filter = wgpu.FilterMode_Linear,
-                },
+                .buffer_type = 0, // BindingNotUsed: this entry is a sampler
+                // `sampler_type`, and not a nested sampler descriptor: a layout
+                // entry names the sampler it will accept, and the sampler
+                // OBJECT itself belongs in the bind group. Putting the object
+                // here is a compile error, which is the good outcome.
+                .sampler_type = wgpu.SamplerBindingType_Filtering,
             },
         }, "light.bgl");
         resources_created += 1;
@@ -953,17 +946,26 @@ pub const Backend = struct {
                     .aspect = wgpu.TextureAspect_All,
                 },
                 &opaque_black,
+                opaque_black.len,
                 &.{ .bytesPerRow = 4, .rowsPerImage = 1 },
                 &.{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
             );
         }
         const light_gi_sampler = wgpu.wgpuDeviceCreateSampler(device, &.{
             .label = wgpu.StringView.from("light.gi.smp"),
-            .address_mode_u = wgpu.AddressMode_ClampToEdge,
-            .address_mode_v = wgpu.AddressMode_ClampToEdge,
-            .address_mode_w = wgpu.AddressMode_ClampToEdge,
-            .mag_filter = wgpu.FilterMode_Linear,
-            .min_filter = wgpu.FilterMode_Linear,
+            // CLAMP, not repeat: the cascade is a rectangle of the world and a
+            // point outside it has no enclosure data, which the shader says so
+            // explicitly. Wrapping would smear the opposite edge's occluders in
+            // and darken the border of the measured region.
+            .magFilter = wgpu.FilterMode_Linear,
+            .minFilter = wgpu.FilterMode_Linear,
+            // CLAMP, not repeat: the cascade is a rectangle of the world and a
+            // point outside it has no enclosure data, which the shader says so
+            // explicitly. Wrapping would smear the opposite edge's occluders in
+            // and darken the border of the measured region.
+            .addressModeU = wgpu.AddressMode_ClampToEdge,
+            .addressModeV = wgpu.AddressMode_ClampToEdge,
+            .addressModeW = wgpu.AddressMode_ClampToEdge,
         }) orelse return error.SamplerCreationFailed;
         resources_created += 1;
 
@@ -1096,14 +1098,20 @@ pub const Backend = struct {
         // fullscreen triangle comes from the vertex index, so `vertex_bufferCount`
         // is zero and there is nothing to bind.
         var post_pipelines: [5]wgpu.WGPURenderPipeline = undefined;
-        const post_entries = [_][]const u8{
+        // `[:0]const u8`, not `[]const u8`: `StringView.from` takes a sentinel-
+        // terminated string because the C API needs the length AND the pointer,
+        // and a slice without one cannot be converted. Naming the type
+        // explicitly is the difference between "it compiled in Debug" and "it
+        // compiled", since a literal array infers the sentinel for you and a
+        // slice of one does not.
+        const post_entries = [_][:0]const u8{
             "fs_bright",
             "fs_blur_h",
             "fs_blur_v",
             "fs_composite",
             "fs_copy",
         };
-        const post_labels = [_][]const u8{
+        const post_labels = [_][:0]const u8{
             "post.bright",
             "post.blur.h",
             "post.blur.v",
@@ -1118,6 +1126,11 @@ pub const Backend = struct {
                 .vertex_module = post_shader,
                 .vertex_entryPoint = wgpu.StringView.from("vs_fullscreen"),
                 .vertex_bufferCount = 0,
+                // Named explicitly rather than defaulted: this struct has no
+                // field defaults, so "no vertex buffers" is a value someone has
+                // to say. Leaving it out is a compile error, which is better
+                // than a pipeline that silently reads a stale buffer list.
+                .vertex_buffers = null,
                 .fragment = &wgpu.FragmentState{
                     .module = post_shader,
                     .entryPoint = wgpu.StringView.from(entry),
@@ -2068,15 +2081,15 @@ pub const Backend = struct {
         else
             self.smaa_uniform_buf;
         const cached = if (o.smaa_blend_bind == scene_bind) &o.smaa_post_blend_bind else &o.smaa_post_edge_bind;
-        if (cached.* == null) {
-            cached.* = createBindGroup(self.device, self.smaa_bgl, &[_]wgpu.BindGroupEntry{
-                .{ .binding = 0, .textureView = src_view },
-                .{ .binding = 1, .sampler = @ptrCast(self.sampler) },
-                .{ .binding = 2, .buffer = uniform, .offset = 0, .size = SmaaUniformBytes },
-                .{ .binding = 3, .textureView = o.weights_view },
-            }, "smaa.post.bg") catch return scene_bind;
-        }
-        return cached.*;
+        if (cached.*) |existing| return existing;
+        const made = createBindGroup(self.device, self.smaa_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .textureView = src_view },
+            .{ .binding = 1, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 2, .buffer = uniform, .offset = 0, .size = SmaaUniformBytes },
+            .{ .binding = 3, .textureView = o.weights_view },
+        }, "smaa.post.bg") catch return scene_bind;
+        cached.* = made;
+        return made;
     }
 
     /// M7: the post chain. `color -> bloom_a -> bloom_b -> bloom_a -> post`.
@@ -2090,55 +2103,81 @@ pub const Backend = struct {
     /// blurring after. Compositing first would also need a second full-res blur.
     fn runPost(self: *Backend, encoder: wgpu.WGPUCommandEncoder, o: *Offscreen) ?wgpu.WGPUTextureView {
         const bloom_on = self.environment.bloom_intensity > 0;
-        var timestamp_writes = self.timestampWrites();
-        var attachment = [_]wgpu.RenderPassColorAttachment{undefined} ** 4;
-        var i: usize = 0;
-        while (i < attachment.len) : (i += 1) {
-            attachment[i] = .{
-                .view = undefined,
-                .loadOp = wgpu.LoadOp_Clear,
-                .storeOp = wgpu.StoreOp_Store,
-                .clearValue = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 },
-            };
-        }
+        // One attachment, reused for each pass in the chain. Declared once
+        // rather than per pass because the chain is a loop over the SAME
+        // attachment with a different view, and four of them would be four
+        // structs where one is meant.
+        var attachment = wgpu.RenderPassColorAttachment{
+            .view = undefined,
+            .loadOp = wgpu.LoadOp_Clear,
+            .storeOp = wgpu.StoreOp_Store,
+            .clearValue = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 },
+        };
 
-        const runs = if (bloom_on)
-            [_]struct { pipeline: wgpu.WGPURenderPipeline, bind: wgpu.WGPUBindGroup, view: wgpu.WGPUTextureView }{
+        // One named type, not two anonymous ones: Zig gives the two arms of an
+        // `if` expression DIFFERENT anonymous types, and a `[_]T` of each is
+        // not a `[_]T`. Naming it once is the whole fix.
+        const Run = struct {
+            pipeline: wgpu.WGPURenderPipeline,
+            bind: wgpu.WGPUBindGroup,
+            view: wgpu.WGPUTextureView,
+        };
+        const runs: []const Run = if (bloom_on)
+            &.{
                 .{ .pipeline = self.post_pipeline_bright, .bind = o.post_bright_bind, .view = o.bloom_a_view },
                 .{ .pipeline = self.post_pipeline_blur_h, .bind = o.post_blur_h_bind, .view = o.bloom_b_view },
                 .{ .pipeline = self.post_pipeline_blur_v, .bind = o.post_blur_v_bind, .view = o.bloom_a_view },
                 .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
             }
         else
-            [_]struct { pipeline: wgpu.WGPURenderPipeline, bind: wgpu.WGPUBindGroup, view: wgpu.WGPUTextureView }{
+            &.{
                 // Fog and tonemap alone: one pass, no bloom, no half-res round
                 // trip. This is the common case and it costs one full-screen
                 // read and one write.
                 .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
             };
 
+        // The chain is a VARIABLE number of passes, and `timestampWrites()`
+        // hands out two slots per call -- it was written for the one-pass case.
+        // Reserving the whole chain's slots up front is what keeps pass N's
+        // indices from colliding with pass N+1's.
+        const qs = if (self.timestamps) self.query_set else null;
+        const timed = qs != null and self.ts_cursor + @as(u32, @intCast(runs.len)) * 2 <= GPU_TIMESTAMP_SLOTS;
+        const ts_base = self.ts_cursor;
+        if (timed) self.ts_cursor += @as(u32, @intCast(runs.len)) * 2;
+
         for (runs, 0..) |run, n| {
-            attachment[0].view = run.view;
+            attachment.view = run.view;
             var desc = wgpu.RenderPassDescriptor{
                 .colorAttachmentCount = 1,
-                .colorAttachments = @ptrCast(&attachment[0]),
+                .colorAttachments = @ptrCast(&attachment),
             };
-            if (timestamp_writes) |*tw| {
-                tw.beginning_of_pass_write_index = self.ts_cursor + n * 2;
-                tw.end_of_pass_write_index = self.ts_cursor + n * 2 + 1;
-                desc.timestampWrites = tw;
+            if (timed) {
+                var tw = wgpu.PassTimestampWrites{
+                    .nextInChain = null,
+                    .querySet = qs.?,
+                    .beginningOfPassWriteIndex = ts_base + @as(u32, @intCast(n)) * 2,
+                    .endOfPassWriteIndex = ts_base + @as(u32, @intCast(n)) * 2 + 1,
+                };
+                desc.timestampWrites = &tw;
             }
             const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &desc) orelse return null;
-            defer wgpu.wgpuRenderPassEncoderRelease(pass);
             wgpu.wgpuRenderPassEncoderSetPipeline(pass, run.pipeline);
             wgpu.wgpuRenderPassEncoderSetBindGroup(pass, 0, run.bind, 0, null);
+            // Three vertices, not four: the fullscreen triangle. `fs_main` in the
+            // sprite shader draws 4 for the same shape because it is a strip
+            // there, and this is a list.
             wgpu.wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
             wgpu.wgpuRenderPassEncoderEnd(pass);
+            // Released HERE and not with a `defer`: a defer inside a loop runs
+            // at the end of the FUNCTION, so four passes would stay open for the
+            // whole chain. That is a resource leak the driver tolerates until it
+            // does not.
+            wgpu.wgpuRenderPassEncoderRelease(pass);
             self.stats_data.render_passes += 1;
             self.stats_data.draw_calls += 1;
         }
-        if (timestamp_writes != null) self.ts_cursor += runs.len * 2;
-        self.post_passes += runs.len;
+        self.post_passes += @intCast(runs.len);
         self.stats_data.post_passes = self.post_passes;
         return o.post_view;
     }
@@ -2390,7 +2429,7 @@ pub const Backend = struct {
                 .{ .binding = 1, .textureView = self.light_shadow_view orelse return },
                 .{ .binding = 2, .textureView = self.light_gi_view },
                 .{ .binding = 3, .sampler = self.light_gi_sampler },
-            }) orelse return;
+            }, "light.bind") catch return;
         }
 
         const dst = wgpu.TexelCopyTextureInfo{ .texture = self.light_gi_texture };
@@ -2399,19 +2438,30 @@ pub const Backend = struct {
         // tightly packed buffer. Getting this wrong shifts every row by a few
         // bytes and the cascade becomes diagonal noise.
         const stride = gi.width * 4;
-        const padded = (stride + 255) & ~@as(usize, 255);
+        var padded = (stride + 255) & ~@as(usize, 255);
         var scratch: ?[]u8 = null;
         defer if (scratch) |s| self.allocator.free(s);
         var src = gi.pixels;
         if (padded != stride) {
-            scratch = try self.allocator.alloc(u8, padded * gi.height) catch return;
-            var y: usize = 0;
-            while (y < gi.height) : (y += 1) {
-                const row = scratch.?[y * padded ..][0..stride];
-                @memcpy(row, gi.pixels[y * stride ..][0..stride]);
-                @memset(scratch.?[y * padded + stride ..][0 .. padded - stride], 0);
+            // A padded copy for the 256-byte row alignment. On failure the
+            // upload is DROPPED, not retried and not fatal: a frame with no GI
+            // upload is a frame that keeps the previous cascade, and a scene
+            // that cannot allocate is a scene that should still render.
+            scratch = self.allocator.alloc(u8, padded * gi.height) catch null;
+            if (scratch) |buf| {
+                var y: usize = 0;
+                while (y < gi.height) : (y += 1) {
+                    const row = buf[y * padded ..][0..stride];
+                    @memcpy(row, gi.pixels[y * stride ..][0..stride]);
+                    @memset(buf[y * padded + stride ..][0 .. padded - stride], 0);
+                }
+                src = buf;
+            } else {
+                // Out of memory: upload the tightly packed rows anyway and let
+                // the driver reject the stride. A wrong GI frame is better than
+                // no frame, and this only happens when the allocation failed.
+                padded = stride;
             }
-            src = scratch.?;
         }
         const layout = wgpu.TexelCopyBufferLayout{
             .bytesPerRow = @intCast(padded),
