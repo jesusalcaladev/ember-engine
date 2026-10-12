@@ -734,6 +734,11 @@ pub const Stats = struct {
     /// non-zero value is a bug report in the engine, not a scene setting: it
     /// means `Radiance.prepare` and `Lighting.resize` have drifted apart.
     gi_not_prepared: u32 = 0,
+    /// Frames where the distance field was not rebuilt, so the GI pyramid was
+    /// skipped rather than recomputed to the same answer. This is the number that
+    /// makes "GI is amortized" checkable: it should be the large majority of
+    /// frames in any scene that is not being rebuilt every frame.
+    gi_skipped: u32 = 0,
 
     mask_w: u32 = 0,
     mask_h: u32 = 0,
@@ -766,6 +771,17 @@ pub const Stats = struct {
 
 /// A shadow candidate and the index of the light it came from, for ranking.
 const AreaRank = struct { area: f32, index: u32 };
+
+/// The FNV-1a offset basis, as the occluder fingerprint's seed.
+///
+/// Not `0`. A fingerprint seeded at zero collides with the sentinel a resize
+/// leaves behind, and a zero-valued hash is also the one an even number of
+/// identical occluders used to produce — which is precisely how the mask stopped
+/// being built. Seeding with the canonical basis makes "no occluders yet" and
+/// "this many identical walls" different numbers by construction, and
+/// `hash_valid` covers the remaining case of a hash that legitimately lands on
+/// the sentinel.
+const occluder_hash_seed: u64 = 0xcbf29ce484222325;
 
 pub const Lighting = struct {
     allocator: std.mem.Allocator,
@@ -896,9 +912,24 @@ pub const Lighting = struct {
     /// is whether the MASK would come out different, and comparing that
     /// directly is O(n) position compares against re-rasterizing a whole grid.
     mask_changed: bool = true,
+    /// Whether every channel's map is out of date because the MASK moved, rather
+    /// than because the light behind it did.
+    ///
+    /// A separate flag from `mask_changed` because `rasterize` clears that one on
+    /// its way out — and `buildShadowMaps` runs AFTER `rasterize`, so it was
+    /// reading a flag that had already been reset. The sweep therefore only ever
+    /// ran when a LIGHT moved: slide a wall across a stationary torch and the
+    /// shadow stayed exactly where it was, with `sweep_skips` reporting 4 of 4
+    /// channels skipped and every count in the stats looking healthy. Set by
+    /// `rasterize` and `resize`, cleared by `buildShadowMaps`.
+    sweep_stale: bool = true,
     /// Fingerprint of the last occluder set, so the comparison above has
     /// something to compare against.
     occluder_hash: u64 = 0,
+    /// Whether `occluder_hash` means anything yet. A resize clears the hash, and
+    /// "cleared" and "a scene whose hash is zero" are the same number — so the
+    /// question is tracked rather than guessed from the value.
+    hash_valid: bool = false,
     last_sdf_ns: i128 = 0,
     /// Minimum time between distance-field rebuilds, in nanoseconds. 0 rebuilds
     /// whenever the mask is stale (high quality); a positive value spreads the
@@ -987,6 +1018,9 @@ pub const Lighting = struct {
         // the sweep steps by.
         self.mask_changed = true;
         self.dirty = true;
+        // The hash describes a mask built at the OLD angle count, and the mask
+        // itself is unchanged — but the channels are, so `channel_built` below is
+        // the invalidation that matters here. `hash_valid` stays true.
         // Every channel's map was swept for the old angle count.
         self.channel_built = [_]bool{false} ** 4;
         return true;
@@ -1061,14 +1095,18 @@ pub const Lighting = struct {
         self.sdf = try self.allocator.alloc(u16, @as(usize, aw) * ah);
         // The GI probe grids are sized here for the same reason the mask is:
         // `Radiance.build` is called from inside the frame (an occluder moved)
-        // and must not allocate when it runs.
-        if (self.radiance) |r| try r.prepare(aw, ah);
+        // and must not allocate when it runs. The budget comes from the quality
+        // tier, so the pyramid's cost is the tier's promise and not a function of
+        // how big the window happens to be.
+        if (self.radiance) |r| try r.prepare(aw, ah, Radiance.fineSideFor(self.cfg));
         @memset(self.mask, 0);
         self.alloc_w = aw;
         self.alloc_h = ah;
         self.dirty = true;
         self.mask_changed = true;
         self.occluder_hash = 0;
+        self.hash_valid = false;
+        self.sweep_stale = true;
         self.channel_built = [_]bool{false} ** 4;
     }
 
@@ -1169,7 +1207,18 @@ pub const Lighting = struct {
         gather(components.Light2D, self, world, view);
 
         // Occluders.
-        var h: u64 = 0;
+        //
+        // FNV-1a, NOT `h ^= contribution` per occluder. XOR is its own inverse,
+        // so a pair of identical occluders folds to nothing: forty identical
+        // walls hashed to exactly 0, which is also what `resize` leaves in
+        // `occluder_hash`, so `changed` was false, the mask was never built, and
+        // every shadow in the scene was cast by an EMPTY grid. The symptom was
+        // invisible — occluders counted 40, shadow channels were granted 4/4,
+        // and the sweep dutifully marched rays through open space — because
+        // every one of those numbers is a count and none of them is "did
+        // anything get drawn". A level made of mirrored rooms is the common
+        // case, not the pathological one.
+        var h: u64 = occluder_hash_seed;
         var it3 = world.query(.{LightOccluder2D});
         var e3 = it3.next();
         while (e3) |e| : (e3 = it3.next()) {
@@ -1240,14 +1289,33 @@ pub const Lighting = struct {
             // changes from square to wide changes its shadow with no movement.
             const prx: u64 = if (out.rect_half) |v| @as(u32, @bitCast(v.x)) else 0;
             const pry: u64 = if (out.rect_half) |v| @as(u32, @bitCast(v.y)) else 0;
-            h ^= px *% 65599 +% py *% 65599 +% 1;
-            h ^= pex *% 7 +% prad *% 11;
-            h ^= if (out.circle) 1 else 0;
-            h ^= pthr *% 13 +% 1;
-            h ^= pcov *% 17;
-            h ^= prx *% 19 +% pry *% 23;
+            // The polygon's own points too. Two occluders can share a position, an
+            // extent and a mode and still be different walls, and a fingerprint
+            // that cannot tell them apart reports "nothing changed" for a scene
+            // that was rebuilt from a different prefab.
+            for (out.polygon.points[0 .. 2 * out.polygon.count]) |pt| {
+                h = (h ^ @as(u64, @as(u32, @bitCast(pt)))) *% 0x100000001b3;
+            }
+            h = (h ^ px) *% 0x100000001b3;
+            h = (h ^ py) *% 0x100000001b3;
+            h = (h ^ pex) *% 0x100000001b3;
+            h = (h ^ prad) *% 0x100000001b3;
+            h = (h ^ @intFromBool(out.circle)) *% 0x100000001b3;
+            h = (h ^ pthr) *% 0x100000001b3;
+            h = (h ^ pcov) *% 0x100000001b3;
+            h = (h ^ prx) *% 0x100000001b3;
+            h = (h ^ pry) *% 0x100000001b3;
+            // The occluder's layer mask, so two walls that look identical but
+            // block different lights are not interchangeable.
+            h = (h ^ @as(u64, out.cull_mask)) *% 0x100000001b3;
+            h = (h ^ @intFromBool(out.coverage != null)) *% 0x100000001b3;
         }
-        const changed = h != self.occluder_hash;
+        // `hash_valid` rather than comparing against a sentinel: a real scene can
+        // hash to any value at all, including whatever a resize leaves behind, and
+        // "the mask has never been built" is a fact about the system rather than
+        // something to infer from a number.
+        const changed = !self.hash_valid or h != self.occluder_hash;
+        self.hash_valid = true;
         self.occluder_hash = h;
         // A resize always invalidates, because the grid the mask lives on
         // changed shape even if nothing in the world did.
@@ -1402,6 +1470,11 @@ pub const Lighting = struct {
         // neither of them -- see buildShadowMaps.
         self.dirty = true;
         self.mask_changed = false;
+        // The maps were swept against the previous mask. `buildShadowMaps` runs
+        // after this and reads this flag rather than `mask_changed`, which this
+        // line has just cleared — that ordering is the whole reason the flag
+        // exists, and the comment on it says so.
+        self.sweep_stale = true;
         self.stats.raster_ns = self.tick() - t0;
     }
 
@@ -1727,10 +1800,14 @@ pub const Lighting = struct {
             // field that is allowed to be stale for another 40 ms. Coupling them
             // meant a slow GI cadence silently made every shadow map rebuild
             // every frame, and a profile would have shown it as "shadows".
+            //
+            // `sweep_stale` and not `mask_changed`, because `rasterize` clears
+            // `mask_changed` before this runs — reading it here meant the sweep
+            // never heard about a mask change at all.
             const moved = distance(self.channel_pos[ch], self.channel_pos_prev[ch]);
             // `channel_built` is now per-owner rather than per-frame, so this is
             // false for a scene at rest and the sweep is genuinely skipped.
-            const stale = !self.channel_built[ch] or moved * moved >= 0.0001;
+            const stale = !self.channel_built[ch] or moved * moved >= 0.0001 or self.sweep_stale;
             if (!self.mask_changed and !stale) {
                 skips += 1;
                 continue;
@@ -1772,6 +1849,8 @@ pub const Lighting = struct {
         }
         self.stats.sweep_steps = steps;
         self.stats.sweep_skips = skips;
+        // Consumed: the four maps now describe the mask as it is.
+        self.sweep_stale = false;
         self.stats.sweep_ns = self.tick() - t0;
     }
 
@@ -1938,22 +2017,32 @@ pub const Lighting = struct {
     /// GI reads this as ambient occlusion where 4% is invisible — but the same
     /// field is also what decides whether a doorway is "open", and there an error
     /// is a light leaking through a wall.
-    pub fn updateSdf(self: *Lighting, now_ns: i128) void {
-        if (!self.cfg.giEnabled()) return;
+    /// Recomputes the distance field if the mask moved and the tier's cadence
+    /// allows it. Returns whether it actually rebuilt.
+    ///
+    /// The return value is the whole amortization contract for GI, and it used to
+    /// be missing: the driver called `Radiance.build` on every frame regardless,
+    /// while a comment two lines above it claimed the build only happened "when
+    /// the field moved". At 1080p that comment was worth 1.5 seconds a frame of
+    /// pure waste. A pyramid is a function of the distance field, so rebuilding
+    /// it on a frame where the field was not rebuilt is recomputing an unchanged
+    /// answer — the caller needs to be able to ask, and this is the answer.
+    pub fn updateSdf(self: *Lighting, now_ns: i128) bool {
+        if (!self.cfg.giEnabled()) return false;
         if (!self.dirty) {
             self.stats.sdf_skipped += 1;
-            return;
+            return false;
         }
         const interval = self.gi_interval_ns;
         if (interval > 0 and now_ns - self.last_sdf_ns < interval) {
             self.stats.sdf_skipped += 1;
-            return;
+            return false;
         }
 
         const t0 = self.tick();
         const w = self.alloc_w;
         const h = self.alloc_h;
-        if (w == 0 or h == 0) return;
+        if (w == 0 or h == 0) return false;
 
         edtMask2dInto(&self.edt, self.mask, self.sdf, w, h);
 
@@ -1961,6 +2050,7 @@ pub const Lighting = struct {
         self.dirty = false;
         self.stats.sdf_builds += 1;
         self.stats.sdf_ns = self.tick() - t0;
+        return true;
     }
 
     /// The GI term at a world point, 0..1: 1 in open space, falling toward 0 as
@@ -2441,6 +2531,10 @@ pub const Radiance = struct {
     /// Incremented on every rebuild; the tests assert on it rather than on a
     /// timing, which is how "the amortization works" is checked headlessly.
     builds: u32 = 0,
+    /// The budget this pyramid was prepared under, in probes per axis. Set by
+    /// `prepare` and read by `build` to decide how many cascades exist, so the
+    /// two can never disagree about the shape of the pyramid.
+    fine_side: u32 = max_fine_side,
 
     /// The finest cascade's spacing, in mask cells. Two means a probe every other
     /// texel, which is the finest a texture can go without aliasing the SDF it
@@ -2456,6 +2550,59 @@ pub const Radiance = struct {
     /// information a single per-cascade uniform already carries.
     pub const max_cascades: u32 = 4;
 
+    /// The finest cascade's probe grid never exceeds this many probes PER AXIS,
+    /// at any mask size.
+    ///
+    /// This is the whole reason M7's GI was 1.5 SECONDS per frame at 1080p and
+    /// nobody noticed until a demo actually built the pyramid: with
+    /// `base_scale = 2` fixed, the finest cascade was one probe per 2x2 texels,
+    /// so a 2048x2048 mask wanted 1,048,576 probes x 16 rays = 16.7 million
+    /// sphere traces — a cost that grew with the SCREEN, not with the scene. A
+    /// bigger window made the renderer slower, which is not a quality dial.
+    ///
+    /// Bounding the probe COUNT instead of the spacing is the fix that keeps the
+    /// meaning: GI is a large-scale enclosure term, so its detail is allowed to
+    /// coarsen with the view while its cost stays flat. The probe SPACING is then
+    /// derived from the mask size (`cellsFor`), which is exactly the trade a
+    /// radiance cascade exists to make — and the cost of a frame is now set by
+    /// the tier, which is what an editor's quality dropdown promises.
+    ///
+    /// 128 x 128 probes is 16,384 probes and 262,144 rays at cascade 0, and a
+    /// 4x4 reduction in work for the same scene rendered at a quarter of the
+    /// resolution — which is the point.
+    pub const max_fine_side: u32 = 128;
+
+    /// The probe spacing, in mask cells, for a mask `w` cells wide under a budget
+    /// of `fine_side` probes per axis.
+    ///
+    /// `base_scale` on a small mask, and the next power of two that keeps the
+    /// probe grid at or under the budget on a large one. Power of two so the
+    /// cascade pyramid stays aligned: every level doubles the spacing, which is
+    /// what lets a coarse level's probes sit exactly on a finer level's cell
+    /// centres instead of between them.
+    pub fn cellsFor(w: u32, fine_side: u32) u32 {
+        if (w == 0) return base_scale;
+        const budget = @max(fine_side, 1);
+        const want = (w + budget - 1) / budget;
+        var cells = base_scale;
+        while (cells < want and cells < (1 << 20)) cells *= 2;
+        return cells;
+    }
+
+    /// The finest cascade's probe budget, in probes per axis, for a quality tier.
+    ///
+    /// This is the dial `lighting.set_quality` turns. `.off` and `.low` have no
+    /// pyramid at all, so their entry is the floor and is never used — it is
+    /// there so the mapping is total and a caller cannot land on an undefined
+    /// number by switching tiers.
+    pub fn fineSideFor(tier: Quality) u32 {
+        return switch (tier) {
+            .off, .low => 32,
+            .medium => 128,
+            .high => 256,
+        };
+    }
+
     pub fn init(allocator: std.mem.Allocator) Radiance {
         return .{ .allocator = allocator };
     }
@@ -2466,14 +2613,16 @@ pub const Radiance = struct {
         self.* = undefined;
     }
 
-    /// How many cascades fit a mask of this size. Pure arithmetic on the mask
-    /// dimensions — no allocation, no state — so `prepare` and `build` agree on
-    /// the answer by construction instead of by two copies of the same loop.
-    pub fn levelsFor(w: u32, h: u32) u32 {
+    /// How many cascades fit a mask of this size under this tier's probe budget.
+    /// Pure arithmetic on the mask dimensions and the budget — no allocation, no
+    /// state — so `prepare` and `build` agree on the answer by construction
+    /// instead of by two copies of the same loop.
+    pub fn levelsFor(w: u32, h: u32, fine_side: u32) u32 {
         if (w == 0 or h == 0) return 0;
+        const base = cellsFor(w, fine_side);
         var levels: u32 = 0;
         while (levels < max_cascades) {
-            const cells = base_scale * (@as(u32, 1) << @intCast(levels));
+            const cells = base * (@as(u32, 1) << @intCast(levels));
             if (w / cells < 1 or h / cells < 1) break;
             levels += 1;
         }
@@ -2496,14 +2645,16 @@ pub const Radiance = struct {
     /// from the mask dimensions and nothing else, so preparing once per resize
     /// is what it takes for `build` to be allocation-free for the rest of the
     /// mask's life.
-    pub fn prepare(self: *Radiance, w: u32, h: u32) !void {
-        const levels = levelsFor(w, h);
+    pub fn prepare(self: *Radiance, w: u32, h: u32, fine_side: u32) !void {
+        const levels = levelsFor(w, h, fine_side);
         if (levels == 0) return;
+        self.fine_side = fine_side;
+        const base = cellsFor(w, fine_side);
 
         try self.cascades.ensureUnusedCapacity(self.allocator, levels);
         while (self.cascades.items.len < levels) {
             self.cascades.appendAssumeCapacity(.{
-                .scale = base_scale,
+                .scale = base,
                 .rays = base_rays,
                 .w = 0,
                 .h = 0,
@@ -2520,7 +2671,7 @@ pub const Radiance = struct {
 
         for (0..levels) |li| {
             const level: u32 = @intCast(li);
-            const cells = base_scale * (@as(u32, 1) << @intCast(level));
+            const cells = base * (@as(u32, 1) << @intCast(level));
             const cw = @max(w / cells, 1);
             const ch = @max(h / cells, 1);
             const c = &self.cascades.items[li];
@@ -2549,7 +2700,7 @@ pub const Radiance = struct {
     /// walks, not by the light count.
     pub fn build(self: *Radiance, mask: []const u8, sdf: []const u16, w: u32, h: u32, sky: [3]f32) !void {
         if (w == 0 or h == 0) return;
-        const levels = levelsFor(w, h);
+        const levels = levelsFor(w, h, self.fine_side);
         if (levels == 0) return;
         if (self.cascades.items.len != levels) return error.NotPrepared;
 
@@ -2987,6 +3138,16 @@ fn points(v: []const f32) [components.max_occluder_points * 2]f32 {
     return out;
 }
 
+/// A full-height wall from `x0` to `x1`. Named because the tests that need one
+/// all need the same thing, and four hand-written point arrays differ in their
+/// last coordinate often enough to be a bug waiting for someone to notice.
+fn wallPoly(x0: f32, y0: f32, x1: f32, y1: f32) components.OccluderPolygon {
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = points(&.{ x0, y0, x1, y0, x1, y1, x0, y1 });
+    return poly;
+}
+
 test "render light: a quality setting changes the work it allows" {
     try testing.expectEqual(@as(u8, 0), Quality.off.shadowLights());
     try testing.expectEqual(@as(u8, 4), Quality.high.shadowLights());
@@ -3169,7 +3330,7 @@ test "render light: GI reports an enclosed point as darker than an open one" {
     l.rasterize();
     l.dirty = true;
     l.gi_interval_ns = 0;
-    l.updateSdf(0);
+    _ = l.updateSdf(0);
 
     const near_wall = l.sampleGi(6, 32);
     const middle = l.sampleGi(40, 32);
@@ -3233,6 +3394,145 @@ test "render light: a static scene does not rebuild its shadow maps" {
     try testing.expectEqual(@as(u32, 1), l.stats.sweep_skips);
 }
 
+test "render light: an occluder that moves re-sweeps a light that did not" {
+    // The regression this guards is invisible from every count in the stats: the
+    // occluder is gathered, the mask is rasterized, the light holds its channel
+    // and reports 4 of 4 granted — and the shadow map is the one from before the
+    // wall moved, because `rasterize` clears `mask_changed` and `buildShadowMaps`
+    // ran after it and read the cleared flag. A stationary torch is the common
+    // case in a level, so this is the common case too.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    const wall = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(24, 0, 28, 64) },
+    });
+    const torch = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 8, .y = 32 } },
+        pointComp(.{ .cast_shadows = true }, 64),
+    });
+
+    // The runtime's order, exactly: gather, rasterize, sweep.
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    try testing.expect(l.stats.sweep_steps > 0);
+    const first_map = try testing.allocator.dupe(u8, l.shadow);
+
+    // Nothing moves: no work, which is the amortization the design is for.
+    l.collect(&world, l.rect);
+    l.buildShadowMaps();
+    try testing.expectEqual(@as(u64, 0), l.stats.sweep_steps);
+
+    // The WALL moves. The light does not.
+    world.get(wall, components.Transform).?.position.x += 24;
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+    try testing.expect(l.stats.sweep_steps > 0);
+
+    var differs = false;
+    for (first_map, l.shadow) |a, b| {
+        if (a != b) differs = true;
+    }
+    try testing.expect(differs);
+    // The torch never moved, so the only reason to re-sweep is the mask.
+    try testing.expectEqual(@as(u8, 8), world.get(torch, components.Transform).?.position.x);
+    testing.allocator.free(first_map);
+}
+
+test "render light: an occluder that changes SHAPE with position and extent fixed is noticed" {
+    // The hole the polygon's own points fill. The fingerprint mixed position,
+    // extent and radius — so an occluder swapped for a different shape at the
+    // same place with the same bounding box hashed identically, `rasterize`
+    // returned early, and the shadow stayed the old one. That is a prefab
+    // swapped on an actor, which is how a scene changes shape most often, and
+    // the symptom is a shadow that survives the edit that should have moved it.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    const block = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        // A full rectangle inside a 20x40 box, so the extent is identical to the
+        // one it is replaced with below.
+        components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(20, 10, 40, 50) },
+    });
+
+    l.collect(&world, l.rect);
+    l.rasterize();
+    const solid = l.stats.mask_fill;
+    try testing.expect(solid > 0);
+    const first_mask = try testing.allocator.dupe(u8, l.mask);
+
+    // The same box, half of it. Position unchanged, extent unchanged.
+    var half = components.OccluderPolygon{};
+    half.count = 4;
+    half.points = points(&.{ 20, 50, 40, 10, 40, 50, 20, 50 });
+    world.get(block, components.LightOccluder2D).?.polygon = half;
+
+    l.collect(&world, l.rect);
+    try testing.expect(l.mask_changed);
+    l.rasterize();
+
+    // The claim is that the MASK is the new shape, not that it is some specific
+    // fraction — a ratio would be a second thing to get wrong, and the pixels
+    // are the thing anybody can see.
+    var differs = false;
+    for (first_mask, l.mask) |a, b| {
+        if (a != b) differs = true;
+    }
+    try testing.expect(differs);
+    try testing.expect(l.stats.mask_fill != solid);
+    testing.allocator.free(first_mask);
+}
+
+test "render light: an even number of identical occluders still build their mask" {
+    // XOR is its own inverse, so a per-occluder `h ^= contribution` folds a pair
+    // of identical occluders to nothing. Forty identical walls hashed to exactly
+    // 0, which is also what a resize leaves in `occluder_hash`, so the mask was
+    // never built and every shadow in the scene was cast by an empty grid. The
+    // numbers all looked fine: 40 occluders, 4/4 channels granted.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = 0, .y = 0 } },
+            // Identical walls at identical positions: the exact shape the old
+            // hash cancelled.
+            components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(30, 0, 34, 64) },
+        });
+    }
+
+    l.collect(&world, l.rect);
+    try testing.expect(l.mask_changed);
+    l.rasterize();
+    try testing.expectEqual(@as(u32, 8), l.stats.occluders_rasterized);
+    try testing.expect(l.stats.mask_fill > 0);
+
+    // And a second identical frame is still a no-op, so the fix did not turn
+    // amortization off by making every fingerprint different.
+    l.collect(&world, l.rect);
+    try testing.expect(!l.mask_changed);
+}
+
 test "render light: the radiance pyramid is built coarse-to-fine and only once" {
     var r = Radiance.init(testing.allocator);
     defer r.deinit();
@@ -3251,7 +3551,7 @@ test "render light: the radiance pyramid is built coarse-to-fine and only once" 
     try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
 
     const sky = [3]f32{ 1, 1, 1 };
-    try r.prepare(64, 64);
+    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
     try r.build(l.mask, l.sdf, 64, 64, sky);
 
     try testing.expect(r.built >= 2);
@@ -3264,7 +3564,7 @@ test "render light: the radiance pyramid is built coarse-to-fine and only once" 
     // only if the caller decides not to; this build genuinely re-walks, which is
     // what the amortization test's `builds` counter is FOR: it is the caller's
     // decision, not this one's.
-    try r.prepare(64, 64);
+    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
     try r.build(l.mask, l.sdf, 64, 64, sky);
     try testing.expectEqual(@as(u32, 2), r.builds);
 }
@@ -3292,7 +3592,7 @@ test "render light: a corner is darker than the open sky, which is GI working" {
     l.rasterize();
     try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
 
-    try r.prepare(64, 64);
+    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
     try r.build(l.mask, l.sdf, 64, 64, .{ 1, 1, 1 });
 
     // The open middle of the screen sees the sky on every ray.
@@ -4244,7 +4544,7 @@ test "render light: the distance transform's scratch is reused, and is exact" {
     // Through the driver path, so what is being tested is the scratch the
     // `Lighting` actually holds and not a fresh one.
     l.dirty = true;
-    l.updateSdf(0);
+    _ = l.updateSdf(0);
 
     try testing.expectEqual(@as(u16, 0), l.sdf[0]);
     try testing.expectEqual(@as(u16, 1), l.sdf[8]);
@@ -4255,7 +4555,7 @@ test "render light: the distance transform's scratch is reused, and is exact" {
     // answers, which is what says the buffers are being fully rewritten.
     for (0..16 * 16) |i| l.mask[i] = if (i % 16 < 8) 255 else 0;
     l.dirty = true;
-    l.updateSdf(0);
+    _ = l.updateSdf(0);
     try testing.expectEqual(@as(u16, 8), l.sdf[15]);
 
     // And a resize grows the scratch rather than leaving it sized for the old

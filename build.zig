@@ -71,6 +71,80 @@ pub fn build(b: *std.Build) void {
 
     // An absolute -L as well as the library name: this version of Zig has no
     // per-library search path option, and `addLibraryPath` is module-wide.
+    // ── Platform module (M0: window + input) ──────────────────────────────────
+const platform_mod = b.createModule(.{
+    .root_source_file = b.path("src/engine/platform/platform.zig"),
+    .target = target,
+    .optimize = optimize,
+    .link_libc = true,
+});
+platform_mod.addImport("core", core_mod);
+
+    // ── M3 asset module (images; PCM lives in the audio bank) ────────────────
+    // Decoding is a native concern (stb_image), so this is its own module and
+    // its own include path. Declared before `render_mod` and `script_mod`
+    // because both reach the image type as a module, not as a file copy.
+    const assets_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/assets/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    assets_mod.addImport("core", core_mod);
+    assets_mod.addIncludePath(b.path("libs"));
+    // The one translation unit that compiles stb_image. See the file: Zig 0.16's
+    // translate-c cannot lower the whole header, so the implementation is C and
+    // the Zig side declares the two externs it uses.
+    assets_mod.addCSourceFile(.{
+        .file = b.path("src/engine/assets/stb_image_impl.c"),
+        .flags = &.{ "-I", "libs" },
+    });
+
+    // ── M8 audio module ─────────────────────────────────────────────────────
+    // The port (`audio.zig`), the pure maths (`mixer.zig`), voices, buses, the
+    // byte-budgeted bank, the SPSC command ring, the rate-limited event ring,
+    // and the two backends. Headless by construction: the null backend opens no
+    // device, so the whole mixing path is exercised in `zig build test` with no
+    // sound card.
+    const audio_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/audio/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    audio_mod.addImport("core", core_mod);
+    audio_mod.addIncludePath(b.path("libs"));
+    // The ONE translation unit that compiles miniaudio (the device and the
+    // decoder). Zig 0.16's translate-c cannot lower the header, so it is C, and
+    // `backend_miniaudio.zig` declares the small extern surface it exposes.
+    audio_mod.addCSourceFile(.{
+        .file = b.path("src/engine/audio/miniaudio_impl.c"),
+        .flags = &.{ "-I", "libs" },
+    });
+    // miniaudio's own link requirements on Linux: the device backends use
+    // dl/pthread (both in libc on any glibc this targets) and the resampler uses
+    // libm.
+    audio_mod.linkSystemLibrary("m", .{});
+
+    // ── Render module (M7) ─────────────────────────────────────────────────────
+    // A module rather than part of the engine boundary because `script` reaches
+    // the renderer too (camera view, render stats). Its root re-exports the
+    // batcher/atlas/2d/light/driver so the engine can re-export them by name
+    // without a relative import that would put a file in two modules.
+const render_mod = b.createModule(.{
+    .root_source_file = b.path("src/engine/render/render.zig"),
+    .target = target,
+    .optimize = optimize,
+    .link_libc = true,
+});
+render_mod.addImport("core", core_mod);
+render_mod.addImport("ecs", ecs_mod);
+render_mod.addImport("physics", physics_mod);
+render_mod.addImport("platform", platform_mod);
+// The atlas bridge borrows `assets.Image`, so the renderer sees the image type
+// as a module rather than a second copy of the file.
+render_mod.addImport("assets", assets_mod);
+
     // ── M3 scripting module (LuaJIT; depends on core + ecs, no Dawn) ─────────
     // Declared before the engine because the engine imports it by module name,
     // and both compile the same sources once. Headless by construction: the only
@@ -88,6 +162,13 @@ pub fn build(b: *std.Build) void {
     // runtime passes the `World` through — two instances of the same file would
     // produce two incompatible `physics.World` types.
     script_mod.addImport("physics", physics_mod);
+    script_mod.addImport("render", render_mod);
+    // M8: the `audio.*` bindings reach the audio system directly, exactly as the
+    // `physics.*` bindings reach the solver. `audio` imports neither `script`
+    // nor `ecs`, so there is no module-file conflict here.
+    script_mod.addImport("audio", audio_mod);
+    script_mod.addImport("assets", assets_mod);
+    script_mod.addImport("platform", platform_mod);
     // Feature flags reach the code through this, not through build-time source
     // rewriting: `zig build -Dsteering` has to be the ONLY way the feature
     // changes, so a stale build can never disagree with what was asked for.
@@ -166,6 +247,13 @@ pub fn build(b: *std.Build) void {
     // `engine.project`, so the import must resolve here — an engine that
     // cannot see the project module cannot honor its own root.zig.
     engine_mod.addImport("project", project_mod);
+    // M8/M7: the engine boundary re-exports `render` and `platform` as MODULES
+    // (see `src/engine/root.zig`), plus audio and the asset layer. A module
+    // import must resolve here for the boundary's own `@import` to work.
+    engine_mod.addImport("render", render_mod);
+    engine_mod.addImport("platform", platform_mod);
+    engine_mod.addImport("audio", audio_mod);
+    engine_mod.addImport("assets", assets_mod);
 
     // The render module declares extern Dawn procs, so anything that links the
     // engine whole (the runtime, the render tests) needs the libraries. They are
@@ -186,6 +274,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     runtime_mod.addImport("engine", engine_mod);
+    // `project_hook.zig` is a file of THIS module (main.zig imports it
+    // relatively), and it reaches `core`, `project` and `audio` by module name —
+    // so the runtime module must be able to resolve them.
+    runtime_mod.addImport("core", core_mod);
+    runtime_mod.addImport("project", project_mod);
+    runtime_mod.addImport("audio", audio_mod);
+    runtime_mod.addImport("assets", assets_mod);
+    runtime_mod.addImport("render", render_mod);
+    runtime_mod.addImport("platform", platform_mod);
 
     // Dawn (WebGPU C API): shared libs from the bootstrap build tree.
     // Linked directly and exposed via runpath so the binary finds them at
@@ -257,13 +354,31 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the M1 ECS benchmark suite");
     bench_step.dependOn(&bench_cmd.step);
 
+    // ── M8 audio benchmark: the M8 criteria, as numbers a test can fail ─────
+    // 64 simultaneous emitters, zero main-thread allocations while they play,
+    // latency ≤ 20 ms and xruns == 0 — all against the null backend, so it runs
+    // anywhere `zig build test` does.
+    const audio_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/audio.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    audio_bench_mod.addImport("core", core_mod);
+    audio_bench_mod.addImport("audio", audio_mod);
+    const audio_bench = b.addExecutable(.{ .name = "ember-bench-audio", .root_module = audio_bench_mod });
+    const audio_bench_cmd = b.addRunArtifact(audio_bench);
+    if (b.args) |args| audio_bench_cmd.addArgs(args);
+    const audio_bench_step = b.step("bench-audio", "M8: 64 emitters, zero-alloc frame path, latency <= 20 ms");
+    audio_bench_step.dependOn(&audio_bench_cmd.step);
+
     // ── M7 lighting benchmark: the CPU half, measured ───────────────────────
     // A separate artifact from `bench` on purpose: the M1 suite must keep
     // running while the renderer is mid-edit, and the lighting bench needs the
     // engine module. It links the same headless modules and nothing else — no
     // Dawn, no window — so it runs anywhere `zig build test` does.
     // Rooted at `bench_root.zig` and not at the engine boundary, for the same
-    // reason `render_test_root.zig` exists: the boundary re-exports modules that
+    // reason `render/test_root.zig` exists: the boundary re-exports modules that
     // are being edited, and a benchmark that cannot compile is a benchmark whose
     // last number is from whenever it last worked.
     //
@@ -278,6 +393,9 @@ pub fn build(b: *std.Build) void {
     });
     bench_engine_mod.addImport("core", core_mod);
     bench_engine_mod.addImport("ecs", ecs_mod);
+    bench_engine_mod.addImport("render", render_mod);
+    bench_engine_mod.addImport("platform", platform_mod);
+    bench_engine_mod.addImport("assets", assets_mod);
 
     const light_bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench/light.zig"),
@@ -484,6 +602,31 @@ pub fn build(b: *std.Build) void {
     const physics_tests = b.addTest(.{ .root_module = physics_mod });
     test_step.dependOn(&b.addRunArtifact(physics_tests).step);
 
+    // M8 audio: the port, the mixer maths, the rate-limited rings, the bus
+    // registry, the byte-budgeted bank and both backends. Headless — the null
+    // backend opens no device — so this runs on CI with no sound card.
+    const audio_tests = b.addTest(.{ .root_module = audio_mod });
+    test_step.dependOn(&b.addRunArtifact(audio_tests).step);
+
+    // M3/M9 assets: the image decoder and the LRU/budget contracts.
+    const assets_tests = b.addTest(.{ .root_module = assets_mod });
+    test_step.dependOn(&b.addRunArtifact(assets_tests).step);
+
+    // The project.config → engine glue (`project_hook.zig`): the section is
+    // validated before it is half-applied, and the mixer is rebuilt only when
+    // the audio section actually changed.
+    const hook_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/project_hook.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    hook_tests_mod.addImport("core", core_mod);
+    hook_tests_mod.addImport("project", project_mod);
+    hook_tests_mod.addImport("audio", audio_mod);
+    const hook_tests = b.addTest(.{ .root_module = hook_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(hook_tests).step);
+
     // M3 API acceptance: an EXECUTABLE, not a `zig test`. LuaJIT installs its
     // own signal/`longjmp` handling, which does not survive Zig's test runner
     // (the identical code segfaults inside `lua_pcall` under `zig test` and
@@ -499,6 +642,12 @@ pub fn build(b: *std.Build) void {
     api_acceptance_mod.addImport("ecs", ecs_mod);
     api_acceptance_mod.addImport("script", script_mod);
     api_acceptance_mod.addImport("physics", physics_mod);
+    // The acceptance runner drives the real audio system and the asset
+    // manager, so both modules must resolve here.
+    api_acceptance_mod.addImport("audio", audio_mod);
+    api_acceptance_mod.addImport("assets", assets_mod);
+    api_acceptance_mod.addImport("render", render_mod);
+    api_acceptance_mod.addImport("platform", platform_mod);
     api_acceptance_mod.addOptions("options", options);
     const api_acceptance_exe = b.addExecutable(.{ .name = "ember-api-test", .root_module = api_acceptance_mod });
     b.installArtifact(api_acceptance_exe);
@@ -565,24 +714,29 @@ pub fn build(b: *std.Build) void {
     // in milliseconds with no window and no GPU, so there is no excuse for
     // waiting on the rest of the suite to find out whether a light still works.
     //
-    // Rooted at `render/test_root.zig` rather than the engine boundary: that
-    // boundary re-exports the project config and the scripting layer, so a file
-    // being edited over there takes the renderer's tests down with it, and a
-    // suite that cannot run stops being run.
+    // Rooted at the engine boundary: that boundary re-exports the project config
+    // and the scripting layer, so a file being edited over there takes the
+    // renderer's tests down with it, and a suite that cannot run stops being
+    // run.
+    // The test root lives INSIDE `src/engine/render/` on purpose — see the long
+    // comment at the top of that file. Rooted outside the directory it could not
+    // see the renderer's tests at all: `render/` is its own module, and Zig
+    // collects tests from the root module's own files. This step therefore builds
+    // its own module rooted there, with `core`/`ecs` as module imports, which is
+    // why `render_mod` is NOT an input: within this compilation the files belong
+    // to the test module, and claiming them twice is the "file exists in two
+    // modules" error.
     const render_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/render_test_root.zig"),
+        .root_source_file = b.path("src/engine/render/test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     render_test_mod.addImport("core", core_mod);
     render_test_mod.addImport("ecs", ecs_mod);
-    render_test_mod.addImport("physics", physics_mod);
-    render_test_mod.addImport("script", script_mod);
 
     const render_only_tests = b.addTest(.{
         .root_module = render_test_mod,
-        .filters = &.{ "render", "light" },
     });
     const light_only_step = b.step("test-light", "Run only the render and lighting tests");
     light_only_step.dependOn(&b.addRunArtifact(render_only_tests).step);

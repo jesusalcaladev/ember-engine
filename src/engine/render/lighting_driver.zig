@@ -41,7 +41,22 @@ const render_mod = @import("render.zig");
 const two_d = @import("2d.zig");
 const Renderer2D = two_d.Renderer2D;
 const ecs = @import("ecs");
-const core_math = @import("core").math;
+const core = @import("core");
+const core_math = core.math;
+
+/// The clock the lighting system times itself against.
+///
+/// The system takes a plain function pointer rather than calling a clock it does
+/// not own, so a test can pass null and get zeros instead of paying for
+/// `clock_gettime` to measure nothing. The DRIVER is the thing that knows this is
+/// a real frame loop, so it installs the real clock here: without it
+/// `stats.collect_ns` and `stats.sweep_ns` are zero in the runtime and in every
+/// benchmark that goes through the driver, which is a measurement of nothing
+/// wearing a number. `Lighting` used directly (the unit tests, the raw
+/// `measure` benchmark) still overrides it themselves.
+fn driverNow() u64 {
+    return core.time.monotonicNs();
+}
 
 const Lighting = light_mod.Lighting;
 const Radiance = light_mod.Radiance;
@@ -88,9 +103,17 @@ pub const Driver = struct {
     shadow_angles: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, tier: light_mod.Quality) !Driver {
+        var l = try Lighting.init(allocator, tier);
+        errdefer l.deinit();
+        // The clock, installed here rather than left to every caller. Two owners
+        // existed before this line and both forgot: `Lighting.now` defaults to
+        // null, and a null clock makes every internal timer read 0. The system
+        // then reports "0 ns to collect, 0 ns to sweep" from inside a real frame
+        // loop, which is worse than not reporting the split at all.
+        l.now = driverNow;
         return .{
             .allocator = allocator,
-            .lighting = try Lighting.init(allocator, tier),
+            .lighting = l,
             .masks = light_mod.CoverageStore.init(allocator),
         };
     }
@@ -215,26 +238,32 @@ pub const Driver = struct {
         // something moves" into "shadows cost a grid fill every frame", and
         // `collect` already computed the answer.
         if (l.mask_changed) l.rasterize();
-        l.updateSdf(now_ns);
-
         l.buildShadowMaps();
 
-        // The pyramid is rebuilt only when the field it traces has changed, so
-        // `builds` — not the frame count — is what the GI upload keys off.
-        if (l.radiance) |r| {
-            // Only when the field moved. `builds` counts REBUILDS rather than
-            // frames, and that counter is what `bench-light` reports -- an
-            // amortization claim that is asserted instead of counted is a claim
-            // about the code, not about the runtime.
-            const before = r.builds;
-            // `NotPrepared` is counted, not swallowed: it means the pyramid was
-            // never sized for this mask, and silently skipping the bounce light
-            // would look exactly like GI that is simply too dark to notice.
-            r.build(l.mask, l.sdf, l.alloc_w, l.alloc_h, self.sky) catch |err| switch (err) {
-                error.NotPrepared => l.stats.gi_not_prepared += 1,
-                else => return,
-            };
-            if (r.builds != before) self.gi_dirty = true;
+        // The pyramid is a function of the distance field, so it is rebuilt on
+        // the frames the FIELD was rebuilt and on no others. `updateSdf` answers
+        // that question; before it returned the answer the driver called `build`
+        // unconditionally, which meant a resting scene rebuilt a 262,144-ray
+        // pyramid 60 times a second to arrive at the same numbers. The comment
+        // here used to say "only when the field moved" over code that moved
+        // every frame, which is the kind of claim that is worth more removed
+        // than kept.
+        const field_rebuilt = l.updateSdf(now_ns);
+        if (field_rebuilt) {
+            if (l.radiance) |r| {
+                const before = r.builds;
+                // `NotPrepared` is counted, not swallowed: it means the pyramid
+                // was never sized for this mask, and silently skipping the bounce
+                // light would look exactly like GI that is simply too dark to
+                // notice.
+                r.build(l.mask, l.sdf, l.alloc_w, l.alloc_h, self.sky) catch |err| switch (err) {
+                    error.NotPrepared => l.stats.gi_not_prepared += 1,
+                    else => return,
+                };
+                if (r.builds != before) self.gi_dirty = true;
+            }
+        } else {
+            l.stats.gi_skipped += 1;
         }
     }
 
