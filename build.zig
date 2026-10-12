@@ -136,6 +136,18 @@ pub fn build(b: *std.Build) void {
     });
     editor_mod.addImport("api_meta", api_meta_mod);
 
+    // M5: the editing session (Play/Stop, undo/redo, the node graph, the
+    // editing document). Headless like the editor core: no Lua, no window,
+    // just the state and the rules, so it tests in milliseconds.
+    const session_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/session/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    session_mod.addImport("core", core_mod);
+    session_mod.addImport("ecs", ecs_mod);
+
     // ── Engine module (public boundary: core + platform + render) ───────────
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine/root.zig"),
@@ -428,6 +440,9 @@ pub fn build(b: *std.Build) void {
     // it on every change.
     const editor_tests = b.addTest(.{ .root_module = editor_mod });
     test_step.dependOn(&b.addRunArtifact(editor_tests).step);
+
+    const session_tests = b.addTest(.{ .root_module = session_mod });
+    test_step.dependOn(&b.addRunArtifact(session_tests).step);
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
