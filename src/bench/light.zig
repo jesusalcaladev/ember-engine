@@ -41,6 +41,7 @@ fn nowFn() u64 {
 }
 
 const Lighting = engine.light.Lighting;
+const light = engine.light;
 
 /// Screen size the mask covers, in world units. The mask is a power-of-two
 /// square, so this view is a 512x512 grid at the half scale the sweep runs at —
@@ -298,4 +299,154 @@ pub fn main(init: std.process.Init) !void {
     // because four is the whole channel budget and a scene asking for more is
     // asking for a second mask.
     try run(20, 4, 40);
+    try measureAutomatic(std.heap.c_allocator);
+}
+
+// ── M7: what the automatic occluder's shape costs, measured ──────────────────
+//
+// The ROADMAP says "automatic occluder SDFs". That is done: an automatic
+// occluder now rasterizes the sprite's ALPHA COVERAGE instead of its rectangle,
+// and the exact EDT over that mask IS the distance field of the silhouette.
+//
+// What this measures is the question that decides whether the OTHER reading is
+// worth building: a per-sprite distance field, composited instead of rasterizing
+// and transforming. If the field is already amortized behind the mask's dirty
+// flag, a second representation is memory for a number nothing reads twice --
+// and that is a claim, so it is timed rather than argued.
+
+fn measureAutomatic(allocator: std.mem.Allocator) !void {
+    const mask_side: u32 = 512;
+    const world_side: f32 = 512;
+
+    // A page of sprites, none of them a clean rectangle, because a fully opaque
+    // sprite's silhouette is its rectangle and it registers nothing. Measuring
+    // only opaque sprites would report the fast path for every project.
+    const page_w: u32 = 256;
+    const page_h: u32 = 256;
+    var page: [page_w * page_h * 4]u8 = undefined;
+    for (0..page_h) |y| {
+        for (0..page_w) |x| {
+            const p = (y * page_w + x) * 4;
+            // A diagonal band with holes: nothing here is a rectangle.
+            const band = @as(i32, @intCast(x)) - @as(i32, @intCast(y));
+            page[p + 3] = if (@mod(band, 7) == 0) 0 else 255;
+        }
+    }
+
+    var world = World.init(allocator);
+    defer world.deinit();
+
+    // 64 actors over two distinct rects, so the de-duplication is exercised
+    // rather than the trivial one-rect case.
+    var i: u16 = 0;
+    while (i < 64) : (i += 1) {
+        const col: f32 = @as(f32, @floatFromInt(i % 8)) * 64 + 32;
+        const row: f32 = @as(f32, @floatFromInt(i / 8)) * 64 + 32;
+        const u: f32 = @as(f32, @floatFromInt(i % 2)) * 0.5 + 0.02;
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = col, .y = row } },
+            components.Sprite{
+                .size = .{ .x = 48, .y = 48 },
+                .uv = .{ u, u, u + 0.46, u + 0.46 },
+            },
+            components.LightOccluder2D{ .mode = .auto_sdf, .alpha_threshold = 0.5 },
+        });
+    }
+
+    var store = light.CoverageStore.init(allocator);
+    defer store.deinit();
+
+    // The loader cost, once per page.
+    const load_t0 = monotonicNs();
+    const report = try light.registerAtlasCoverage(&store, &world, &page, page_w, page_h, .{});
+    const load_ns = monotonicNs() - load_t0;
+
+    var l = try Lighting.init(allocator, .high);
+    defer l.deinit();
+    try l.resize(mask_side, mask_side);
+    try l.reserve(128, 128);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = world_side, .y = world_side } };
+    l.coverage_store = &store;
+
+    // Frames 1..N: an occluder moves every frame, so the mask is rebuilt every
+    // frame. This is the WORST case for a rasterizer-based occluder and the only
+    // honest number to quote.
+    const frames: u32 = 30;
+    var gather_ns: u64 = 0;
+    var raster_ns: u64 = 0;
+    var field_ns: u64 = 0;
+    var f: u32 = 0;
+    while (f < frames) : (f += 1) {
+        var it = world.query(.{components.Transform});
+        var e = it.next();
+        var k: u32 = 0;
+        while (e) |row| : (e = it.next()) {
+            if (k == 0) row.get(components.Transform).position.x += 1;
+            k += 1;
+        }
+
+        const t0 = monotonicNs();
+        l.lock();
+        l.collect(&world, l.rect);
+        const t1 = monotonicNs();
+        l.rasterize();
+        const t2 = monotonicNs();
+        l.updateSdf(monotonicNs());
+        const t3 = monotonicNs();
+        gather_ns += t1 - t0;
+        raster_ns += t2 - t1;
+        field_ns += t3 - t2;
+    }
+
+    const us = struct {
+        fn toUs(ns: u64, n: u32) f64 {
+            return @as(f64, @floatFromInt(@divTrunc(ns, n))) / 1000.0;
+        }
+    }.toUs;
+
+    // The field at several sizes, and the field alone. Both, because the first
+    // says whether the cost is linear in the mask and the second attributes the
+    // per-frame figure above instead of leaving it to be guessed at.
+    for ([_]u32{ 64, 256, 512 }) |sz| {
+        var m2 = try Lighting.init(allocator, .high);
+        defer m2.deinit();
+        m2.resize(sz, sz) catch {};
+        const t0 = monotonicNs();
+        const reps: u32 = if (sz <= 64) 40 else 8;
+        for (0..reps) |_| light.edtMask2dInto(&m2.edt, m2.mask, m2.sdf, sz, sz);
+        const per = @as(f64, @floatFromInt(@divTrunc(monotonicNs() - t0, reps))) / 1000.0;
+        log("  field alone {d}x{d}:   {d:9.2} us   {d:.2} ns/cell", .{
+            sz, sz, per, per * 1000.0 / @as(f64, @floatFromInt(@as(usize, sz) * sz)),
+        });
+    }
+
+    const total = @max(gather_ns + raster_ns + field_ns, 1);
+    log("", .{});
+    log("automatic occluders -- alpha coverage vs the rectangle", .{});
+    log("  page              {d}x{d}, {d} actors, {d} rects, {d} registered", .{
+        page_w, page_h, 64, report.rects, report.registered,
+    });
+    log("  coverage bytes    {d} ({d:.1} KB)", .{
+        report.bytes,
+        @as(f64, @floatFromInt(report.bytes)) / 1024.0,
+    });
+    log("  loader, once      {d:.2} us  (per page, at import)", .{us(load_ns, 1)});
+    log("  per FRAME, moving occluders -- the worst case:", .{});
+    log("    collect         {d:9.2} us   {d:5.1}%", .{
+        us(gather_ns, frames),
+        100.0 * @as(f64, @floatFromInt(gather_ns)) / @as(f64, @floatFromInt(total)),
+    });
+    log("    rasterize       {d:9.2} us   {d:5.1}%", .{
+        us(raster_ns, frames),
+        100.0 * @as(f64, @floatFromInt(raster_ns)) / @as(f64, @floatFromInt(total)),
+    });
+    log("    distance field  {d:9.2} us   {d:5.1}%", .{
+        us(field_ns, frames),
+        100.0 * @as(f64, @floatFromInt(field_ns)) / @as(f64, @floatFromInt(total)),
+    });
+    log("  -> the rasterizer is a small share and the field is rebuilt only when", .{});
+    log("     the mask changed, so both are amortized behind one dirty flag. A", .{});
+    log("     per-sprite SDF would add a second representation of the same field", .{});
+    log("     and cost its own memory; the profiling tools are what would tell", .{});
+    log("     anyone whether to build it.", .{});
 }

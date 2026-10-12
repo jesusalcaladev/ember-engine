@@ -162,6 +162,10 @@ pub fn build(b: *std.Build) void {
     // M3: the LuaJIT scripting layer. It links LuaJIT but NOT Dawn, so the
     // scripting tests and the M3 bench run headless like the ECS ones do.
     engine_mod.addImport("script", script_mod);
+    // M-project: `project.config`. The engine boundary re-exports it as
+    // `engine.project`, so the import must resolve here — an engine that
+    // cannot see the project module cannot honor its own root.zig.
+    engine_mod.addImport("project", project_mod);
 
     // The render module declares extern Dawn procs, so anything that links the
     // engine whole (the runtime, the render tests) needs the libraries. They are
@@ -258,6 +262,23 @@ pub fn build(b: *std.Build) void {
     // running while the renderer is mid-edit, and the lighting bench needs the
     // engine module. It links the same headless modules and nothing else — no
     // Dawn, no window — so it runs anywhere `zig build test` does.
+    // Rooted at `bench_root.zig` and not at the engine boundary, for the same
+    // reason `render_test_root.zig` exists: the boundary re-exports modules that
+    // are being edited, and a benchmark that cannot compile is a benchmark whose
+    // last number is from whenever it last worked.
+    //
+    // ReleaseSafe, matching the bench module that consumes it. Inheriting the
+    // build's `optimize` here means a default Debug build measures Debug code,
+    // which is a timing of the compiler's safety checks rather than of the engine.
+    const bench_engine_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/bench_root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    bench_engine_mod.addImport("core", core_mod);
+    bench_engine_mod.addImport("ecs", ecs_mod);
+
     const light_bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench/light.zig"),
         .target = target,
@@ -266,7 +287,7 @@ pub fn build(b: *std.Build) void {
     });
     light_bench_mod.addImport("core", core_mod);
     light_bench_mod.addImport("ecs", ecs_mod);
-    light_bench_mod.addImport("engine", engine_mod);
+    light_bench_mod.addImport("engine", bench_engine_mod);
     // The engine module declares the Dawn externs, so anything linking it needs
     // the libraries — declared once on `engine_mod`, which this shares.
     light_bench_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn"));
@@ -449,6 +470,15 @@ pub fn build(b: *std.Build) void {
 
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
+
+    // M-project: `project.config`. Pure Zig (core only), milliseconds, no
+    // window — so it gets its OWN step as well as a seat in `test`: the
+    // parser/schema loop is where most of the editing happens, and waiting on
+    // Dawn's shaders to learn that a field name broke is a bad trade.
+    const project_tests = b.addTest(.{ .root_module = project_mod });
+    test_step.dependOn(&b.addRunArtifact(project_tests).step);
+    const project_step = b.step("test-project", "Run the project.config suite (parse, validate, round-trip)");
+    project_step.dependOn(&b.addRunArtifact(project_tests).step);
 
 
     const physics_tests = b.addTest(.{ .root_module = physics_mod });

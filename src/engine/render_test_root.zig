@@ -26,7 +26,10 @@ pub const atlas = @import("render/atlas.zig");
 pub const two_d = @import("render/2d.zig");
 pub const light = @import("render/light.zig");
 pub const backend_null = @import("render/backend_null.zig");
-pub const backend_dawn = @import("render/backend_dawn.zig");
+// `backend_dawn` is deliberately NOT here. It imports the platform layer, which
+// is a per-platform file (inotify, GLFW, X11) that is being edited -- and a
+// subsystem's tests should not stop running because an unrelated file does not
+// compile. The Dawn path is exercised by `zig build` and the acceptance runner.
 pub const lighting_driver = @import("render/lighting_driver.zig");
 
 test {

@@ -72,6 +72,16 @@ pub const Driver = struct {
     /// accurate answer.
     gi_dirty: bool = false,
 
+    /// The sprite coverage the automatic occluders rasterize from.
+    ///
+    /// OWNED by the driver and not borrowed, for the same reason the engine owns
+    /// its other long-lived subsystems: a loader that registers a mask and then
+    /// goes away must not take the pointer with it.
+    ///
+    /// Named `masks` and not `coverage` because a struct cannot have a field and
+    /// a method of the same name -- the accessor below is `coverage()`.
+    masks: light_mod.CoverageStore = undefined,
+
     /// The shadow map's angle count as the BACKEND last sized it. Kept here so a
     /// quality change can tell `submitLights` to re-create rather than relying on
     /// the backend's cache to notice on its own.
@@ -81,10 +91,17 @@ pub const Driver = struct {
         return .{
             .allocator = allocator,
             .lighting = try Lighting.init(allocator, tier),
+            .masks = light_mod.CoverageStore.init(allocator),
         };
     }
 
     pub fn deinit(self: *Driver) void {
+        // The store first: `lighting` holds a pointer into it, and freeing the
+        // owner first leaves a dangling pointer in a struct that is about to be
+        // overwritten anyway -- harmless today and a use-after-free the day
+        // someone reads it in a debugger.
+        self.masks.deinit();
+        self.lighting.coverage_store = null;
         self.lighting.deinit();
         self.* = undefined;
     }
@@ -101,6 +118,40 @@ pub const Driver = struct {
         if (changed) try self.lighting.resize(w, h);
         self.lighting.rect = view;
         self.needs_resize = changed;
+    }
+
+    /// Registers coverage for every non-opaque sprite rect in an atlas page, and
+    /// writes the resulting index into every actor using one.
+    ///
+    /// ## Call this once per atlas page, after upload
+    ///
+    /// This is the loader's whole job for M7's automatic occluders. Before it, an
+    /// automatic `LightOccluder2D` cast its sprite's rectangle; after it, the
+    /// same scene casts the sprite's silhouette, and nothing in the scene file
+    /// changed. That is what "zero dev action" means here.
+    ///
+    /// The store is owned by the driver, so an owner outliving a reload cannot
+    /// dangle. A caller with its own store can set `lighting.coverage_store`
+    /// directly instead.
+    ///
+    /// Not frame work -- it allocates and walks every sprite. A loader call.
+    pub fn registerAtlasCoverage(
+        self: *Driver,
+        world: *ecs.World,
+        pixels: []const u8,
+        page_w: u32,
+        page_h: u32,
+    ) !light_mod.CoverageReport {
+        self.lighting.coverage_store = &self.masks;
+        return light_mod.registerAtlasCoverage(&self.masks, world, pixels, page_w, page_h, .{});
+    }
+
+    /// The coverage store this driver owns. Public so a tool can inspect what a
+    /// page registered, and so an editor can tell an author why a sprite's shadow
+    /// is a rectangle: it registered nothing, because the sprite is opaque and for
+    /// an opaque sprite a rectangle IS the silhouette.
+    pub fn coverage(self: *const Driver) *const light_mod.CoverageStore {
+        return &self.masks;
     }
 
     /// Changes the quality tier. Delegates, and reports whether it took.
@@ -558,4 +609,118 @@ test "render light driver: a quality change invalidates every shadow channel" {
     try testing.expect(d.setQuality(.low));
     // And now none of them are.
     for (d.lighting.channel_built) |b| try testing.expect(!b);
+}
+
+test "render light driver: the driver's own store makes an occluder's silhouette, end to end" {
+    // The whole ROADMAP promise in one test: a page goes in, a sprite with a hole
+    // comes out occluding by its silhouette, and the author's scene file is never
+    // touched. Everything else in the lighting system is downstream of this.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    try d.lighting.resize(32, 32);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    const w: u32 = 32;
+    var page: [w * w * 4]u8 = undefined;
+    for (0..w) |y| {
+        for (0..w) |x| {
+            page[(y * w + x) * 4 + 3] = if (x >= 12 and x < 20 and y >= 12 and y < 20) 0 else 255;
+        }
+    }
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        // uv naming a sub-rect rather than the whole page: the whole page is the
+        // "no texture" default and registers nothing.
+        components.Sprite{
+            .size = .{ .x = 32, .y = 32 },
+            .uv = .{ 0.0625, 0.0625, 0.9375, 0.9375 },
+        },
+        components.LightOccluder2D{ .mode = .auto_sdf, .alpha_threshold = 0.5 },
+    });
+
+    const report = try d.registerAtlasCoverage(&world, &page, w, w);
+    try testing.expectEqual(@as(u32, 1), report.rects);
+    try testing.expectEqual(@as(u32, 1), report.registered);
+    try testing.expectEqual(@as(u32, 0), report.fully_opaque);
+    try testing.expectEqual(@as(usize, 1), d.coverage().count());
+
+    d.update(&world, 0);
+
+    // The hole. With the rectangle fallback this cell would be 255, and the shadow
+    // would be a solid block over a gap the viewer can see through.
+    try testing.expectEqual(@as(u8, 0), d.lighting.mask[16 * 32 + 16]);
+    // And the sprite's corners, which are solid.
+    try testing.expectEqual(@as(u8, 255), d.lighting.mask[1 * 32 + 1]);
+    try testing.expectEqual(@as(u8, 255), d.lighting.mask[30 * 32 + 30]);
+
+    // The field was rebuilt once, from the corrected mask. That is the SDF the
+    // ROADMAP asks for, and it needed no new representation: the exact EDT over a
+    // correct mask IS the distance field of the silhouette, and it is already
+    // amortized behind the mask's own dirty flag. `dirty` is false here, not
+    // true: `update` rasterizes and then immediately transforms.
+    try testing.expectEqual(@as(u32, 1), d.lighting.stats.sdf_builds);
+    try testing.expect(!d.lighting.dirty);
+}
+
+test "render light driver: a whole-page sprite is the no-atlas default and registers nothing" {
+    // `uv = (0,0,1,1)` is what a sprite with no atlas texture carries. Making a
+    // coverage mask of the ENTIRE page would give every untextured sprite the
+    // page's contents -- so it is declined, and the rectangle fallback is right.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+
+    var blank: [16 * 16 * 4]u8 = undefined;
+    @memset(&blank, 0);
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{},
+        components.Sprite{ .size = .{ .x = 16, .y = 16 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+
+    const report = try d.registerAtlasCoverage(&world, &blank, 16, 16);
+    try testing.expectEqual(@as(u32, 0), report.rects);
+    try testing.expectEqual(@as(u32, 0), report.registered);
+    try testing.expectEqual(@as(usize, 0), d.coverage().count());
+}
+
+test "render light driver: the store outlives a reload, because the driver owns it" {
+    // A loader that registers a mask and then goes away must not take the pointer
+    // with it. The driver owns it, so this is an assertion about ownership rather
+    // than about arithmetic.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    try d.lighting.resize(16, 16);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
+
+    var page: [16 * 16 * 4]u8 = undefined;
+    for (0..16) |y| {
+        for (0..16) |x| {
+            page[(y * 16 + x) * 4 + 3] = if (x < 8 and y < 8) 0 else 255;
+        }
+    }
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 8, .y = 8 } },
+        components.Sprite{ .size = .{ .x = 16, .y = 16 }, .uv = .{ 0, 0, 0.5, 0.5 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+
+    {
+        // A nested scope standing in for a loader that comes and goes.
+        _ = try d.registerAtlasCoverage(&world, &page, 16, 16);
+    }
+    // Still registered, and the lookup still resolves through `collect`.
+    try testing.expectEqual(@as(usize, 1), d.coverage().count());
+    d.update(&world, 0);
+    try testing.expectEqual(@as(u32, 1), d.lighting.stats.coverage_used);
+    try testing.expect(d.lighting.coverage_store != null);
 }

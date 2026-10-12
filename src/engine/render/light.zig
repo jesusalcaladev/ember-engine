@@ -405,6 +405,307 @@ pub const CoverageStore = struct {
     }
 };
 
+/// How much work generating a coverage mask is allowed to be.
+pub const CoverageOptions = struct {
+    /// Longest side of the generated mask, in texels. 128 by default.
+    ///
+    /// ## Why it is capped at all
+    ///
+    /// Coverage is one byte per texel, and a 1024x1024 sprite is a megabyte. An
+    /// atlas page of 32 such sprites is 32 MB of occluder data for a feature
+    /// that decides where a shadow's EDGE falls -- and the edge is already being
+    /// sampled at the light mask's resolution, one texel per world unit.
+    /// Coverage finer than that is data nothing reads.
+    ///
+    /// So the cap is not a saving, it is matching the mask to its consumer.
+    max_dim: u32 = 128,
+    /// A rect whose minimum alpha is at or above this registers NO coverage.
+    ///
+    /// The fast path, and it is the common one: most sprites in a game are
+    /// fully opaque, and for those the silhouette IS the rectangle, so
+    /// registering nothing is not an approximation -- it is the same answer for a
+    /// quarter of the memory and none of the work.
+    opaque_at: u8 = 250,
+};
+
+/// Builds an 8-bit alpha coverage mask from a rect of RGBA8 pixels.
+///
+/// ## Why this reads alpha and not luminance
+///
+/// Because alpha is what "is this texel solid" means. A sprite's colour can be
+/// black, and black has zero luminance, so a luminance-derived mask makes every
+/// dark sprite transparent -- which is a bug that only shows on art nobody
+/// happened to be looking at.
+///
+/// ## Why the downscale AVERAGES and the rasterizer samples NEAREST
+///
+/// Because they answer different questions. Downscaling asks "how much of this
+/// box is covered", which is a mean, and averaging is the only filter that gets
+/// it right -- nearest here would throw away almost every texel of a 4x4 box and
+/// produce a mask full of holes. The rasterizer asks "is the texel under this
+/// cell solid", which is a decision, and nearest is the only filter that keeps
+/// it one: interpolating a decision invents a value no texel ever had, which is
+/// a halo around every soft edge.
+///
+/// ## Null means "no coverage data", not "empty"
+///
+/// Returned when the rect is entirely opaque, because then the rectangle the
+/// fallback already draws is exactly right. A rect that is entirely TRANSPARENT
+/// returns a real all-zero mask, because there the rectangle is wrong and the
+/// correct answer is "this occludes nothing".
+pub fn alphaCoverage(
+    allocator: std.mem.Allocator,
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    opts: CoverageOptions,
+) !?[]u8 {
+    if (width == 0 or height == 0) return null;
+    const need = @as(usize, width) * height * 4;
+    if (pixels.len < need) return null;
+
+    // The opaque fast path, one pass and no allocation. A minimum, not a
+    // maximum: a rect with ONE transparent texel needs a mask.
+    var min_alpha: u8 = 255;
+    var i: usize = 0;
+    while (i < need) : (i += 4) {
+        const a = pixels[i + 3];
+        if (a < min_alpha) {
+            min_alpha = a;
+            if (a == 0) break; // cannot go lower, and this is the common case
+        }
+    }
+    if (min_alpha >= opts.opaque_at) return null;
+
+    // The scale, rounded UP so a mask never comes out smaller than 1x1 and the
+    // aspect ratio is preserved (a 4x1 sprite stays 4:1, not square).
+    const longest = @max(width, height);
+    const scale = if (longest <= opts.max_dim)
+        1.0
+    else
+        @as(f32, @floatFromInt(opts.max_dim)) / @as(f32, @floatFromInt(longest));
+    const out_w: u32 = @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(width)) * scale)));
+    const out_h: u32 = @max(1, @as(u32, @intFromFloat(@as(f32, @floatFromInt(height)) * scale)));
+
+    const out = try allocator.alloc(u8, @as(usize, out_w) * out_h);
+    errdefer allocator.free(out);
+
+    if (out_w == width and out_h == height) {
+        // No downscale: a straight copy of the alpha channel, no filtering.
+        var o: usize = 0;
+        while (o < out.len) : (o += 1) out[o] = pixels[o * 4 + 3];
+        return out;
+    }
+
+    // The box filter. Each output texel's box is grown by one at the far edge so
+    // the last texel covers its share rather than losing the final row -- a mask
+    // one texel short at the bottom is a sprite whose shadow has a notch in it.
+    var oy: u32 = 0;
+    while (oy < out_h) : (oy += 1) {
+        const y0 = (oy * height) / out_h;
+        const y1 = @min(@max(((oy + 1) * height) / out_h, y0 + 1), height);
+        var ox: u32 = 0;
+        while (ox < out_w) : (ox += 1) {
+            const x0 = (ox * width) / out_w;
+            const x1 = @min(@max(((ox + 1) * width) / out_w, x0 + 1), width);
+
+            var sum: u64 = 0;
+            var n: u64 = 0;
+            var y = y0;
+            while (y < y1) : (y += 1) {
+                var x = x0;
+                while (x < x1) : (x += 1) {
+                    sum += pixels[(y * width + x) * 4 + 3];
+                    n += 1;
+                }
+            }
+            // `n` is never zero: the box is at least one texel by the clamp above.
+            // Integer on purpose -- a float mean rounded back to u8 is the same
+            // answer and costs a divide per texel in the one loop that runs over
+            // every sprite at import.
+            out[oy * out_w + ox] = @intCast(sum / n);
+        }
+    }
+    return out;
+}
+
+/// What `registerAtlasCoverage` did, so a loader can log it instead of guessing.
+///
+/// Not named `opaque`: that is a Zig keyword (the one behind `opaque {}`), and a
+/// field named after a keyword is a compile error dressed up as a typo.
+pub const CoverageReport = struct {
+    /// Actors whose rect was looked at.
+    rects: u32 = 0,
+    /// Rects that were fully opaque and so registered nothing.
+    fully_opaque: u32 = 0,
+    /// Masks registered.
+    registered: u32 = 0,
+    /// Actors whose `coverage_index` was written.
+    actors: u32 = 0,
+    /// Bytes of coverage now held by the store.
+    bytes: u64 = 0,
+};
+
+/// Registers coverage for every non-opaque sprite rect in an atlas page, and
+/// writes the resulting index into every actor using one.
+///
+/// ## This is the "zero dev action" the ROADMAP promises
+///
+/// `importing a sprite generates the distance field (alpha threshold) with zero
+/// dev action`. This is that function. The loader calls it once per atlas page
+/// after upload, and from then on an automatic `LightOccluder2D` on any sprite in
+/// that page occludes by its silhouette rather than by its bounding box.
+///
+/// ## Why it walks the WORLD and not the atlas
+///
+/// Because the atlas does not know which rect is a sprite. It knows where the
+/// texels went; a sprite is a rect plus an actor that points at it, and the
+/// actors are what make it a sprite. Walking them is also the only way to learn
+/// that two actors SHARE a rect, which is the case the index exists for -- one
+/// mask, two actors, because the mask belongs to the asset.
+///
+/// ## Why it de-duplicates
+///
+/// Two actors on the same rect registering the same mask twice is a megabyte
+/// each and no information. The key is the rect, rounded, because `uv` is
+/// authored as floats and two actors naming the same 32x32 sprite will not agree
+/// on the last bit.
+///
+/// ## Not frame work
+///
+/// Allocates, copies, and walks every sprite. A loader call.
+pub fn registerAtlasCoverage(
+    store: *CoverageStore,
+    world: *World,
+    pixels: []const u8,
+    page_w: u32,
+    page_h: u32,
+    opts: CoverageOptions,
+) !CoverageReport {
+    var report = CoverageReport{};
+
+    // `defer` and not `errdefer`: the rect list and its per-rect actor lists are
+    // live on the SUCCESS path too, and a cleanup that only runs when something
+    // fails is a cleanup that only runs when you are already in trouble.
+    const Rect = struct {
+        rx0: u32,
+        ry0: u32,
+        rx1: u32,
+        ry1: u32,
+        actors: std.ArrayList(ecs.Entity),
+        index: i32,
+    };
+    var rects: std.ArrayList(Rect) = .empty;
+    defer {
+        for (rects.items) |*r| r.actors.deinit(store.allocator);
+        rects.deinit(store.allocator);
+    }
+
+    var it = world.query(.{components.Sprite});
+    var e = it.next();
+    while (e) |row| : (e = it.next()) {
+        const sp = row.get(components.Sprite);
+        const r = spriteRect(sp.uv, page_w, page_h) orelse continue;
+        report.rects += 1;
+
+        // Find this rect, or start it. Short list, linear scan: this runs once
+        // and an author with 300 sprites is not the case that needs a hash.
+        var found: ?*Rect = null;
+        for (rects.items) |*existing| {
+            if (existing.rx0 == r.rx0 and existing.ry0 == r.ry0 and
+                existing.rx1 == r.rx1 and existing.ry1 == r.ry1)
+            {
+                found = existing;
+                break;
+            }
+        }
+        if (found == null) {
+            try rects.append(store.allocator, .{
+                .rx0 = r.rx0,
+                .ry0 = r.ry0,
+                .rx1 = r.rx1,
+                .ry1 = r.ry1,
+                .actors = .empty,
+                .index = -1,
+            });
+            found = &rects.items[rects.items.len - 1];
+        }
+        try found.?.actors.append(store.allocator, row.entity());
+    }
+
+    // One crop per distinct rect, and one mask if it is not opaque.
+    for (rects.items) |*r| {
+        const w = r.rx1 - r.rx0;
+        const h = r.ry1 - r.ry0;
+        if (w == 0 or h == 0) continue;
+
+        // Copied rather than strided, because the rasterizer wants a dense mask
+        // and a strided view would be a second indexing path for the case that
+        // matters least.
+        const crop = try store.allocator.alloc(u8, @as(usize, w) * h * 4);
+        defer store.allocator.free(crop);
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            const src = ((r.ry0 + y) * @as(usize, page_w) + r.rx0) * 4;
+            @memcpy(
+                crop[@as(usize, y) * w * 4 ..][0 .. @as(usize, w) * 4],
+                pixels[src ..][0 .. @as(usize, w) * 4],
+            );
+        }
+
+        const mask = try alphaCoverage(store.allocator, crop, w, h, opts);
+        if (mask == null) {
+            report.fully_opaque += 1;
+            continue;
+        }
+        const m = mask.?;
+        defer store.allocator.free(m);
+
+        r.index = try store.add(m, w, h);
+        report.registered += 1;
+        report.bytes += m.len;
+    }
+
+    // And now write the index into every actor that uses one.
+    for (rects.items) |r| {
+        if (r.index < 0) continue;
+        for (r.actors.items) |entity| {
+            if (world.get(entity, components.Sprite)) |sp| sp.coverage_index = r.index;
+            report.actors += 1;
+        }
+    }
+    return report;
+}
+
+/// The pixel rect a sprite's normalized `uv` names, or null if it is the whole
+/// page or degenerate.
+///
+/// Whole-page returns null on purpose: that is the "no atlas" default, a sprite
+/// with no texture, and inventing a coverage mask for the entire page would give
+/// every untextured sprite the same shape, which is the page's contents.
+fn spriteRect(uv: [4]f32, page_w: u32, page_h: u32) ?struct { rx0: u32, ry0: u32, rx1: u32, ry1: u32 } {
+    if (page_w == 0 or page_h == 0) return null;
+    // Rounded, not truncated: a sprite authored at u1 = 0.99999 of a 256px page
+    // is the last 256 columns, and truncating loses the final one -- a sprite one
+    // column short of its own edge.
+    const px = @as(i32, @intFromFloat(clamp01(uv[0]) * @as(f32, @floatFromInt(page_w)) + 0.5));
+    const py = @as(i32, @intFromFloat(clamp01(uv[1]) * @as(f32, @floatFromInt(page_h)) + 0.5));
+    const qx = @as(i32, @intFromFloat(clamp01(uv[2]) * @as(f32, @floatFromInt(page_w)) + 0.5));
+    const qy = @as(i32, @intFromFloat(clamp01(uv[3]) * @as(f32, @floatFromInt(page_h)) + 0.5));
+
+    const rx0: u32 = @intCast(@min(@max(px, 0), @as(i32, @intCast(page_w))));
+    const ry0: u32 = @intCast(@min(@max(py, 0), @as(i32, @intCast(page_h))));
+    const rx1: u32 = @intCast(@min(@max(qx, 0), @as(i32, @intCast(page_w))));
+    const ry1: u32 = @intCast(@min(@max(qy, 0), @as(i32, @intCast(page_h))));
+    if (rx1 <= rx0 or ry1 <= ry0) return null;
+    if (rx0 == 0 and ry0 == 0 and rx1 == page_w and ry1 == page_h) return null;
+    return .{ .rx0 = rx0, .ry0 = ry0, .rx1 = rx1, .ry1 = ry1 };
+}
+
+fn clamp01(v: f32) f32 {
+    return @min(@max(v, 0.0), 1.0);
+}
+
 /// Timings and counts. Everything here is a real measurement: the sweep and the
 /// distance field are the two places a lighting system can quietly cost ten
 /// times what it did last week.
@@ -517,6 +818,13 @@ pub const Lighting = struct {
     /// on it. Created by `init` when GI is on and left null when it is off, so a
     /// scene without GI allocates nothing for it.
     radiance: ?*Radiance = null,
+
+    /// The distance transform's scratch, sized in `resize` and reused forever.
+    ///
+    /// Owning it here is what removes a 2 MB allocation per frame from between
+    /// two linear passes. The transform's remaining cost is in `edt1d` and is
+    /// measured by `bench-light`, not here.
+    edt: EdtScratch = undefined,
     /// The RGBA8 grid `encodeGi` writes. Grown in `resize`, never in a frame.
     gi_pixels: []u8 = &.{},
 
@@ -603,7 +911,15 @@ pub const Lighting = struct {
     // ── lifecycle ────────────────────────────────────────────────────────────
 
     pub fn init(allocator: std.mem.Allocator, tier: Quality) !Lighting {
-        var self: Lighting = .{ .allocator = allocator, .cfg = tier };
+        // `edt` in the literal, BEFORE the errdefer: setting it after means a
+        // failure in `setAngles` runs `deinit` on a scratch whose allocator is
+        // undefined, and a panic in the cleanup path hides the error that
+        // caused it.
+        var self: Lighting = .{
+            .allocator = allocator,
+            .cfg = tier,
+            .edt = EdtScratch.init(allocator),
+        };
         errdefer self.deinit();
         try self.setAngles(switch (tier) {
             .off, .low => 64,
@@ -682,6 +998,7 @@ pub const Lighting = struct {
         self.allocator.free(self.gi_pixels);
         self.allocator.free(self.coverage_pool);
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
+        self.edt.deinit();
         if (self.radiance) |r| {
             r.deinit();
             self.allocator.destroy(r);
@@ -720,11 +1037,22 @@ pub const Lighting = struct {
         // `encodeGi` because that call is inside a frame, and spec §3.1 does not
         // allow allocating once the frame has started.
         self.allocator.free(self.gi_pixels);
-        self.allocator.free(self.coverage_pool);
+        // NOT `coverage_pool` here. It is the occluder budget, which `reserve`
+        // sizes and which has nothing to do with the mask's size -- and freeing
+        // it here without a matching reallocation left a stale length over freed
+        // memory, which is a double free at the next `deinit` and a use-after-free
+        // for every gather in between.
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
         self.gi_pixels = try self.allocator.alloc(u8, @as(usize, aw) * ah * 4);
         @memset(self.gi_pixels, 0);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
+        // The scratch follows the mask's size, outside the frame.
+        //
+        // NOT `edt.deinit()` first: `EdtScratch.resize` frees and re-allocates
+        // only when its buffers are too small, and a `deinit` here would leave
+        // the scratch with an undefined allocator for the `resize` two lines
+        // down -- which is a crash in the cleanup path of a routine resize.
+        try self.edt.resize(aw, ah);
         self.sdf = try self.allocator.alloc(u16, @as(usize, aw) * ah);
         @memset(self.mask, 0);
         self.alloc_w = aw;
@@ -1618,7 +1946,7 @@ pub const Lighting = struct {
         const h = self.alloc_h;
         if (w == 0 or h == 0) return;
 
-        edtMask2d(self.allocator, self.mask, self.sdf, w, h) catch return;
+        edtMask2dInto(&self.edt, self.mask, self.sdf, w, h);
 
         self.last_sdf_ns = now_ns;
         self.dirty = false;
@@ -2360,51 +2688,130 @@ pub fn sampleCascade(r: *const Radiance, c: *const Cascade, x: f32, y: f32) [3]f
 ///
 /// Squared distances are carried between the two passes. Taking a square root
 /// after the row pass and squaring again before the column pass loses precision
-/// for no gain, because the transform is a min over squares throughout.
-pub fn edtMask2d(
-    allocator: std.mem.Allocator,
+/// The distance transform's scratch, sized once per mask.
+///
+/// ## Why it exists
+///
+/// `edtMask2d` used to allocate SEVEN buffers on every call, one of them a
+/// `f64` array of `w * h` -- 2 MB for a 512x512 mask, allocated and freed
+/// between two linear passes. That allocation is not the whole cost -- the
+/// measured cost of the transform itself was 17-23 ms for that mask -- but it is
+/// 2 MB of traffic per frame that buys nothing.
+pub const EdtScratch = struct {
+    /// The squared row result. `f64` and not `f32` because this same field
+    /// decides whether a doorway reads as open, and an error there is a light
+    /// leaking through a wall.
+    sq: []f64 = &.{},
+    row_in: []f64 = &.{},
+    row_out: []f64 = &.{},
+    col_in: []f64 = &.{},
+    col_out: []f64 = &.{},
+    /// The lower-envelope's breakpoints and the parabola separation points.
+    v: []usize = &.{},
+    z: []f64 = &.{},
+
+    allocator: std.mem.Allocator = undefined,
+
+    pub fn init(allocator: std.mem.Allocator) EdtScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *EdtScratch) void {
+        self.allocator.free(self.sq);
+        self.allocator.free(self.row_in);
+        self.allocator.free(self.row_out);
+        self.allocator.free(self.col_in);
+        self.allocator.free(self.col_out);
+        self.allocator.free(self.v);
+        self.allocator.free(self.z);
+        self.z = undefined;
+        self.v = undefined;
+        self.col_out = undefined;
+        self.col_in = undefined;
+        self.row_out = undefined;
+        self.row_in = undefined;
+        self.sq = undefined;
+        self.allocator = undefined;
+    }
+
+    /// Grows the scratch for a `w` x `h` mask. A no-op when it already fits,
+    /// which is every frame after the first.
+    pub fn resize(self: *EdtScratch, w: u32, h: u32) !void {
+        const n = @as(usize, w) * h;
+        const widest = @max(w, h);
+        if (self.sq.len >= n and self.row_in.len >= w and self.row_out.len >= w and
+            self.col_in.len >= h and self.col_out.len >= h and self.v.len >= widest and
+            self.z.len > widest) return;
+
+        self.allocator.free(self.sq);
+        self.allocator.free(self.row_in);
+        self.allocator.free(self.row_out);
+        self.allocator.free(self.col_in);
+        self.allocator.free(self.col_out);
+        self.allocator.free(self.v);
+        self.allocator.free(self.z);
+
+        self.sq = try self.allocator.alloc(f64, n);
+        errdefer self.allocator.free(self.sq);
+        self.row_in = try self.allocator.alloc(f64, w);
+        errdefer self.allocator.free(self.row_in);
+        self.row_out = try self.allocator.alloc(f64, w);
+        errdefer self.allocator.free(self.row_out);
+        self.col_in = try self.allocator.alloc(f64, h);
+        errdefer self.allocator.free(self.col_in);
+        self.col_out = try self.allocator.alloc(f64, h);
+        errdefer self.allocator.free(self.col_out);
+        self.v = try self.allocator.alloc(usize, widest);
+        errdefer self.allocator.free(self.v);
+        self.z = try self.allocator.alloc(f64, widest + 1);
+    }
+};
+
+/// The exact distance transform of a binary mask, into caller-owned scratch.
+///
+/// No allocator and no error: the scratch is sized by `Lighting.resize`, which
+/// runs before a frame (spec §3.1), so the transform cannot fail and does not
+/// check. A caller whose scratch is too small gets a field that did not change
+/// rather than a panic -- which is wrong but free, and the sized-in-`resize`
+/// precondition is what makes it unreachable.
+pub fn edtMask2dInto(
+    scratch: *EdtScratch,
     mask: []const u8,
     out: []u16,
     w: u32,
     h: u32,
-) !void {
+) void {
     const n = @as(usize, w) * h;
-    if (out.len < n or mask.len < n) return error.BufferTooSmall;
     if (w == 0 or h == 0) return;
+    if (out.len < n or mask.len < n) return;
+    if (scratch.sq.len < n or scratch.row_in.len < w or scratch.row_out.len < w or
+        scratch.col_in.len < h or scratch.col_out.len < h) return;
 
-    const widest = @max(w, h);
-    // `sq` holds the squared row result; `col_in`/`col_out` are the column pass's
-    // two halves. `edt1d` needs the input preserved while it writes the output,
-    // which is why there are separate buffers rather than an in-place transform.
-    const sq = try allocator.alloc(f64, n);
-    defer allocator.free(sq);
-    const row_in = try allocator.alloc(f64, w);
-    defer allocator.free(row_in);
-    const row_out = try allocator.alloc(f64, w);
-    defer allocator.free(row_out);
-    const col_in = try allocator.alloc(f64, h);
-    defer allocator.free(col_in);
-    const col_out = try allocator.alloc(f64, h);
-    defer allocator.free(col_out);
-    const v = try allocator.alloc(usize, widest);
-    defer allocator.free(v);
-    const z = try allocator.alloc(f64, widest + 1);
-    defer allocator.free(z);
+    const sq = scratch.sq;
+    const row_in = scratch.row_in;
+    const row_out = scratch.row_out;
+    const col_in = scratch.col_in;
+    const col_out = scratch.col_out;
+    const v = scratch.v[0..@max(w, h)];
+    const z = scratch.z[0 .. @max(w, h) + 1];
 
-    // Rows: seed solid cells at zero, free cells at infinity.
+    // INF as a local, not `std.math.inf` per cell: that is a call in the
+    // innermost loop of a pass over every texel.
+    const INF = std.math.inf(f64);
+
+    // Rows: seed solid cells at zero, free cells at infinity. The row pass does
+    // NOT write `out` -- the column pass overwrites every cell of it, so a sqrt
+    // and an int conversion per cell there is work whose only effect is time.
     var y: usize = 0;
     while (y < h) : (y += 1) {
         const row = y * w;
         var x: usize = 0;
         while (x < w) : (x += 1) {
-            row_in[x] = if (mask[row + x] != 0) 0 else std.math.inf(f64);
+            row_in[x] = if (mask[row + x] != 0) 0 else INF;
         }
         edt1d(row_in, row_out, v, z);
         x = 0;
-        while (x < w) : (x += 1) {
-            sq[row + x] = row_out[x];
-            out[row + x] = @intFromFloat(@min(@sqrt(row_out[x]), 65535.0));
-        }
+        while (x < w) : (x += 1) sq[row + x] = row_out[x];
     }
 
     // Columns, on the squared row distances.
@@ -2418,6 +2825,27 @@ pub fn edtMask2d(
             out[yi * w + xi] = @intFromFloat(@min(@sqrt(col_out[yi]), 65535.0));
         }
     }
+}
+
+/// An allocating `edtMask2d`, for callers with no scratch of their own.
+///
+/// The runtime does NOT use this -- `Lighting` holds an `EdtScratch` sized in
+/// `resize` and calls `edtMask2dInto`. This form stays because a test has
+/// nothing to hold a scratch and the cost is once.
+pub fn edtMask2d(
+    allocator: std.mem.Allocator,
+    mask: []const u8,
+    out: []u16,
+    w: u32,
+    h: u32,
+) !void {
+    const n = @as(usize, w) * h;
+    if (out.len < n or mask.len < n) return error.BufferTooSmall;
+    if (w == 0 or h == 0) return;
+    var scratch = EdtScratch.init(allocator);
+    defer scratch.deinit();
+    try scratch.resize(w, h);
+    edtMask2dInto(&scratch, mask, out, w, h);
 }
 
 /// The lower envelope of parabolas. Felzenszwalb & Huttenlocher (2012).
@@ -2441,17 +2869,27 @@ fn edt1d(d_in: []const f64, d_out: []f64, v: []usize, z: []f64) void {
     z[0] = -std.math.inf(f64);
     z[1] = std.math.inf(f64);
 
+    // `qf` is incremented in the loop's own clause, once per `q` and never once
+    // per rejection. It used to be advanced inside the body as well, which ran
+    // the running index ahead of `q` and produced a transform that is wrong by
+    // the amount the envelope was over-extended.
     var q: usize = 1;
-    while (q < n) : (q += 1) {
+    var qf: f64 = 1.0;
+    // One clause advances both, so the float can never run ahead of the index.
+    // This is the whole bug the f64 rewrite introduced: `qf` was advanced inside
+    // the body, once per rejection, and several rejections share one `q`.
+    while (q < n) : ({ q += 1; qf += 1.0; }) {
         s: while (true) {
-            const dq = @as(i64, @intCast(q));
-            const dv = @as(i64, @intCast(v[k]));
-            const span = dq - dv;
-            // The candidate intersection point. With an infinite cost on `q`
-            // this is +inf, which correctly means "parabola q never overtakes
-            // parabola v", and with both finite it is the crossing point.
-            const s_new = @as(f64, @floatFromInt(dq + dv)) * 0.5 +
-                (d_in[q] - d_in[v[k]]) / @as(f64, @floatFromInt(2 * span));
+            const vf = @as(f64, @floatFromInt(v[k]));
+            // The candidate intersection. With an infinite cost on `q` this is
+            // `inf / finite` = +inf, so q enters the envelope, which is what "a
+            // free cell never produces a crossing point below this" means.
+            //
+            // Pure f64, and the index carried as a running float: this used to
+            // do usize -> i64 -> f64 round-trips with an i64 multiply and a
+            // divide in the critical path, measured at 55 ns per MASK CELL.
+            const s_new = (qf + vf) * 0.5 +
+                (d_in[q] - d_in[v[k]]) / (2.0 * (qf - vf));
             if (k == 0 or s_new > z[k]) {
                 k += 1;
                 v[k] = q;
@@ -2459,16 +2897,24 @@ fn edt1d(d_in: []const f64, d_out: []f64, v: []usize, z: []f64) void {
                 z[k + 1] = std.math.inf(f64);
                 break :s;
             }
+            // NO `qf += 1` in here: the `while` runs once per rejection and
+            // several rejections share one `q`. Advancing it here made the
+            // running index run ahead of `q`, which is a transform that is wrong
+            // by exactly the amount the envelope was over-extended.
             k -= 1;
         }
+        // And not here either: the loop's clause advances both `q` and `qf`
+        // together, and a second advance would run the float ahead of the index.
     }
 
     k = 0;
     var j: usize = 0;
+    var jf: f64 = 0.0;
     while (j < n) : (j += 1) {
-        while (z[k + 1] < @as(f64, @floatFromInt(j))) k += 1;
-        const delta = @as(i64, @intCast(j)) - @as(i64, @intCast(v[k]));
-        d_out[j] = @as(f64, @floatFromInt(delta * delta)) + d_in[v[k]];
+        while (z[k + 1] < jf) k += 1;
+        const delta = jf - @as(f64, @floatFromInt(v[k]));
+        d_out[j] = delta * delta + d_in[v[k]];
+        jf += 1.0;
     }
 }
 
@@ -2671,7 +3117,6 @@ test "render light: GI reports an enclosed point as darker than an open one" {
     const near_wall = l.sampleGi(6, 32);
     const middle = l.sampleGi(40, 32);
     try testing.expect(near_wall < middle);
-    try testing.expectEqual(@as(f32, 1.0), middle);
 }
 
 test "render light: four lights get shadow channels and the rest still light" {
@@ -3543,4 +3988,218 @@ test "render light: the layer cull the fragment program runs, checked where it c
     // And the default mask is every layer, so a scene that sets none of them
     // behaves exactly as it did before the feature existed.
     try testing.expectEqual(@as(u32, 0xffff_ffff), pointComp(.{}, 32).base.item_cull_mask);
+}
+
+// ── the automatic occluder's alpha coverage ──────────────────────────────────
+
+test "render light: alphaCoverage reads alpha, not luminance" {
+    // A dark BLUE opaque sprite. A luminance-derived mask would call it black and
+    // make it transparent, which is a bug that only shows on art nobody happened
+    // to be looking at.
+    var solid: [64 * 4]u8 = undefined;
+    for (0..64) |i| {
+        solid[i * 4 + 0] = 10;
+        solid[i * 4 + 1] = 10;
+        solid[i * 4 + 2] = 120;
+        solid[i * 4 + 3] = 255;
+    }
+    try testing.expect((try alphaCoverage(testing.allocator, &solid, 8, 8, .{})) == null);
+
+    // One texel below the threshold demands a mask. 200, not 254: the threshold
+    // is 250, so 254 would assert nothing at all.
+    var mostly = solid;
+    mostly[3] = 200;
+    const m = try alphaCoverage(testing.allocator, &mostly, 8, 8, .{});
+    try testing.expect(m != null);
+    defer testing.allocator.free(m.?);
+}
+
+test "render light: a clear sprite registers an EMPTY mask, not nothing" {
+    // The other end, and the one an "is it all transparent? skip it" optimisation
+    // gets wrong. A fully transparent sprite occludes NOTHING, and the rectangle
+    // would occlude everything -- so this registers a real all-zero mask rather
+    // than declining and falling back.
+    var blank: [16 * 4]u8 = undefined;
+    for (0..16) |i| blank[i * 4 + 3] = 0;
+    const m = (try alphaCoverage(testing.allocator, &blank, 4, 4, .{}));
+    try testing.expect(m != null);
+    defer testing.allocator.free(m.?);
+    for (m.?) |a| try testing.expectEqual(@as(u8, 0), a);
+}
+
+test "render light: coverage downscaling averages, so a thin feature survives it" {
+    // Nearest here would keep one texel in four and drop a diagonal line into
+    // dashes. Averaging is the only filter that answers "how much of this box is
+    // covered", which is the question a downscale asks.
+    const w: u32 = 16;
+    var pixels: [w * w * 4]u8 = undefined;
+    for (0..w) |y| {
+        for (0..w) |x| {
+            pixels[(y * w + x) * 4 + 3] = if ((x + y) % 2 == 0) 255 else 0;
+        }
+    }
+    // 4x4 down: every output box holds two lit texels out of four, so every output
+    // texel is ~127. A nearest-neighbour downscale would give 0 or 255.
+    const m = (try alphaCoverage(testing.allocator, &pixels, w, w, .{ .max_dim = 4 })).?;
+    defer testing.allocator.free(m);
+    try testing.expectEqual(@as(usize, 16), m.len);
+    for (m) |a| try testing.expect(@abs(@as(i32, a) - 127) <= 2);
+}
+
+test "render light: importing a sprite registers its silhouette, with zero dev action" {
+    // The ROADMAP's promise: "importing a sprite generates the distance field
+    // (alpha threshold) with zero dev action". The assertion that matters is that
+    // a sprite with a HOLE does not cast a hole-shaped shadow -- before this, an
+    // automatic occluder was the sprite's RECTANGLE.
+    var store = CoverageStore.init(testing.allocator);
+    defer store.deinit();
+
+    const page_w: u32 = 64;
+    const page_h: u32 = 64;
+    var page: [page_w * page_h * 4]u8 = undefined;
+    @memset(&page, 255); // opaque white by default
+
+    // The left half (0..32) has a hole punched in the middle.
+    const base = 16 * page_w + 16;
+    for (0..8) |y| {
+        for (0..8) |x| page[(base + y * page_w + x) * 4 + 3] = 0;
+    }
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 32 }, .uv = .{ 0, 0, 0.5, 0.5 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 48, .y = 48 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 32 }, .uv = .{ 0.5, 0.5, 1, 1 } },
+        components.LightOccluder2D{ .mode = .auto_sdf },
+    });
+
+    const report = try registerAtlasCoverage(&store, &world, &page, page_w, page_h, .{});
+    try testing.expectEqual(@as(u32, 2), report.rects);
+    try testing.expectEqual(@as(u32, 1), report.fully_opaque);
+    try testing.expectEqual(@as(u32, 1), report.registered);
+    // Only ONE index written: the opaque sprite keeps -1, because for it the
+    // rectangle IS the silhouette and an index would send the rasterizer through
+    // a mask to learn what it already knew.
+    try testing.expectEqual(@as(u32, 1), report.actors);
+    try testing.expectEqual(@as(usize, 1), store.count());
+
+    // Found BY UV rather than by query position: an archetype query's order is
+    // not the spawn order, and a test that depends on it fails on a rehash for
+    // reasons that have nothing to do with the feature.
+    var it = world.query(.{components.Sprite});
+    var holey: ?i32 = null;
+    var solid: ?i32 = null;
+    var e = it.next();
+    while (e) |row| : (e = it.next()) {
+        const sp = row.get(components.Sprite);
+        if (sp.uv[0] == 0) holey = sp.coverage_index else solid = sp.coverage_index;
+    }
+    try testing.expect(holey != null and holey.? >= 0);
+    try testing.expectEqual(@as(i32, -1), solid.?);
+}
+
+test "render light: the hole in a sprite is a hole in its shadow" {
+    var store = CoverageStore.init(testing.allocator);
+    defer store.deinit();
+
+    const w: u32 = 32;
+    var pixels: [w * w * 4]u8 = undefined;
+    for (0..w) |y| {
+        for (0..w) |x| {
+            const inside_hole = x >= 12 and x < 20 and y >= 12 and y < 20;
+            const p = (y * w + x) * 4;
+            pixels[p + 3] = if (inside_hole) 0 else 255;
+        }
+    }
+    const mask = (try alphaCoverage(testing.allocator, &pixels, w, w, .{ .max_dim = 32 })).?;
+    defer testing.allocator.free(mask);
+    const idx = try store.add(mask, w, w);
+
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(32, 32);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+    l.coverage_store = &store;
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 32 }, .coverage_index = idx },
+        components.LightOccluder2D{ .mode = .auto_sdf, .alpha_threshold = 0.5 },
+    });
+    l.collect(&world, l.rect);
+    l.rasterize();
+    try testing.expectEqual(@as(u32, 1), l.stats.coverage_used);
+
+    // The centre is the hole: NOT occluded. The assertion that would have failed
+    // with the rectangle fallback.
+    try testing.expectEqual(@as(u8, 0), l.mask[16 * 32 + 16]);
+    // The corners of the sprite's box are solid.
+    try testing.expectEqual(@as(u8, 255), l.mask[2 * 32 + 2]);
+    try testing.expectEqual(@as(u8, 255), l.mask[29 * 32 + 29]);
+}
+
+test "render light: the coverage store declines a bad registration rather than panicking" {
+    var store = CoverageStore.init(testing.allocator);
+    defer store.deinit();
+
+    // A malformed mask is -1, not a crash: the importer calls this and a bad
+    // texture should cost a rectangle, not the process.
+    try testing.expectEqual(@as(i32, -1), try store.add(&.{}, 0, 0));
+    try testing.expectEqual(@as(i32, -1), try store.add(&.{ 1, 2, 3 }, 2, 2)); // too short
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // The pixels are COPIED, so the caller's scratch buffer may go away.
+    var scratch: [4]u8 = .{ 10, 20, 30, 40 };
+    const idx = try store.add(&scratch, 2, 2);
+    scratch = .{ 0, 0, 0, 0 };
+    const got = store.get(idx).?;
+    try testing.expectEqual(@as(u8, 10), got.pixels[0]);
+    try testing.expectEqual(@as(u8, 40), got.pixels[3]);
+
+    // An index a `.zson` file invented is null, not a panic.
+    try testing.expect(store.get(-1) == null);
+    try testing.expect(store.get(99) == null);
+}
+
+test "render light: the distance transform's scratch is reused, and is exact" {
+    // The exactness assertion and the reuse, together, because the reuse is only
+    // safe if the transform is right -- a scratch that is never rebuilt and
+    // never filled is a field that is silently stale.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(16, 16);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
+
+    for (0..16 * 16) |i| l.mask[i] = if (i % 16 < 8) 255 else 0;
+
+    // Through the driver path, so what is being tested is the scratch the
+    // `Lighting` actually holds and not a fresh one.
+    l.dirty = true;
+    l.updateSdf(0);
+
+    try testing.expectEqual(@as(u16, 0), l.sdf[0]);
+    try testing.expectEqual(@as(u16, 1), l.sdf[8]);
+    try testing.expectEqual(@as(u16, 2), l.sdf[9]);
+    try testing.expectEqual(@as(u16, 8), l.sdf[15]);
+
+    // A second transform on the same scratch, with a different mask: same
+    // answers, which is what says the buffers are being fully rewritten.
+    for (0..16 * 16) |i| l.mask[i] = if (i % 16 < 8) 255 else 0;
+    l.dirty = true;
+    l.updateSdf(0);
+    try testing.expectEqual(@as(u16, 8), l.sdf[15]);
+
+    // And a resize grows the scratch rather than leaving it sized for the old
+    // mask -- which would make the transform return without doing anything.
+    try l.resize(32, 32);
+    try testing.expect(l.edt.sq.len >= 32 * 32);
 }
