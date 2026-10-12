@@ -1058,6 +1058,159 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "light.kind_of",
+        .module = "light",
+        .signature = "light.kind_of(self) -> string|nil",
+        .summary = "Which light component this actor carries: point, spot, directional, ambient or legacy. nil when it carries none.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .any, .doc = "the kind's name as a string, or nil for no light" },
+        },
+        .example =
+        \\\if light.kind_of(actor) == "spot" then panel = spot_panel end
+        ,
+    },
+    .{
+        .name = "light.describe",
+        .module = "light",
+        .signature = "light.describe(self) -> table",
+        .summary = "Every readable field of whichever light component is present, as one flat string-keyed table. An empty table when there is no light.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "field name to value" },
+        },
+        .example =
+        \\\for field, value in pairs(light.describe(actor)) do panel:add(field, value) end
+        ,
+    },
+    .{
+        .name = "lighting.quality",
+        .module = "lighting",
+        .signature = "lighting.quality() -> number",
+        .summary = "The lighting quality tier: 0 off, 1 low, 2 medium, 3 high. -1 when no lighting system is wired.",
+        .params = &.{
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "the tier, or -1" },
+        },
+        .example =
+        \\\if lighting.quality() < 2 then show("performance mode") end
+        ,
+    },
+    .{
+        .name = "lighting.set_quality",
+        .module = "lighting",
+        .signature = "lighting.set_quality(tier) -> bool",
+        .summary = "Changes the lighting quality tier. False when it could not be taken, which is one case: a GI-on tier on a driver created with GI off declines, because the pyramid is a startup budget decision.",
+        .params = &.{
+            .{ .name = "tier", .kind = .number, .doc = "0 off, 1 low, 2 medium, 3 high" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "whether the tier was taken" },
+        },
+        .example =
+        \\\if not lighting.set_quality(2) then print("no GI budget") end
+        ,
+    },
+    .{
+        .name = "lighting.stats",
+        .module = "lighting",
+        .signature = "lighting.stats() -> table",
+        .summary = "What the lighting system cost this frame: light counts, shadow channels, sweep steps, occluder counts and the per-pass timings in nanoseconds. Empty when no system is wired.",
+        .params = &.{
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "stat name to value" },
+        },
+        .example =
+        \\local s = lighting.stats() print(s.lights, s.sweep_ns)
+        ,
+    },
+    .{
+        .name = "environment.new",
+        .module = "environment",
+        .signature = "environment.new(self)",
+        .summary = "Adds an Environment to this actor. Without it the other environment.* functions are unreachable in a scene that has no actor carrying one.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\environment.new(actor)
+        ,
+    },
+    .{
+        .name = "environment.set_bloom",
+        .module = "environment",
+        .signature = "environment.set_bloom(intensity, threshold)",
+        .summary = "How much bloom is added, and the luminance above which a pixel contributes to it. Zero intensity skips the four-pass chain entirely rather than running it with a zero multiplier.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "intensity", .kind = .number, .doc = "0..1; 0 disables the chain" },
+            .{ .name = "threshold", .kind = .number, .doc = "0..1 luminance" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\environment.set_bloom(actor, 0.4, 0.85)
+        ,
+    },
+    .{
+        .name = "environment.set_sky",
+        .module = "environment",
+        .signature = "environment.set_sky(self, r, g, b)",
+        .summary = "The radiance a ray that escapes the occluder mask carries. This is the base case of every GI merge, so it decides whether light bouncing around a corner is warm at sunset or white at noon.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "r", .kind = .number, .doc = "red" },
+            .{ .name = "g", .kind = .number, .doc = "green" },
+            .{ .name = "b", .kind = .number, .doc = "blue" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\environment.set_sky(actor, 0.4, 0.45, 0.6)
+        ,
+    },
+    .{
+        .name = "environment.set_gi",
+        .module = "environment",
+        .signature = "environment.set_gi(self, enabled, albedo)",
+        .summary = "Whether to build the radiance cascades, and how much an occluder reflects back. Off by default: it is the most expensive thing in the lighting system, and a scene that gets GI without asking has corners darker than its author drew.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "build the cascades" },
+            .{ .name = "albedo", .kind = .number, .doc = "0..1 bounce; 0.85 is a mid-grey wall" },
+        },
+        .returns = &.{
+        },
+        .example =
+        \\\environment.set_gi(actor, true, 0.8)
+        ,
+    },
+    .{
+        .name = "environment.get_sky",
+        .module = "environment",
+        .signature = "environment.get_sky(self) -> r, g, b",
+        .summary = "The sky's radiance as three numbers.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "red" },
+            .{ .kind = .number, .doc = "green" },
+            .{ .kind = .number, .doc = "blue" },
+        },
+        .example =
+        \\\local r, g, b = environment.get_sky(actor)
+        ,
+    },
+    .{
         .name = "material.new",
         .module = "material",
         .signature = "material.new(self, shader)",

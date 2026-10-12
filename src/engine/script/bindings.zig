@@ -1635,6 +1635,9 @@ const TTable: c_int = 5;
 // than a copy-pasted block that a fix to the shadow filter would miss.
 
 const PointLight = components.PointLight2D;
+/// The legacy single-component light. Kept distinct here because `kind_of` has
+/// to report it: an actor carrying both it and a `PointLight2D` lights twice.
+const LegacyLight = components.Light2D;
 const SpotLight = components.SpotLight2D;
 const DirLight = components.DirectionalLight2D;
 const AmbientLight = components.AmbientLight2D;
@@ -1978,8 +1981,20 @@ fn lua_light_get_shadow(L: ?*lua_State) callconv(.c) c_int {
     return 3;
 }
 
+/// The M7 lighting system's own module: the quality tier and the per-frame
+/// stats. Separate from `light` because `light.*` acts ON AN ACTOR and these
+/// act on the process-wide system that draws them.
+const lighting_regs = [_]luaL_Reg{
+    .{ .name = "quality", .func = lua_lighting_quality },
+    .{ .name = "set_quality", .func = lua_lighting_set_quality },
+    .{ .name = "stats", .func = lua_lighting_stats },
+    .{ .name = null, .func = null },
+};
+
 const light_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_light_new },
+    .{ .name = "kind_of", .func = lua_light_kind_of },
+    .{ .name = "describe", .func = lua_light_describe },
     .{ .name = "set_color", .func = lua_light_set_color },
     .{ .name = "set_energy", .func = lua_light_set_energy },
     .{ .name = "set_blend", .func = lua_light_set_blend },
@@ -2173,13 +2188,273 @@ fn lua_environment_set_clear(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `environment.set_bloom(threshold)` — 0 disables it.
+/// `environment.set_bloom(intensity, threshold)` — how much bloom is added, and
+/// the luminance above which a pixel contributes to it.
+///
+/// TWO arguments, and the previous one-argument form is the bug this fixes: it
+/// wrote `bloom_threshold` with an intensity clamp of 0..0.2, so a scene could
+/// set a "bloom" value that neither enabled the chain nor was a threshold, and
+/// `bloom_intensity` — the number that decides whether the four passes run at
+/// all — had no binding and could never be set from Lua. Bloom was unreachable.
+///
+/// Zero intensity skips the chain entirely rather than running it with a zero
+/// multiplier, which is why it is not just another colour channel.
 fn lua_environment_set_bloom(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
     const env: *Env = ctx.world.get(e, Env) orelse return 0;
-    env.bloom_threshold = @min(@max(lua.toF32(L, 2), 0), 0.2);
+    env.bloom_intensity = @min(@max(lua.toF32(L, 2), 0), 1);
+    env.bloom_threshold = @min(@max(lua.toF32(L, 3), 0), 1);
     return 0;
+}
+
+/// `environment.set_sky(r, g, b)` — the radiance a ray that escapes the occluder
+/// mask carries.
+///
+/// This is the base case of every Radiance Cascade merge, so it is what decides
+/// whether light bouncing around a corner is warm at sunset or white at noon.
+/// Black by default, because a scene in a sealed room has no sky and inventing
+/// one makes the room brighter than its own torches.
+fn lua_environment_set_sky(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.sky_color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), 1 };
+    return 0;
+}
+
+/// `environment.set_gi(enabled, albedo)` — whether to build the radiance
+/// cascades, and how much an occluder reflects back.
+///
+/// Off by default because it is the most expensive thing in the lighting system
+/// and because a scene that gets GI without asking has corners darker than its
+/// author drew. A light's own `gi_contribution` is a second, per-light opt-in on
+/// top of this one.
+fn lua_environment_set_gi(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    env.gi_enabled = lua.toBool(L, 2);
+    env.gi_albedo = @min(@max(lua.toF32(L, 3), 0), 1);
+    return 0;
+}
+
+/// `environment.new(self)` — adds an Environment. There was no way to create one
+/// from Lua, which made the eight other `environment.*` functions unreachable in
+/// a scene that did not already have an actor carrying the component.
+fn lua_environment_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, Env) == null) {
+        _ = ctx.world.add(e, Env{}) catch return 0;
+    }
+    return 0;
+}
+
+/// `environment.get_sky(self) -> r, g, b` — the sky's radiance.
+fn lua_environment_get_sky(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const env: *Env = ctx.world.get(e, Env) orelse return 0;
+    const s = env.sky();
+    lua.pushF32(L, s[0]);
+    lua.pushF32(L, s[1]);
+    lua.pushF32(L, s[2]);
+    return 3;
+}
+
+/// `light.kind_of(self) -> "point" | "spot" | "directional" | "ambient" | "legacy" | nil`
+///
+/// ## Why this is the first thing an inspector asks for
+///
+/// An actor has FOUR light components and the inspector has to show the right
+/// panel for whichever is present. Without this it would probe five `has_component`
+/// calls and pick the first that answers, which is fine — but only if the engine
+/// tells it the answer directly, and only if there is exactly one answer. An
+/// actor carrying both a legacy `Light2D` and a `PointLight2D` lights twice,
+/// and that is worth being able to SEE rather than discover by counting shadows.
+///
+/// ## Why a string and not a number
+///
+/// Because the editor's panel list is keyed by name and a number here is a
+/// translation it has to keep in step with the engine's enum. `nil` means "no
+/// light", which is distinct from every kind — and distinct from an error, which
+/// is why this returns rather than throwing.
+fn lua_light_kind_of(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const name: ?[:0]const u8 =
+        if (ctx.world.get(e, PointLight)) |_| "point"
+        else if (ctx.world.get(e, SpotLight)) |_| "spot"
+        else if (ctx.world.get(e, DirLight)) |_| "directional"
+        else if (ctx.world.get(e, AmbientLight)) |_| "ambient"
+        else if (ctx.world.get(e, LegacyLight)) |_| "legacy"
+        else
+            null;
+    const n = name orelse {
+        lua.lua_pushnil(L);
+        return 1;
+    };
+    lua.lua_pushstring(L, n.ptr);
+    return 1;
+}
+
+/// `light.describe(self) -> table` — every readable field of whichever light
+/// component is present, as one flat table.
+///
+/// ## Why a table and not twenty getters
+///
+/// An inspector does not know in advance which fields it will draw: it draws
+/// whatever the component has. Twenty `light.get_*` calls means the binding list
+/// and the inspector's field list are two places that must agree, and the
+/// failure is a property that exists and is not editable. One table that is
+/// RETURNED rather than declared is the same information with no second list.
+///
+/// ## Flat and string-keyed
+///
+/// Flat because the four components share `LightBase` and a nested table would
+/// mean the inspector has to know which fields are shared. Keys are the field
+/// names as `LightBase` and the per-kind struct spell them, so a name in this
+/// table is a name `metadata.zig` documents.
+///
+/// Returns an EMPTY table, not nil, for "no light": "an actor with no light has
+/// no fields" and "this call failed" must not look the same to a caller.
+fn lua_light_describe(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    // The array part is reserved even though every key is a string: `next` over
+    // a hash-only table works, but `pairs` ordering is then unspecified and an
+    // inspector that re-reads the table per frame would flicker its field order.
+    lua.lua_createtable(L, 0, 16);
+
+    // `St`, not `L`: the helper's parameter would otherwise shadow the enclosing
+    // C function's `L`, which Zig rejects -- and rightly, because two states in
+    // one expression is exactly the confusion that produces a stack corruption.
+    const put = struct {
+        fn f(St: ?*lua_State, key: [:0]const u8, v: f32) void {
+            lua.lua_pushstring(St, key.ptr);
+            lua.pushF32(St, v);
+            lua.lua_rawset(St, -3);
+        }
+        fn b(St: ?*lua_State, key: [:0]const u8, v: bool) void {
+            lua.lua_pushstring(St, key.ptr);
+            // c_int, not bool: LuaJIT's push takes a C int and Zig will not
+            // coerce a bool into one implicitly, which is the right refusal.
+            lua.lua_pushboolean(St, @intFromBool(v));
+            lua.lua_rawset(St, -3);
+        }
+    };
+
+    if (ctx.world.get(e, PointLight)) |l| {
+        put.b(L, "cast_shadows", l.base.cast_shadows);
+        put.f(L, "energy", l.base.energy);
+        put.f(L, "radius", l.radius);
+        put.f(L, "attenuation", l.attenuation);
+        put.f(L, "gi_contribution", l.base.gi_contribution);
+        put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
+        put.f(L, "blend", @floatFromInt(@intFromEnum(l.base.blend)));
+        put.f(L, "shadow_filter", @floatFromInt(@intFromEnum(l.base.shadow_filter)));
+    } else if (ctx.world.get(e, SpotLight)) |l| {
+        put.b(L, "cast_shadows", l.base.cast_shadows);
+        put.f(L, "energy", l.base.energy);
+        put.f(L, "radius", l.radius);
+        put.f(L, "angle", l.angle);
+        put.f(L, "cone_angle", l.cone_angle);
+        put.f(L, "penumbra", l.penumbra);
+        put.f(L, "attenuation", l.attenuation);
+        put.f(L, "gi_contribution", l.base.gi_contribution);
+        put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
+        put.f(L, "blend", @floatFromInt(@intFromEnum(l.base.blend)));
+    } else if (ctx.world.get(e, DirLight)) |l| {
+        put.b(L, "cast_shadows", l.base.cast_shadows);
+        put.f(L, "energy", l.base.energy);
+        put.f(L, "angle", l.angle);
+        put.f(L, "height", l.height);
+        put.f(L, "max_distance", l.max_distance);
+        put.f(L, "gi_contribution", l.base.gi_contribution);
+        put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
+    } else if (ctx.world.get(e, AmbientLight)) |l| {
+        put.f(L, "energy", l.base.energy);
+        put.b(L, "global", l.global);
+        put.f(L, "max_distance", l.max_distance);
+    }
+    return 1;
+}
+
+/// `lighting.quality(self) -> 0..3` — the tier the lighting system is running at.
+///
+/// 0 off, 1 low, 2 medium, 3 high. Each tier changes the shadow channel count, the
+/// angle resolution and whether GI is built, and those are the three numbers an
+/// inspector's quality dropdown has to show next to its slider.
+///
+/// -1 when no driver is wired (a headless tool, a test), which is distinct from
+/// 0 = off: one is "there is no lighting system" and the other is "the lighting
+/// system is switched off", and an inspector that shows them the same sends the
+/// user looking for a bug that is not there.
+fn lua_lighting_quality(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.lighting orelse {
+        lua.pushF32(L, -1);
+        return 1;
+    };
+    lua.pushF32(L, @floatFromInt(h.get_quality(h.ctx)));
+    return 1;
+}
+
+/// `lighting.set_quality(tier) -> bool` — 0 off, 1 low, 2 medium, 3 high.
+///
+/// False when the tier could not be taken, which is one case and it is worth
+/// naming: the pyramid only exists when the driver was created with GI on, so
+/// asking a GI-off driver for a GI-on tier declines. That is a BUDGET decision
+/// made at startup, and answering honestly is better than allocating a pyramid
+/// the frame was never sized for.
+fn lua_lighting_set_quality(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.lighting orelse {
+        lua.lua_pushboolean(L, 0);
+        return 1;
+    };
+    const raw = lua.toF32(L, 2);
+    const tier: u8 = @intFromFloat(@min(@max(raw, 0), 3));
+    const ok: bool = h.set_quality(h.ctx, tier);
+    lua.lua_pushboolean(L, @intFromBool(ok));
+    return 1;
+}
+
+/// `lighting.stats(self) -> table` — what the lighting system cost this frame.
+///
+/// Timings and counts, not a summary: a profile that reports "the lighting is
+/// fine" is not a profile, and these are the numbers `bench-light` prints. The
+/// keys are the `Stats` field names, so a doc entry for one of them is this
+/// table's documentation.
+fn lua_lighting_stats(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    // Reserved for the string part only; every key here is a string.
+    lua.lua_createtable(L, 0, 16);
+    const h = ctx.lighting orelse return 1; // an empty table: no system, no stats
+    var raw: [16]f64 = undefined;
+    const n = h.stats(h.ctx, &raw);
+    const s = raw[0..n];
+    const put = struct {
+        fn f(St: ?*lua_State, key: [:0]const u8, v: f64) void {
+            lua.lua_pushstring(St, key.ptr);
+            lua.lua_pushnumber(St, v);
+            lua.lua_rawset(St, -3);
+        }
+    };
+    // Index order IS the name order, and both live here: a fixed array crossed
+    // with a separately-maintained list of names is exactly the pair that drifts,
+    // and the drift is a stats table where every value is one field off.
+    const names = [_][:0]const u8{
+        "lights",          "shadow_lights",    "shadow_denied",
+        "occluders",       "occluders_rasterized", "coverage_used",
+        "coverage_dropped", "sweep_steps",     "sweep_skips",
+        "channel_masks_built", "mask_fill",    "collect_ns",
+        "sweep_ns",        "raster_ns",        "sdf_ns",
+    };
+    const count = @min(@min(names.len, s.len), @as(usize, @intCast(n)));
+    for (names[0..count], 0..) |key, i| put.f(L, key, s[i]);
+    return 1;
 }
 
 /// `environment.set_tonemap(enabled)`. For HDR scenes, where a light at energy 3
@@ -2232,11 +2507,15 @@ fn lua_environment_get_fog(L: ?*lua_State) callconv(.c) c_int {
 }
 
 const environment_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_environment_new },
     .{ .name = "set_ambient", .func = lua_environment_set_ambient },
     .{ .name = "set_clear", .func = lua_environment_set_clear },
     .{ .name = "set_bloom", .func = lua_environment_set_bloom },
     .{ .name = "set_tonemap", .func = lua_environment_set_tonemap },
     .{ .name = "set_fog", .func = lua_environment_set_fog },
+    .{ .name = "set_sky", .func = lua_environment_set_sky },
+    .{ .name = "set_gi", .func = lua_environment_set_gi },
+    .{ .name = "get_sky", .func = lua_environment_get_sky },
     .{ .name = "get_ambient", .func = lua_environment_get_ambient },
     .{ .name = "get_clear", .func = lua_environment_get_clear },
     .{ .name = "get_fog", .func = lua_environment_get_fog },
@@ -3026,6 +3305,15 @@ pub const registered_names = [_][]const u8{
     "environment.get_ambient",
     "environment.get_clear",
     "environment.get_fog",
+    "light.kind_of",
+    "light.describe",
+    "lighting.quality",
+    "lighting.set_quality",
+    "lighting.stats",
+    "environment.new",
+    "environment.set_sky",
+    "environment.set_gi",
+    "environment.get_sky",
     "light.set_color",
     "light.set_energy",
     "light.set_blend",
@@ -3132,6 +3420,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "sprite", &sprite_regs);
     installModule(L, ctx, "material", &material_regs);
     installModule(L, ctx, "light", &light_regs);
+    installModule(L, ctx, "lighting", &lighting_regs);
     installModule(L, ctx, "point", &point_regs);
     installModule(L, ctx, "spot", &spot_regs);
     installModule(L, ctx, "directional", &directional_regs);

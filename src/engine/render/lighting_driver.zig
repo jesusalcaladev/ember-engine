@@ -72,10 +72,15 @@ pub const Driver = struct {
     /// accurate answer.
     gi_dirty: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, quality: light_mod.Quality) !Driver {
+    /// The shadow map's angle count as the BACKEND last sized it. Kept here so a
+    /// quality change can tell `submitLights` to re-create rather than relying on
+    /// the backend's cache to notice on its own.
+    shadow_angles: u32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, tier: light_mod.Quality) !Driver {
         return .{
             .allocator = allocator,
-            .lighting = try Lighting.init(allocator, quality),
+            .lighting = try Lighting.init(allocator, tier),
         };
     }
 
@@ -96,6 +101,23 @@ pub const Driver = struct {
         if (changed) try self.lighting.resize(w, h);
         self.lighting.rect = view;
         self.needs_resize = changed;
+    }
+
+    /// Changes the quality tier. Delegates, and reports whether it took.
+    ///
+    /// The editor's quality dropdown's whole job, so it lives here rather than
+    /// being four things a caller has to do in the right order.
+    pub fn setQuality(self: *Driver, tier: light_mod.Quality) bool {
+        const ok = self.lighting.setQuality(tier) catch return false;
+        // The shadow map's width follows the tier, so the texture has to be
+        // rebuilt. `createShadowMap` is the thing that knows, and it caches on
+        // the angle count — so this is a call, not a flag.
+        self.shadow_angles = self.lighting.angles;
+        return ok;
+    }
+
+    pub fn quality(self: *const Driver) light_mod.Quality {
+        return self.lighting.quality();
     }
 
     /// The world-space rectangle the mask covers, from the camera's view and the
@@ -461,4 +483,79 @@ test "render light driver: the mask covers the viewport AND the margin around it
     }, w, h);
     try testing.expectApproxEqAbs(@as(f32, 1000 + 400 + 64), panned.max.x, 0.001);
     try testing.expectApproxEqAbs(@as(f32, -500 - 300 - 64), panned.min.y, 0.001);
+}
+
+test "render light driver: setQuality reconfigures what it claims to, not just a field" {
+    // Three of the four tiers change something ALREADY ALLOCATED — the angle
+    // count, the GI interval, the channel invalidation — and writing `cfg` alone
+    // would leave the buffers sized for the old tier while every read went to the
+    // new one. So this asserts the things that actually moved.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+
+    try testing.expectEqual(light_mod.Quality.high, d.quality());
+    const high_angles = d.lighting.angles;
+    try testing.expectEqual(@as(u8, 4), d.lighting.cfg.shadowLights());
+    try testing.expect(d.lighting.gi_interval_ns == 0);
+
+    try testing.expect(d.setQuality(.low));
+    try testing.expectEqual(light_mod.Quality.low, d.quality());
+    try testing.expect(d.lighting.angles < high_angles);
+    try testing.expect(d.lighting.cfg.shadowLights() < 4);
+    // And the backend is told, because the shadow map's WIDTH has to follow.
+    try testing.expectEqual(@as(u32, d.lighting.angles), d.shadow_angles);
+
+    // Down, then back up, which is what a user does to a slider.
+    try testing.expect(d.setQuality(.high));
+    try testing.expectEqual(light_mod.Quality.high, d.quality());
+    try testing.expectEqual(high_angles, d.lighting.angles);
+}
+
+test "render light driver: a GI tier is declined by a driver that has no pyramid" {
+    // The one honest "no". The pyramid is a STARTUP budget decision: a driver
+    // created with `.off` has none, and building one here would allocate inside
+    // what the caller believes is a settings change. Answering no is better than
+    // allocating something the frame was never sized for.
+    var d = try Driver.init(testing.allocator, .off);
+    defer d.deinit();
+
+    try testing.expect(d.lighting.radiance == null);
+    try testing.expectEqual(light_mod.Quality.off, d.quality());
+
+    // Down is always available — there is nothing to allocate.
+    try testing.expect(d.setQuality(.off));
+    // Up to a GI tier is not.
+    try testing.expect(!d.setQuality(.medium));
+    try testing.expectEqual(light_mod.Quality.off, d.quality());
+}
+
+test "render light driver: a quality change invalidates every shadow channel" {
+    // The maps were swept for the OLD angle count. Leaving them marked built
+    // would mean the first frame at the new tier sweeps nothing and every light
+    // casts a shadow sampled from a map of the wrong width.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    try d.lighting.resize(64, 64);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = @as(f32, @floatFromInt(i)) * 16 + 8, .y = 32 } },
+            components.PointLight2D{ .radius = 24, .base = .{ .cast_shadows = true } },
+        });
+    }
+    d.lighting.collect(&world, d.lighting.rect);
+    d.lighting.rasterize();
+    d.lighting.buildShadowMaps();
+    try testing.expectEqual(@as(u32, 4), d.lighting.stats.shadow_lights);
+    // Built, so every channel is marked built.
+    for (d.lighting.channel_built) |b| try testing.expect(b);
+
+    try testing.expect(d.setQuality(.low));
+    // And now none of them are.
+    for (d.lighting.channel_built) |b| try testing.expect(!b);
 }

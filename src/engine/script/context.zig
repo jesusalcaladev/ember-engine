@@ -25,6 +25,26 @@ const statemachine = @import("statemachine.zig");
 const spatial = @import("spatial.zig");
 const physics_mod = @import("physics");
 
+/// The three operations the M7 `lighting.*` bindings need, as function pointers.
+///
+/// `ctx` is whatever the runtime's closures need -- the `*Driver` -- and is
+/// passed back to every call, so the runtime does not need a module-level global
+/// to find it. That matters because the editor and a test can both have a
+/// lighting system alive at once and they must not share one.
+pub const LightingHooks = struct {
+    ctx: ?*anyopaque,
+    /// The current tier: 0 off, 1 low, 2 medium, 3 high.
+    get_quality: *const fn (ctx: ?*anyopaque) u8,
+    /// Changes the tier. False when it could not be taken -- a GI-on tier on a
+    /// driver that was created with GI off declines, because the pyramid is a
+    /// startup budget decision and the frame was not sized for one.
+    set_quality: *const fn (ctx: ?*anyopaque, tier: u8) bool,
+    /// Writes the per-frame stats into `out` and returns how many it wrote.
+    /// A fixed array and not a struct so the two modules cannot disagree about a
+    /// layout: the count is what pairs each number with its name.
+    stats: *const fn (ctx: ?*anyopaque, out: *[16]f64) u32,
+};
+
 pub const World = ecs.World;
 pub const Actor = ecs.Actor;
 pub const Entity = ecs.Entity;
@@ -100,6 +120,24 @@ pub const Context = struct {
     /// scanning the world linearly, so a missing grid fails safe instead of
     /// silently turning an O(n^2) query into a correct-but-slow one.
     spatial: ?*spatial.Grid = null,
+    /// What the M7 `lighting.*` bindings need from the lighting system, as
+    /// function pointers. Null when the runtime has no renderer wired (a headless
+    /// tool, a test, an editor with no 2D view).
+    ///
+    /// A VTABLE and not the `Driver` type because `script` is its own build
+    /// MODULE and cannot import `render` -- reaching the file directly is a
+    /// compile error ("file exists in modules 'engine' and 'script'"), and
+    /// widening the module graph to fix one field would couple the scripting
+    /// layer to the renderer.
+    ///
+    /// It is also the smaller ask. What the bindings need is two numbers and a
+    /// bag of counters, not a mask, four shadow channels and a radiance pyramid.
+    /// Exposing exactly that is what keeps the boundary honest.
+    ///
+    /// Null means the bindings REPORT failure rather than reaching through a
+    /// null pointer: a `lighting.set_quality` that silently did nothing would be
+    /// an inspector dropdown that appears to work.
+    lighting: ?*const LightingHooks = null,
     /// The physics world, or null when the runtime has none (a headless tool, a
     /// test, an editor previewing a scene without physics). Null rather than a
     /// dummy world on purpose: a dummy would answer "nothing in the way" to a

@@ -97,6 +97,101 @@ render.all_resident()                       -- the default
 hidden sprite is a decision somebody made, a culled one is the engine saving
 you work. A scene where `culled` is zero is paying to draw a world nobody sees.
 
+### Lighting (M7)
+
+Four components, Godot's names: `PointLight2D`, `SpotLight2D`,
+`DirectionalLight2D`, `AmbientLight2D`. An actor carries one of them; the
+legacy `Light2D` still exists and still lights, because its dense component id
+is the `.zson` encoding and scenes committed before M7 carry it.
+
+**Start here — which panel to draw:**
+
+```lua
+light.kind_of(actor) -> "point" | "spot" | "directional" | "ambient" | "legacy" | nil
+light.describe(actor) -> table   -- flat, string-keyed, whatever is present
+```
+
+`kind_of` returns `nil` for "no light", which is **different from every kind**
+and different from an error. `describe` returns an empty table rather than nil
+for the same reason: an inspector reading `describe` per frame must not have to
+guard.
+
+`describe` is flat on purpose. `LightBase` is shared by all four components, so
+a nested table would mean the editor has to know which fields are shared. The
+key names are the field names the components spell, so a name in that table is
+a name in the metadata.
+
+**Then the setters**, one module per kind:
+
+```lua
+point.new(actor, radius)              spot.new(actor, radius)
+directional.new(actor)                ambient.new(actor)
+spot.set_cone(actor, degrees, penumbra)
+directional.set_angle(actor, radians) -- direction the light TRAVELS
+directional.set_height(actor, 0..1)   -- scales shadow LENGTH
+ambient.set_local(actor, distance)    -- 0 restores the scene-wide kind
+```
+
+**Shared, work on whichever of the four is present** — `light.*`:
+
+```lua
+light.set_color(actor, r, g, b, a)   -- alpha IS the opacity
+light.set_energy(actor, n)
+light.set_blend(actor, 0|1|2)        -- add / subtract / mix
+light.set_shadow(actor, on, filter, smoothness)
+light.set_gi(actor, 0..1)            -- default 0: bounce is opt-in per light
+light.set_mask(actor, bitmask)       -- which sprite layers this light affects
+```
+
+**Occluders:**
+
+```lua
+occluder.new(actor, mode)            -- 0 auto, 1 manual, 2 none
+occluder.set_threshold(actor, alpha) -- where an automatic shape draws its edge
+occluder.set_mask(actor, bitmask)    -- which lights' shadows it blocks
+occluder.set_polygon(actor, {x0,y0,...})
+occluder.get_polygon(actor) -> table -- an editor that drags vertices reads this
+```
+
+**Environment** — scene-wide, one per scene:
+
+```lua
+environment.new(actor)                        -- without this the rest is unreachable
+environment.set_ambient(actor, r, g, b, a)
+environment.set_clear(actor, r, g, b, a)
+environment.set_sky(actor, r, g, b)            -- the radiance a GI ray escapes with
+environment.set_gi(actor, enabled, albedo)     -- the cascades; off by default
+environment.set_bloom(actor, intensity, threshold)
+environment.set_tonemap(actor, on)
+environment.set_fog(actor, near, far)
+```
+
+**The system itself**, not an actor — for a quality dropdown and a perf panel:
+
+```lua
+lighting.quality() -> 0..3, or -1 when no system is wired
+lighting.set_quality(tier) -> bool   -- false when a GI tier is refused
+lighting.stats() -> table            -- counts and per-pass ns, empty if unwired
+```
+
+`lighting.set_quality` returns **false in exactly one case**: a GI-on tier on a
+system created with GI off. The pyramid is a startup budget decision, so it
+declines rather than allocating during what the user believes is a settings
+change. `lighting.quality()` returns **-1**, not 0, when nothing is wired —
+"there is no lighting system" and "it is switched off" send a user looking for
+different bugs.
+
+**Two things that will surprise you**, both stated in the bindings' own docs:
+
+- `light.set_mask` is a bitmask of `Sprite.layer`. A scene with no layer masks
+  set pays nothing for it, and the default is every layer — a light that
+  silently stopped lighting would be the worst possible default.
+- An automatic occluder uses the sprite's **alpha coverage** when the asset
+  pipeline has registered one, and its **rectangle** when it has not. Until M6
+  exists, every automatic occluder is a rectangle. `lighting.stats()` reports
+  `coverage_used` and `coverage_dropped`, so you can tell which case a scene is
+  in instead of guessing from a shadow's shape.
+
 ## What is NOT there yet
 
 Build against this list as things to request, not things to use.

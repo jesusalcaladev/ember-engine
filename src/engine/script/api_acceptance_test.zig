@@ -496,6 +496,65 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             ,
         },
         .{
+            .name = "the inspector surface: kind_of, describe and the GI/bloom fields",
+            // What an editor's light panel is built on. `kind_of` decides which
+            // panel to draw, `describe` decides which fields, and the
+            // environment setters are the only way GI and bloom can be reached
+            // from a scene at all — they had no bindings before this.
+            .src =
+            \\local self = T.__actor_self
+            \\-- "no light" is nil, not a kind: an inspector must be able to tell
+            \\-- "this actor has no light" from "this actor has a broken one".
+            \\if light.kind_of(self) ~= nil then return false end
+            \\point.new(self, 192)
+            \\if light.kind_of(self) ~= "point" then return false end
+            \\local d = light.describe(self)
+            \\if d.radius ~= 192 then return false end
+            \\if d.cast_shadows == nil then return false end
+            \\-- The mask that used to be a field nothing read.
+            \\light.set_mask(self, 4)
+            \\if light.describe(self).item_cull_mask ~= 4 then return false end
+            \\-- A spot is a DIFFERENT panel with an EXTRA field.
+            \\local other = T.__spawn()
+            \\spot.new(other, 300)
+            \\spot.set_cone(other, 45, 0.25)
+            \\if light.kind_of(other) ~= "spot" then return false end
+            \\local sd = light.describe(other)
+            \\if sd.cone_angle == nil or sd.penumbra == nil then return false end
+            \\-- And the shared fields are under the SAME names in both, which is
+            \\-- why `describe` is flat.
+            \\if sd.energy == nil or sd.radius == nil then return false end
+            \\-- GI and bloom were unreachable: no environment.new, and no setter
+            \\-- for the sky, the GI switch, or the intensity that actually turns
+            \\-- the chain on.
+            \\environment.new(self)
+            \\environment.set_sky(self, 0.4, 0.45, 0.6)
+            \\local r, g, b = environment.get_sky(self)
+            \\if r ~= 0.4 or g ~= 0.45 or b ~= 0.6 then return false end
+            \\environment.set_gi(self, true, 0.8)
+            \\environment.set_bloom(self, 0.4, 0.85)
+            \\local amb = environment.get_ambient(self)
+            \\return amb ~= nil and r == 0.4
+            ,
+        },
+        .{
+            .name = "lighting.quality reports -1 with no system and never lies",
+            // The editor's quality dropdown. With no driver wired it must say
+            // -1 rather than 0, because "there is no lighting system" and "the
+            // lighting system is off" send the user looking for different bugs.
+            .src =
+            \\local self = T.__actor_self
+            \\local q = lighting.quality()
+            \\if q ~= -1 then return false end
+            \\if lighting.set_quality(2) ~= false then return false end
+            \\-- And the stats table is empty rather than nil, so an inspector can
+            \\-- read it without a guard.
+            \\local s = lighting.stats()
+            \\if s == nil then return false end
+            \\return next(s) == nil
+            ,
+        },
+        .{
             .name = "a body at rest reads as not awake, an impulse wakes it",
             .src =
             \\local self = T.__actor_self

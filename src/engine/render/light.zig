@@ -602,15 +602,15 @@ pub const Lighting = struct {
 
     // ── lifecycle ────────────────────────────────────────────────────────────
 
-    pub fn init(allocator: std.mem.Allocator, quality: Quality) !Lighting {
-        var self: Lighting = .{ .allocator = allocator, .cfg = quality };
+    pub fn init(allocator: std.mem.Allocator, tier: Quality) !Lighting {
+        var self: Lighting = .{ .allocator = allocator, .cfg = tier };
         errdefer self.deinit();
-        try self.setAngles(switch (quality) {
+        try self.setAngles(switch (tier) {
             .off, .low => 64,
             .medium => 128,
             .high => 256,
         });
-        self.gi_interval_ns = switch (quality) {
+        self.gi_interval_ns = switch (tier) {
             // 100 ms is ten rebuilds a second. A GI field is a slow-moving
             // quantity -- an occluder has to move a long way before "how
             // enclosed is this point" changes -- and rebuilding it every frame
@@ -623,13 +623,56 @@ pub const Lighting = struct {
         // bounce should not be carrying a four-level probe grid it will never
         // fill — so this is allocated on the quality setting, not on a flag
         // that starts out true and gets turned off later.
-        if (quality.giEnabled()) {
+        if (tier.giEnabled()) {
             const r = try self.allocator.create(Radiance);
             errdefer self.allocator.destroy(r);
             r.* = Radiance.init(self.allocator);
             self.radiance = r;
         }
         return self;
+    }
+
+    /// Changes the quality tier at runtime.
+    ///
+    /// A setter and not a field, because three of the four tiers change something
+    /// that is ALREADY ALLOCATED — the angle count, the GI pyramid — and writing
+    /// `cfg` alone would leave the buffers sized for the old tier while every
+    /// read went to the new one. An editor's quality dropdown calls this.
+    ///
+    /// Not frame work: `setAngles` reallocates, and spec §3.1 forbids that inside
+    /// a frame. The editor's setting panel is not in a frame.
+    ///
+    /// Returns false when the tier needs GI and GI was never created, because
+    /// raising the tier is a request and the answer may be no — a scene that
+    /// started with GI off has no pyramid to fill and building one here would be
+    /// an allocation the caller did not budget for.
+    pub fn setQuality(self: *Lighting, tier: Quality) !bool {
+        if (tier == self.cfg) return true;
+        if (tier.giEnabled() and self.radiance == null) return false;
+
+        const angles: u16 = switch (tier) {
+            .off, .low => 64,
+            .medium => 128,
+            .high => 256,
+        };
+        try self.setAngles(angles);
+        self.gi_interval_ns = switch (tier) {
+            .medium => 100 * std.time.ns_per_ms,
+            else => 0,
+        };
+        self.cfg = tier;
+        // The mask resolution halves at the lower tiers, so the tier change is a
+        // resize: the grid is sized in `resize` and `mask_w`/`mask_h` are what
+        // the sweep steps by.
+        self.mask_changed = true;
+        self.dirty = true;
+        // Every channel's map was swept for the old angle count.
+        self.channel_built = [_]bool{false} ** 4;
+        return true;
+    }
+
+    pub fn quality(self: *const Lighting) Quality {
+        return self.cfg;
     }
 
     pub fn deinit(self: *Lighting) void {

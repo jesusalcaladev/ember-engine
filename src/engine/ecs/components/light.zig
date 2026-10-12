@@ -417,10 +417,19 @@ pub const Environment = struct {
     /// Separate from `ambient_color` because one is what the world does to what
     /// it lights and the other is what nothing lights at all.
     clear_color: [4]f32 = .{ 0.02, 0.02, 0.03, 1 },
-    /// 0..0.2. A wash over the whole scene, which is how a bright room stops
-    /// looking like a dark room with five torches in it. Defaults to zero: it is
-    /// an artistic dial and a scene has to ask for it.
-    bloom_threshold: f32 = 0.0,
+    /// How much bloom is added, 0..1. ZERO disables the chain ENTIRELY — the
+    /// four passes are skipped, not run with a zero multiplier — because a scene
+    /// that has never enabled bloom should not be paying for a half-resolution
+    /// blur every frame.
+    ///
+    /// This is why there are TWO bloom numbers rather than one. A single
+    /// "bloom" dial has to be both "how bright must a pixel be" and "how much
+    /// glow", and those are not the same quantity: a slider that does both means
+    /// setting one of them changes the other, which is not a dial, it is a
+    /// coupling nobody asked for.
+    bloom_intensity: f32 = 0.0,
+    /// Luminance above which a pixel contributes to the bloom, 0..1.
+    bloom_threshold: f32 = 1.0,
     /// Screen-space tonemap, off by default. On for HDR scenes, where a light
     /// at energy 3 otherwise clips to white and a colour ramp nobody chose.
     tonemap: bool = false,

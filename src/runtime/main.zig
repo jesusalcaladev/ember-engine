@@ -93,6 +93,60 @@ fn onOff(value: []const u8, default: bool) bool {
 /// different cameras, sprites get culled for a view they are then drawn outside
 /// of (invisible but paid for), which is the failure this pairing exists to make
 /// impossible.
+/// The M7 `lighting.*` bindings, as a vtable over the driver.
+///
+/// The script module cannot import `render`, so the three things a Lua caller
+/// needs -- the tier, a way to change it, and the per-frame stats -- are published
+/// as function pointers instead of a pointer to the driver. A vtable and not a
+/// module global: the editor and a test can both have a lighting system alive at
+/// once and they must not share one.
+///
+/// `ctx` is filled in once the driver exists, below.
+var lighting_hooks = script.context.LightingHooks{
+    .ctx = undefined,
+    .get_quality = struct {
+        fn f(ctx: ?*anyopaque) u8 {
+            const d: *lighting_driver.Driver = @ptrCast(@alignCast(ctx.?));
+            return @intFromEnum(d.quality());
+        }
+    }.f,
+    .set_quality = struct {
+        fn f(ctx: ?*anyopaque, tier: u8) bool {
+            const d: *lighting_driver.Driver = @ptrCast(@alignCast(ctx.?));
+            return d.setQuality(@enumFromInt(tier));
+        }
+    }.f,
+    // Index order IS the name order in `lua_lighting_stats`. Both lists live in
+    // one place per module and a fixed 16-wide array crosses the boundary, so a
+    // value cannot be paired with the wrong name.
+    .stats = struct {
+        fn f(ctx: ?*anyopaque, out: *[16]f64) u32 {
+            const d: *lighting_driver.Driver = @ptrCast(@alignCast(ctx.?));
+            const s = &d.lighting.stats;
+            const v = [_]f64{
+                @floatFromInt(s.lights),
+                @floatFromInt(s.shadow_lights),
+                @floatFromInt(s.shadow_denied),
+                @floatFromInt(s.occluders),
+                @floatFromInt(s.occluders_rasterized),
+                @floatFromInt(s.coverage_used),
+                @floatFromInt(s.coverage_dropped),
+                @floatFromInt(s.sweep_steps),
+                @floatFromInt(s.sweep_skips),
+                @floatFromInt(d.lighting.channel_masks_built),
+                @as(f64, @floatCast(s.mask_fill)),
+                @floatFromInt(s.collect_ns),
+                @floatFromInt(s.sweep_ns),
+                @floatFromInt(s.raster_ns),
+                @floatFromInt(s.sdf_ns),
+            };
+            const n = @min(v.len, out.len);
+            @memcpy(out[0..n], v[0..n]);
+            return @intCast(n);
+        }
+    }.f,
+};
+
 fn sceneCamera(view: ?ecs.camera.View, width: u32, height: u32) render.Camera {
     const v = view orelse return render.makeCamera(@floatFromInt(width), @floatFromInt(height));
     return render.makeCameraCustom(
@@ -256,6 +310,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
     defer lighting.deinit();
+    // Publish the lighting system to Lua's `lighting.*` module. Here, after both
+    // exist and before the first script runs, so a script that asks for the
+    // quality in its first tick gets a real answer rather than -1.
+    lighting_hooks.ctx = &lighting;
+    behaviors.ctx.lighting = &lighting_hooks;
     // A budget rather than a count taken from the world: `collect` appends
     // without capacity checks, and a scene that grows past this CLIPS rather
     // than allocating in the middle of a frame. Reported, not silent.
