@@ -265,8 +265,51 @@ fn findZone(prof: *const Profiler, name: []const u8) ?usize {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
-test "a fast run passes the frame budget" {
+test "the spec's per-system budget constants are the ones spec.md states" {
+    // Checked here, exactly, because the timing test below cannot check them
+    // exactly: it can only measure. §2's numbers are the whole point of the
+    // file, and a constant that drifts should fail loudly rather than widen a
+    // test's margins until nothing can fail.
     const b = Budget{};
+    try std.testing.expectEqual(@as(f64, 7.0), b.frame_work_ms_p50);
+    try std.testing.expectEqual(@as(f64, 10.0), b.frame_work_ms_p99);
+    try std.testing.expectEqual(@as(f64, 16.6), b.frame_work_ms_p999);
+    try std.testing.expectEqual(@as(f64, 2.0), b.lua_update_ms);
+    try std.testing.expectEqual(@as(f64, 2.0), b.physics_ms);
+    try std.testing.expectEqual(@as(f64, 1.5), b.render_cpu_ms);
+    try std.testing.expectEqual(@as(f64, 0.8), b.signals_ms);
+    try std.testing.expectEqual(@as(f64, 2.0), b.editor_overlay_ms);
+    try std.testing.expectEqual(@as(f64, 6.0), b.gpu_ms);
+    try std.testing.expectEqual(@as(u64, 32), b.draw_calls);
+    try std.testing.expectEqual(@as(u64, 64), b.draw_calls_with_gi);
+    try std.testing.expectEqual(@as(u64, 2 << 20), b.upload_bytes_per_frame);
+}
+
+test "a fast run passes the frame budget" {
+    // The zone limit is widened to 50 ms for THIS test, and that is the whole
+    // point of the change. It used to sleep 1 ms against the real 1.5 ms §2
+    // render budget — a 1.5x margin on a wall-clock measurement, which means
+    // the test failed whenever the machine was busy for half a millisecond.
+    // It was flaky at roughly one run in three on an otherwise idle box, and
+    // what it was actually asserting was that the scheduler is punctual.
+    //
+    // What it means to assert is: given measured zones under their limits,
+    // `evaluate` says PASS. A 50 ms limit with a ~1 ms measurement says that
+    // with thirteen times the headroom a loaded CI box needs. The real 1.5 ms
+    // constant is not weakened by this — it is asserted exactly, to the digit,
+    // in the test above.
+    //
+    // Sleeping at all is a compromise. The alternative is to inject durations
+    // into the profiler, which would make this test perfect and would also mean
+    // the profiler has a test-only seam in its hot path for the sake of one
+    // caller. The seam is not worth it while `Profiler` measures the only thing
+    // it exists to measure.
+    var b = Budget{};
+    b.render_cpu_ms = 50.0;
+    b.frame_work_ms_p50 = 50.0;
+    b.frame_work_ms_p99 = 50.0;
+    b.frame_work_ms_p999 = 50.0;
+
     var prof = Profiler{};
     var ctr = Counters{};
     // three measured frames of 1 ms of work each
@@ -285,7 +328,14 @@ test "a fast run passes the frame budget" {
     ctr.upload_bytes = 128 * 1024;
 
     const rep = evaluate(b, &prof, &ctr, .game);
-    try std.testing.expect(rep.allPass());
+    if (!rep.allPass()) {
+        // Say which one failed. `expect` on a boolean reports only the boolean,
+        // and "allPass() is false" is not a bug report.
+        for (rep.results[0..rep.count]) |r| {
+            if (r.status == .fail) r.render();
+        }
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expectEqual(@as(usize, 0), rep.failCount());
 }
 
