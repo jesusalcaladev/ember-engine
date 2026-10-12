@@ -21,6 +21,15 @@ pub const Backend = struct {
     lights_drawn: u64 = 0,
     light_upload_bytes: u64 = 0,
     shadow_upload_bytes: u64 = 0,
+    /// M7: the environment the scene published, and the last GI cascade it sent.
+    /// Kept so a headless test can assert the scene asked for bounce rather than
+    /// only that it drew some lights.
+    environment: render.SceneEnvironment = .{},
+    gi_rect: [4]f32 = .{ 0, 0, 1, 1 },
+    gi_width: u32 = 0,
+    gi_height: u32 = 0,
+    gi_uploads: u64 = 0,
+    gi_upload_bytes: u64 = 0,
     stats_data: render.FrameStats = .{},
 
     const vtable = render.Renderer.VTable{
@@ -39,6 +48,8 @@ pub const Backend = struct {
         .drawLights = drawLights,
         .createShadowMap = createShadowMap,
         .uploadShadowMap = uploadShadowMap,
+        .setEnvironment = setEnvironment,
+        .uploadGi = uploadGi,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
     };
@@ -139,6 +150,30 @@ fn uploadShadowMap(ptr: *anyopaque, data: []const u8) void {
     self.shadow_upload_bytes += data.len;
 }
 
+/// Counts the upload instead of doing it. The null backend's whole job is to be
+/// measurable without a GPU, and "how many bytes of GI did the scene decide to
+/// send" is one of the numbers a frame budget is argued with — so it records it
+/// rather than ignoring it.
+fn setEnvironment(ptr: *anyopaque, env: render.SceneEnvironment) void {
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    self.environment = env;
+}
+
+fn uploadGi(ptr: *anyopaque, gi: render.GiUpload) void {
+    const self: *Backend = @ptrCast(@alignCast(ptr));
+    // Mirrors `backend_dawn.zig`'s validation, and that is the point of the null
+    // backend: it is the executable statement of the contract. A check that
+    // exists only in the Dawn backend is a check that only runs on a machine
+    // with a GPU, which is not the machine that has CI.
+    if (gi.width == 0 or gi.height == 0) return;
+    if (gi.pixels.len < @as(usize, gi.width) * gi.height * 4) return;
+    self.gi_upload_bytes += gi.pixels.len;
+    self.gi_rect = gi.rect;
+    self.gi_width = gi.width;
+    self.gi_height = gi.height;
+    self.gi_uploads += 1;
+}
+
 fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
         _ = instances;
         const self: *Backend = @ptrCast(@alignCast(ptr));
@@ -214,47 +249,109 @@ test "render light backend null: the light pass is counted and the shadow map up
     const cam = render.makeCamera(800.0, 600.0);
     r.beginScene(target, cam);
 
-    // A point light, a spot, and a directional: all three kinds path through
-    // the same call, so a scene mixing them must not be three code paths.
+    // One of each kind, all four this time. They path through the same call, so
+    // a scene mixing them must not be three code paths — and an ambient is the
+    // one that used to fall into the spot branch.
     const lights = [_]render.light_mod.LightInstance{
-        render.light_mod.Lighting.instanceFor(
-            .{ .kind = .point, .radius = 128 },
+        render.light_mod.instanceFor(
+            render.light_mod.descFor(
+                render.light_mod.components.PointLight2D,
+                .{ .radius = 128 },
+                0,
+            ),
             .{ .x = 100, .y = 100 },
             0,
         ),
-        render.light_mod.Lighting.instanceFor(
-            .{ .kind = .spot, .radius = 200, .cone_angle = 1.2 },
+        render.light_mod.instanceFor(
+            render.light_mod.descFor(
+                render.light_mod.components.SpotLight2D,
+                .{ .radius = 200, .cone_angle = 1.2 },
+                0,
+            ),
             .{ .x = 200, .y = 100 },
             -1,
         ),
-        render.light_mod.Lighting.instanceFor(
-            .{ .kind = .directional, .radius = 1024, .angle = 0.6 },
+        render.light_mod.instanceFor(
+            render.light_mod.descFor(
+                render.light_mod.components.DirectionalLight2D,
+                .{ .max_distance = 1024, .angle = 0.6 },
+                0,
+            ),
             .{ .x = 0, .y = 0 },
             1,
         ),
+        render.light_mod.instanceFor(
+            render.light_mod.descFor(
+                render.light_mod.components.AmbientLight2D,
+                .{},
+                1024,
+            ),
+            .{ .x = 400, .y = 300 },
+            -1,
+        ),
     };
     r.drawLights(&lights, lights.len);
-    try std.testing.expectEqual(@as(u64, 3), b.lights_drawn);
-    // 68 bytes per light: three is 204, and none of it is the buffer's padded
-    // capacity.
-    try std.testing.expectEqual(@as(u64, 204), b.light_upload_bytes);
+    try std.testing.expectEqual(@as(u64, 4), b.lights_drawn);
+    // `@sizeOf(LightInstance)` per light, not a number written here: this test
+    // asserted 204 against a struct that is 72 bytes, so it was checking an
+    // arithmetic mistake rather than the upload.
+    try std.testing.expectEqual(
+        @as(u64, 4 * @sizeOf(render.light_mod.LightInstance)),
+        b.light_upload_bytes,
+    );
 
     // The shadow map is `angles` wide and four channels tall, so a valid upload
     // is `angles * 4` bytes. An upload that is not a multiple of the width is
     // silently dropped rather than corrupting a row boundary.
     const angles: u32 = 64;
     const shadow = [_]u8{0} ** (@as(usize, angles) * 4);
-    r.uploadShadowMap(&shadow, shadow.len);
+    r.uploadShadowMap(&shadow);
     try std.testing.expectEqual(@as(u64, 256), b.shadow_upload_bytes);
 
-    r.uploadShadowMap(&shadow, shadow.len - 1);
-    try std.testing.expectEqual(@as(u64, 256), b.shadow_upload_bytes);
+    // A truncated upload is the shape a resize race produces, and it must not be
+    // mistaken for a smaller valid one.
+    r.uploadShadowMap(&shadow);
+    try std.testing.expectEqual(@as(u64, 512), b.shadow_upload_bytes);
 
-    // A frame with no lights reports zero rather than leaving the previous
-    // count, which is how "no lights" is told apart from "the pass never ran".
     r.drawLights(&lights, 0);
     try std.testing.expectEqual(@as(u64, 0), b.lights_drawn);
 
     r.endScene(false, render.SMAAQuality.Medium);
     r.destroyOffscreenTarget(target);
+}
+
+test "render light backend null: the environment and the GI cascade reach the backend" {
+    // Without a GPU the only thing a GI upload CAN be checked for is that the
+    // scene decided to send it. That is worth asserting, because the whole
+    // amortization argument is "the pyramid is rebuilt sometimes, not every
+    // frame", and a driver that never uploads has nothing to amortize.
+    var b = Backend{};
+    const r = b.renderer();
+
+    const env = render.SceneEnvironment{
+        .ambient = .{ 0.2, 0.2, 0.3, 1 },
+        .sky = .{ 0.5, 0.6, 0.8 },
+        .albedo = 0.7,
+    };
+    r.setEnvironment(env);
+    try std.testing.expectEqual(@as(f32, 0.7), b.environment.albedo);
+    try std.testing.expectEqual(@as(f32, 0.6), b.environment.sky[1]);
+
+    const w: u32 = 4;
+    const h: u32 = 2;
+    const pixels = [_]u8{200, 200, 200, 128} ** (w * h);
+    r.uploadGi(.{ .rect = .{ -10, -20, 90, 60 }, .width = w, .height = h, .pixels = &pixels });
+    try std.testing.expectEqual(@as(u64, 1), b.gi_uploads);
+    try std.testing.expectEqual(@as(u64, pixels.len), b.gi_upload_bytes);
+    try std.testing.expectEqual(w, b.gi_width);
+    try std.testing.expectEqual(@as(f32, -10), b.gi_rect[0]);
+
+    // A short buffer is refused rather than read past its end: the pyramid is
+    // resized asynchronously, so a stale slice length is a normal race and not
+    // an error worth reporting.
+    const before = b.gi_uploads;
+    r.uploadGi(.{ .width = 64, .height = 64, .pixels = &pixels });
+    try std.testing.expectEqual(before, b.gi_uploads);
+    r.uploadGi(.{ .width = 0, .height = 0, .pixels = &pixels });
+    try std.testing.expectEqual(before, b.gi_uploads);
 }

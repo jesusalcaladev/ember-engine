@@ -132,6 +132,38 @@ pub const OffscreenTarget = struct {
 /// SMAA quality presets.
 pub const SMAAQuality = enum { Low, Medium, High };
 
+/// M7: the pieces of an `Environment` a backend needs, as plain data.
+///
+/// A POD rather than the ECS component itself: a backend should not have to
+/// import the ECS to know what colour the sky is, and the null backend in
+/// particular has no business depending on a world it will never read.
+pub const SceneEnvironment = struct {
+    /// Ambient colour, already multiplied by energy. Alpha is the ambient's
+    /// opacity, like every other light.
+    ambient: [4]f32 = .{ 0, 0, 0, 1 },
+    /// The radiance a ray that escapes the mask carries. This is the base
+    /// case of every GI merge, so it is the number that decides whether
+    /// bounce light is warm at sunset or white at noon.
+    sky: [3]f32 = .{ 0, 0, 0 },
+    /// How much of what arrives at an occluder is reflected back. 0.85 is a
+    /// mid-grey wall; 0.2 is velvet.
+    albedo: f32 = 0.85,
+};
+
+/// M7: the GI cascade, as the backend receives it.
+pub const GiUpload = struct {
+    /// The cascade's world-space rectangle: `min.xy`, `max.zw`. The shader
+    /// needs it to turn a world position into a texel, and it moves with the
+    /// camera — which is why it travels with the pixels rather than being
+    /// baked into the texture once at boot.
+    rect: [4]f32 = .{ 0, 0, 1, 1 },
+    width: u32 = 1,
+    height: u32 = 1,
+    /// RGBA8, tightly packed, `width * height * 4` bytes. Alpha is the
+    /// enclosure term.
+    pixels: []const u8 = &.{},
+};
+
 pub const Renderer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -184,6 +216,28 @@ pub const Renderer = struct {
         createShadowMap: *const fn (ptr: *anyopaque, angles: u32) ?*anyopaque,
         /// M7: upload the 1D shadow maps as four rows of `angles` bytes.
         uploadShadowMap: *const fn (ptr: *anyopaque, data: []const u8) void,
+        /// M7: publish the scene's Environment — the ambient colour, the sky
+        /// radiance the GI cascades measure against, and the bounce albedo.
+        ///
+        /// A separate call rather than an argument to `beginScene` because the
+        /// Environment belongs to the SCENE and the camera belongs to the VIEW,
+        /// and the two change on different clocks: a camera follows a player
+        /// every frame, while an Environment changes when an author changes it.
+        /// Threading it through `beginScene` would make every caller pass a
+        /// value it usually does not have.
+        setEnvironment: *const fn (ptr: *anyopaque, env: SceneEnvironment) void,
+        /// M7: upload the GI cascade as an RGBA8 probe grid.
+        ///
+        /// Alpha is the ENCLOSURE term — how much of the hemisphere a point can
+        /// see — and it is what the light shader multiplies `gi_contribution`
+        /// into. RGB carries the radiance, so the same upload serves a pass
+        /// that wants the colour and not only the occlusion.
+        ///
+        /// Amortized by the caller: this is only invoked when the pyramid has
+        /// been rebuilt, which is not once per frame. A backend that uploaded
+        /// every frame would be spending the bandwidth this design exists to
+        /// avoid.
+        uploadGi: *const fn (ptr: *anyopaque, gi: GiUpload) void,
         /// Creates a texture from RGBA8 pixels (atlas upload). Returns an opaque
         /// handle the backend understands in drawSprites (via the vertex's texture index).
         createTexture: *const fn (ptr: *anyopaque, width: u32, height: u32, pixels: []const u8) ?*anyopaque,
@@ -228,6 +282,32 @@ pub const Renderer = struct {
     }
     pub fn drawSprites(self: Renderer, instances: []const SpriteInstance, count: usize) void {
         self.vtable.drawSprites(self.ptr, instances, count);
+    }
+    /// M7: draws `count` lights from `instances`.
+    ///
+    /// `count` is what this call means. The slice may be longer — it is the
+    /// capacity the instance buffer was sized for — and uploading all of it
+    /// would commit stale lights and pay the bandwidth for them.
+    pub fn drawLights(self: Renderer, instances: []const light_mod.LightInstance, count: usize) void {
+        self.vtable.drawLights(self.ptr, instances, count);
+    }
+    /// M7: sizes the 1D shadow map. Returns null if the backend declined, which
+    /// is a real outcome rather than an error: a boot with no GPU cannot make
+    /// one, and the caller still gets a frame.
+    pub fn createShadowMap(self: Renderer, angles: u32) ?*anyopaque {
+        return self.vtable.createShadowMap(self.ptr, angles);
+    }
+    /// M7: uploads the four rows of `angles` bytes.
+    pub fn uploadShadowMap(self: Renderer, data: []const u8) void {
+        self.vtable.uploadShadowMap(self.ptr, data);
+    }
+    /// M7: publishes the scene's environment.
+    pub fn setEnvironment(self: Renderer, env: SceneEnvironment) void {
+        self.vtable.setEnvironment(self.ptr, env);
+    }
+    /// M7: uploads the GI cascade.
+    pub fn uploadGi(self: Renderer, gi: GiUpload) void {
+        self.vtable.uploadGi(self.ptr, gi);
     }
     pub fn createTexture(self: Renderer, width: u32, height: u32, pixels: []const u8) ?*anyopaque {
         return self.vtable.createTexture(self.ptr, width, height, pixels);

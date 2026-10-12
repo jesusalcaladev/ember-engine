@@ -28,10 +28,6 @@ const log = @import("core").log.scoped("render");
 
 const quad_wgsl = @embedFile("shaders/quad.wgsl");
 const light_wgsl = @embedFile("shaders/light.wgsl");
-/// The M7 light pass's instance size. Declared AGAIN from the Zig struct so a
-/// change in one that is not mirrored in the other is a link-time failure
-/// instead of a shader reading the wrong offset -- a class of silent bug.
-const LightInstanceBytes: u64 = 68;
 const sprite_wgsl = @embedFile("shaders/sprite.wgsl");
 const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
 
@@ -210,6 +206,19 @@ pub const Backend = struct {
         light_bind_group: wgpu.WGPUBindGroup = undefined,
         /// The shadow map's width in angle buckets; zero until it is created.
         light_shadow_angles: u32 = 0,
+        /// The GI cascade. Starts as the 1x1 opaque-black placeholder created at
+        /// boot, and is REPLACED when the pyramid's dimensions change -- which is
+        /// why the bind group is rebuilt alongside it and not once at boot.
+        light_gi_texture: wgpu.WGPUTexture = undefined,
+        light_gi_view: wgpu.WGPUTextureView = undefined,
+        light_gi_sampler: wgpu.WGPUSampler = undefined,
+        light_gi_bgl: wgpu.WGPUBindGroupLayout = undefined,
+        light_gi_w: u32 = 1,
+        light_gi_h: u32 = 1,
+        /// The cascade's world-space rectangle, republished into the uniform on
+        /// every upload because it moves with the camera.
+        gi_rect: [4]f32 = .{ 0, 0, 1, 1 },
+        environment: render.SceneEnvironment = .{},
         /// Which light the last drawLights call actually drew. Reported through
         /// FrameStats so a scene with no lights can be told apart from a pass
         /// that was never called.
@@ -309,8 +318,20 @@ pub const Backend = struct {
     /// Instance record: pos(8) + half(8) + uv4xu16(8) + color4xu8(4) + slot(1)
     /// + pad(3) = 32 bytes, exactly @sizeOf(render.SpriteInstance).
     const SpriteInstanceBytes: u32 = 32;
-    /// `Globals` in light.wgsl: mat4(64) + vec2 + vec2 + vec4(16) = 112.
-    const LightUniformBytes: u64 = 112;
+    /// `Globals` in light.wgsl: mat4(64) + vec2 + vec2 + vec4(16) + vec4(16)
+    /// + vec4(16) = 128. The last two are the GI cascade's rectangle and the
+    /// sky; both are here rather than in the instance because they are the
+    /// same for every light in the frame, and per-instance means per-vertex.
+    const LightUniformBytes: u64 = 128;
+    /// `LightInstance` in light.zig: pos(8) + radius + shadow_ratio(8) +
+    /// half(8) + angle + cos_outer + cos_inner + energy(16) + color(16) +
+    /// attenuation + softness + gi + flags(16) = 72.
+    ///
+    /// Derived from the struct rather than written down again. The two used to
+    /// be separate numbers and they DISAGREED: the struct was 68 bytes and the
+    /// shader read offsets laid out for 72, so every light reached the GPU with
+    /// its half extents where its colour goes. One definition cannot drift.
+    const LightInstanceBytes: u64 = @sizeOf(render.light_mod.LightInstance);
     /// Globals uniform: mat4 (64) + texel (8) + inverse (8) + pad(8) = 88 → 96.
     const SpriteUniformBytes: u64 = 96;
     /// SMAA `EdgeUniforms`: 2 x vec2f = 24 bytes.
@@ -332,6 +353,8 @@ pub const Backend = struct {
         .drawLights = drawLights,
         .createShadowMap = createShadowMap,
         .uploadShadowMap = uploadShadowMap,
+        .setEnvironment = setEnvironment,
+        .uploadGi = uploadGi,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
     };
@@ -700,6 +723,36 @@ pub const Backend = struct {
                 .texture_sampleType = wgpu.TextureSampleType_Float,
                 .texture_viewDimension = wgpu.TextureViewDimension_2D,
             },
+            // The GI cascade and its sampler. Bound from boot with a 1x1 black
+            // placeholder, because a pipeline layout that names a binding the
+            // bind group does not supply is a VALIDATION ERROR at draw time --
+            // and the first draw of a scene is exactly when nobody is reading
+            // validation output. A bound black cascade with `gi_contribution` at
+            // zero is not wrong: it is the same answer, arrived at honestly.
+            .{
+                .binding = 2,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0,
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
+            .{
+                .binding = 3,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                .sampler = &.{
+                    .type = wgpu.SamplerBindingType_Filtering,
+                    // CLAMP, not repeat: the cascade is a rectangle of the world
+                    // and a point outside it has no enclosure data, which the
+                    // shader says so explicitly. Wrapping would smear the
+                    // opposite edge's occluders in and darken the border.
+                    .address_mode_u = wgpu.AddressMode_ClampToEdge,
+                    .address_mode_v = wgpu.AddressMode_ClampToEdge,
+                    .address_mode_w = wgpu.AddressMode_ClampToEdge,
+                    .mag_filter = wgpu.FilterMode_Linear,
+                    .min_filter = wgpu.FilterMode_Linear,
+                },
+            },
         }, "light.bgl");
         resources_created += 1;
 
@@ -829,13 +882,58 @@ pub const Backend = struct {
         resources_created += 1;
         const light_shadow_view = wgpu.wgpuTextureCreateView(light_shadow_texture, null) orelse return error.TextureViewCreationFailed;
         resources_created += 1;
+
+        // The GI cascade placeholder: ONE texel, fully transparent. Alpha is the
+        // enclosure term, so a transparent cascade reads as "sees nothing of the
+        // sky" and the shader's `1 - si_gi * (1 - alpha)` would darken
+        // everything. It has to be OPAQUE black, not transparent black: the
+        // alpha channel is the data, and an unwritten one is not a neutral.
+        const light_gi_texture = wgpu.wgpuDeviceCreateTexture(device, &.{
+            .label = wgpu.StringView.from("light.gi"),
+            .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
+            .format = wgpu.TextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return error.TextureCreationFailed;
+        resources_created += 1;
+        const light_gi_view = wgpu.wgpuTextureCreateView(light_gi_texture, null) orelse return error.TextureViewCreationFailed;
+        resources_created += 1;
+        {
+            const opaque_black = [_]u8{ 0, 0, 0, 255 };
+            wgpu.wgpuQueueWriteTexture(
+                queue,
+                &.{
+                    .texture = light_gi_texture,
+                    .mipLevel = 0,
+                    .origin = .{ .x = 0, .y = 0, .z = 0 },
+                    .aspect = wgpu.TextureAspect_All,
+                },
+                &opaque_black,
+                &.{ .bytesPerRow = 4, .rowsPerImage = 1 },
+                &.{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
+            );
+        }
+        const light_gi_sampler = wgpu.wgpuDeviceCreateSampler(device, &.{
+            .label = wgpu.StringView.from("light.gi.smp"),
+            .address_mode_u = wgpu.AddressMode_ClampToEdge,
+            .address_mode_v = wgpu.AddressMode_ClampToEdge,
+            .address_mode_w = wgpu.AddressMode_ClampToEdge,
+            .mag_filter = wgpu.FilterMode_Linear,
+            .min_filter = wgpu.FilterMode_Linear,
+        }) orelse return error.SamplerCreationFailed;
+        resources_created += 1;
+
         const light_bind_group = wgpu.wgpuDeviceCreateBindGroup(device, &.{
             .label = wgpu.StringView.from("light.bind"),
             .layout = light_bgl,
-            .entryCount = 2,
+            .entryCount = 4,
             .entries = &[_]wgpu.BindGroupEntry{
                 .{ .binding = 0, .buffer = light_uniform_buf, .offset = 0, .size = LightUniformBytes },
                 .{ .binding = 1, .textureView = light_shadow_view },
+                .{ .binding = 2, .textureView = light_gi_view },
+                .{ .binding = 3, .sampler = light_gi_sampler },
             },
         }) orelse return error.BindGroupCreationFailed;
         resources_created += 1;
@@ -991,6 +1089,10 @@ pub const Backend = struct {
             .light_shadow_texture = light_shadow_texture,
             .light_shadow_view = light_shadow_view,
             .light_bind_group = light_bind_group,
+            .light_gi_texture = light_gi_texture,
+            .light_gi_view = light_gi_view,
+            .light_gi_sampler = light_gi_sampler,
+            .light_gi_bgl = light_bgl,
             .light_instance_capacity = options.max_lights,
             .sprite_pipeline_solid = sprite_pipeline_solid,
             .sprite_pipeline_additive = sprite_pipeline_additive,
@@ -1516,6 +1618,46 @@ pub const Backend = struct {
         globals[21] = 0;
         wgpu.wgpuQueueWriteBuffer(self.queue, self.sprite_uniform_buf, 0, &globals, SpriteUniformBytes);
         self.stats_data.upload_bytes += SpriteUniformBytes;
+
+        // The light pass's own uniform, which used to never be written at all.
+        //
+        // That is worth stating plainly: `beginScene` filled the sprite uniform
+        // and stopped, so every light pass read a `Globals` buffer that had
+        // never been written since boot. Its `vp` was whatever the allocator
+        // handed over, which for a uniform buffer is zeros -- and a zero
+        // view-projection puts every light quad outside clip space, so the pass
+        // drew nothing, drew everything, or drew noise, depending on the frame.
+        //
+        // It is a separate buffer rather than a longer shared one because the
+        // two `Globals` structs are different (the light one carries the GI
+        // rectangle and the sky), and a combined buffer would need an offset
+        // that is one more number to keep correct.
+        self.writeLightUniform(camera.vp, o.width, o.height);
+    }
+
+    /// Writes the light pass's `Globals`. 128 bytes, fixed, every `beginScene`.
+    fn writeLightUniform(self: *Backend, vp: [16]f32, w: u32, h: u32) void {
+        const fw: f32 = @floatFromInt(@max(1, w));
+        const fh: f32 = @floatFromInt(@max(1, h));
+        // 16 mat4 + 4 screen + 4 ambient + 4 mask_rect + 4 sky = 32 floats.
+        var g: [32]f32 = undefined;
+        @memcpy(g[0..16], &vp);
+        g[16] = fw;
+        g[17] = fh;
+        g[18] = 1.0 / fw;
+        g[19] = 1.0 / fh;
+        const env = self.environment;
+        g[20] = env.ambient[0];
+        g[21] = env.ambient[1];
+        g[22] = env.ambient[2];
+        g[23] = env.ambient[3];
+        @memcpy(g[24..28], &self.gi_rect);
+        g[28] = env.sky[0];
+        g[29] = env.sky[1];
+        g[30] = env.sky[2];
+        g[31] = env.albedo;
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.light_uniform_buf, 0, &g, LightUniformBytes);
+        self.stats_data.upload_bytes += LightUniformBytes;
     }
 
     fn endScene(ptr: *anyopaque, enable_smaa: bool, smaa_quality: render.SMAAQuality) void {
@@ -1777,6 +1919,100 @@ pub const Backend = struct {
         };
         const size = wgpu.Extent3D{ .width = cols, .height = @intCast(rows) };
         wgpu.wgpuQueueWriteTexture(self.queue, &dst, data.ptr, data.len, &layout, &size);
+    }
+
+    fn setEnvironment(ptr: *anyopaque, env: render.SceneEnvironment) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        self.environment = env;
+        // The uniform is written in `beginScene`, which is once per frame and
+        // not once per environment. Writing it here too would be a second
+        // 128-byte upload for a value that usually did not change.
+    }
+
+    /// M7: the GI cascade upload.
+    ///
+    /// Reallocates the texture only when the pyramid's dimensions change, which
+    /// is on a resize and not per frame -- so the steady state is one
+    /// `writeTexture` of a grid the CPU already rebuilt. Reallocating every
+    /// time would also invalidate the bind group, which is why the two are done
+    /// together here instead of at two call sites.
+    fn uploadGi(ptr: *anyopaque, gi: render.GiUpload) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        if (gi.width == 0 or gi.height == 0) return;
+        const need = @as(usize, gi.width) * gi.height * 4;
+        if (gi.pixels.len < need) return;
+
+        self.gi_rect = gi.rect;
+
+        if (gi.width != self.light_gi_w or gi.height != self.light_gi_h) {
+            wgpu.wgpuTextureViewRelease(self.light_gi_view);
+            wgpu.wgpuTextureRelease(self.light_gi_texture);
+            self.light_gi_w = gi.width;
+            self.light_gi_h = gi.height;
+
+            self.light_gi_texture = wgpu.wgpuDeviceCreateTexture(self.device, &.{
+                .label = wgpu.StringView.from("light.gi"),
+                .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
+                .dimension = wgpu.TextureDimension_2D,
+                .size = .{
+                    .width = gi.width,
+                    .height = gi.height,
+                    .depthOrArrayLayers = 1,
+                },
+                .format = wgpu.TextureFormat_RGBA8Unorm,
+                .mipLevelCount = 1,
+                .sampleCount = 1,
+            }) orelse return;
+            self.light_gi_view =
+                wgpu.wgpuTextureCreateView(self.light_gi_texture, null) orelse return;
+
+            // The bind group holds a texture view, so a new view means a new
+            // bind group. Forgetting this is not a crash: the old group keeps
+            // the 1x1 placeholder and the scene renders with GI silently
+            // disabled, which is the hardest version of this bug to report.
+            wgpu.wgpuBindGroupRelease(self.light_bind_group);
+            self.light_bind_group = createBindGroup(self.device, self.light_gi_bgl, &[_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .buffer = self.light_uniform_buf, .offset = 0, .size = LightUniformBytes },
+                .{ .binding = 1, .textureView = self.light_shadow_view orelse return },
+                .{ .binding = 2, .textureView = self.light_gi_view },
+                .{ .binding = 3, .sampler = self.light_gi_sampler },
+            }) orelse return;
+        }
+
+        const dst = wgpu.TexelCopyTextureInfo{ .texture = self.light_gi_texture };
+        // 256 is `bytesPerRow`'s alignment floor, so the row is padded and the
+        // padding has to be SKIPPED -- `writeTexture` takes the stride, not a
+        // tightly packed buffer. Getting this wrong shifts every row by a few
+        // bytes and the cascade becomes diagonal noise.
+        const stride = gi.width * 4;
+        const padded = (stride + 255) & ~@as(usize, 255);
+        var scratch: ?[]u8 = null;
+        defer if (scratch) |s| self.allocator.free(s);
+        var src = gi.pixels;
+        if (padded != stride) {
+            scratch = try self.allocator.alloc(u8, padded * gi.height) catch return;
+            var y: usize = 0;
+            while (y < gi.height) : (y += 1) {
+                const row = scratch.?[y * padded ..][0..stride];
+                @memcpy(row, gi.pixels[y * stride ..][0..stride]);
+                @memset(scratch.?[y * padded + stride ..][0 .. padded - stride], 0);
+            }
+            src = scratch.?;
+        }
+        const layout = wgpu.TexelCopyBufferLayout{
+            .bytesPerRow = @intCast(padded),
+            .rowsPerImage = gi.height,
+        };
+        const size = wgpu.Extent3D{ .width = gi.width, .height = gi.height };
+        wgpu.wgpuQueueWriteTexture(
+            self.queue,
+            &dst,
+            src.ptr,
+            padded * gi.height,
+            &layout,
+            &size,
+        );
+        self.stats_data.upload_bytes += need;
     }
 
     fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {

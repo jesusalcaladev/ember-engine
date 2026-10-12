@@ -369,7 +369,27 @@ pub const Renderer2D = struct {
         self.stats.draw_calls = @intCast(r.stats().draw_calls);
     }
 
-    /// The M7 light pass, with the shadow map the CPU half built.
+    /// The M7 light pass: everything it needs, in one value.
+    ///
+    /// A struct rather than five arguments because this call grew from two
+    /// parameters to five and each one is a `[]const` slice whose length has to
+    /// be checked against something else. Five positional slices is a call site
+    /// where swapping two of them compiles and renders the wrong scene.
+    pub const LightFrame = struct {
+        lights: []const render.light_mod.LightInstance = &.{},
+        /// The 1D shadow maps, four rows of `angles` bytes.
+        shadow: []const u8 = &.{},
+        angles: u32 = 0,
+        env: render.SceneEnvironment = .{},
+        /// The GI cascade. Only uploaded when `gi_dirty`, because the pyramid is
+        /// amortized and uploading an unchanged grid every frame would turn an
+        /// amortized cost back into a per-frame one — which is the entire reason
+        /// it is amortized.
+        gi: render.GiUpload = .{},
+        gi_dirty: bool = false,
+    };
+
+    /// Submits the frame's lights, with the shadow map the CPU half built.
     ///
     /// Lights are drawn AFTER the sprites and with the load op as Load, so a
     /// light adds to the scene rather than erasing it — that ordering is the
@@ -379,15 +399,26 @@ pub const Renderer2D = struct {
     /// Returns the number of lights drawn, so a caller can tell "no lights in
     /// the scene" from "the pass was never invoked", which are two very
     /// different debugging problems.
-    pub fn submitLights(self: *Renderer2D, r: render.Renderer, lights: []const render.light_mod.LightInstance, shadow: []const u8, angles: u32) usize {
+    pub fn submitLights(self: *Renderer2D, r: render.Renderer, f: LightFrame) usize {
         _ = self;
-        if (lights.len == 0 or angles == 0) return 0;
-        _ = r.createShadowMap(angles);
-        if (shadow.len >= @as(usize, angles) * 4) {
-            r.uploadShadowMap(shadow[0 .. @as(usize, angles) * 4]);
+        // The environment first: it is what `beginScene`'s uniform is missing,
+        // and a light pass that runs before it reads an ambient of zero.
+        r.setEnvironment(f.env);
+
+        const shadow_len = @as(usize, f.angles) * 4;
+        if (f.angles != 0 and f.shadow.len >= shadow_len) {
+            _ = r.createShadowMap(f.angles);
+            r.uploadShadowMap(f.shadow[0..shadow_len]);
         }
-        r.drawLights(lights, lights.len);
-        return lights.len;
+        if (f.gi_dirty) {
+            const want = @as(usize, f.gi.width) * f.gi.height * 4;
+            if (f.gi.width != 0 and f.gi.height != 0 and f.gi.pixels.len >= want) {
+                r.uploadGi(f.gi);
+            }
+        }
+        if (f.lights.len == 0) return 0;
+        r.drawLights(f.lights, f.lights.len);
+        return f.lights.len;
     }
 
     /// Draw-call runs of the current frame (diagnostics + tests).

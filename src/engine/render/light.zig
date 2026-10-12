@@ -31,7 +31,9 @@
 
 const std = @import("std");
 const ecs = @import("ecs");
-const components = ecs.components;
+/// Re-exported so a backend's tests can name the component types without
+/// importing the ECS themselves.
+pub const components = ecs.components;
 
 const Vec2 = components.Vec2;
 const LightOccluder2D = components.LightOccluder2D;
@@ -1034,7 +1036,7 @@ fn lightReaches(kind: components.LightKind, pos: Vec2, radius: f32, v: MaskRect)
 /// is also the honest description of how much the four kinds actually differ:
 /// a spot has a cone and a directional light does not, and apart from that the
 /// difference is which numbers exist at all.
-const LightShape = struct {
+pub const LightShape = struct {
     /// Offset from the Transform, in the Transform's own frame.
     offset: Vec2 = .{ .x = 0, .y = 0 },
     angle: f32 = 0,
@@ -1061,7 +1063,7 @@ const LightShape = struct {
 };
 
 /// A light of any kind, in the shape `collect` consumes.
-const LightDesc = struct {
+pub const LightDesc = struct {
     base: components.LightBase,
     shape: LightShape,
     kind: components.LightKind,
@@ -1086,10 +1088,16 @@ fn shadowReachForHeight(height: f32, view_diag: f32) f32 {
 
 /// Flattens one of the four light components into a `LightDesc`.
 ///
+/// Flattens one of the four light components into a `LightDesc`.
+///
+/// Public because a backend's tests have to build the same instances `collect`
+/// builds: a test that constructs its own `LightInstance` by hand proves
+/// nothing about the collector.
+///
 /// A `switch` on the TYPE, which Zig evaluates at comptime, so each arm is
 /// checked against its real component and a renamed field is a compile error
 /// rather than a silent zero.
-fn descFor(comptime C: type, c: C, view_diag: f32) LightDesc {
+pub fn descFor(comptime C: type, c: C, view_diag: f32) LightDesc {
     return switch (C) {
         components.PointLight2D => .{
             .base = c.base,
@@ -1223,7 +1231,8 @@ fn spotDesc(base: components.LightBase, radius: f32, angle: f32, cone: f32, penu
     }, 0);
 }
 
-fn lightPos(base: Vec2, s: LightShape) Vec2 {    if (s.offset.x == 0 and s.offset.y == 0) return base;
+fn lightPos(base: Vec2, s: LightShape) Vec2 {
+    if (s.offset.x == 0 and s.offset.y == 0) return base;
     const c = @cos(s.angle);
     const sn = @sin(s.angle);
     return .{
@@ -1235,7 +1244,7 @@ fn lightPos(base: Vec2, s: LightShape) Vec2 {    if (s.offset.x == 0 and s.offse
 /// The wire form of a light at a position. `channel` is -1 when the light casts
 /// no shadow, and the bit that says so is part of `flags` precisely because a
 /// shader that has to test it per pixel should not have to read a second byte.
-fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
+pub fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
     const s = d.shape;
     // No cone means a cone that includes every direction, which is what cos(0)
     // is. Clamping the half-angle keeps a zero-width cone from becoming a full

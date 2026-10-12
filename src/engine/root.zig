@@ -21,7 +21,26 @@ pub const light = @import("render/light.zig");
 /// through the engine boundary so gameplay/runtime can drive it without ever
 /// importing LuaJIT directly (spec §7: Lua never touches the platform).
 pub const script = @import("script");
+/// M-project: `project.config` — the file that says what a project IS. The UI
+/// panel drives `project.Config`; the engine consumes `project.RuntimeConfig`.
+pub const project = @import("project");
 
 test {
     @import("std").testing.refAllDecls(@This());
+
+    // `refAllDecls(@This())` covers THIS root's declarations and stops there.
+    // It does not recurse, so a declaration that lives one level down — inside
+    // `render` — is never referenced, and an unreferenced `@import` is a file
+    // whose tests never enter the test binary at all.
+    //
+    // That is not hypothetical. `render.backend_null` holds the only headless
+    // check of the light pass, and it was compiled but never run: the suite was
+    // green, 46 tests passed, and nothing had ever exercised `drawLights`. A
+    // green suite that silently omits its own tests is worse than a red one,
+    // because it is the one you stop looking at.
+    //
+    // Referenced explicitly rather than through `refAllDecls(render)` so the
+    // intent survives: these are the backends, and a backend with no test is a
+    // backend whose contract is only checked on a machine with a GPU.
+    _ = render.backend_null;
 }

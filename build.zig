@@ -101,6 +101,17 @@ pub fn build(b: *std.Build) void {
     script_mod.addIncludePath(.{ .cwd_relative = "/usr/include/luajit-2.1" });
     script_mod.linkSystemLibrary("luajit-5.1", .{});
 
+    // ── Project config module (M-project) ────────────────────────────────────
+    // The `project.config` system: comptime registry, runtime Config, parser,
+    // key bindings. Pure Zig, no native deps, tested like core/ecs.
+    const project_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/project/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    project_mod.addImport("core", core_mod);
+
     // ── Editor module (M5.5: the non-UI half of the code editor) ─────────────
     // Depends on nothing but itself. A document, a cursor, a highlighter, a
     // parser and a find engine are pure Zig, which is exactly why they are
@@ -139,6 +150,7 @@ pub fn build(b: *std.Build) void {
     // M3: the LuaJIT scripting layer. It links LuaJIT but NOT Dawn, so the
     // scripting tests and the M3 bench run headless like the ECS ones do.
     engine_mod.addImport("script", script_mod);
+    engine_mod.addImport("project", project_mod);
 
     // The render module declares extern Dawn procs, so anything that links the
     // engine whole (the runtime, the render tests) needs the libraries. They are
@@ -423,6 +435,9 @@ pub fn build(b: *std.Build) void {
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 
+    const project_tests = b.addTest(.{ .root_module = project_mod });
+    test_step.dependOn(&b.addRunArtifact(project_tests).step);
+
     const physics_tests = b.addTest(.{ .root_module = physics_mod });
     test_step.dependOn(&b.addRunArtifact(physics_tests).step);
 
@@ -506,7 +521,27 @@ pub fn build(b: *std.Build) void {
     // The same tests, alone. They are the ones this milestone owns, and they run
     // in milliseconds with no window and no GPU, so there is no excuse for
     // waiting on the rest of the suite to find out whether a light still works.
-    const light_only_step = b.step("test-light", "Run only the lighting tests");
-    light_only_step.dependOn(&b.addRunArtifact(render_tests).step);
+    //
+    // Rooted at `render/test_root.zig` rather than the engine boundary: that
+    // boundary re-exports the project config and the scripting layer, so a file
+    // being edited over there takes the renderer's tests down with it, and a
+    // suite that cannot run stops being run.
+    const render_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine/render_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    render_test_mod.addImport("core", core_mod);
+    render_test_mod.addImport("ecs", ecs_mod);
+    render_test_mod.addImport("physics", physics_mod);
+    render_test_mod.addImport("script", script_mod);
+
+    const render_only_tests = b.addTest(.{
+        .root_module = render_test_mod,
+        .filters = &.{ "render", "light" },
+    });
+    const light_only_step = b.step("test-light", "Run only the render and lighting tests");
+    light_only_step.dependOn(&b.addRunArtifact(render_only_tests).step);
     light_only_step.dependOn(shaders_step);
 }
