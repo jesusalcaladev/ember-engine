@@ -26,7 +26,7 @@
 - [x] **Radiance Cascades GI** - CPU ref + GPU compute (f64 puro, coarse-to-fine)
 - [x] **Blend Modes** - Add / Subtract / Mix (3 pipelines)
 - [x] **Layer Masking** - per-pixel en light shader
-- [x] **Auto-SDF Oclusores** - Cobertura α → máscara → EDT → Radiance Cascades
+- [x] **Auto-SDF Oclusores** - Cobertura α → máscara → EDT → Radiance Cascades (⚠️ la cobertura α estaba escrita pero **no cableada** — ya corregido, ver abajo)
 - [x] **Editor Bindings** - 167 bindings con metadata docs
 - [x] **Tests** - 86/86 passing (`zig build test-light`), 6 shaders validados
 
@@ -91,6 +91,32 @@ Un guard en `build.zig` (el sitio donde estaba el error, y al que un test dentro
 del módulo no puede alcanzar: se desarma justo cuando hace falta) y otro en
 `test_root.zig` que detecta un subsistema alcanzado como MÓDULO. Los dos
 verificados reintroduciendo el bug.
+
+### ⚠️ LO QUE ESTABA ESCRITO Y NO EXISTÍA
+
+`registerAtlasCoverage` — la función que convierte "cobertura α del sprite" en
+sombra de silueta — estaba escrita, testeada, benchmarkeada, documentada como
+"la acción cero de desarrollo que promete el ROADMAP"… y **no la llamaba nadie**.
+Ni el loader, ni `uploadAtlas`, ni `main`. En toda build real, todo
+`LightOccluder2D` automático proyectaba el **rectángulo** de su sprite, y
+`coverage_used` se quedaba en un cero permanente que nadie señalaba.
+
+La costura es un puntero a función, no una dependencia, porque `uploadAtlas` es
+el único momento en que los píxeles de una página son definitivos y ese archivo
+no sabe qué es un sprite:
+
+```zig
+atlas_mgr.onPageUploaded(driver, lighting_driver.Driver.registerCoverageForPage);
+```
+
+**Eso destapó tres bugs latentes en `atlas_bridge.zig`**, cuyos tests tampoco se
+recolectaban nunca (el mismo fallo, en pequeño):
+
+| Bug | Efecto |
+|---|---|
+| `AtlasPacker.init(..., allow_growth = true)` | `insert` nunca devolvía null → `nextPage` **nunca se llamaba** → `pages` tenía siempre 1 entrada. Y el packer repartía rects **pasando** `width`/`height` mientras `uploadAtlas` sube cada página con el `width`/`height` ORIGINALES. **La cola del atlas se escribía fuera de la textura enviada a la GPU.** Esos sprites no sampling nada. |
+| `pageCount` devolvía `usize` desde una firma `u32` | No compilaba (nunca se había compilado). |
+| `std.fmt.bufPrint` con la forma de 2 argumentos | Pre-0.16. No compilaba. |
 
 ---
 
