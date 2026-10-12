@@ -17,6 +17,10 @@ pub const atlas = @import("render/atlas.zig");
 pub const render2d = @import("render/2d.zig");
 /// M7: 2D lighting. Lights, occluders, 1D shadow maps and the GI field.
 pub const light = @import("render/light.zig");
+/// M7: the lighting DRIVER — the owner that ties the above to the renderer.
+/// Separate from `light` because `light.zig` is the system and the driver is
+/// the wiring, and the runtime needs the wiring.
+pub const lighting_driver = @import("render/lighting_driver.zig");
 /// M3: the LuaJIT scripting layer (behaviors, bindings, metadata). Exposed
 /// through the engine boundary so gameplay/runtime can drive it without ever
 /// importing LuaJIT directly (spec §7: Lua never touches the platform).

@@ -47,6 +47,10 @@ const Lighting = light_mod.Lighting;
 const Radiance = light_mod.Radiance;
 const MaskRect = light_mod.MaskRect;
 
+/// How far the mask reaches beyond the viewport, in world units. See
+/// `Driver.viewFor` for why it is not zero.
+const mask_margin: f32 = 64;
+
 pub const Driver = struct {
     allocator: std.mem.Allocator,
     lighting: Lighting,
@@ -92,6 +96,36 @@ pub const Driver = struct {
         if (changed) try self.lighting.resize(w, h);
         self.lighting.rect = view;
         self.needs_resize = changed;
+    }
+
+    /// The world-space rectangle the mask covers, from the camera's view and the
+    /// framebuffer's size.
+    ///
+    /// PADDED by `mask_margin`, and that padding is the whole reason this is a
+    /// function rather than the viewport passed straight through: the mask is
+    /// also where the shadow SWEEPS start, and a light just off the left edge of
+    /// the screen casts a shadow onto the visible part. A mask that stopped at
+    /// the viewport would silently drop those shadows — and silently is how it
+    /// would be found, by a user whose torches cast shadows that fade out a few
+    /// pixels past the edge of the window.
+    ///
+    /// The margin matches the sprite culler's, for the same reason, and reusing
+    /// the number is better than having two that agree by accident.
+    pub fn viewFor(view: ?ecs.camera.View, fb_w: u32, fb_h: u32) MaskRect {
+        const w: f32 = @floatFromInt(@max(1, fb_w));
+        const h: f32 = @floatFromInt(@max(1, fb_h));
+        const v = view orelse return .{
+            // The identity camera shows `w x h` world units centred on the
+            // origin, so that is the mask for a scene with no camera at all.
+            .min = .{ .x = -w * 0.5 - mask_margin, .y = -h * 0.5 - mask_margin },
+            .max = .{ .x = w * 0.5 + mask_margin, .y = h * 0.5 + mask_margin },
+        };
+        const hw = v.viewport_w / v.zoom * 0.5 + mask_margin;
+        const hh = v.viewport_h / v.zoom * 0.5 + mask_margin;
+        return .{
+            .min = .{ .x = v.cx - hw, .y = v.cy - hh },
+            .max = .{ .x = v.cx + hw, .y = v.cy + hh },
+        };
     }
 
     /// One frame of lighting, up to but not including submission.
@@ -379,4 +413,52 @@ test "render light driver: encodeGi writes the enclosure term into alpha" {
     const up = d.giUpload();
     try testing.expectEqual(d.lighting.alloc_w, up.width);
     try testing.expectEqual(@as(usize, @as(usize, d.lighting.alloc_w) * d.lighting.alloc_h * 4), up.pixels.len);
+}
+
+test "render light driver: the mask covers the viewport AND the margin around it" {
+    // The margin is the assertion. A mask that stops at the viewport edge drops
+    // the shadow of any light just outside it, and a light just outside the
+    // screen is most of them — which is how a scene ends up with shadows that
+    // fade out a few pixels before the window does.
+    const w: u32 = 800;
+    const h: u32 = 600;
+
+    const identity = Driver.viewFor(null, w, h);
+    // No camera: the identity view is `w x h` centred on the origin.
+    try testing.expectApproxEqAbs(@as(f32, -400 - 64), identity.min.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 400 + 64), identity.max.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -300 - 64), identity.min.y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 300 + 64), identity.max.y, 0.001);
+
+    // And it is CENTRED, because an off-centre mask would put the shadow sweeps
+    // in the wrong place relative to the sprites they fall on.
+    try testing.expectApproxEqAbs(
+        (identity.min.x + identity.max.x) * 0.5,
+        0,
+        0.001,
+    );
+
+    // A zoomed-out camera widens the rect by 1/zoom and keeps the margin
+    // ABSOLUTE, not proportional: the margin exists for lights just off screen,
+    // and how far off screen is a world distance rather than a screen fraction.
+    const wide = Driver.viewFor(.{
+        .cx = 0,
+        .cy = 0,
+        .zoom = 0.5,
+        .viewport_w = w,
+        .viewport_h = h,
+    }, w, h);
+    try testing.expectApproxEqAbs(@as(f32, 800 + 64), wide.max.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -800 - 64), wide.min.x, 0.001);
+
+    // A camera off the origin moves the rect with it.
+    const panned = Driver.viewFor(.{
+        .cx = 1000,
+        .cy = -500,
+        .zoom = 1,
+        .viewport_w = w,
+        .viewport_h = h,
+    }, w, h);
+    try testing.expectApproxEqAbs(@as(f32, 1000 + 400 + 64), panned.max.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -500 - 300 - 64), panned.min.y, 0.001);
 }

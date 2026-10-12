@@ -16,12 +16,16 @@ const core = engine.core;
 const platform = engine.platform;
 const render = engine.render;
 const render2d = engine.render2d;
+/// M7: the lighting driver. The one owner of the mask, the shadow channels and
+/// the GI pyramid — see the note where it is constructed.
+const lighting_driver = engine.lighting_driver;
 const batcher_mod = engine.batcher;
 const backend_null = engine.render.backend_null;
 const backend_dawn = engine.render.backend_dawn;
 const ecs = engine.ecs;
 const script = engine.script;
 const components = ecs.components;
+const log = core.log.scoped("runtime");
 
 const fixed_dt: f32 = 1.0 / 60.0;
 const rotation_speed: f32 = 1.5; // rad/s
@@ -76,6 +80,28 @@ fn onOff(value: []const u8, default: bool) bool {
     if (std.mem.startsWith(u8, value, "0")) return false;
     if (std.mem.startsWith(u8, value, "no")) return false;
     return true;
+}
+
+/// The camera the scene is DRAWN with this frame (M4.5).
+///
+/// The M4.5 `Camera2D` view when the scene has one — which is the only case in
+/// which a follow, a zoom or a shake is visible at all — and otherwise the plain
+/// centred orthographic camera M2 used before cameras existed.
+///
+/// This closes the loop the culler alone does not: `collectFiltered` decides
+/// WHAT is worth drawing and this decides WHERE it lands. If those two read
+/// different cameras, sprites get culled for a view they are then drawn outside
+/// of (invisible but paid for), which is the failure this pairing exists to make
+/// impossible.
+fn sceneCamera(view: ?ecs.camera.View, width: u32, height: u32) render.Camera {
+    const v = view orelse return render.makeCamera(@floatFromInt(width), @floatFromInt(height));
+    return render.makeCameraCustom(
+        v.viewProjection(),
+        0,
+        0,
+        width,
+        height,
+    );
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -217,6 +243,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // ── M2: render2d system (ECS → GPU instances)
     var r2d = render2d.Renderer2D.init(boot_alloc);
+
+    // ── M7: lighting. Owns the mask, the shadow channels and the GI pyramid.
+    //
+    // `scale` is world units per mask texel: 1 means the mask is the size of the
+    // view in pixels, which is also what makes the shadow sweep's step length
+    // half a texel. Halving it doubles the mask along each axis and quarters the
+    // angle a shadow map's bucket covers, which is the quality dial the whole
+    // system turns on.
+    var lighting = lighting_driver.Driver.init(boot_alloc, .medium) catch |err| {
+        log.err("lighting init failed: {s} — the scene renders unlit", .{@errorName(err)});
+        return err;
+    };
+    defer lighting.deinit();
+    // A budget rather than a count taken from the world: `collect` appends
+    // without capacity checks, and a scene that grows past this CLIPS rather
+    // than allocating in the middle of a frame. Reported, not silent.
+    const lighting_budget = .{ .lights = 256, .occluders = 512 };
+    var lighting_drawn: usize = 0;
+    var lighting_env: render.SceneEnvironment = .{};
+    var frame_index: i128 = 0;
     defer r2d.deinit();
     try r2d.reserve(args.sprites);
     r2d.options.sort = args.sort;
@@ -227,6 +273,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_ns = core.time.monotonicNs();
     var frame_count: u64 = 0;
     var draw_calls_max: u32 = 0;
+
+    // ── M4.5: the Timer → Lua signal bridge.
+    // `Behaviors.dispatchSignal` broadcasts to every `on_signal`, and the timer
+    // system needs to reach it through an erased callback because the ECS must
+    // not import the script layer. One shim function carries the pointer; there
+    // is exactly one Behaviors in this process.
+    const timer_bridge = ecs.timer.SignalBridge{
+        .ctx = &behaviors,
+        .dispatch = struct {
+            fn fire(ctx: ?*anyopaque, name: []const u8) void {
+                const b: *script.Behaviors = @ptrCast(@alignCast(ctx.?));
+                b.dispatchSignal(name);
+            }
+        }.fire,
+    };
+
+    // ── M4.5: the camera's view, kept between frames.
+    // `null` means the scene has no enabled Camera2D, and that is not an error:
+    // the culler then draws everything, exactly as it did before M4.5.
+    var camera_view: ?ecs.camera.View = null;
 
     while (true) {
         // ── Frame limiter (Godot-style). Runs BEFORE the frame so the pacing
@@ -268,10 +334,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const steps = loop.addTime(real_dt);
         var s: u32 = 0;
         while (s < steps) : (s += 1) {
+            // ── M4.5: the Timer system, BEFORE the behaviors run.
+            // That order is the contract a scripted timer depends on: a
+            // behavior's `fixed_update` observes exactly the signals its own
+            // timers fired THIS tick, not the ones from the previous one. The
+            // bridge forwards the fired names to Lua `on_signal`, which the
+            // typed bus cannot reach by itself.
+            ecs.timer.tick(&world, fixed_dt, timer_bridge);
             // M3: behaviors run at the fixed 60 Hz tick. `startAll` already ran,
             // so this is the gameplay itself: Lua -> actor.* bindings -> ECS.
             behaviors.fixedUpdate(fixed_dt);
         }
+        // ── M4.5: the Camera2D system, once per fixed window (not per step).
+        // The camera is what the player LOOKS at, so it belongs to the rendered
+        // frame, and stepping it once per sub-step would advance follow and
+        // decay trauma at 2x on a 120 Hz display for the same motion.
+        camera_view = ecs.camera.update(
+            &world,
+            fixed_dt * @as(f32, @floatFromInt(steps)),
+            @floatFromInt(view_w),
+            @floatFromInt(view_h),
+        );
         z_sim.end();
 
         // M3: the scripted per-frame update (decoupled from the fixed step, like
@@ -286,7 +369,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         // ── M2: ECS → GPU instances via render2d.
         var z_batch = prof.zone("batch");
-        r2d.collect(&world, loop.alpha());
+        // The camera's view, translated from `camera.View` into the renderer's
+        // `ViewRect`. The margin is the sprite-extent insurance the culler asks
+        // for: a sprite walking right must not pop out one frame before it is
+        // actually on screen. Without a camera the view is null and the culler
+        // draws everything — the pre-M4.5 behaviour, unchanged.
+        r2d.collectFiltered(
+            &world,
+            loop.alpha(),
+            if (camera_view) |v| render2d.ViewRect.around(
+                v.cx,
+                v.cy,
+                v.viewport_w / v.zoom * 0.5,
+                v.viewport_h / v.zoom * 0.5,
+                64,
+            ) else null,
+            null,
+        );
         z_batch.end();
 
         // ── M2: render into the offscreen target, SMAA, compose to swapchain.
@@ -297,18 +396,50 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // own call and the profiler can time it apart from the encoding.
         renderer.beginFrame();
         if (has_window) renderer.acquireSurface();
+
+        // The Environment is read every frame because a script can change it
+        // mid-run, and reading it is two field loads. The sky follows it, since
+        // the GI cascades measure against whatever the sky is right now.
+        lighting_env = lighting_driver.Driver.environmentOf(&world, .{});
+        lighting.sky = lighting_env.sky;
+
+        // ── M7: the lighting driver. One owner, one call, one place.
+        //
+        // The driver is what makes a `PointLight2D` in a scene actually light
+        // that scene: it owns the `Lighting`, sizes its mask to the view, gathers
+        // the lights, rasterizes the occluders, sweeps the shadow channels,
+        // rebuilds the GI pyramid when the field moved, and hands the lot to the
+        // renderer. Every one of those steps existed and none of them was called.
+        //
+        // `resize` is here rather than in the setup because the mask follows the
+        // view, and the view follows the camera. It is a no-op when the view has
+        // not changed, and it only reports `needs_resize` on the frame it did.
+        // Two integers rather than a struct. Zig's anonymous struct types are
+        // NOMINAL: `Window.framebufferSize`'s result is a different type from an
+        // equally-shaped literal, so an `if` that produced one or the other does
+        // not type-check however alike they look. Two scalars are the shape that
+        // a conditional expression can actually produce.
+        const fb_w: u32 = if (has_window) window.framebufferSize().w else view_w;
+        const fb_h: u32 = if (has_window) window.framebufferSize().h else view_h;
+        lighting.resize(lighting_driver.Driver.viewFor(camera_view, fb_w, fb_h)) catch |err| log.warn("lighting mask resize failed: {s}", .{@errorName(err)});
+        if (lighting.needs_resize) {
+            // A precondition, not a hint: `collect` appends without capacity
+            // checks because allocating mid-frame is forbidden (spec §3.1).
+            lighting.lighting.reserve(lighting_budget.lights, lighting_budget.occluders) catch {};
+        }
+
         if (has_window) {
             const fb = window.framebufferSize();
-            const cam = render.makeCamera(@floatFromInt(fb.w), @floatFromInt(fb.h));
-            renderer.beginScene(target, cam);
+            renderer.beginScene(target, sceneCamera(camera_view, fb.w, fb.h));
             r2d.submit(renderer);
+            lighting_drawn = lighting.render(&world, &r2d, renderer, lighting_env, frame_index);
             renderer.endScene(args.smaa, .Medium);
         } else {
             // Headless: still exercise the whole M2 path against the null
             // backend so CI measures draw calls and batching for real.
-            const cam = render.makeCamera(@floatFromInt(view_w), @floatFromInt(view_h));
-            renderer.beginScene(target, cam);
+            renderer.beginScene(target, sceneCamera(camera_view, view_w, view_h));
             r2d.submit(renderer);
+            lighting_drawn = lighting.render(&world, &r2d, renderer, lighting_env, frame_index);
             renderer.endScene(args.smaa, .Medium);
         }
         renderer.present();
@@ -323,6 +454,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         prof.endFrame(); // records duration and drains zones
         if (has_window) window.input.endFrame();
 
+        frame_index += 1;
         frame_count += 1;
         if (args.frames != 0 and frame_count >= args.frames) break;
     }
@@ -339,6 +471,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         st.draw_calls,
         st.render_passes,
         st.resources_created_frame,
+    });
+    // M7: the numbers that say whether lighting is doing anything at all. A
+    // scene reporting zero lights and zero post passes is a scene with no lights
+    // in it OR a scene whose lights were never gathered, and those two look
+    // identical from the outside — so both are printed.
+    core.log.info("lighting: {d} lights in the last frame, {d} post passes", .{
+        lighting_drawn,
+        st.post_passes,
+    });
+    core.log.info("  occluders {d}, shadow channels {d}/{d} granted, shadow rays/frame {d}", .{
+        lighting.lighting.stats.occluders,
+        lighting.lighting.stats.shadow_lights,
+        lighting.lighting.cfg.shadowLights(),
+        lighting.lighting.stats.sweep_steps,
     });
     core.log.info("gpu upload: {d} B/frame (budget 2097152, spec §4)", .{st.upload_bytes});
     if (st.upload_bytes > 2 * 1024 * 1024) {
