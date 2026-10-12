@@ -175,6 +175,14 @@ const Offscreen = struct {
     // finishes, or it reads garbage).
     color: wgpu.WGPUTexture = undefined,
     color_view: wgpu.WGPUTextureView = undefined,
+    /// Which sprite layer each pixel is on, written by the sprite pass as a
+    /// second colour attachment and read by the light pass for `item_cull_mask`.
+    ///
+    /// R8Unorm, not an integer format: R8Unorm is renderable on every backend
+    /// that can render to R8 at all, and the one `* 255` on the read side is
+    /// cheaper than a format some drivers refuse.
+    layer: wgpu.WGPUTexture = undefined,
+    layer_view: wgpu.WGPUTextureView = undefined,
     depth: wgpu.WGPUTexture = undefined,
     depth_view: wgpu.WGPUTextureView = undefined,
     /// SMAA pass 1 output (edge directions), half resolution.
@@ -262,6 +270,11 @@ pub const Backend = struct {
         post_passes: u32 = 0,
         light_gi_w: u32 = 1,
         light_gi_h: u32 = 1,
+        /// The offscreen target's LAYER view, which is what `item_cull_mask` is
+        /// tested against. Null until a target exists, so the boot bind group
+        /// carries a 1x1 placeholder instead — a bind group that names a view
+        /// that does not exist yet is not a thing you can build.
+        light_layer_view: ?wgpu.WGPUTextureView = null,
         /// The cascade's world-space rectangle, republished into the uniform on
         /// every upload because it moves with the camera.
         gi_rect: [4]f32 = .{ 0, 0, 1, 1 },
@@ -697,11 +710,16 @@ pub const Backend = struct {
             .{ .format = wgpu.VertexFormat_Unorm16x4, .offset = 16, .shaderLocation = 2 },
             .{ .format = wgpu.VertexFormat_Unorm8x4, .offset = 24, .shaderLocation = 3 },
             .{ .format = wgpu.VertexFormat_Uint32, .offset = 28, .shaderLocation = 4 },
+            // The light layer, in the byte `SpriteInstance` used to pad. One
+            // attribute for one byte rather than folding it into the u32 above,
+            // because slot and shape already share that word and a third field
+            // there would mean a shift at every vertex.
+            .{ .format = wgpu.VertexFormat_Uint8, .offset = 30, .shaderLocation = 5 },
         };
         const sprite_vlayout = wgpu.VertexBufferLayout{
             .stepMode = wgpu.VertexStepMode_Instance,
             .arrayStride = SpriteInstanceBytes,
-            .attributeCount = 5,
+            .attributeCount = 6,
             .attributes = &sprite_instance_attrs,
         };
 
@@ -710,7 +728,15 @@ pub const Backend = struct {
             .color = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_SrcAlpha, .dstFactor = wgpu.BlendFactor_OneMinusSrcAlpha },
             .alpha = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_OneMinusSrcAlpha },
         };
-        const alpha_target = [_]wgpu.ColorTargetState{.{ .format = format, .blend = @ptrCast(&blend) }};
+        // Two targets. The colour one blends; the layer one does NOT, which is
+        // what makes it a replace -- and a replace is right, because the layer is
+        // not an accumulation. It is which sprite is ON TOP, and the scene
+        // already resolved that with the painter's algorithm. Blending two
+        // layers would produce a number that is neither.
+        const alpha_target = [_]wgpu.ColorTargetState{
+            .{ .format = format, .blend = @ptrCast(&blend) },
+            .{ .format = wgpu.TextureFormat_R8Unorm },
+        };
         const sprite_fragment_textured = wgpu.FragmentState{
             .module = sprite_shader,
             .entryPoint = wgpu.StringView.from("fs_main"),
@@ -730,7 +756,10 @@ pub const Backend = struct {
         resources_created += 1;
 
         // Solid (untextured) variant: no alpha blend needed, writes opaque.
-        const solid_target = [_]wgpu.ColorTargetState{.{ .format = format }};
+        const solid_target = [_]wgpu.ColorTargetState{
+            .{ .format = format },
+            .{ .format = wgpu.TextureFormat_R8Unorm },
+        };
         const sprite_fragment_solid = wgpu.FragmentState{
             .module = sprite_shader,
             .entryPoint = wgpu.StringView.from("fs_main_solid"),
@@ -796,6 +825,17 @@ pub const Backend = struct {
                 // here is a compile error, which is the good outcome.
                 .sampler_type = wgpu.SamplerBindingType_Filtering,
             },
+            // The sprite-layer target, for `item_cull_mask`. A 1x1 placeholder at
+            // boot for the same reason the GI cascade has one: the bind group is
+            // built at startup and a binding it does not supply is a validation
+            // error on the first draw of the scene.
+            .{
+                .binding = 4,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0, // BindingNotUsed: this entry is a texture
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
         }, "light.bgl");
         resources_created += 1;
 
@@ -828,11 +868,16 @@ pub const Backend = struct {
             .{ .format = wgpu.VertexFormat_Float32x4, .offset = 40, .shaderLocation = 5 },
             .{ .format = wgpu.VertexFormat_Float32x2, .offset = 48, .shaderLocation = 6 },
             .{ .format = wgpu.VertexFormat_Float32x2, .offset = 56, .shaderLocation = 7 },
+            // The sprite-layer mask, its own u32 at byte 64. A ninth attribute and
+            // four more bytes per light, which is what a per-light 32-bit mask
+            // costs; folding it into `flags` would mean dropping to u16 layers,
+            // and layers are a scene author's numbering.
+            .{ .format = wgpu.VertexFormat_Uint32, .offset = 64, .shaderLocation = 8 },
         };
         const light_vlayout = wgpu.VertexBufferLayout{
             .stepMode = wgpu.VertexStepMode_Instance,
             .arrayStride = LightInstanceBytes,
-            .attributeCount = 8,
+            .attributeCount = 9,
             .attributes = &light_attrs,
         };
 
@@ -959,6 +1004,38 @@ pub const Backend = struct {
                 &.{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
             );
         }
+        // The layer placeholder: one texel at the WILDCARD value, so a light
+        // that samples it before a target exists sees "lit by everything", which
+        // is the same answer it would give on the empty background.
+        const light_layer_placeholder = wgpu.wgpuDeviceCreateTexture(device, &.{
+            .label = wgpu.StringView.from("light.layer.placeholder"),
+            .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
+            .format = wgpu.TextureFormat_R8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        }) orelse return error.TextureCreationFailed;
+        resources_created += 1;
+        const light_layer_placeholder_view = wgpu.wgpuTextureCreateView(light_layer_placeholder, null) orelse return error.TextureViewCreationFailed;
+        resources_created += 1;
+        {
+            const wildcard = [_]u8{ 255 };
+            wgpu.wgpuQueueWriteTexture(
+                queue,
+                &.{
+                    .texture = light_layer_placeholder,
+                    .mipLevel = 0,
+                    .origin = .{ .x = 0, .y = 0, .z = 0 },
+                    .aspect = wgpu.TextureAspect_All,
+                },
+                &wildcard,
+                wildcard.len,
+                &.{ .bytesPerRow = 4, .rowsPerImage = 1 },
+                &.{ .width = 1, .height = 1, .depthOrArrayLayers = 1 },
+            );
+        }
+
         const light_gi_sampler = wgpu.wgpuDeviceCreateSampler(device, &.{
             .label = wgpu.StringView.from("light.gi.smp"),
             // CLAMP, not repeat: the cascade is a rectangle of the world and a
@@ -980,12 +1057,13 @@ pub const Backend = struct {
         const light_bind_group = wgpu.wgpuDeviceCreateBindGroup(device, &.{
             .label = wgpu.StringView.from("light.bind"),
             .layout = light_bgl,
-            .entryCount = 4,
+            .entryCount = 5,
             .entries = &[_]wgpu.BindGroupEntry{
                 .{ .binding = 0, .buffer = light_uniform_buf, .offset = 0, .size = LightUniformBytes },
                 .{ .binding = 1, .textureView = light_shadow_view },
                 .{ .binding = 2, .textureView = light_gi_view },
                 .{ .binding = 3, .sampler = light_gi_sampler },
+                .{ .binding = 4, .textureView = light_layer_placeholder_view },
             },
         }) orelse return error.BindGroupCreationFailed;
         resources_created += 1;
@@ -995,11 +1073,18 @@ pub const Backend = struct {
             .color = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_SrcAlpha, .dstFactor = wgpu.BlendFactor_One },
             .alpha = .{ .operation = wgpu.BlendOperation_Add, .srcFactor = wgpu.BlendFactor_One, .dstFactor = wgpu.BlendFactor_One },
         };
-        const additive_target = [_]wgpu.ColorTargetState{.{ .format = format, .blend = @ptrCast(&blend) }};
+        // A SPRITE pipeline, so it needs the layer target too — the same second,
+        // unblended output as the other two sprite pipelines. An additive sprite
+        // (a glow, a flare) still occludes the layer below it, so replacing is
+        // right: the light pass must light whatever the user SEES on top.
+        const additive_target = [_]wgpu.ColorTargetState{
+            .{ .format = format, .blend = @ptrCast(&blend) },
+            .{ .format = wgpu.TextureFormat_R8Unorm },
+        };
         const sprite_fragment_additive = wgpu.FragmentState{
             .module = sprite_shader,
             .entryPoint = wgpu.StringView.from("fs_main"),
-            .targetCount = 1,
+            .targetCount = 2,
             .targets = &additive_target,
         };
         const sprite_pipeline_additive = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
@@ -1627,6 +1712,8 @@ pub const Backend = struct {
         if (o.smaa_post_blend_bind) |b| wgpu.wgpuBindGroupRelease(b);
         wgpu.wgpuTextureViewRelease(o.color_view);
         wgpu.wgpuTextureRelease(o.color);
+        wgpu.wgpuTextureViewRelease(o.layer_view);
+        wgpu.wgpuTextureRelease(o.layer);
         wgpu.wgpuTextureViewRelease(o.depth_view);
         wgpu.wgpuTextureRelease(o.depth);
         wgpu.wgpuTextureViewRelease(o.edge_view);
@@ -1675,6 +1762,18 @@ pub const Backend = struct {
             return no_target;
         };
         o.color_view = wgpu.wgpuTextureCreateView(o.color, null).?;
+        o.layer = wgpu.wgpuDeviceCreateTexture(self.device, &.{
+            .label = wgpu.StringView.from("offscreen.layer"),
+            .usage = wgpu.TextureUsage_RenderAttachment | wgpu.TextureUsage_TextureBinding,
+            .dimension = wgpu.TextureDimension_2D,
+            .size = .{ .width = w, .height = h },
+            .format = wgpu.TextureFormat_R8Unorm,
+        }) orelse {
+            log.err("offscreen layer texture creation failed ({}x{})", .{ w, h });
+            self.destroyOffscreen(o);
+            return no_target;
+        };
+        o.layer_view = wgpu.wgpuTextureCreateView(o.layer, null).?;
 
         // Depth/stencil: the editor's gizmos and M7's 2D shadows need it, and
         // it lets the scene pass do early-Z (overdraw rule).
@@ -1860,6 +1959,15 @@ pub const Backend = struct {
         self.scene_target = o;
         self.scene_camera = camera;
         self.scene_active = true;
+
+        // Publish the layer view and rebuild the light bind group if it moved.
+        // Done HERE rather than in `createOffscreenTarget` because the light
+        // bind group is built before any target exists, and rebuilding it on a
+        // target swap is the only moment the view it names can change.
+        if (self.light_layer_view == null or !sameView(self.light_layer_view, o.layer_view)) {
+            self.light_layer_view = o.layer_view;
+            self.rebuildLightBindGroup() catch {};
+        }
 
         // Upload the camera + texel size once (fixed 96 bytes; spec §3.6).
         // Layout matches `Globals` in sprite.wgsl: mat4 (64 B) + 4 x f32 (16 B).
@@ -2393,6 +2501,17 @@ pub const Backend = struct {
         return @ptrCast(created);
     }
 
+    /// Whether two texture views are the same object.
+    ///
+    /// Pointer equality on the opaque handle, which is all Dawn gives us. It
+    /// answers the only question the caller has — "did the target change?" — and
+    /// a target that changes every frame would rebuild the bind group every
+    /// frame, which is exactly what the shadow map's cache exists to prevent.
+    fn sameView(a: ?wgpu.WGPUTextureView, b: ?wgpu.WGPUTextureView) bool {
+        if (a == null or b == null) return false;
+        return @intFromPtr(a.?) == @intFromPtr(b.?);
+    }
+
     /// Rebuilds the light pass's bind group from the CURRENT shadow and GI views.
     ///
     /// One function, because both views can change and getting the pairing wrong
@@ -2401,12 +2520,14 @@ pub const Backend = struct {
     /// silently never arrives).
     fn rebuildLightBindGroup(self: *Backend) !void {
         const shadow = self.light_shadow_view orelse return error.NoShadowMap;
+        const layer = self.light_layer_view orelse return error.NoLayerTarget;
         wgpu.wgpuBindGroupRelease(self.light_bind_group);
         self.light_bind_group = try createBindGroup(self.device, self.light_gi_bgl, &[_]wgpu.BindGroupEntry{
             .{ .binding = 0, .buffer = self.light_uniform_buf, .offset = 0, .size = LightUniformBytes },
             .{ .binding = 1, .textureView = shadow },
             .{ .binding = 2, .textureView = self.light_gi_view },
             .{ .binding = 3, .sampler = self.light_gi_sampler },
+            .{ .binding = 4, .textureView = layer },
         }, "light.bind");
     }
 
@@ -2563,9 +2684,21 @@ pub const Backend = struct {
             .storeOp = wgpu.StoreOp_Store,
             .clearValue = .{ .r = 0.06, .g = 0.07, .b = 0.10, .a = 1.0 },
         };
+        // The layer target, cleared to the WILDCARD. Every pixel with no sprite
+        // on it therefore reads as "lit by every light", which is what a layer
+        // mask means: it is about which SPRITES a light touches, and the empty
+        // background belongs to everyone. Clearing to layer 0 instead would mean
+        // a masked light left the whole background black.
+        const layer_attachment = wgpu.RenderPassColorAttachment{
+            .view = o.layer_view,
+            .loadOp = wgpu.LoadOp_Clear,
+            .storeOp = wgpu.StoreOp_Store,
+            .clearValue = .{ .r = 1.0, .g = 0.0, .b = 0.0, .a = 1.0 },
+        };
+        const attachments = [_]wgpu.RenderPassColorAttachment{ color_attachment, layer_attachment };
         var pass_desc = wgpu.RenderPassDescriptor{
-            .colorAttachmentCount = 1,
-            .colorAttachments = @ptrCast(&color_attachment),
+            .colorAttachmentCount = 2,
+            .colorAttachments = @ptrCast(&attachments),
         };
         if (timestamp_writes) |*tw| pass_desc.timestampWrites = tw;
         const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc) orelse return;

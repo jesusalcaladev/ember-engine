@@ -30,6 +30,11 @@ struct Instance {
     @location(3) color: vec4f,    // rgba unorm8
     @location(4) slot: u32,       // atlas slot (unused here; drives batching)
     @location(5) shape: u32,      // 0 = quad, 1 = circle
+    /// Which light layer this sprite is on. Travels as its own attribute so the
+    /// fragment stage can hand it to the LAYER TARGET without a varying — a
+    /// per-pixel-varying integer would be flat, and flat on a sprite that spans
+    /// the screen is fine, but it costs an interpolator for one byte.
+    @location(6) layer: u32,
 };
 
 struct VSOut {
@@ -41,6 +46,7 @@ struct VSOut {
     // tint rejects the file without it. It is also correct — the shape is a
     // property of the sprite, not of the pixel.
     @location(3) @interpolate(flat) shape: u32, // which mask to apply
+    @location(4) @interpolate(flat) layer: u32, // which light layer this is
 };
 
 /// Triangle-strip corners from the vertex index: (0,0) (1,0) (0,1) (1,1).
@@ -60,11 +66,37 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VSOut {
     // circle rather than a square pretending to be one.
     out.local = corner;
     out.shape = inst.shape;
+    out.layer = inst.layer;
     return out;
 }
 
+/// The sprite's colour, and its light layer.
+///
+/// ## Why the layer is an output and not a uniform
+///
+/// `LightBase.item_cull_mask` says "this light affects these sprite layers". The
+/// light pass is a quad drawn over the whole scene, so it cannot know which
+/// sprite is under each pixel — it only knows the pixel. Something has to record
+/// "which layer is here", and recording it as the sprite pass writes is the
+/// cheapest place there is: one extra byte per pixel, no extra pass, no readback.
+///
+/// ## Why the second target REPLACES rather than blends
+///
+/// The layer is not a colour to accumulate; it is which sprite is ON TOP. The
+/// scene already resolved that with the painter's algorithm, so the last sprite
+/// to write a pixel is the one a user sees, and that is the one whose layer the
+/// light pass should consult. Blending two layers would produce a number that is
+/// neither.
+///
+/// @location(1) has NO blend state in the pipeline, which is what makes it a
+/// replace. The colour target keeps its alpha blend.
+struct FragOut {
+    @location(0) color: vec4f,
+    @location(1) layer: f32,
+};
+
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4f {
+fn fs_main(in: VSOut) -> FragOut {
     // Clamp half a texel inside the sprite rect: without it the bilinear
     // filter of a packed atlas bleeds the neighbouring sprite (the classic
     // transparent fringe).
@@ -96,7 +128,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         }
     }
 
-    return in.color * textureSample(atlas_tex, atlas_smp, uv);
+    var out: FragOut;
+    out.color = in.color * textureSample(atlas_tex, atlas_smp, uv);
+    // The layer, normalized: the target is R8Unorm, so the light pass multiplies
+    // by 255 to get the number back. Unorm rather than an integer format
+    // because R8Unorm is renderable everywhere an R8Uint is, and one conversion
+    // in one place is cheaper than a format that some drivers refuse.
+    out.layer = f32(in.layer) / 255.0;
+    return out;
 }
 
 /// Untextured variant (a material without atlas): solid tint per instance.

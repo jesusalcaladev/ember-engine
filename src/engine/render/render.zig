@@ -56,7 +56,15 @@ pub const SpriteInstance = struct {
     /// stride of the whole vertex buffer. Growing it to carry one enum would
     /// double the buffer's memory for a prototype feature.
     shape: u8 = 0,
-    _pad: [2]u8 = .{ 0, 0 },
+    /// Which render/light layer this sprite is on, 0..255.
+    ///
+    /// In what used to be padding, for the same reason `shape` is: this struct is
+    /// a hard 32 bytes and it is the stride of the whole vertex buffer, so a new
+    /// field costs a megabyte at 32k instances. The cap is 255 rather than the
+    /// component's u16 because a single byte is what fits, and a scene with 256
+    /// distinct layers is not a scene anyone has.
+    layer: u8 = 0,
+    _pad: [1]u8 = .{0},
 };
 
 comptime {

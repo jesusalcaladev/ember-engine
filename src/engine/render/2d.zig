@@ -458,6 +458,15 @@ fn instanceFor(t: Transform, sprite: *const Sprite) render.SpriteInstance {
             render.toUnorm8(sprite.tint[3]),
         },
         .slot = sprite.atlas,
+        // Which light layer this sprite is on, for `item_cull_mask`.
+        //
+        // CLAMPED to a byte, and that is not a silent truncation: the shader
+        // reads an 8-bit attribute and the layer target is R8, so a sprite on
+        // layer 300 arriving as 44 would be lit by lights masked for 44 -- a
+        // scene that looks wrong with no way to find out why. 255 is the
+        // wildcard the light pass treats as "every light", and the clamp puts
+        // every out-of-range layer there, which is the safe direction.
+        .layer = @intCast(@min(sprite.layer, 255)),
     };
 }
 
@@ -779,4 +788,29 @@ test "a sprite on an evicted atlas page is skipped, not drawn" {
     try testing.expectEqual(@as(u32, 1), r.stats.instances);
     try testing.expectEqual(@as(u32, 1), r.stats.not_resident);
     try testing.expectEqual(@as(u32, 0), r.stats.culled);
+}
+
+test "render light 2d: a sprite's layer reaches the instance, clamped to the byte the GPU reads" {
+    // The layer is 8 bits END TO END: an 8-bit vertex attribute, an R8 target
+    // and a `* 255` on the read side. A sprite on layer 300 must NOT arrive as
+    // 44, because a light masked for layer 44 would light it and the scene looks
+    // wrong with no way to find out why.
+    //
+    // The clamp puts every out-of-range layer on 255, which the light pass reads
+    // as the WILDCARD -- "lit by everything". That is the safe direction, and it
+    // is what an unset layer already means, so running out of layers fails as
+    // "a few more things get lit" rather than "some things go black in a scene
+    // that used to work".
+    const t = Transform{ .position = .{ .x = 0, .y = 0 } };
+    try testing.expectEqual(@as(u8, 0), instanceFor(t, &Sprite{}).layer);
+    try testing.expectEqual(@as(u8, 7), instanceFor(t, &Sprite{ .layer = 7 }).layer);
+    try testing.expectEqual(@as(u8, 44), instanceFor(t, &Sprite{ .layer = 44 }).layer);
+    try testing.expectEqual(@as(u8, 255), instanceFor(t, &Sprite{ .layer = 255 }).layer);
+    // 300 is the interesting one: 300 & 0xFF is 44, which is the wrong answer
+    // and the one a truncating cast would have given.
+    try testing.expectEqual(@as(u8, 255), instanceFor(t, &Sprite{ .layer = 300 }).layer);
+
+    // And the instance is still 32 bytes, because a megabyte at 32k instances is
+    // not worth a layer.
+    try testing.expectEqual(@as(usize, 32), @sizeOf(render.SpriteInstance));
 }

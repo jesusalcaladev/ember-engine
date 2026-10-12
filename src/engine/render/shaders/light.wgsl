@@ -43,6 +43,13 @@ struct LightIn {
     @location(6) atten_soft: vec2f,
     /// Byte 56: gi contribution, packed flags.
     @location(7) gi_flags: vec2f,
+    /// Byte 64: the sprite layers this light affects, as a bitmask.
+    ///
+    /// A separate attribute and not part of the packed flags because it is 32
+    /// bits of its own: cramming it in would mean either a second vertex buffer
+    /// or dropping to u16 layers, and the mask is the one field a scene with
+    /// twenty lights most wants to vary between them.
+    @location(8) cull_mask: u32,
 };
 
 // flags: kind & 7 | blend << 3 | filter << 5 | has_shadow << 7 | channel << 8
@@ -96,6 +103,34 @@ struct Globals {
 @group(0) @binding(2) var gi_tex: texture_2d<f32>;
 @group(0) @binding(3) var gi_smp: sampler;
 
+/// Which sprite layer each pixel of the scene is on, written by the sprite pass
+/// as a SECOND colour target.
+///
+/// ## Why this exists rather than a light list per sprite
+///
+/// `LightBase.item_cull_mask` says "this light affects these sprite layers". The
+/// light pass draws a quad over the lit area and never learns which sprite is
+/// under a pixel, so it has to be told. The alternatives are all worse:
+///
+///   - a per-pixel loop over lights in the SPRITE shader: every pixel reads every
+///     light, which is the thing the quad-per-light design exists to avoid;
+///   - drawing sprites once per layer so only some lights apply: breaks the
+///     batcher, and 8 layers is 8 sprite passes;
+///   - sorting lights and skipping whole quads: a light that covers two layers
+///     either lights both or neither.
+///
+/// One byte per pixel, written for free by a pass that already runs, and read
+/// once by a fragment that already runs. The cost is a second attachment.
+@group(0) @binding(4) var layer_tex: texture_2d<f32>;
+
+/// The layer a pixel with NO sprite carries.
+///
+/// The scene clears this target to it, and the light pass treats it as "lit by
+/// everything". A light that stopped lighting the background the moment a layer
+/// mask was set is not what anyone means by a layer mask — the mask is about
+/// which SPRITES a light touches, and the empty background belongs to everyone.
+const LAYER_WILDCARD: u32 = 255;
+
 struct VSOut {
     @builtin(position) clip: vec4f,
     @location(0) light_pos: vec2f,
@@ -114,6 +149,7 @@ struct VSOut {
     @location(11) @interpolate(flat) si_flags: u32,
     @location(12) @interpolate(flat) si_filter: u32,
     @location(13) @interpolate(flat) si_color: vec4f,
+    @location(14) @interpolate(flat) si_cull_mask: u32,
 };
 
 @vertex
@@ -142,6 +178,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, in: LightIn) -> VSOut {
     out.si_flags = flags;
     out.si_filter = (flags >> 5) & 3u;
     out.si_color = in.color;
+    out.si_cull_mask = in.cull_mask;
     return out;
 }
 
@@ -149,6 +186,27 @@ fn vs_main(@builtin(vertex_index) vi: u32, in: LightIn) -> VSOut {
 fn fs_main(in: VSOut) -> @location(0) vec4f {
     let kind = in.si_flags & KIND_MASK;
     let color = in.si_color;
+
+    // LAYER CULLING. One texel fetch and one shift, before anything else.
+    //
+    // `textureLoad`, not a sampler: this is an integer ID, and filtering one
+    // would invent layers that no sprite is on. The coordinate is the fragment's
+    // own position, which needs no uniform — the target is the same size as the
+    // one being written.
+    if (in.si_cull_mask != 0xFFFFFFFF) {
+        let lp = vec2u(in.clip.xy);
+        let raw = textureLoad(layer_tex, lp, 0).r * 255.0;
+        let layer: u32 = u32(raw + 0.5);
+        // Split out because a shift-and-mask inside an `if` is a wall of
+        // parentheses, and a wall of parentheses is where a precedence bug hides.
+        let bit: u32 = (in.si_cull_mask >> layer) & 1u;
+        if (layer != LAYER_WILDCARD && bit == 0u) {
+            // This pixel is on a layer this light does not affect. Early out, so
+            // a scene with many masked lights pays for the cone test only where
+            // the light actually applies.
+            return vec4f(0.0);
+        }
+    }
 
     let to_pixel = in.world - in.light_pos;
     let dist = length(to_pixel);

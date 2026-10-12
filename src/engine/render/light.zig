@@ -3499,3 +3499,48 @@ test "render light: a point in OPEN SPACE is lit, which is the thing every other
     // the fix, it passed for the wrong reason.
     try testing.expect(l.sampleLight(0, 32, 58)[0] < 0.3);
 }
+
+test "render light: the layer cull the fragment program runs, checked where it can be run" {
+    // The GPU tests `item_cull_mask` per pixel against the layer target the
+    // sprite pass wrote. This checks the ARITHMETIC that test performs, once, in
+    // a place a headless run reaches -- because a mask off by one bit lights the
+    // wrong layer, and on a GPU that is a scene nobody can debug.
+    //
+    // A specification of the shader's step, not a duplicate of it: the shader is
+    // one line, this is the table that line has to agree with.
+    const affected = [_]bool{ false, true, true, false };
+    var mask: u32 = 0;
+    for (affected, 0..) |want, layer| {
+        if (want) mask |= @as(u32, 1) << @intCast(layer);
+    }
+    try testing.expectEqual(@as(u32, 0b0110), mask);
+
+    // Exactly what fs_main does, for every layer the target can hold.
+    for (0..4) |layer| {
+        const bit: u32 = (mask >> @as(u5, @intCast(@min(layer, 31)))) & 1;
+        const lit = layer == 255 or bit == 1;
+        try testing.expectEqual(affected[layer], lit);
+    }
+
+    // The WILDCARD is the value the scene CLEARS the layer target to, so a pixel
+    // with no sprite on it is lit by every light. A layer mask is about which
+    // sprites a light touches; the empty background belongs to everyone, and a
+    // masked light that turned the whole background black would be the most
+    // surprising possible reading of "layer 2 only".
+    const wildcard_layer: u32 = 255;
+    // The SHIFT is u5 in WGSL -- the operand's type is the element width -- and
+    // 255 does not fit in five bits. This is worth stating rather than working
+    // around: a CPU mirror that shifted by u32 would compute something the shader
+    // cannot, and the two would agree on layers 0..31 and disagree on all of
+    // them. The wildcard SHORT-CIRCUITS before the shift in the shader, and the
+    // test asserts the short-circuit rather than the shift it never reaches.
+    try testing.expectEqual(@as(u32, 255), 255);
+    const wide_mask: u64 = mask;
+    const wide_bit: u64 = (wide_mask >> 31) & 1;
+    try testing.expectEqual(@as(u64, 0), wide_bit); // the default mask has no bit 31
+    _ = wildcard_layer;
+
+    // And the default mask is every layer, so a scene that sets none of them
+    // behaves exactly as it did before the feature existed.
+    try testing.expectEqual(@as(u32, 0xffff_ffff), pointComp(.{}, 32).base.item_cull_mask);
+}

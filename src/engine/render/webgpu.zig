@@ -58,6 +58,11 @@ pub const VertexFormat_Float32x4: c_uint = 0x0000001F;
 pub const VertexFormat_Unorm16x4: c_uint = 0x00000015;
 pub const VertexFormat_Unorm8x4: c_uint = 0x00000009;
 pub const VertexFormat_Uint32: c_uint = 0x00000020;
+/// From Dawn's own header (`WGPUVertexFormat_Uint8 = 0x00000001`), read out of
+/// the vendored tree rather than from memory: these are opaque numbers, and
+/// guessing one produces a vertex layout that is silently wrong — every vertex
+/// reads the wrong bytes and the scene renders nonsense that looks like art.
+pub const VertexFormat_Uint8: c_uint = 0x00000001;
 pub const VertexStepMode_Vertex: c_uint = 1;
 pub const VertexStepMode_Instance: c_uint = 2;
 pub const PrimitiveTopology_TriangleList: c_uint = 4;
