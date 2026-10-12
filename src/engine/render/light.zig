@@ -161,17 +161,30 @@ pub const LightInstance = extern struct {
     /// Byte 64. How much this light contributes to the GI term. 0 by default: GI
     /// is an explicit opt-in per light, not something that happens to everyone.
     gi: f32,
-    /// Byte 68. kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7.
+    /// Byte 68. kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7
+    /// | channel << 8.
+    ///
     /// Named `flags` and not `packed`: `packed` is a Zig keyword, and a field
     /// called after a keyword is a compile error dressed up as a typo.
     flags: u32,
+    /// Which sprite layers this light affects, as a bitmask of `Sprite.layer`.
+    ///
+    /// In the INSTANCE and not in the uniform because it is per light and the
+    /// uniform is per frame: twenty lights with twenty different masks is a
+    /// normal scene, and one uniform would mean twenty of them.
+    ///
+    /// Every layer by default, because a light that silently stopped lighting the
+    /// scene is the worst possible default — and "I added a layer mask and now
+    /// my scene is dark" is a worse first experience than "I set a mask and some
+    /// things are unlit", which is at least what it says.
+    item_cull_mask: u32 = 0xffff_ffff,
 
     comptime {
         // 72 bytes, and every offset above is asserted rather than trusted. A
         // struct whose layout drifts from the shader's is not a wrong light, it
         // is garbage that renders as *something* — the failure mode is a scene
         // that looks lit but has never been correct, which nobody reports.
-        if (@sizeOf(LightInstance) != 72) @compileError("LightInstance must stay 72 bytes");
+        if (@sizeOf(LightInstance) != 76) @compileError("LightInstance must stay 76 bytes");
         if (@offsetOf(LightInstance, "half") != 16) @compileError("half must sit at byte 16");
         if (@offsetOf(LightInstance, "color") != 40) @compileError("color must sit at byte 40");
         if (@offsetOf(LightInstance, "gi") != 64) @compileError("gi must sit at byte 64");
@@ -528,6 +541,28 @@ pub const Lighting = struct {
     /// the current state of M6.
     coverage_store: ?*const CoverageStore = null,
 
+    /// One occupancy grid PER SHADOW CHANNEL, allocated lazily and only for the
+    /// channels whose light actually restricts which occluders block it.
+    ///
+    /// ## Why the single mask cannot answer the question
+    ///
+    /// `LightOccluder2D.cull_mask` says "this wall blocks my torch but not my
+    /// sun". One grid cannot express that: the sweep for the sun and the sweep
+    /// for the torch read the same cells, so honouring the mask means each sweep
+    /// reads a grid built from the occluders IT cares about.
+    ///
+    /// ## Why the default scene pays nothing
+    ///
+    /// A channel whose light has the full mask needs the union, which `mask`
+    /// already is, so `channel_mask[ch]` stays null and that sweep reads `mask`
+    /// exactly as before. The four extra grids appear only when a scene uses the
+    /// feature, which is what keeps "per-channel masks" from being a permanent
+    /// 4x of the rasterization cost for every project.
+    channel_mask: [4]?[]u8 = .{ null, null, null, null },
+    /// How many channels needed their own grid this frame. Reported so a profile
+    /// can tell "the cull-mask feature is on" from "everything is".
+    channel_masks_built: u32 = 0,
+
     /// One slot per occluder for its resolved `CoverageMask`, grown in `reserve`.
     ///
     /// A pool and not a per-occluder allocation because `collect` runs inside the
@@ -603,6 +638,7 @@ pub const Lighting = struct {
         self.allocator.free(self.sdf);
         self.allocator.free(self.gi_pixels);
         self.allocator.free(self.coverage_pool);
+        for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
         if (self.radiance) |r| {
             r.deinit();
             self.allocator.destroy(r);
@@ -642,6 +678,7 @@ pub const Lighting = struct {
         // allow allocating once the frame has started.
         self.allocator.free(self.gi_pixels);
         self.allocator.free(self.coverage_pool);
+        for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
         self.gi_pixels = try self.allocator.alloc(u8, @as(usize, aw) * ah * 4);
         @memset(self.gi_pixels, 0);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
@@ -676,6 +713,7 @@ pub const Lighting = struct {
         // when the budget grows, which is a scene change and not a frame.
         if (self.coverage_pool.len < occluders) {
             self.allocator.free(self.coverage_pool);
+        for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
             self.coverage_pool = try self.allocator.alloc(CoverageMask, occluders);
         }
         try self.scratch.ensureUnusedCapacity(self.allocator, lights);
@@ -978,12 +1016,145 @@ pub const Lighting = struct {
         self.stats.raster_cells = written;
         self.stats.mask_fill = @as(f32, @floatFromInt(written)) /
             @as(f32, @floatFromInt(@max(w * h, 1)));
+        self.buildChannelMasks();
         // The mask changed, so the distance field is now stale. `dirty` is
         // about the field, not about the mask, and the sweep's skip check reads
         // neither of them -- see buildShadowMaps.
         self.dirty = true;
         self.mask_changed = false;
         self.stats.raster_ns = self.tick() - t0;
+    }
+
+    /// Builds the per-channel occupancy grids, for the channels that need one.
+    ///
+    /// A channel needs its own grid when its light's `item_cull_mask` is not the
+    /// full mask AND some occluder disagrees with it — because until an occluder
+    /// says otherwise, "every occluder blocks me" is true and the union is the
+    /// right answer. That condition is what keeps the feature free for a scene
+    /// that sets a mask and never uses it.
+    ///
+    /// Runs at the END of `rasterize`, so it can assume the union is already
+    /// correct and only has to decide which occluders the restricted lights
+    /// exclude.
+    fn buildChannelMasks(self: *Lighting) void {
+        const w = self.alloc_w;
+        const h = self.alloc_h;
+        if (w == 0 or h == 0) return;
+        const cells = @as(usize, w) * h;
+        self.channel_masks_built = 0;
+
+        for (0..4) |ch| {
+            const owner = self.channel_owner[ch];
+            if (owner == 0) {
+                if (self.channel_mask[ch]) |g| self.allocator.free(g);
+                self.channel_mask[ch] = null;
+                continue;
+            }
+            const li = self.lightOf(owner) orelse {
+                if (self.channel_mask[ch]) |g| self.allocator.free(g);
+                self.channel_mask[ch] = null;
+                continue;
+            };
+            const light_mask = self.lights.items[li].item_cull_mask;
+
+            // Any occluder this light does NOT see?
+            var restricted = false;
+            for (self.occluders.items) |oc| {
+                if ((oc.cull_mask & light_mask) == 0) {
+                    restricted = true;
+                    break;
+                }
+            }
+
+            if (!restricted) {
+                if (self.channel_mask[ch]) |g| self.allocator.free(g);
+                self.channel_mask[ch] = null;
+                continue;
+            }
+
+            if (self.channel_mask[ch]) |g| {
+                if (g.len < cells) {
+                    self.allocator.free(g);
+                    self.channel_mask[ch] = null;
+                }
+            }
+            if (self.channel_mask[ch] == null) {
+                self.channel_mask[ch] = self.allocator.alloc(u8, cells) catch null;
+            }
+            const grid = self.channel_mask[ch] orelse continue;
+
+            // Rebuilt from the occluders this light sees. Not "the union minus
+            // the excluded ones": an occluder the light does not see may sit
+            // INSIDE one it does, and subtracting its cells would punch a hole in
+            // the wall. So this walks the occluder list and fills only the ones
+            // that pass, which is the only form that is correct under overlap.
+            @memset(grid, 0);
+            const cell = self.rect.cell(w, h);
+            for (self.occluders.items) |oc| {
+                if ((oc.cull_mask & light_mask) == 0) continue;
+                self.fillOccluder(grid, oc, cell);
+            }
+            self.channel_masks_built += 1;
+        }
+    }
+
+    /// The index in `lights.items` of the light owned by `entity_bits`, or null.
+    fn lightOf(self: *const Lighting, entity_bits: u64) ?usize {
+        for (self.owner_of.items, 0..) |owner, i| {
+            if (owner == entity_bits) return i;
+        }
+        return null;
+    }
+
+    /// Writes one occluder into `grid`, whichever shape it has.
+    ///
+    /// A separate function from `rasterize`'s inline body because the same three
+    /// shapes have to be drawn twice — once into the union and once per
+    /// restricted channel — and a second copy of a rasterizer is a second answer
+    /// to "what does this occluder look like".
+    fn fillOccluder(self: *Lighting, grid: []u8, oc: Occluder, cell: Vec2) void {
+        const w = self.alloc_w;
+        if (oc.coverage) |cov| {
+            // `cov.*`, because the optional holds a pointer and the rasterizer
+            // wants the descriptor. One dereference at the seam rather than a
+            // pointer parameter that every caller has to remember to unwrap.
+            _ = rasterCoverageInto(self, grid, oc, cov.*, cell);
+            return;
+        }
+        if (oc.circle) {
+            _ = rasterCircleInto(self, grid, oc.pos, oc.radius, cell);
+            return;
+        }
+        if (oc.rect_half) |half| {
+            _ = rasterRectInto(self, grid, oc.pos, half);
+            return;
+        }
+        const n = oc.polygon.vertexCount();
+        if (n < 3) return;
+        var b: [4]f32 = undefined;
+        oc.polygon.bounds(&b);
+        const lo = worldToMask(self.rect, w, self.alloc_h, .{
+            .x = oc.pos.x + @min(b[0], b[2]),
+            .y = oc.pos.y + @min(b[1], b[3]),
+        });
+        const hi = worldToMask(self.rect, w, self.alloc_h, .{
+            .x = oc.pos.x + @max(b[0], b[2]),
+            .y = oc.pos.y + @max(b[1], b[3]),
+        });
+        const x0: u32 = @intCast(@max(lo[0], 0));
+        const y0: u32 = @intCast(@max(lo[1], 0));
+        const x1: u32 = @intCast(@min(hi[0], w));
+        const y1: u32 = @intCast(@min(hi[1], self.alloc_h));
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                const wx = self.rect.min.x + (@as(f32, @floatFromInt(x)) + 0.5) * cell.x;
+                const wy = self.rect.min.y + (@as(f32, @floatFromInt(y)) + 0.5) * cell.y;
+                if (!oc.polygon.contains(wx - oc.pos.x, wy - oc.pos.y)) continue;
+                grid[@as(usize, y) * w + x] = 255;
+            }
+        }
     }
 
     /// Rasterizes an axis-aligned rectangle, the automatic occluder's fallback.
@@ -993,6 +1164,12 @@ pub const Lighting = struct {
     /// as wide as the crate on one side — which is a bug that looks like the
     /// light being in the wrong place.
     fn rasterRect(self: *Lighting, pos: Vec2, half: Vec2, cell: Vec2) u64 {
+        _ = cell; // a rectangle is axis-aligned; it does not need the cell size
+        return rasterRectInto(self, self.mask, pos, half);
+    }
+
+    /// The rectangle rasterizer, writing into `grid`.
+    fn rasterRectInto(self: *Lighting, grid: []u8, pos: Vec2, half: Vec2) u64 {
         const hx = @abs(half.x);
         const hy = @abs(half.y);
         if (hx <= 0 or hy <= 0) return 0;
@@ -1007,10 +1184,9 @@ pub const Lighting = struct {
         var written: u64 = 0;
         var y = y0;
         while (y < y1) : (y += 1) {
-            @memset(self.mask[@as(usize, y) * self.alloc_w + x0 ..][0 .. (x1 - x0)], 255);
+            @memset(grid[@as(usize, y) * self.alloc_w + x0 ..][0 .. (x1 - x0)], 255);
             written += x1 - x0;
         }
-        _ = cell;
         return written;
     }
 
@@ -1027,6 +1203,11 @@ pub const Lighting = struct {
     /// transparent ones. That is what "no threshold" should mean: the author said
     /// the sprite occludes, so it occludes.
     fn rasterCoverage(self: *Lighting, oc: Occluder, cov: CoverageMask, cell: Vec2) u64 {
+        return rasterCoverageInto(self, self.mask, oc, cov, cell);
+    }
+
+    /// The coverage rasterizer, writing into `grid`.
+    fn rasterCoverageInto(self: *Lighting, grid: []u8, oc: Occluder, cov: CoverageMask, cell: Vec2) u64 {
         if (cov.w == 0 or cov.h == 0) return 0;
         const cut: u8 = @intFromFloat(@min(@max(oc.alpha_threshold, 0), 1) * 255.0);
 
@@ -1065,7 +1246,7 @@ pub const Lighting = struct {
                 var tx: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(x - x0)) * sx));
                 tx = @min(tx, cov.w - 1);
                 if (cov.pixels[@as(usize, ty) * cov.w + tx] < cut) continue;
-                self.mask[@as(usize, y) * self.alloc_w + x] = 255;
+                grid[@as(usize, y) * self.alloc_w + x] = 255;
                 written += 1;
             }
         }
@@ -1078,6 +1259,15 @@ pub const Lighting = struct {
     /// approximation of a circle produces a visible polygonal shadow edge at the
     /// sizes a 2D light actually casts.
     fn rasterCircle(self: *Lighting, pos: Vec2, radius: f32, cell: Vec2) u64 {
+        return rasterCircleInto(self, self.mask, pos, radius, cell);
+    }
+
+    /// The circle rasterizer, writing into `grid`.
+    ///
+    /// Split out because the per-channel grids need the same three shapes drawn
+    /// a second time, and a second copy of a rasterizer is a second answer to
+    /// "what does this occluder look like".
+    fn rasterCircleInto(self: *Lighting, grid: []u8, pos: Vec2, radius: f32, cell: Vec2) u64 {
         if (radius <= 0) return 0;
         const lo = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{
             .x = pos.x - radius,
@@ -1102,7 +1292,7 @@ pub const Lighting = struct {
                 const dx = wx - pos.x;
                 const dy = wy - pos.y;
                 if (dx * dx + dy * dy > radius * radius) continue;
-                self.mask[@as(usize, y) * self.alloc_w + x] = 255;
+                grid[@as(usize, y) * self.alloc_w + x] = 255;
                 written += 1;
             }
         }
@@ -1138,6 +1328,12 @@ pub const Lighting = struct {
         for (0..4) |ch| {
             const radius = self.channel_radius[ch];
             if (radius <= 0) continue;
+
+            // This channel's grid: its own when its light restricts which
+            // occluders block it, and the union otherwise. Null means "the union
+            // is the right answer", which is the default scene's case and costs
+            // nothing.
+            const grid = if (self.channel_mask[ch]) |g| g else self.mask;
 
             // Sweeping a light that has not moved pays nothing: the map is a
             // function of the light and the mask, and neither changed. A static
@@ -1184,7 +1380,7 @@ pub const Lighting = struct {
                     if (!self.rect.containsPoint(p)) break;
                     const c = worldToMask(self.rect, self.alloc_w, self.alloc_h, p);
                     const idx = @as(usize, @intCast(c[1])) * self.alloc_w + @as(usize, @intCast(c[0]));
-                    if (self.mask[idx] != 0) {
+                    if (grid[idx] != 0) {
                         hit = 1.0 - (t / radius);
                         break;
                     }
@@ -1277,14 +1473,33 @@ pub const Lighting = struct {
             // subtly, invisibly the wrong length.
             const w = @max(li_.softness * rec01, 1e-4);
             const here = 1.0 - @min(rec01 / @max(li_.shadow_ratio, 1e-4), 1.0);
-            vis = smoothstep(occ - w, occ, here);
-            // A filter is an average of neighbours, not a single sample.
-            switch (li_.filter()) {
-                .off => {},
-                .pcf1 => vis = averageMask(occ, li_, here),
-                .pcf3 => vis = 0.5 * vis + 0.5 * averageMask(occ, li_, here),
-                .pcf5 => vis = 0.25 * vis + 0.5 * averageMask(occ, li_, here) +
-                    0.25 * averageMask(occ, li_, here),
+
+            // 255 MEANS CLEAR, and it collides with "a blocker at distance zero":
+            // both encode to 255, because the sweep writes `1 - t/radius` and both
+            // `t = 0` and "nothing there" leave it at 1.0.
+            //
+            // The test below compares the pixel's normalized distance (`here`)
+            // against the stored proximity (`occ`) and asks "is the pixel CLOSER
+            // than the blocker", which needs `here > occ` -- and `here` can never
+            // exceed 1. So a stored 1.0 could never be exceeded, and EVERY PIXEL
+            // whose ray found nothing was reported as fully shadowed.
+            //
+            // It hid because every shadow test in this file sampled a point
+            // BEHIND a wall, where the ray IS blocked and the comparison happens
+            // to give the right answer. A point in open space was never sampled,
+            // which is the one thing a lighting system has to get right.
+            if (occ >= 0.999) {
+                vis = 1;
+            } else {
+                vis = smoothstep(occ - w, occ, here);
+                // A filter is an average of neighbours, not a single sample.
+                switch (li_.filter()) {
+                    .off => {},
+                    .pcf1 => vis = averageMask(occ, li_, here),
+                    .pcf3 => vis = 0.5 * vis + 0.5 * averageMask(occ, li_, here),
+                    .pcf5 => vis = 0.25 * vis + 0.5 * averageMask(occ, li_, here) +
+                        0.25 * averageMask(occ, li_, here),
+                }
             }
         }
         return falloff * vis * li_.energy * li_.color[3];
@@ -1766,6 +1981,7 @@ pub fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
         .attenuation = s.attenuation,
         .softness = @max(d.base.shadow_filter_smooth, 0) * 0.02,
         .gi = d.base.gi_contribution,
+        .item_cull_mask = d.base.item_cull_mask,
         .flags = @as(u32, @intFromEnum(d.kind)) |
             (@as(u32, @intFromEnum(d.base.blend)) << 3) |
             (@as(u32, @intFromEnum(d.base.shadow_filter)) << 5) |
@@ -2693,7 +2909,8 @@ test "render light: a point light's instance is laid out where the shader reads 
     // light, it is garbage that still renders — so the layout is asserted here,
     // where a change to it is a change to a test rather than to a scene.
     const i = instanceFor(pointDesc(.{}, 100), .{ .x = 5, .y = 6 }, 3);
-    try testing.expectEqual(@as(u32, 72), @sizeOf(LightInstance));
+    try testing.expectEqual(@as(u32, 76), @sizeOf(LightInstance));
+    try testing.expectEqual(@as(usize, 72), @offsetOf(LightInstance, "item_cull_mask"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(LightInstance, "pos"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(LightInstance, "radius"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(LightInstance, "shadow_ratio"));
@@ -3058,4 +3275,184 @@ test "render light: a scaled actor occludes with a scaled rectangle" {
     // and the one at 20 is not.
     try testing.expectEqual(@as(u8, 255), l.mask[28 * 64 + 28]);
     try testing.expectEqual(@as(u8, 0), l.mask[12 * 64 + 12]);
+}
+
+test "render light: a light's item_cull_mask reaches the instance, because the shader reads it there" {
+    // `light.set_mask` wrote `item_cull_mask` on the component and the component
+    // went no further: it was not in `LightInstance`, not in the vertex layout and
+    // not in the shader, so a mask was a number that changed nothing.
+    //
+    // What the shader will do with it: the sprite pass writes each pixel's layer
+    // into a target, the light pass samples it, and a pixel whose layer is not in
+    // the light's mask gets nothing. So the number has to survive the trip.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(32, 32);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        // Layer 2 only.
+        components.PointLight2D{ .radius = 16, .base = .{ .item_cull_mask = 0b0100, .cast_shadows = true } },
+    });
+    // A second light with the default mask, for the contrast.
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 8, .y = 8 } },
+        components.PointLight2D{ .radius = 8 },
+    });
+    l.collect(&world, l.rect);
+
+    try testing.expectEqual(@as(u32, 2), l.stats.lights);
+    // Every layer by default, so a light never silently stops lighting anything.
+    try testing.expectEqual(@as(u32, 0xffff_ffff), l.lights.items[1].item_cull_mask);
+    // The restricted one carries its mask, whichever channel it was ranked into.
+    var found = false;
+    for (l.lights.items) |inst| {
+        if (inst.item_cull_mask == 0b0100) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "render light: an occluder that excludes a light does not shadow it, and one that does not pays nothing" {
+    // `occluder.set_mask` wrote `cull_mask` and nothing read it. The feature is
+    // "this wall blocks my torch but not my sun", which one occupancy grid cannot
+    // express — so each restricted light gets its own.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    // Two shadowed lights: one on layer 0, one on layer 1.
+    const a = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 8, .y = 32 } },
+        components.PointLight2D{
+            .radius = 48,
+            .base = .{ .cast_shadows = true, .item_cull_mask = 0b0001 },
+        },
+    });
+    const b = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 56, .y = 32 } },
+        components.PointLight2D{
+            .radius = 48,
+            .base = .{ .cast_shadows = true, .item_cull_mask = 0b0010 },
+        },
+    });
+    // A wall at x=30..32 that blocks ONLY layer 0 — so it shadows `a` and not `b`.
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = .{ 30, 0, 32, 0, 32, 64, 30, 64, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = poly, .cull_mask = 0b0001 },
+    });
+
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+
+    // Both lights are restricted (one mask each) and one occluder disagrees with
+    // one of them, so exactly ONE channel needed its own grid. The other light
+    // sees every occluder, so the union is its right answer for free.
+    try testing.expectEqual(@as(u32, 1), l.channel_masks_built);
+    var grids: u32 = 0;
+    for (l.channel_mask) |m| {
+        if (m != null) grids += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), grids);
+
+    // The wall shadows `a`, which is on the far side of it from `a`'s position,
+    // and does NOT shadow `b` — which is the feature, asserted by the light
+    // being lit rather than by the grid being right.
+    const shadowed = l.sampleLight(l.lightOf(a.bits()).?, 48, 32)[0];
+    const lit = l.sampleLight(l.lightOf(b.bits()).?, 40, 32)[0];
+    try testing.expect(shadowed < 0.05);
+    try testing.expect(lit > 0.05);
+}
+
+test "render light: a scene with no cull masks builds no channel grids at all" {
+    // The whole reason the feature can exist: a project that never uses it must
+    // not pay 4x the rasterization for a feature it does not have.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = @as(f32, @floatFromInt(i)) * 16 + 8, .y = 32 } },
+            pointComp(.{ .cast_shadows = true }, 24),
+        });
+    }
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = .{ 30, 0, 32, 0, 32, 64, 30, 64, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+    });
+
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+
+    try testing.expectEqual(@as(u32, 4), l.stats.shadow_lights);
+    try testing.expectEqual(@as(u32, 0), l.channel_masks_built);
+    for (l.channel_mask) |m| try testing.expect(m == null);
+}
+
+test "render light: a point in OPEN SPACE is lit, which is the thing every other test missed" {
+    // Every shadow test in this file sampled a point BEHIND a wall. Not one
+    // sampled a point whose ray reached its full reach with nothing in the way —
+    // which is where the encoding's one ambiguity lives: the sweep writes
+    // `1 - t/radius` for a blocker and leaves it at 1.0 for "nothing there", so a
+    // clear ray and a blocker at distance zero both store 255.
+    //
+    // The test asked "is the pixel closer than the blocker", which needs
+    // `here > occ`, and `here` can never exceed 1. So every unblocked pixel was
+    // reported as fully shadowed, and the suite was green because the one thing
+    // it never asked was whether a light works in an empty room.
+    var l = try Lighting.init(testing.allocator, .high);
+    defer l.deinit();
+    try l.resize(64, 64);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+    // A NARROW wall between the light at (32,32) and the control point at
+    // (32,58), and nowhere near the other two. Narrow matters: a wall across the
+    // whole mask would put the diagonal point in shadow too and the test would
+    // pass for the wrong reason a second time.
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = .{ 30, 44, 34, 44, 34, 46, 30, 46, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 32, .y = 32 } },
+        components.PointLight2D{ .radius = 60, .base = .{ .cast_shadows = true } },
+    });
+    l.collect(&world, l.rect);
+    l.rasterize();
+    l.buildShadowMaps();
+
+    // Directly above the light, in open space, most of the way out.
+    try testing.expect(l.sampleLight(0, 32, 8)[0] > 0.5);
+    // Diagonally, in open space.
+    try testing.expect(l.sampleLight(0, 50, 50)[0] > 0.4);
+    // And behind the wall, in its shadow: the control. If this one passed before
+    // the fix, it passed for the wrong reason.
+    try testing.expect(l.sampleLight(0, 32, 58)[0] < 0.3);
 }

@@ -217,24 +217,38 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         let w = max(in.si_softness * rec01, 1e-4);
 
         let o0 = textureLoad(shadow_map, vec2u(idx, channel), 0).r;
-        vis = smoothstep(o0 - w, o0, here);
 
-        // The filter is an average of NEIGHBOURS, which is what makes a shadow
-        // edge soft rather than blocky. Weights sum to 1 and the centre tap
-        // always counts, so `off` and the highest filter cannot differ in
-        // brightness — only in how hard the edge is.
-        if (in.si_filter != 0u) {
-            let om = smoothstep(o0 - w, o0, here);
-            let op = textureLoad(shadow_map, vec2u((idx + n_angles - 1u) % n_angles, channel), 0).r;
-            let on = textureLoad(shadow_map, vec2u((idx + 1u) % n_angles, channel), 0).r;
-            let vp = smoothstep(op - w, op, here);
-            let vn = smoothstep(on - w, on, here);
-            if (in.si_filter == 1u) {
-                vis = om;
-            } else if (in.si_filter == 2u) {
-                vis = 0.5 * vis + 0.5 * om;
-            } else {
-                vis = 0.25 * vis + 0.5 * om + 0.25 * vp * vn;
+        // 255 MEANS CLEAR, and it collides with "a blocker at distance zero": the
+        // sweep writes `1 - t/reach` and both `t = 0` and "nothing there" leave
+        // it at 1.0. The test below asks "is the pixel CLOSER than the blocker",
+        // which needs `here > o0` -- and `here` can never exceed 1. So a stored
+        // 1.0 could never be exceeded, and every pixel whose ray found nothing was
+        // fully shadowed.
+        //
+        // Tested FIRST and on the CPU identically: this is one arithmetic
+        // expression in two languages, and a divergence here is a scene where the
+        // reference and the GPU disagree about what light is.
+        if (o0 >= 0.999) {
+            vis = 1.0;
+        } else {
+            vis = smoothstep(o0 - w, o0, here);
+
+            // The filter is an average of NEIGHBOURS, which is what makes a shadow
+            // edge soft rather than blocky. Weights sum to 1 and the centre tap
+            // always counts, so `off` and the highest filter cannot differ in
+            // brightness -- only in how hard the edge is.
+            if (in.si_filter != 0u) {
+                let op = textureLoad(shadow_map, vec2u((idx + n_angles - 1u) % n_angles, channel), 0).r;
+                let on = textureLoad(shadow_map, vec2u((idx + 1u) % n_angles, channel), 0).r;
+                let vp = smoothstep(op - w, op, here);
+                let vn = smoothstep(on - w, on, here);
+                if (in.si_filter == 1u) {
+                    vis = vp * 0.25 + vis * 0.5 + vn * 0.25;
+                } else if (in.si_filter == 2u) {
+                    vis = vis * 0.5 + 0.5 * vp;
+                } else {
+                    vis = vis * 0.25 + vp * 0.375 + vn * 0.375;
+                }
             }
         }
     }
