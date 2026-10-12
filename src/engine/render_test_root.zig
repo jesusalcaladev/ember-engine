@@ -27,6 +27,7 @@ pub const two_d = @import("render/2d.zig");
 pub const light = @import("render/light.zig");
 pub const backend_null = @import("render/backend_null.zig");
 pub const backend_dawn = @import("render/backend_dawn.zig");
+pub const lighting_driver = @import("render/lighting_driver.zig");
 
 test {
     // `refAllDecls` on THIS is what pulls each file's own tests into the

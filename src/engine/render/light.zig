@@ -306,6 +306,15 @@ pub const Lighting = struct {
     /// solid one, which is the "how much sky can I see from here" answer GI wants.
     sdf: []u16 = &.{},
 
+    /// The radiance-cascade pyramid. A POINTER because `Radiance` is declared
+    /// further down this file and Zig has no forward declarations: an inline
+    /// value would be a cycle, and an `anytype` field would cost every method
+    /// on it. Created by `init` when GI is on and left null when it is off, so a
+    /// scene without GI allocates nothing for it.
+    radiance: ?*Radiance = null,
+    /// The RGBA8 grid `encodeGi` writes. Grown in `resize`, never in a frame.
+    gi_pixels: []u8 = &.{},
+
     /// The gather buffers. `std.ArrayList` of trivially-copyable structs, grown
     /// by the caller before a frame and not during one (spec §3.1).
     lights: std.ArrayList(LightInstance) = .empty,
@@ -365,6 +374,16 @@ pub const Lighting = struct {
             .medium => 100 * std.time.ns_per_ms,
             else => 0,
         };
+        // The pyramid only exists when GI does. A scene that never asks for
+        // bounce should not be carrying a four-level probe grid it will never
+        // fill — so this is allocated on the quality setting, not on a flag
+        // that starts out true and gets turned off later.
+        if (quality.giEnabled()) {
+            const r = try self.allocator.create(Radiance);
+            errdefer self.allocator.destroy(r);
+            r.* = Radiance.init(self.allocator);
+            self.radiance = r;
+        }
         return self;
     }
 
@@ -372,6 +391,11 @@ pub const Lighting = struct {
         self.allocator.free(self.mask);
         self.allocator.free(self.shadow);
         self.allocator.free(self.sdf);
+        self.allocator.free(self.gi_pixels);
+        if (self.radiance) |r| {
+            r.deinit();
+            self.allocator.destroy(r);
+        }
         self.lights.deinit(self.allocator);
         self.channel_of.deinit(self.allocator);
         self.reach_of.deinit(self.allocator);
@@ -401,6 +425,12 @@ pub const Lighting = struct {
 
         self.allocator.free(self.mask);
         self.allocator.free(self.sdf);
+        // One texel per mask cell, RGBA. Allocated here rather than on the first
+        // `encodeGi` because that call is inside a frame, and spec §3.1 does not
+        // allow allocating once the frame has started.
+        self.allocator.free(self.gi_pixels);
+        self.gi_pixels = try self.allocator.alloc(u8, @as(usize, aw) * ah * 4);
+        @memset(self.gi_pixels, 0);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
         self.sdf = try self.allocator.alloc(u16, @as(usize, aw) * ah);
         @memset(self.mask, 0);
@@ -980,6 +1010,57 @@ pub const Lighting = struct {
         return @min(cells / 6.0, 1.0);
     }
 
+    /// Encodes the GI field as the RGBA8 grid `uploadGi` wants: alpha is the
+    /// enclosure term, RGB is the finest cascade's radiance.
+    ///
+    /// One buffer, no allocation, and the same arithmetic the sampler uses — so
+    /// the CPU reference and the texture the shader reads cannot disagree about
+    /// what "enclosed" means. A second implementation of the enclosure curve
+    /// would be a second answer to the same question, and the two would differ
+    /// by exactly the amount nobody could explain.
+    ///
+    /// Returns false and leaves `out` untouched when there is no field yet, so
+    /// a caller can distinguish "GI is off" from "GI is on and everything is
+    /// open", which render identically but mean different things to a test.
+    pub fn encodeGi(self: *Lighting, out: []u8) bool {
+        const w = self.alloc_w;
+        const h = self.alloc_h;
+        if (!self.cfg.giEnabled() or self.sdf.len == 0 or w == 0 or h == 0) return false;
+        const need = @as(usize, w) * h * 4;
+        if (out.len < need) return false;
+
+        // The finest cascade, when there is one. Sampled rather than read raw:
+        // it is already a bilinear-filterable grid at `base_scale`, and reading
+        // probes straight would put a probe value in every texel between two
+        // probes and turn the cascade into visible blocks.
+        const r = self.radiance orelse return false;
+        const fine: ?*const Cascade = if (r.cascades.items.len > 0)
+            &r.cascades.items[0]
+        else
+            null;
+
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
+                const idx = @as(usize, y) * w + x;
+                const px = @as(f32, @floatFromInt(x));
+                const py = @as(f32, @floatFromInt(y));
+                const enclosure = @min(@as(f32, @floatFromInt(self.sdf[idx])) / 6.0, 1.0);
+
+                var rgb = [3]f32{ 0, 0, 0 };
+                if (fine) |c| rgb = sampleCascade(r, c, px, py);
+
+                const o = idx * 4;
+                out[o + 0] = clampByte(rgb[0]);
+                out[o + 1] = clampByte(rgb[1]);
+                out[o + 2] = clampByte(rgb[2]);
+                out[o + 3] = clampByte(enclosure);
+            }
+        }
+        return true;
+    }
+
     /// Sum of every light at a point, for the CPU reference path and the tests.
     pub fn sampleAll(self: *const Lighting, x: f32, y: f32) [3]f32 {
         var sum = [3]f32{ 0, 0, 0 };
@@ -999,6 +1080,14 @@ pub const Lighting = struct {
 
 fn clampI32(v: i32, lo: i32, hi: i32) i32 {
     return @min(@max(v, lo), hi);
+}
+
+/// 0..1 to a byte. Named rather than inlined because the GI encoder writes four
+/// channels and a clamp that only two of them use is how the other two go out of
+/// range.
+fn clampByte(v: f32) u8 {
+    const x = @min(@max(v, 0.0), 1.0);
+    return @intFromFloat(x * 255.0 + 0.5);
 }
 
 fn distance(a: Vec2, b: Vec2) f32 {
@@ -1561,7 +1650,7 @@ fn probeAt(
         if (next) |n| {
             const hx = @as(f32, @floatFromInt(px)) + dir.x * t;
             const hy = @as(f32, @floatFromInt(py)) + dir.y * t;
-            from_here = sampleCascade(r, n, hx, hy, sky);
+            from_here = sampleCascade(r, n, hx, hy);
         }
         // A hit contributes what it reflects, not what it receives: a fraction
         // scattered back into the hemisphere. 0.85 is a mid-grey wall.
@@ -1573,16 +1662,19 @@ fn probeAt(
 }
 
 /// Nearest-probe read of a cascade, at probe units.
-fn sampleCascade(r: *const Radiance, c: *const Cascade, x: f32, y: f32, sky: [3]f32) [3]f32 {
+pub fn sampleCascade(r: *const Radiance, c: *const Cascade, x: f32, y: f32) [3]f32 {
     _ = r;
     const gx = @floor(x / @as(f32, @floatFromInt(c.scale)));
     const gy = @floor(y / @as(f32, @floatFromInt(c.scale)));
     const x0: u32 = @intFromFloat(gx);
     const y0: u32 = @intFromFloat(gy);
-    if (x0 >= c.w or y0 >= c.h) return sky;
+    // Outside the built region the answer is nothing, not the sky: a probe grid
+    // that runs out says "no information here", and the caller decides what
+    // "no information" means. Returning the sky from a nearest-probe read would
+    // make the edge of the grid the brightest part of the image.
+    if (x0 >= c.w or y0 >= c.h) return .{ 0, 0, 0 };
     const idx = @as(usize, y0) * c.w + x0;
-    if (idx >= c.probes.len) return sky;
-    // Outside the built region, the sky is the answer.
+    if (idx >= c.probes.len) return .{ 0, 0, 0 };
     return c.probes[idx].incoming;
 }
 
