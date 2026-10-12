@@ -275,6 +275,9 @@ pub const Backend = struct {
         /// carries a 1x1 placeholder instead — a bind group that names a view
         /// that does not exist yet is not a thing you can build.
         light_layer_view: ?wgpu.WGPUTextureView = null,
+        /// The layer texture view used in atlas bind groups for item_cull_mask.
+        /// Updated when the offscreen target's layer view changes.
+        layer_atlas_view: ?wgpu.WGPUTextureView = null,
         /// The cascade's world-space rectangle, republished into the uniform on
         /// every upload because it moves with the camera.
         gi_rect: [4]f32 = .{ 0, 0, 1, 1 },
@@ -647,6 +650,15 @@ pub const Backend = struct {
                 .buffer_type = 0, // BindingNotUsed: this entry is a sampler
                 .sampler_type = wgpu.SamplerBindingType_Filtering,
             },
+            // The layer target, for `item_cull_mask`. Written by the sprite pass
+            // as a second colour attachment, read by the light pass.
+            .{
+                .binding = 3,
+                .visibility = wgpu.ShaderStage_Fragment,
+                .buffer_type = 0, // BindingNotUsed: this entry is a texture
+                .texture_sampleType = wgpu.TextureSampleType_Float,
+                .texture_viewDimension = wgpu.TextureViewDimension_2D,
+            },
         }, "sprite.bgl");
         resources_created += 1;
 
@@ -715,6 +727,14 @@ pub const Backend = struct {
             // because slot and shape already share that word and a third field
             // there would mean a shift at every vertex.
             .{ .format = wgpu.VertexFormat_Uint8, .offset = 30, .shaderLocation = 5 },
+            // The light layer this sprite is on, for `item_cull_mask`.
+            //
+            // CLAMPED to a byte, and that is not a silent truncation: the shader
+            // reads an 8-bit attribute and the layer target is R8, so a sprite on
+            // layer 300 arriving as 44 would be lit by lights masked for layer 44.
+            // The clamp puts every out-of-range layer on 255, which the light pass
+            // treats as the wildcard -- the safe direction.
+            .{ .format = wgpu.VertexFormat_Uint8, .offset = 31, .shaderLocation = 6 },
         };
         const sprite_vlayout = wgpu.VertexBufferLayout{
             .stepMode = wgpu.VertexStepMode_Instance,
@@ -1774,6 +1794,9 @@ pub const Backend = struct {
             return no_target;
         };
         o.layer_view = wgpu.wgpuTextureCreateView(o.layer, null).?;
+        // The layer texture view is used in atlas bind groups for item_cull_mask.
+        // Set it here so rebuildAtlasBindGroups can use it.
+        self.layer_atlas_view = o.layer_view;
 
         // Depth/stencil: the editor's gizmos and M7's 2D shadows need it, and
         // it lets the scene pass do early-Z (overdraw rule).
@@ -1967,6 +1990,13 @@ pub const Backend = struct {
         if (self.light_layer_view == null or !sameView(self.light_layer_view, o.layer_view)) {
             self.light_layer_view = o.layer_view;
             self.rebuildLightBindGroup() catch {};
+        }
+
+        // Also rebuild atlas bind groups if the layer view changed, so sprites
+        // use the correct layer texture for item_cull_mask.
+        if (self.layer_atlas_view == null or !sameView(self.layer_atlas_view, o.layer_view)) {
+            self.layer_atlas_view = o.layer_view;
+            self.rebuildAtlasBindGroups() catch {};
         }
 
         // Upload the camera + texel size once (fixed 96 bytes; spec §3.6).
@@ -2531,6 +2561,24 @@ pub const Backend = struct {
         }, "light.bind");
     }
 
+    /// Rebuilds all atlas bind groups with the current layer texture view.
+    ///
+    /// Called when the offscreen target's layer view changes (e.g. on resize).
+    /// The atlas bind groups need the layer texture view at binding 3 for
+    /// item_cull_mask in the sprite shader.
+    fn rebuildAtlasBindGroups(self: *Backend) !void {
+        const layer = self.layer_atlas_view orelse return error.NoLayerTarget;
+        for (self.atlases.items) |*atlas| {
+            wgpu.wgpuBindGroupRelease(atlas.bind_group);
+            atlas.bind_group = try createBindGroup(self.device, self.sprite_bgl, &[_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .buffer = self.sprite_uniform_buf, .offset = 0, .size = SpriteUniformBytes },
+                .{ .binding = 1, .textureView = atlas.view },
+                .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+                .{ .binding = 3, .textureView = layer },
+            }, "atlas.bg");
+        }
+    }
+
     /// The four 1D shadow maps, as rows of `angles` bytes each. One write per
     /// frame, at most `4 * angles` — 512 bytes at the default, which is nothing.
     fn uploadShadowMap(ptr: *anyopaque, data: []const u8) void {
@@ -2788,6 +2836,7 @@ pub const Backend = struct {
             .{ .binding = 0, .buffer = self.sprite_uniform_buf, .offset = 0, .size = SpriteUniformBytes },
             .{ .binding = 1, .textureView = view },
             .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+            .{ .binding = 3, .textureView = self.layer_atlas_view orelse return null },
         }, "atlas.bg") catch {
             wgpu.wgpuTextureViewRelease(view);
             wgpu.wgpuTextureRelease(texture);
