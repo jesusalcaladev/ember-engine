@@ -714,20 +714,48 @@ render_mod.addImport("assets", assets_mod);
     // in milliseconds with no window and no GPU, so there is no excuse for
     // waiting on the rest of the suite to find out whether a light still works.
     //
-    // Rooted at the engine boundary: that boundary re-exports the project config
-    // and the scripting layer, so a file being edited over there takes the
-    // renderer's tests down with it, and a suite that cannot run stops being
-    // run.
     // The test root lives INSIDE `src/engine/render/` on purpose — see the long
-    // comment at the top of that file. Rooted outside the directory it could not
+    // comment at the top of that file. Rooted outside the directory it cannot
     // see the renderer's tests at all: `render/` is its own module, and Zig
     // collects tests from the root module's own files. This step therefore builds
     // its own module rooted there, with `core`/`ecs` as module imports, which is
     // why `render_mod` is NOT an input: within this compilation the files belong
     // to the test module, and claiming them twice is the "file exists in two
     // modules" error.
+    //
+    // Rooted at the engine boundary instead? That boundary re-exports the project
+    // config and the scripting layer, so a file being edited over there takes the
+    // renderer's tests down with it, and a suite that cannot run stops being run.
+    const render_test_root = "src/engine/render/test_root.zig";
+
+    // THE GUARD. Not a style check — this exact mistake shipped, and the failure
+    // mode was the worst kind available: `zig build test-light` printed
+    // "1 passed", the build went green, and eighty-five tests never ran. Nobody
+    // noticed for months because a suite that silently disappears and a suite
+    // that passes look identical from the outside.
+    //
+    // It lives HERE, in the build script, rather than as a test inside
+    // `test_root.zig`, because of where the mistake was. A test guarding the
+    // module layout has to live in the module whose layout it guards — so when
+    // the layout regresses, the guard stops being collected too, and a guard
+    // that disarms in the same moment as the thing it guards is not a guard.
+    // That was not a hypothesis: putting the check in `test_root.zig` and then
+    // re-introducing the bug produced 85 passing tests with the tripwire nowhere
+    // in the run. The check has to be somewhere the bug cannot reach, and the
+    // bug was in this file.
+    //
+    // A comptime string compare, run once when the build script is analysed. It
+    // cannot drift: the thing it reads is the very string passed to
+    // `root_source_file` three lines below, so there is no second copy of the
+    // path to fall out of sync.
+    comptime {
+        if (!std.mem.endsWith(u8, render_test_root, "render/test_root.zig")) {
+            @panic("test-light's root must live inside src/engine/render/: Zig collects tests from the root module's own files only, so a root anywhere else compiles every renderer test and runs none of them");
+        }
+    }
+
     const render_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/engine/render/test_root.zig"),
+        .root_source_file = b.path(render_test_root),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
