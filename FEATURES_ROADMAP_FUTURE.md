@@ -71,7 +71,7 @@ Ahora el campo GI tiene **resolución propia**, ajustable por el developer desde
 ```
 lighting {
   gi_resolution 128        # lado mayor del campo GI, en celdas. 0 = una celda GI por celda de máscara
-  shadow_resolution 2048   # lado mayor de la máscara de sombras, en celdas
+  shadow_resolution 1024   # lado mayor de la máscara de sombras, en celdas
 }
 ```
 
@@ -104,22 +104,136 @@ anterior.
 | Costo medio de frame | 125.9 ms | **4.7 ms** |
 | Subida de GI | 16 MiB | **64 KiB** |
 
-Un frame en movimiento a 1080p **cabe ahora en un frame de 60 Hz** (14.2 ms de
-16.67 ms), donde antes era 23× el presupuesto entero.
+Un frame en movimiento a 1080p bajó de 23× el presupuesto a 14.2 ms.
+
+> **CORREGIDO MÁS ABAJO — esta afirmación estaba mal.** "14.2 ms cabe en un frame
+> de 60 Hz"merce las 2.4 ms restantes a un sprite, la física, Lua, el audio, la UI
+> y el propio driver del batch, y no caben. La medición posterior (`sweepBudgetGrid`)
+>拉克orta que el coste estaba mal atribuido y que el default era 2.8× más caro de
+> lo que estas cifras sugerían. Se conserva el texto porque el error está
+> registrado, no borrado.
 
 **Lo que sigue sin cumplirse**: el presupuesto de 1.5 ms amortizados. El
-`resample` es lineal en la MÁSCULA y ninguna resolución lo reduce, así que 2.7 ms
+`resample` es lineal en la MÁSCARA y ninguna resolución lo reduce, así que 2.7 ms
 es el piso con este diseño. Está registrado como tal, no maquillado.
 
 Nota: el bench tiene ~20% de dispersión entre corridas; las cifras de EDT y
 pirámide son rangos.
+
+
+### ✅ EL DEFAULT DE `shadow_resolution`: 2048 → 1024, POR MEDICIÓN
+
+La pregunta era "un juego 2D de mundo abierto puede ir a 60 fps con GI", y la
+respuesta corta resultó ser: **no, con los defaults que había**. El coste de un
+frame de iluminación con oclusores moviéndose era de **26.6 ms** — 1.6× un frame
+entero de 60 Hz — y la mitad erarasterizado de máscara y barrido angular, que son
+lineales en área.
+
+#### El hallazgo que cambió la recomendación
+
+Medí `shadow_resolution` primero, porque era la hipótesis evidente. **No era el
+dial**, y el sweep lo dice de forma inequívoca: la pirámide se mantiene en
+22–27 ms en **todas** las resoluciones de 256 a 4096, porque no lee la máscara de
+sombras — lee `gi_resolution`, que es un presupuesto aparte. Bajar la resolución
+de sombras no toca la pirámide.
+
+Lo que sí baja es la máscara y el barrido, que corren **cada frame** en que se
+mueve un oclusor. El coste por reconstrucción (µs, GI activo, 21 luces, 40
+oclusores, vista 1920×1080):
+
+| `shadow_resolution` | máscara | pasos de rayo | máscara | barrido | campo GI | pirámide | total |
+|---|---|---|---|---|---|---|---|
+| 256/512 | 512² | 49 918 | 612–863 | 1131–1401 | 1485–2523 | 21618–22124 | **24.8–26.9 ms** |
+| 1024 | 1024² | 98 341 | 1775 | 3427 | 2316 | 23391 | **30.9 ms** |
+| 2048 | 2048² | 195 965 | 10 067 | 5226 | 3624 | 22544 | **41.5 ms** |
+| 4096 | 4096² | 391 110 | 40 291 | 11 025 | 11 053 | 21 853 | **84.2 ms** |
+
+2048 era una costumbre, no una medición: es el tamaño de un mapa de sombras en
+un motor 3D donde una texel cubre una superficie entera. Aquí una texel cubre una
+celda 2D, y 1024 sobre una vista de 1920 ya es una texel por ~2×2 píxeles de
+pantalla — bajo un término de GI que es 128×128, nadie lo ve.
+
+#### La tabla que decide
+
+µs por frame **amortizado**, con la forma real de un frame con oclusores en
+movimiento: máscara + barrido **cada frame**, campo + pirámide repartidos en 6
+frames (`gi_interval_ns` = 100 ms). El intervalo gobierna el campo y la pirámide,
+**no** la máscara ni el barrido, y dividir el frame entero entre 6 subestima
+justo en la dirección que hace parecer que el dial barato es el bueno.
+
+| `shadow_res` ↓ / `gi_res` → | 32 | 64 | 128 |
+|---|---|---|---|
+| **512** | **1612** | 3640 | 7565 |
+| **1024** | 5634 | 6358 | 9507 |
+| **2048** (antes) | 21089 | 15045 | **26597** ⚠️ |
+
+⚠️ = se pasa un frame entero. La celda elegida es **1024 × 128**, que entrega
+**9.5 ms** — un 2.8× de mejora sobre el default anterior.
+
+La calidad de `gi_res` ya estaba medida (MAE contra el campo a resolución
+completa): 0.199 en 32, 0.109 en 64, **0.041 en 128**, 0.025 en 256. El error cae
+como ~1/res, así que 128 es el codo de la curva — y también cuatro veces el coste
+del de abajo.
+
+**Resultado medido con los defaults que se envían**
+(`zig build bench-light`, "M7 ACCEPTANCE"):
+
+| | antes (2048) | ahora (1024) |
+|---|---|---|
+| Máscara | 2048² | **1024²** |
+| Frame en movimiento | 14 891 µs | **5285 µs** |
+| Costo medio de frame | 4972 µs | **1770 µs** |
+| % del presupuesto de 60 Hz | 49.2% | **10.6%** |
+| Frame en reposo | 12 µs | 12 µs |
+
+### 🐛 LA SECCIÓN `lighting` DEL CONFIG **NUNCA LLEGÓ AL DRIVER**
+
+Encontrado al intentar hacer que el acceptance midiera el default que se envía, y
+es la clase de defecto que este motor ha ido acumulando:
+
+- `Driver.applyLightingConfig` **no tenía ningún caller** en el árbol entero.
+- Leía un campo llamado **`backend`**, que `project.config.Lighting` nunca ha
+  tenido: se llama `gi_backend`, y es un enum, no el `u8` que la función esperaba.
+- Era genérica sobre `anytype` + `@field`, así que un genérico sólo se comprueba
+  contra lo que se le pasa, y no se le pasaba nada.
+
+Consecuencia: **`gi_backend`, `gi_resolution`, `shadow_resolution`,
+`bounce_iterations` y `bounce_albedo` eran inertes.** Se parseaban, se
+documentaban en el esquema con tooltips, seEGF They'd appear in an editor
+dropdown, y no se usaban. Un proyecto podía poner `shadow_resolution 512` y el
+render seguiría con la suposición del constructor.
+
+Tres arreglos:
+
+1. **`applyLightingConfig` ahora toma `project.config.Lighting` concreto.** El
+   parámetro se escribe explícito a propósito: volverlo genérico reintroduce la
+   misma clase de error y además elimina la única comprobación que lo detectó.
+2. **Un callback `applyLighting` en `project.runtime.apply`.** Es un callback de
+   config y no una línea de arranque, así que editar el fichero lo re-aplica. Los
+   dos dials que más cuestan son exactamente los que uno ajusta mirando el frame
+   time, y un ajuste que exige relanzar se ajusta una vez y se olvida.
+3. **`Driver` recuerda `shadow_resolution`.** `setShadowResolution` calcula una
+   *escala* a partir de una vista, y `resize` divide por ella, así que el driver
+   conservaba la escala de la vista ANTERIOR: la máscara se movía exactamente en
+   la proporción en que se movía la ventana. Una resolución que no se puede
+   conservar no es una resolución. `resize` vuelve a derivar la escala a partir de
+   la vista que recibe.
+
+Con (3) desaparece también una trampa de orden: `applyLighting` **no** redimensiona.
+En tiempo de config el driver todavía no tiene vista (`lighting.rect` está vacío),
+y redimensionar ahí pide una máscara de 1×1 contra una escala pensada para 1920.
+Se probó, y entra en pánico en `allocMask` en el primer frame.
+
+Dos tests nuevos, en `lighting_driver.zig`, que fallan contra el código anterior:
+la sección del config llega al driver (backend, dials **y** el tamaño real de la
+máscara), y la resolución configurada sobrevive a un `resize`.
 
 ### ✅ GI: TRES MODELOS, UN ENUM, TODO PARAMETRIZADO
 
 ```
 lighting {
   gi_resolution 128          # lado mayor del campo GI (0 = 1 celda GI por celda de máscara)
-  shadow_resolution 2048     # lado mayor de la máscara de sombras
+  shadow_resolution 1024     # lado mayor de la máscara de sombras (medido: 2048 costaba 26.6 ms/frame)
   gi_backend "sky"           # off | sky | bounce
   bounce_iterations 8        # pases de difusión por frame (modelo bounce)
   bounce_albedo 0.6          # fracción de luz que conserva una pared por rebote

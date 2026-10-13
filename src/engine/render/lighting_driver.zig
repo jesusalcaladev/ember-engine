@@ -37,6 +37,11 @@
 
 const std = @import("std");
 const light_mod = @import("light.zig");
+/// `project.config`, so this module can apply the settings a project actually
+/// ships. Spelled as an import rather than an `anytype` parameter because the
+/// fields are the contract and the compiler should be the one holding it to
+/// them.
+const project_config = @import("project").config;
 const render_mod = @import("render.zig");
 const two_d = @import("2d.zig");
 const atlas_bridge = @import("atlas_bridge.zig");
@@ -117,6 +122,17 @@ pub const Driver = struct {
 
     bounce_iterations: u32 = light_mod.bounce_iterations,
     gi_albedo: f32 = light_mod.default_bounce_albedo,
+    /// The project's `lighting.shadow_resolution`, kept so `resize` can re-apply
+    /// it every time the view changes.
+    ///
+    /// It was not kept, which meant the setting only survived until the window
+    /// moved: `setShadowResolution` computes a SCALE from a view, and `resize`
+    /// then divides by that scale, so the moment the view changed the scale went
+    /// with it and the mask silently returned to whatever `Driver.init` guessed.
+    /// A resolution the user cannot keep is not a resolution.
+    ///
+    /// `0` means "not configured", and the driver's own default applies.
+    shadow_resolution: u32 = 0,
 
     /// The scene this driver last saw.
     ///
@@ -166,6 +182,12 @@ pub const Driver = struct {
     /// the world, and a driver that counted them would need a second query pass
     /// every frame for a number that only matters when something is added.
     pub fn resize(self: *Driver, view: MaskRect) !void {
+        // Re-derive the scale from the NEW view before dividing by it. Without
+        // this the scale is the one the PREVIOUS view asked for, so every resize
+        // moved the mask by exactly the ratio the window moved — which is how a
+        // project's `shadow_resolution` turned into a suggestion the moment
+        // anything was resized.
+        if (self.shadow_resolution != 0) self.setShadowResolution(self.shadow_resolution, view);
         const w: u32 = @intFromFloat(@max(1, (view.max.x - view.min.x) / self.scale));
         const h: u32 = @intFromFloat(@max(1, (view.max.y - view.min.y) / self.scale));
         const changed = w != self.lighting.alloc_w or h != self.lighting.alloc_h;
@@ -398,6 +420,7 @@ pub const Driver = struct {
     /// them means a caller that resizes anyway pays for it once.
     pub fn setShadowResolution(self: *Driver, cells: u32, view: MaskRect) void {
         if (cells == 0) return;
+        self.shadow_resolution = cells;
         const longest = @max(view.max.x - view.min.x, view.max.y - view.min.y);
         if (longest <= 0) return;
         // `resize` computes `cells_wanted = extent / scale`, so the scale that
@@ -420,17 +443,35 @@ pub const Driver = struct {
     ///
     /// Allocates when it changes, so it belongs with `resize` and not inside a
     /// frame. The editor's settings panel applies configs between frames.
-    pub fn applyLightingConfig(self: *Driver, c: anytype) !void {
-        self.default_backend = switch (@as(u8, @intFromEnum(@field(c, "backend")))) {
-            0 => light_mod.GiBackend.off,
-            1 => light_mod.GiBackend.sky,
-            else => light_mod.GiBackend.bounce,
+    /// Applies `project.config`'s `lighting` section to this driver.
+    ///
+    /// Field names are `project.config.Lighting`'s, spelled out rather than
+    /// `@field`-ed, and the reason is the whole history of this function: it
+    /// read a field called `backend`, which `config.Lighting` has never had —
+    /// it is called `gi_backend` and holds an ENUM, not the `u8` this expected.
+    ///
+    /// It had no caller either, which is the only reason the mismatch survived:
+    /// a generic function against `@field` is checked against whatever is passed
+    /// in, and nothing was ever passed in. So the entire `lighting` section of
+    /// `project.config` — the backend, the GI resolution, the shadow resolution,
+    /// the bounce dials — was inert. A project could set `shadow_resolution` to
+    /// 512 in its config and the driver would have kept running at the tier's
+    /// built-in value, with nothing to say so.
+    ///
+    /// Concrete and spelled out because the moment this takes an `anytype` again
+    /// the same class of mistake returns, and the compile error that would have
+    /// caught it only appears when a caller finally exists.
+    pub fn applyLightingConfig(self: *Driver, c: project_config.Lighting) !void {
+        self.default_backend = switch (c.gi_backend) {
+            .off => light_mod.GiBackend.off,
+            .sky => light_mod.GiBackend.sky,
+            .bounce => light_mod.GiBackend.bounce,
         };
-        self.bounce_iterations = @intCast(@max(@field(c, "bounce_iterations"), 0));
-        self.gi_albedo = @floatCast(@max(@min(@field(c, "bounce_albedo"), 1.0), 0.0));
+        self.bounce_iterations = @intCast(@max(c.bounce_iterations, 0));
+        self.gi_albedo = @floatCast(@max(@min(c.bounce_albedo, 1.0), 0.0));
         self.lighting.gi_backend = self.default_backend;
-        try self.setGiResolution(@intCast(@max(@field(c, "gi_resolution"), 0)));
-        try self.setShadowResolution(@intCast(@max(@field(c, "shadow_resolution"), 256)), self.lighting.rect);
+        try self.setGiResolution(@intCast(@max(c.gi_resolution, 0)));
+        self.setShadowResolution(@intCast(@max(c.shadow_resolution, 256)), self.lighting.rect);
     }
 
     /// The GI field's longest side, in cells. `0` means "match the mask".
@@ -1366,4 +1407,78 @@ test "render light driver: an environment picks the backend, and only for its ow
     // bounce running in a courtyard, and nothing in the picture would say so.
     d.update(&outdoors, 1_000_000);
     try testing.expectEqual(light_mod.GiBackend.sky, d.lighting.gi_backend);
+}
+
+test "render light driver: a project's `lighting` section actually reaches the driver" {
+    // The defect this exists for.
+    //
+    // `applyLightingConfig` had NO CALLER and read a field called `backend`,
+    // which `project.config.Lighting` has never had — it is `gi_backend`, and it
+    // is an enum rather than the `u8` the function expected. A generic function
+    // over `@field` is checked against whatever is passed in, and nothing ever
+    // was, so the mismatch cost nothing to compile.
+    //
+    // The consequence was that the entire `lighting` section of `project.config`
+    // was inert: `gi_backend`, `gi_resolution`, `shadow_resolution`,
+    // `bounce_iterations` and `bounce_albedo` were parsed, documented in the
+    // schema with tooltips, shown in an editor dropdown, and never used. A
+    // project could set `shadow_resolution` to 512 and the renderer would have
+    // carried on at its constructor's guess.
+    var d = try Driver.init(testing.allocator, .medium);
+    defer d.deinit();
+
+    try d.applyLightingConfig(.{
+        .gi_backend = .bounce,
+        .gi_resolution = 64,
+        .shadow_resolution = 512,
+        .bounce_iterations = 3,
+        .bounce_albedo = 0.42,
+    });
+
+    try testing.expectEqual(light_mod.GiBackend.bounce, d.default_backend);
+    try testing.expectEqual(light_mod.GiBackend.bounce, d.lighting.gi_backend);
+    try testing.expectEqual(@as(u32, 3), d.bounce_iterations);
+    try testing.expectApproxEqAbs(@as(f32, 0.42), d.gi_albedo, 1e-6);
+    try testing.expectEqual(@as(u32, 512), d.shadow_resolution);
+
+    // The field itself, not just the knob that sizes it: a GI resolution the
+    // driver remembered but never applied would pass every assertion above.
+    const view = MaskRect{
+        .min = .{ .x = 0, .y = 0 },
+        .max = .{ .x = 1920, .y = 1080 },
+    };
+    try d.resize(view);
+    try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
+}
+
+test "render light driver: the configured resolution survives a resize" {
+    // `setShadowResolution` computes a SCALE from a view and `resize` divides by
+    // it, so a driver that set the scale once kept the OLD view's scale until
+    // something changed it. The mask therefore moved by exactly the ratio the
+    // window moved, and a project's `shadow_resolution` became a suggestion that
+    // lasted until the first resize.
+    //
+    // Shrinking the view must keep the cell count, not the scale: 1920 wide at
+    // 512 cells is a scale of 3.75, and 960 wide at the same 512 is 1.875. The
+    // second number is the one the driver has to recompute, and it did not.
+    var d = try Driver.init(testing.allocator, .medium);
+    defer d.deinit();
+    try d.applyLightingConfig(.{
+        .gi_backend = .sky,
+        .gi_resolution = 0,
+        .shadow_resolution = 512,
+        .bounce_iterations = 8,
+        .bounce_albedo = 0.6,
+    });
+
+    try d.resize(.{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 1920, .y = 1080 } });
+    try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
+    const first_scale = d.scale;
+
+    try d.resize(.{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 960, .y = 540 } });
+    try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
+    // And the scale really did change — a driver that recomputed nothing would
+    // pass the cell-count assertions above by accident, because the mask had
+    // already been allocated and `resize` would have early-ed out.
+    try testing.expect(d.scale < first_scale);
 }

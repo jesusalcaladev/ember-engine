@@ -192,6 +192,13 @@ render_mod.addImport("assets", assets_mod);
         .link_libc = true,
     });
     project_mod.addImport("core", core_mod);
+    // Declared above `render_mod`'s imports on purpose, so that the renderer can
+    // name it: `Driver.applyLightingConfig` is the only path by which a
+    // project's `lighting` section reaches the driver, and it cannot exist
+    // without this. It is attached here rather than at the renderer's own
+    // declaration because `project_mod` did not exist yet at that point — the
+    // ordering is the constraint and the import is the consequence.
+    render_mod.addImport("project", project_mod);
 
     // ── Editor module (M5.5: the non-UI half of the code editor) ─────────────
     // Depends on nothing but itself. A document, a cursor, a highlighter, a
@@ -406,6 +413,11 @@ render_mod.addImport("assets", assets_mod);
     light_bench_mod.addImport("core", core_mod);
     light_bench_mod.addImport("ecs", ecs_mod);
     light_bench_mod.addImport("engine", bench_engine_mod);
+    // `project`, so the acceptance can ask `project.config` for the shipped
+    // default rather than reconstructing it. Without it the acceptance measured
+    // the tier's built-in `shadow_resolution` and kept reporting 2048 after the
+    // default moved to 1024 — a benchmark of a configuration nobody ships.
+    light_bench_mod.addImport("project", project_mod);
     // The engine module declares the Dawn externs, so anything linking it needs
     // the libraries — declared once on `engine_mod`, which this shares.
     light_bench_mod.addLibraryPath(b.path("libs/dawn/build/src/dawn"));
@@ -778,6 +790,13 @@ render_mod.addImport("assets", assets_mod);
     // excluded because it pulls in GLFW, X11 and inotify, and those are edited
     // far more often than the renderer is.
     render_test_mod.addImport("assets", assets_mod);
+    // `project`, because `lighting_driver.applyLightingConfig` takes a
+    // `project.config.Lighting` and there are tests here that call it. The
+    // parameter is spelled out rather than generic precisely so that the
+    // compiler is the thing holding the field names honest; making it generic
+    // again to avoid this import would also remove the only check that caught
+    // the original `backend`/`gi_backend` mismatch.
+    render_test_mod.addImport("project", project_mod);
 
     const render_only_tests = b.addTest(.{
         .root_module = render_test_mod,

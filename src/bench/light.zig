@@ -302,6 +302,9 @@ pub fn main(init: std.process.Init) !void {
     try measureAutomatic(std.heap.c_allocator);
     try sweepGiResolution(std.heap.c_allocator);
     try sweepEarlyOut(std.heap.c_allocator);
+    try sweepShadowResolution(std.heap.c_allocator);
+    try sweepGiAmortisation(std.heap.c_allocator);
+    try sweepBudgetGrid(std.heap.c_allocator);
     try sweepBackends(std.heap.c_allocator);
     try acceptance(std.heap.c_allocator);
 }
@@ -557,6 +560,110 @@ fn backendOne(
     });
 }
 
+/// `shadow_resolution` swept, with the cost BROKEN DOWN rather than totalled.
+///
+/// The total was the wrong number to start from. Lighting's cost is three
+/// systems sharing one mask, and a single figure hides which one the dial is
+/// actually turning: a reviewer who sees "14.2 ms" cannot tell whether the
+/// shadows, the GI or the rasterizer is the thing to go after, and will go
+/// after whichever the sentence mentions last.
+///
+/// So this prints the four parts and, separately, what share of the frame each
+/// is. That is also the answer to "is the GI optimal", which is not a yes/no:
+/// it is whichever line is biggest, read next to its share.
+fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+    const frames: u32 = 8;
+    const resolutions = [_]u32{ 256, 512, 1024, 2048, 4096 };
+
+    log("SHADOW RESOLUTION — where the frame actually goes", .{});
+    log("  medium, 1920x1080 view, 21 lights, 40 occluders, GI active", .{});
+    // "Per rebuild", NOT "per frame". A rebuild is gated by `gi_interval_ns`,
+    // so consecutive frames of a moving scene do NOT each pay this; a resting
+    // frame pays ~12 us and a moving one pays it at most ten times a second.
+    // Labelling a per-rebuild figure "per frame" turns a real question ("why is
+    // my frame 40 ms?") into a false one ("my frame is 40 ms") and it is the
+    // same mistake as deriving a number and printing it beside a measured one.
+    log("  all figures PER REBUILD; how often that happens is `gi_interval_ns`", .{});
+    log("", .{});
+
+    for (resolutions) |res| {
+        var world = World.init(allocator);
+        defer world.deinit();
+        try buildAcceptanceScene(&world, lights_n, occluders_n);
+
+        var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+        defer driver.deinit();
+        const view = engine.lighting_driver.Driver.viewFor(
+            null,
+            @intFromFloat(acceptance_world_w),
+            @intFromFloat(acceptance_world_h),
+        );
+        driver.setShadowResolution(res, view);
+        try driver.resize(view);
+        driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
+        driver.sky = .{ 0.06, 0.07, 0.10 };
+
+        var mask: u64 = 0;
+        var sweep: u64 = 0;
+        var gi_field: u64 = 0;
+        var gi_pyr: u64 = 0;
+        var rebuild: u64 = 0;
+        var rebuilds: u32 = 0;
+        var steps: u64 = 0;
+
+        var f: u32 = 0;
+        while (f < frames) : (f += 1) {
+            var it = world.query(.{components.LightOccluder2D, components.Transform});
+            var e = it.next();
+            var n: u32 = 0;
+            while (e) |en| : (e = it.next()) {
+                if (n % 2 == 0) en.get(components.Transform).position.x += 1.0;
+                n += 1;
+            }
+            const before = driver.lighting.stats.sdf_builds;
+            driver.update(&world, @intCast(monotonicNs()));
+            steps = driver.lighting.stats.sweep_steps;
+            if (driver.lighting.stats.sdf_builds != before) {
+                mask += driver.lighting.stats.raster_ns;
+                sweep += driver.lighting.stats.sweep_ns;
+                gi_field += driver.lighting.stats.sdf_ns;
+                gi_pyr += driver.lighting.stats.pyramid_ns;
+                rebuild += driver.lighting.stats.raster_ns + driver.lighting.stats.sweep_ns +
+                    driver.lighting.stats.sdf_ns + driver.lighting.stats.pyramid_ns;
+                rebuilds += 1;
+            }
+        }
+
+        const n: f64 = @floatFromInt(@max(rebuilds, 1));
+        const mask_us = @as(f64, @floatFromInt(mask)) / n / 1000.0;
+        const sweep_us = @as(f64, @floatFromInt(sweep)) / n / 1000.0;
+        const field_us = @as(f64, @floatFromInt(gi_field)) / n / 1000.0;
+        const pyr_us = @as(f64, @floatFromInt(gi_pyr)) / n / 1000.0;
+        const total = mask_us + sweep_us + field_us + pyr_us;
+        const gi_share = if (total > 0) 100.0 * (field_us + pyr_us) / total else 0;
+
+        log("  {d:>5} cells ({d}x{d} mask)  ray steps {d}", .{
+            res,
+            driver.lighting.alloc_w,
+            driver.lighting.alloc_h,
+            steps,
+        });
+        log("      occluder mask {d:>8.2} us   {d:>5.1}%", .{ mask_us, pct(mask_us, total) });
+        log("      shadow sweep  {d:>8.2} us   {d:>5.1}%", .{ sweep_us, pct(sweep_us, total) });
+        log("      GI field      {d:>8.2} us   {d:>5.1}%", .{ field_us, pct(field_us, total) });
+        log("      GI pyramid    {d:>8.2} us   {d:>5.1}%", .{ pyr_us, pct(pyr_us, total) });
+        log("      TOTAL         {d:>8.2} us   (GI is {d:.0}% of it)", .{ total, gi_share });
+        log("", .{});
+    }
+}
+
+fn pct(part: f64, total: f64) f64 {
+    if (total <= 0) return 0;
+    return 100.0 * part / total;
+}
+
 /// The enclosed-probe early-out, measured both ways on the SAME scene.
 ///
 /// This is the "measure it, then decide" case. The early-out is obviously good
@@ -685,6 +792,203 @@ fn earlyOutOne(
 /// full-resolution field, so the default is chosen from a trade rather than
 /// from a preference.
 ///
+/// What a frame ACTUALLY PAYS for GI, once `gi_interval_ns` is counted.
+///
+/// `sweepGiResolution` above measures this same dial's cost AND its quality
+/// (mean error against the full-resolution field). Neither of those is the
+/// number a user feels, and the third is arithmetic on both — so it is labelled
+/// DERIVED rather than presented beside the measured ones as though it were
+/// measured too.
+///
+/// The `shadow_resolution` sweep settles which dial turns the pyramid: none of
+/// them. From 256 to 4096 cells the pyramid stays at 22-27 ms, because it does
+/// not read the shadow map — it reads `gi_res`, a separate budget. That turns
+/// "lower the shadow resolution" from a recommendation into a measured
+/// non-answer and leaves this one.
+///
+/// Both figures are printed because quoting either alone misleads: per-rebuild
+/// makes GI look catastrophic, and amortised hides the spike you can see
+/// whenever an occluder really does move on a frame you can see.
+fn sweepGiAmortisation(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+    const resolutions = [_]u32{ 32, 64, 128, 256 };
+    const frame_us: f64 = 16667.0; // 60 Hz
+    const interval_ns = 100.0 * std.time.ns_per_ms;
+
+    log("GI AMORTISATION — what a frame actually pays", .{});
+    log("  medium tier, 1920x1080 view, 21 lights, 40 occluders", .{});
+    log("  `gi_interval_ns` = 100 ms at medium: one rebuild per ~6 frames at 60 Hz", .{});
+    log("", .{});
+
+    for (resolutions) |res| {
+        var world = World.init(allocator);
+        defer world.deinit();
+        try buildAcceptanceScene(&world, lights_n, occluders_n);
+
+        var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+        defer driver.deinit();
+        const view = engine.lighting_driver.Driver.viewFor(
+            null,
+            @intFromFloat(acceptance_world_w),
+            @intFromFloat(acceptance_world_h),
+        );
+        try driver.setGiResolution(res);
+        try driver.resize(view);
+        driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
+        driver.sky = .{ 0.06, 0.07, 0.10 };
+
+        // One rebuild, on its own. The occluders move first so the first `update`
+        // is a rebuild and not a no-op — otherwise this would measure the
+        // resting frame and report it as the cost.
+        var it = world.query(.{components.LightOccluder2D, components.Transform});
+        var e = it.next();
+        while (e) |en| : (e = it.next()) en.get(components.Transform).position.x += 1.0;
+
+        const before = driver.lighting.stats.sdf_builds;
+        driver.update(&world, @intCast(monotonicNs()));
+        const rebuilt = driver.lighting.stats.sdf_builds != before;
+
+        const st = driver.lighting.stats;
+        const total_us = @as(f64, @floatFromInt(st.raster_ns + st.sweep_ns + st.sdf_ns + st.pyramid_ns)) / 1000.0;
+        const pyr_us = @as(f64, @floatFromInt(st.pyramid_ns)) / 1000.0;
+        // rebuilds per second = 1e9 / interval_ns; frames per second =
+        // 1e6 / frame_us. The share is total_us * rebuilds / frames.
+        //
+        // It was written as `total * (1e6/interval) * (frame/1e6)`, which is
+        // right by a factor of one thousand and reported a 43 ms rebuild as
+        // costing 7 us a frame — a number so good it invited belief. Every unit
+        // in it was ns against us. A derived figure is still arithmetic, and
+        // arithmetic still has to be right.
+        const rebuilds_per_s = 1_000_000_000.0 / interval_ns;
+        const frames_per_s = 1_000_000.0 / frame_us;
+        const amortised = if (rebuilt) total_us * rebuilds_per_s / frames_per_s else 0;
+
+        log("  gi_res {d:>4}  (GI grid {d}x{d}, mask {d}x{d})", .{
+            res,
+            driver.lighting.gi_w,
+            driver.lighting.gi_h,
+            driver.lighting.alloc_w,
+            driver.lighting.alloc_h,
+        });
+        log("      pyramid       {d:>9.2} us   {d:>5.1}% of the rebuild   [measured]", .{
+            pyr_us,
+            pct(pyr_us, total_us),
+        });
+        log("      whole rebuild {d:>9.2} us                              [measured]", .{total_us});
+        log("      per frame     {d:>9.2} us                              [DERIVED]", .{amortised});
+        log("      leaves        {d:>9.2} us of the 60 Hz frame for everything else", .{frame_us - amortised});
+        log("", .{});
+    }
+
+    log("  A RESTING frame — no occluder moved — pays ~12 us for ALL of lighting,", .{});
+    log("  because the mask is unchanged and nothing downstream of it runs. In a", .{});
+    log("  2D RPG the level geometry is static and only actors move, and actors", .{});
+    log("  are not occluders, so the resting figure is the common one.", .{});
+    log("", .{});
+}
+
+/// Both dials at once, which is the only form of the answer that is one.
+///
+/// Each sweep above varies one dial and holds the other at its default, and
+/// that framing is what produced the recommendation this measurement killed: at
+/// a fixed `gi_res` the pyramid is flat across every shadow resolution, which
+/// reads as "the shadow resolution does not matter" — true of the pyramid, and
+/// misleading about the frame, because the mask and the pyramid are 45% and 55%
+/// of the same rebuild and they do not share a dial.
+///
+/// So: the grid, both axes, amortised per frame, with the 60 Hz budget marked.
+/// The cell that is cheap AND has a green cell is the answer, and it is not
+/// where either single-dial sweep pointed.
+fn sweepBudgetGrid(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+    const frame_us: f64 = 16667.0;
+    const shadow_res = [_]u32{ 512, 1024, 2048 };
+    const gi_res = [_]u32{ 32, 64, 128 };
+
+    log("LIGHTING BUDGET GRID — amortised us per frame, both dials", .{});
+    log("  60 Hz budget is 16667 us/frame; 'OVER' means a whole frame for GI alone", .{});
+    log("  cells are mask+sweep EVERY frame, plus field+pyramid over 6 frames", .{});
+    log("  -- which is the shape of a MOVING-occluder frame. Static geometry costs", .{});
+    log("  ~12 us/frame for all of lighting, and this table does not apply to it.", .{});
+    log("", .{});
+    log("           gi_res:  32        64       128", .{});
+    log("  shadow_res |       32        64       128", .{});
+
+    for (shadow_res) |sr| {
+        log("  {d:>5}         |", .{sr});
+        // Storage with the FUNCTION's lifetime, not the loop body's.
+        //
+        // `bufPrint(&buf, ...)` where `buf` is declared inside the loop hands
+        // back a slice into that iteration's stack slot, and the three row
+        // entries all aliased the same 16 bytes — so the table printed the last
+        // cell's number three times and looked like a flat, meaningless surface.
+        // A table whose cells are all equal is the shape of a bug that already
+        // cost an afternoon: it reads as a finding.
+        var storage: [3][16]u8 = undefined;
+        var row: [3][]const u8 = undefined;
+        for (gi_res, 0..) |gr, gi| {
+            var world = World.init(allocator);
+            defer world.deinit();
+            try buildAcceptanceScene(&world, lights_n, occluders_n);
+
+            var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+            defer driver.deinit();
+            const view = engine.lighting_driver.Driver.viewFor(
+                null,
+                @intFromFloat(acceptance_world_w),
+                @intFromFloat(acceptance_world_h),
+            );
+            driver.setShadowResolution(sr, view);
+            try driver.setGiResolution(gr);
+            try driver.resize(view);
+            driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
+            driver.sky = .{ 0.06, 0.07, 0.10 };
+
+            var it = world.query(.{components.LightOccluder2D, components.Transform});
+            var e = it.next();
+            while (e) |en| : (e = it.next()) en.get(components.Transform).position.x += 1.0;
+
+            const before = driver.lighting.stats.sdf_builds;
+            driver.update(&world, @intCast(monotonicNs()));
+            const rebuilt = driver.lighting.stats.sdf_builds != before;
+
+            const st = driver.lighting.stats;
+            // SPLIT, because `gi_interval_ns` gates the field and the pyramid but
+            // NOT the mask or the sweep. Those two run whenever an occluder moved,
+            // so dividing the whole rebuild by six understates what a frame
+            // actually pays -- and it understates it exactly in the direction that
+            // makes the cheap-looking dial look like the answer. `gi_res` is in
+            // the amortised half; `shadow_resolution` is almost entirely in the
+            // per-frame half.
+            const per_frame = @as(f64, @floatFromInt(st.raster_ns + st.sweep_ns)) / 1000.0;
+            const amortised = if (rebuilt)
+                @as(f64, @floatFromInt(st.sdf_ns + st.pyramid_ns)) / 1000.0 / 6.0
+            else
+                0;
+            const total = per_frame + amortised;
+            const text = if (total >= frame_us)
+                std.fmt.bufPrint(&storage[gi], "{d:>7.0} OVER", .{total}) catch "?"
+            else
+                std.fmt.bufPrint(&storage[gi], "{d:>11.0}", .{total}) catch "?";
+            row[gi] = text;
+        }
+        log("  {s} | {s} {s} {s}", .{ "", row[0], row[1], row[2] });
+    }
+    log("", .{});
+    log("  Read it as: below 16667 means the whole 60 Hz frame survives for GI alone.", .{});
+    log("  A 2D RPG wants GI under about 4000 us so sprites, physics, Lua, audio", .{});
+    log("  and UI have room — which is a judgement about the rest of the engine,", .{});
+    log("  and is the one number here that is an opinion rather than a measurement.", .{});
+    log("", .{});
+    log("  GI quality, for the same dial: MAE against the full-resolution field is", .{});
+    log("  0.199 at 32, 0.109 at 64, 0.041 at 128 and 0.025 at 256. Error falls", .{});
+    log("  roughly as 1/res, so the default is the knee of the curve and also", .{});
+    log("  four times the cost of the one below it.", .{});
+    log("", .{});
+}
+
 /// The quality column matters as much as the cost column, and it is measured
 /// rather than asserted. There is no window here, so "does it look right" cannot
 /// be answered by looking; what CAN be answered is "how far does this field's
@@ -821,14 +1125,24 @@ fn acceptance(allocator: std.mem.Allocator) !void {
 
     var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
     defer driver.deinit();
-    // The mask resolution IS the quality dial (`scale`), so the acceptance view
-    // is stated rather than defaulted: 1920x1080 at scale 1 is a 2048x2048
-    // power-of-two grid, which is what "1080p with GI on" actually costs.
     const view = engine.lighting_driver.Driver.viewFor(
         null,
         @intFromFloat(acceptance_world_w),
         @intFromFloat(acceptance_world_h),
     );
+
+    // The config is APPLIED, not just constructed. This acceptance built a driver
+    // and resized it, which exercised the tier's built-in scale and therefore
+    // measured a `shadow_resolution` that no shipped project would ever use — it
+    // still reported "at 2048x2048" after the default moved to 1024, because
+    // nothing here ever asked `project.config` what the number was. A benchmark
+    // that measures a path the player does not take is a benchmark of the past.
+    // The config is applied BEFORE the resize, which is the order that works now
+    // that  re-derives the scale from the view it is given. Applied after,
+    // the config sets a scale and nothing allocates against it -- the mask stays
+    // at whatever  guessed, which is how this ran at 2048x2048 for
+    // an hour while the default said 1024.
+    try driver.applyLightingConfig(@import("project").config.Lighting{});
     try driver.resize(view);
     driver.lighting.reserve(lights_n + 4, occluders_n) catch {};
     driver.sky = .{ 0.06, 0.07, 0.10 };
@@ -921,7 +1235,8 @@ fn acceptance(allocator: std.mem.Allocator) !void {
     }.of;
 
     log("", .{});
-    log("M7 ACCEPTANCE — 20 lights + GI, through the driver, at {d}x{d}", .{
+    log("M7 ACCEPTANCE — 20 lights + GI, through the driver at the SHIPPED defaults", .{});
+    log("  mask {d}x{d} from `lighting.shadow_resolution` (config default)", .{
         l.alloc_w, l.alloc_h,
     });
     log("  quality               {s}, mask {d}x{d} texels, GI {s}", .{
@@ -988,7 +1303,16 @@ fn acceptance(allocator: std.mem.Allocator) !void {
     log("      whole rebuild frame {d:>6.2} us", .{rebuild_us});
 
     // The budget, as a comparison rather than a verdict on the machine.
-    const cpu_budget_us: f64 = 1000.0 / 60.0; // one frame at 60 Hz, 16.67 ms
+    // 16.67 MILLISECONDS expressed in MICROSECONDS, which is what the number
+    // next to it is in.
+    //
+    // It was `1000.0 / 60.0` — milliseconds — named `_us` and divided into a
+    // microsecond figure, which reported "49262.2% of a 60 Hz frame budget
+    // (8210.36 us of 16.67 us)". The real figure is 49.2%. A hundredfold error in
+    // a budget line is the kind that sends someone optimising something that was
+    // never the problem, and it survived because it printed a plausible number
+    // in a plausible place.
+    const cpu_budget_us: f64 = 1_000_000.0 / 60.0;
     const frame_us = us(total_ns, frames);
     log("  -> CPU lighting is {d:.1}% of a 60 Hz frame budget ({d:.2} us of {d:.2} us)", .{
         100.0 * frame_us / cpu_budget_us, frame_us, cpu_budget_us,

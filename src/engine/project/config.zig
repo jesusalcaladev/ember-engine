@@ -215,7 +215,24 @@ pub const Lighting = struct {
     /// `gi_resolution` this is a budget rather than a look: the angular sweep
     /// marches a step per cell, so halving it halves the work and the fidelity
     /// together.
-    shadow_resolution: i32 = 2048,
+    /// 1024, MEASURED, and down from 2048.
+    ///
+    /// The cost of this dial is not the pyramid — the pyramid reads `gi_res` and
+    /// is unaffected by it — but the mask raster and the angular sweep, which run
+    /// on every frame an occluder moves and are linear in area. `bench-light`'s
+    /// `sweepBudgetGrid` measures the whole lighting frame at both values:
+    ///
+    ///     shadow 2048, gi 128 :  26597 us/frame   (1.6x a whole 60 Hz frame)
+    ///     shadow 1024, gi 128 :   9507 us/frame
+    ///     shadow  512, gi 128 :   7565 us/frame
+    ///
+    /// 2048 was a habit, not a measurement: it is the size of a shadow map in a
+    /// 3D engine where one texel has to cover a whole surface. Here it covers a
+    /// 2D cell, and 1024 over a 1920-wide view is already one texel per ~2x2
+    /// screen pixels — under a GI term that is itself 128x128, nobody can see the
+    /// difference, and the sweep halves. It stays a dial: a project that wants
+    /// crisper contact shadows sets it back, and pays 2.8x for them.
+    shadow_resolution: i32 = 1024,
 };
 
 pub const Physics = struct {

@@ -236,6 +236,45 @@ fn applyPhysics(_: *anyopaque, p: *const project.config.Physics) void {
     _ = p;
 }
 
+/// The `lighting` section, applied to the live driver.
+///
+/// This callback is the ONLY path by which `lighting.gi_backend`,
+/// `gi_resolution`, `shadow_resolution`, `bounce_iterations` and `bounce_albedo`
+/// ever reach the lighting system. Without it the whole section is inert and the
+/// driver runs on its constructor's guesses — which is how `shadow_resolution`
+/// stayed at 2048 for a release while the config file said 1024.
+///
+/// It is a config callback rather than a line at boot so that EDITING the file
+/// re-applies it: the two dials that cost the most are exactly the two a
+/// developer tunes by watching the frame time, and a setting you must relaunch to
+/// see is one you tune once and forget.
+///
+/// `applyLightingConfig` can allocate (a resolution change resizes the field),
+/// so the error is logged rather than propagated: a project that asks for a GI
+/// grid too large to allocate gets the driver's previous settings and a warning,
+/// rather than no window.
+fn applyLighting(ctx: *anyopaque, l: *const project.config.Lighting) void {
+    const driver: *lighting_driver.Driver = @ptrCast(@alignCast(ctx));
+    driver.applyLightingConfig(l.*) catch |err| {
+        log.warn("lighting config not applied ({s}); keeping the previous settings", .{
+            @errorName(err),
+        });
+        return;
+    };
+    // NO resize here, deliberately.
+    //
+    // At config-apply time the driver has no view yet — `lighting.rect` is still
+    // empty — and the shadow resolution is a SCALE derived from a view, so
+    // resizing there asks the mask to be 1x1 against a scale meant for 1920 and
+    // panics in `allocMask`. It was tried, and it crashed on the first frame.
+    //
+    // Nothing is lost by waiting: `Driver.resize` re-derives the scale from the
+    // view it is given, so the frame loop's own resize — which has a real view —
+    // applies the stored resolution. Storing the number at config time and
+    // applying it at resize time is also the only order that survives a window
+    // resize, which is why `Driver` remembers it rather than deriving it once.
+}
+
 fn applyLayers(_: *anyopaque, l: *const project.config.Layers) void {
     // Collision layer names would need ecs.collision_layers.Registry integration.
     _ = l;
@@ -445,6 +484,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .rendering = applyRendering,
             .physics = applyPhysics,
             .layers = applyLayers,
+            .lighting = applyLighting,
             .audio = project_hook.AudioHook.apply,
             .input_map = applyInputMap,
         }) catch |err| {
