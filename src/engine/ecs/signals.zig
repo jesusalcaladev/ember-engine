@@ -115,6 +115,19 @@ pub const Signals = struct {
         try signal.conns.insert(allocator, at, conn);
     }
 
+    /// Reserves a signal name at LOAD time, without subscribing to it.
+    ///
+    /// `emit` interns a name on first use, and a first use INSIDE the frame is
+    /// a panic by design (spec §3.1: the frame does not allocate). So a producer
+    /// whose signal nobody subscribes to yet — an engine system emitting
+    /// `sound_finished`, where the listeners are Lua handlers rather than ECS
+    /// connections — has to say the name out loud once, at boot, or its first
+    /// event takes the process down.
+    pub fn preintern(self: *Self, name: []const u8) !void {
+        const allocator = self.allocator orelse return error.NoAllocator;
+        _ = try self.intern(name, allocator);
+    }
+
     /// Drops every connection registered under `order` (an entity went away).
     pub fn off(self: *Self, order: SceneId) void {
         const allocator = self.allocator orelse return;
@@ -312,6 +325,24 @@ test "a queue full is a budget, not a spill" {
     // Growth would be an allocation in the frame loop: refused.
     // (The panic path is exercised in the runtime benchmark.)
     try std.testing.expectEqual(@as(usize, 4), signals.queuedEvents());
+}
+
+test "a name can be reserved at load time to stay alloc-free inside the frame" {
+    const allocator = std.testing.allocator;
+    var signals = Signals{};
+    defer signals.deinit();
+    try signals.reserve(allocator, 4);
+    try signals.preintern("sound_finished");
+    try signals.preintern("sound_finished"); // idempotent: one name, one intern
+    try std.testing.expectEqual(@as(usize, 1), signals.signalCount());
+
+    // Locked is the frame. Emitting a RESERVED name is a queue write, not an
+    // allocation — which is the entire reason reserving exists.
+    signals.locked = true;
+    signals.emit(u16, "sound_finished", 7);
+    try std.testing.expectEqual(@as(usize, 1), signals.queuedEvents());
+    signals.drain();
+    try std.testing.expectEqual(@as(usize, 0), signals.queuedEvents());
 }
 
 test "interning the same name reuses one signal" {

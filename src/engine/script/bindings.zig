@@ -26,6 +26,7 @@ const std = @import("std");
 const lua = @import("luajit.zig");
 const metadata = @import("metadata.zig");
 const context_mod = @import("context.zig");
+const assets_mod = @import("assets");
 
 const lua_State = lua.lua_State;
 const luaL_Reg = lua.luaL_Reg;
@@ -41,6 +42,29 @@ const Sprite = context_mod.components.Sprite;
 const components = context_mod.components;
 const core_math = @import("core").math;
 const ShaderMaterial = context_mod.components.ShaderMaterial;
+/// The M8 emitter component the `sound.*` bindings read and write.
+const SoundEmitter2D = components.SoundEmitter2D;
+
+// The layout pin `ecs/components/sound_emitter.zig` promises.
+//
+// The component cannot import `audio` (ecs is the module everything imports,
+// and `audio` drags in a device, a decoder and a C translation unit), so the
+// voice handle is declared twice: once in `ecs` as `VoiceRef`, once in `audio`
+// as `VoiceId`. This is the ONE file that sees both, so the assertion that
+// they are the same two `u32`s in the same order lives here — and if either
+// side ever drifts, this fails to compile instead of a component silently
+// holding a handle the mixer misreads.
+comptime {
+    if (@sizeOf(components.VoiceRef) != @sizeOf(VoiceId) or
+        @offsetOf(components.VoiceRef, "index") != @offsetOf(VoiceId, "index") or
+        @offsetOf(components.VoiceRef, "generation") != @offsetOf(VoiceId, "generation"))
+    {
+        @compileError("ecs.components.VoiceRef and audio.VoiceId must be field-for-field identical");
+    }
+    if (@sizeOf(components.SoundEmitter2D) > 128) {
+        @compileError("SoundEmitter2D outgrew the .zson decode buffer (max_stride)");
+    }
+}
 
 // ── self <-> entity bridge ───────────────────────────────────────────────────
 
@@ -329,6 +353,113 @@ fn lua_emit(L: ?*lua_State) callconv(.c) c_int {
     const Signal = struct {};
     ctx.actor(entity).emit(Signal, event, .{});
     return 0;
+}
+
+/// `actor.set_transform(self, x, y, rot?, scale?)` — the batch write.
+///
+/// One call where the naive spelling is three, and each binding is ~145 ns of
+/// LuaJIT dispatch (spec §2): a spawn, a teleport and a reset-to-default all
+/// write the same triple, so they pay for it three times. Rotation and scale
+/// are OPTIONAL and keep their current value when omitted, because a spawn
+/// usually means "put it here, facing where it faced".
+///
+/// `prev_*` is deliberately NOT written: the fixed tick calls
+/// `capturePrevious`, and a script that stamped the previous snapshot itself
+/// would make the renderer interpolate from a point the simulation never
+/// occupied. A teleport therefore interpolates across one tick, which is what
+/// §3.3 says it should do.
+fn lua_actor_set_transform(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const entity = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(entity, Transform) orelse return 0;
+    t.position = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    if (lua.getTop(L) >= 4) t.rotation = lua.toF32(L, 4);
+    if (lua.getTop(L) >= 5) {
+        const s = lua.toF32(L, 5);
+        t.scale = .{ .x = s, .y = s };
+    }
+    return 0;
+}
+
+/// `actor.get_all(self) -> table` — the batch read: every component this actor
+/// carries, as nested tables.
+///
+/// Why one table and not N getters: the same reason `light.describe` exists. An
+/// inspector, a save system and a debug overlay all want "what is on this
+/// actor", and a getter per field means the field list lives in two places and
+/// drifts. A component that is absent is an ABSENT KEY rather than a zeroed
+/// stub — "no sprite" and "a sprite at the origin" are different facts, and
+/// collapsing them is how a tool ends up drawing an invisible sprite.
+///
+/// `transform.position` is a `{x, y}` table, the same shape `vec2.new` returns,
+/// so a caller can hand one straight back to `vec2.*`.
+fn lua_actor_get_all(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse {
+        lua.lua_createtable(L, 0, 0);
+        return 1;
+    };
+    lua.lua_createtable(L, 0, 3);
+
+    if (ctx.world.get(e, Transform)) |t| {
+        lua.lua_createtable(L, 0, 3);
+        pushVec2(L, t.position);
+        lua.setField(L, -2, "position");
+        pushVec2(L, t.scale);
+        lua.setField(L, -2, "scale");
+        lua.pushF32(L, t.rotation);
+        lua.setField(L, -2, "rotation");
+        lua.setField(L, -2, "transform");
+    }
+    if (ctx.world.get(e, Sprite)) |s| {
+        lua.lua_createtable(L, 0, 8);
+        pushVec2(L, s.size);
+        lua.setField(L, -2, "size");
+        lua.lua_createtable(L, 0, 4);
+        for (s.uv, 0..) |c, i| {
+            lua.pushF32(L, c);
+            lua.lua_rawseti(L, -2, @intCast(i + 1));
+        }
+        lua.setField(L, -2, "uv");
+        lua.lua_createtable(L, 0, 4);
+        for (s.tint, 0..) |c, i| {
+            lua.pushF32(L, c);
+            lua.lua_rawseti(L, -2, @intCast(i + 1));
+        }
+        lua.setField(L, -2, "tint");
+        lua.pushF32(L, @floatFromInt(s.atlas));
+        lua.setField(L, -2, "atlas");
+        lua.pushF32(L, @floatFromInt(s.layer));
+        lua.setField(L, -2, "layer");
+        lua.pushF32(L, @floatFromInt(@intFromEnum(s.blend)));
+        lua.setField(L, -2, "blend");
+        lua.pushF32(L, @floatFromInt(@intFromEnum(s.shape)));
+        lua.setField(L, -2, "shape");
+        lua.lua_pushboolean(L, @intFromBool(s.visible));
+        lua.setField(L, -2, "visible");
+        lua.setField(L, -2, "sprite");
+    }
+    if (ctx.world.get(e, components.Name)) |n| {
+        lua.pushSlice(L, n.slice());
+        lua.setField(L, -2, "name");
+    }
+    if (ctx.world.get(e, SoundEmitter2D)) |em| {
+        lua.lua_createtable(L, 0, 6);
+        lua.pushF32(L, @floatFromInt(em.bank_slot));
+        lua.setField(L, -2, "bank_slot");
+        lua.pushF32(L, @floatFromInt(em.bus));
+        lua.setField(L, -2, "bus");
+        lua.pushF32(L, em.volume);
+        lua.setField(L, -2, "volume");
+        lua.pushF32(L, em.pitch);
+        lua.setField(L, -2, "pitch");
+        lua.lua_pushboolean(L, @intFromBool(em.loop));
+        lua.setField(L, -2, "loop");
+        lua.lua_pushboolean(L, @intFromBool(em.autoplay));
+        lua.setField(L, -2, "autoplay");
+        lua.setField(L, -2, "sound");
+    }
+    return 1;
 }
 
 // ── Input bindings (action-based) ────────────────────────────────────────────
@@ -802,6 +933,12 @@ const actor_regs = [_]luaL_Reg{
     .{ .name = "set_rotation", .func = lua_set_rotation },
     .{ .name = "get_name", .func = lua_get_name },
     .{ .name = "emit", .func = lua_emit },
+    // The batch pair: one call to write position+rotation+scale, one to read
+    // every component back. Both exist because of the measured per-binding cost
+    // (spec §2), and both are documented in `metadata.zig` like everything else
+    // this table hands to Lua.
+    .{ .name = "set_transform", .func = lua_actor_set_transform },
+    .{ .name = "get_all", .func = lua_actor_get_all },
 
     // ── actor: spatial queries between actors ──────────────────────────────
     // These take the OTHER actor as an argument, which in this engine is just
@@ -1406,6 +1543,11 @@ fn lua_actor_add_component(L: ?*lua_State) callconv(.c) c_int {
     } else if (std.mem.eql(u8, name, "Name")) {
         if (ctx.world.get(e, context_mod.components.Name) != null) return pushFalse(L);
         _ = ctx.world.add(e, context_mod.components.Name{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "SoundEmitter2D")) {
+        // M8: the emitter is plain data (a bank slot, a bus, a gain), so adding
+        // one from the inspector is safe and needs no system call.
+        if (ctx.world.get(e, SoundEmitter2D) != null) return pushFalse(L);
+        _ = ctx.world.add(e, SoundEmitter2D{}) catch return pushFalse(L);
     } else {
         // An unknown name is a reportable error, not a silent no-op: a tool that
         // asks for a component that does not exist has a bug, and hiding it here
@@ -1430,6 +1572,8 @@ fn lua_actor_has_component(L: ?*lua_State) callconv(.c) c_int {
         ctx.world.get(e, Collider2D) != null
     else if (std.mem.eql(u8, name, "Name"))
         ctx.world.get(e, context_mod.components.Name) != null
+    else if (std.mem.eql(u8, name, "SoundEmitter2D"))
+        ctx.world.get(e, SoundEmitter2D) != null
     else
         false;
     return pushBool(L, present);
@@ -1452,6 +1596,8 @@ fn lua_actor_remove_component(L: ?*lua_State) callconv(.c) c_int {
         ctx.world.remove(e, CollisionLayers)
     else if (std.mem.eql(u8, name, "Collider2D"))
         ctx.world.remove(e, Collider2D)
+    else if (std.mem.eql(u8, name, "SoundEmitter2D"))
+        ctx.world.remove(e, SoundEmitter2D)
     else
         false;
     return pushBool(L, removed);
@@ -1482,6 +1628,56 @@ fn lua_sprite_set_uv(L: ?*lua_State) callconv(.c) c_int {
 fn lua_sprite_set_atlas(L: ?*lua_State) callconv(.c) c_int {
     const sprite = spriteOf(L) orelse return 0;
     sprite.atlas = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    return 0;
+}
+
+/// `sprite.set_image(self, path)` — loads image, adds to atlas, sets atlas slot + UV in one call.
+fn lua_sprite_set_image(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const renderer = ctx.renderer orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "renderer not initialized");
+        return 2;
+    };
+    const am = ctx.assets orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "assets system not initialized");
+        return 2;
+    };
+    const path = lua.toSlice(L, 2) orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "path must be a string");
+        return 2;
+    };
+    const slot = am.getOrLoad(path) catch |err| {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, @errorName(err));
+        return 2;
+    };
+    const payload = am.get(assets_mod.AssetHandle{ .id = slot, .generation = 0 }) orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "asset not loaded");
+        return 2;
+    };
+    const image = @as(*const assets_mod.Image, @ptrCast(@alignCast(payload)));
+    const atlas_mgr = renderer.createAtlasManager(2048, 2048) orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "failed to create atlas manager");
+        return 2;
+    };
+    const uv = renderer.addImageToAtlas(atlas_mgr, path, image.width, image.height, image.pixels) orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "failed to add image to atlas");
+        return 2;
+    };
+    _ = renderer.uploadAtlas(atlas_mgr) orelse {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "failed to upload atlas");
+        return 2;
+    };
+    const sprite = spriteOf(L) orelse return 0;
+    sprite.atlas = @truncate(@as(u32, @intCast(slot)));
+    sprite.uv = uv;
     return 0;
 }
 
@@ -1663,9 +1859,6 @@ fn setShadow(base: *components.LightBase, enabled: bool, f: u8, smooth: f32) voi
     base.shadow_filter = @enumFromInt(f);
     base.shadow_filter_smooth = smooth;
 }
-fn setGi(base: *components.LightBase, v: f32) void {
-    base.gi_contribution = v;
-}
 fn setMask(base: *components.LightBase, v: u32) void {
     base.item_cull_mask = v;
 }
@@ -1722,19 +1915,6 @@ fn lua_light_set_shadow(L: ?*lua_State) callconv(.c) c_int {
     if (ctx.world.get(e, PointLight)) |l| setShadow(&l.base, enabled, f, smooth);
     if (ctx.world.get(e, SpotLight)) |l| setShadow(&l.base, enabled, f, smooth);
     if (ctx.world.get(e, DirLight)) |l| setShadow(&l.base, enabled, f, smooth);
-    return 0;
-}
-
-/// `light.set_gi(self, contribution)` — how much of the global-illumination
-/// enclosure term this light applies. Zero by default: a scene that did not
-/// ask for bounce should not have it.
-fn lua_light_set_gi(L: ?*lua_State) callconv(.c) c_int {
-    const ctx = ctxOf(L);
-    const e = entityOf(L, 1) orelse return 0;
-    const v = @min(@max(lua.toF32(L, 3), 0), 1);
-    if (ctx.world.get(e, PointLight)) |l| setGi(&l.base, v);
-    if (ctx.world.get(e, SpotLight)) |l| setGi(&l.base, v);
-    if (ctx.world.get(e, DirLight)) |l| setGi(&l.base, v);
     return 0;
 }
 
@@ -1999,7 +2179,6 @@ const light_regs = [_]luaL_Reg{
     .{ .name = "set_energy", .func = lua_light_set_energy },
     .{ .name = "set_blend", .func = lua_light_set_blend },
     .{ .name = "set_shadow", .func = lua_light_set_shadow },
-    .{ .name = "set_gi", .func = lua_light_set_gi },
     .{ .name = "set_mask", .func = lua_light_set_mask },
     .{ .name = "set_cone", .func = lua_light_set_cone },
     .{ .name = "get_energy", .func = lua_light_get_energy },
@@ -2208,40 +2387,6 @@ fn lua_environment_set_bloom(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `environment.set_sky(r, g, b)` — the radiance a ray that escapes the occluder
-/// mask carries.
-///
-/// This is the base case of every Radiance Cascade merge, so it is what decides
-/// whether light bouncing around a corner is warm at sunset or white at noon.
-/// Black by default, because a scene in a sealed room has no sky and inventing
-/// one makes the room brighter than its own torches.
-fn lua_environment_set_sky(L: ?*lua_State) callconv(.c) c_int {
-    const ctx = ctxOf(L);
-    const e = entityOf(L, 1) orelse return 0;
-    const env: *Env = ctx.world.get(e, Env) orelse return 0;
-    env.sky_color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), 1 };
-    return 0;
-}
-
-/// `environment.set_gi(enabled, albedo)` — whether to build the radiance
-/// cascades, and how much an occluder reflects back.
-///
-/// Off by default because it is the most expensive thing in the lighting system
-/// and because a scene that gets GI without asking has corners darker than its
-/// author drew. A light's own `gi_contribution` is a second, per-light opt-in on
-/// top of this one.
-fn lua_environment_set_gi(L: ?*lua_State) callconv(.c) c_int {
-    const ctx = ctxOf(L);
-    const e = entityOf(L, 1) orelse return 0;
-    const env: *Env = ctx.world.get(e, Env) orelse return 0;
-    env.gi_enabled = lua.toBool(L, 2);
-    env.gi_albedo = @min(@max(lua.toF32(L, 3), 0), 1);
-    return 0;
-}
-
-/// `environment.new(self)` — adds an Environment. There was no way to create one
-/// from Lua, which made the eight other `environment.*` functions unreachable in
-/// a scene that did not already have an actor carrying the component.
 fn lua_environment_new(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
@@ -2252,18 +2397,118 @@ fn lua_environment_new(L: ?*lua_State) callconv(.c) c_int {
 }
 
 /// `environment.get_sky(self) -> r, g, b` — the sky's radiance.
-fn lua_environment_get_sky(L: ?*lua_State) callconv(.c) c_int {
+// ── M9: scene transitions (the fade) ──────────────────────────────────────────
+
+/// `scene.fade_out(duration, r, g, b)` — covers the screen with `color` over
+/// `duration` real seconds. Zero duration is an instant cover. Restarting an
+/// existing fade replaces it from zero (an interrupted fade is not two
+/// overlapping curtains).
+fn lua_scene_fade_out(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
-    const e = entityOf(L, 1) orelse return 0;
-    const env: *Env = ctx.world.get(e, Env) orelse return 0;
-    const s = env.sky();
-    lua.pushF32(L, s[0]);
-    lua.pushF32(L, s[1]);
-    lua.pushF32(L, s[2]);
-    return 3;
+    const h = ctx.scene orelse return 0;
+    const duration = @max(lua.toF32(L, 2), 0);
+    const r = @min(@max(lua.toF32(L, 3), 0), 1);
+    const g = @min(@max(lua.toF32(L, 4), 0), 1);
+    const b = @min(@max(lua.toF32(L, 5), 0), 1);
+    h.fade_out(h.ctx, duration, r, g, b);
+    return 0;
 }
 
-/// `light.kind_of(self) -> "point" | "spot" | "directional" | "ambient" | "legacy" | nil`
+/// `scene.fade_in(duration)` — uncovers from wherever the curtain currently is.
+/// Zero duration is an instant clear.
+fn lua_scene_fade_in(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.scene orelse return 0;
+    const duration = @max(lua.toF32(L, 2), 0);
+    h.fade_in(h.ctx, duration);
+    return 0;
+}
+
+/// `scene.fade_covered(r, g, b)` — jumps straight to a fully covered screen.
+/// What a loading screen does: the player must not watch a fade play before a
+/// black frame they are going to sit on for two seconds anyway.
+fn lua_scene_fade_covered(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.scene orelse return 0;
+    const r = @min(@max(lua.toF32(L, 2), 0), 1);
+    const g = @min(@max(lua.toF32(L, 3), 0), 1);
+    const b = @min(@max(lua.toF32(L, 4), 0), 1);
+    h.fade_covered(h.ctx, r, g, b);
+    return 0;
+}
+
+/// `scene.fade_clear()` — jumps back to a clear screen.
+fn lua_scene_fade_clear(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.scene orelse return 0;
+    h.fade_clear(h.ctx);
+    return 0;
+}
+
+/// `scene.fade_amount() -> 0..1` — current coverage.
+fn lua_scene_fade_amount(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.scene orelse {
+        lua.pushF32(L, 0);
+        return 1;
+    };
+    lua.pushF32(L, h.amount(h.ctx));
+    return 1;
+}
+
+/// `scene.fading() -> boolean` — true while a transition is running.
+fn lua_scene_fading(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.scene orelse {
+        lua.lua_pushboolean(L, 0);
+        return 1;
+    };
+    lua.lua_pushboolean(L, @intFromBool(h.fading(h.ctx)));
+    return 1;
+}
+
+// ── M9: particles (the CPU pool) ──────────────────────────────────────────────
+
+/// `particles.burst(self, count)` — emits `count` particles NOW, from the
+/// actor's ParticleEmitter2D. Returns how many were actually emitted (may be
+/// less if the emitter's slab is full, and that is counted and reported).
+///
+/// The CONFIGURE half of the particle API is plain component writes:
+/// `emitter.rate = 10`, `emitter.capacity = 256`, `emitter.color_start = 0xFFFFFFFF`,
+/// etc. Those work through the normal component surface and do not need this
+/// hook. `burst` is the one operation that needs the SYSTEM'S pool.
+fn lua_particles_burst(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.particles orelse return 0;
+    const e = entityOf(L, 1) orelse return 0;
+    const count: u32 = @as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0)));
+    lua.lua_pushinteger(L, @as(i32, @intCast(h.burst(h.ctx, e.bits(), count))));
+    return 1;
+}
+
+/// `particles.stats() -> { simulated, live, spawned, drawn, culled, dropped_spawn, slab_denied, sim_ms, collect_ms }`
+///
+/// The names and order are fixed here so a script that reads the table knows
+/// exactly what it is getting, and a stub generator can annotate the keys.
+fn lua_particles_stats(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.particles orelse return 0;
+    lua.lua_createtable(L, 0, 9);
+    var raw: [16]f64 = undefined;
+    const n = h.stats(h.ctx, &raw);
+    const names = [_][:0]const u8{
+        "simulated",    "live",       "spawned",       "drawn",
+        "culled",       "dropped_spawn", "slab_denied",  "sim_ms",
+        "collect_ms",
+    };
+    const count = @min(@min(names.len, n), 9);
+    for (names[0..count], 0..) |key, i| {
+        lua.lua_pushstring(L, key.ptr);
+        lua.lua_pushnumber(L, raw[i]);
+        lua.lua_rawset(L, -3);
+    }
+    return 1;
+}
 ///
 /// ## Why this is the first thing an inspector asks for
 ///
@@ -2350,7 +2595,6 @@ fn lua_light_describe(L: ?*lua_State) callconv(.c) c_int {
         put.f(L, "energy", l.base.energy);
         put.f(L, "radius", l.radius);
         put.f(L, "attenuation", l.attenuation);
-        put.f(L, "gi_contribution", l.base.gi_contribution);
         put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
         put.f(L, "blend", @floatFromInt(@intFromEnum(l.base.blend)));
         put.f(L, "shadow_filter", @floatFromInt(@intFromEnum(l.base.shadow_filter)));
@@ -2362,7 +2606,6 @@ fn lua_light_describe(L: ?*lua_State) callconv(.c) c_int {
         put.f(L, "cone_angle", l.cone_angle);
         put.f(L, "penumbra", l.penumbra);
         put.f(L, "attenuation", l.attenuation);
-        put.f(L, "gi_contribution", l.base.gi_contribution);
         put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
         put.f(L, "blend", @floatFromInt(@intFromEnum(l.base.blend)));
     } else if (ctx.world.get(e, DirLight)) |l| {
@@ -2371,7 +2614,6 @@ fn lua_light_describe(L: ?*lua_State) callconv(.c) c_int {
         put.f(L, "angle", l.angle);
         put.f(L, "height", l.height);
         put.f(L, "max_distance", l.max_distance);
-        put.f(L, "gi_contribution", l.base.gi_contribution);
         put.f(L, "item_cull_mask", @floatFromInt(l.base.item_cull_mask));
     } else if (ctx.world.get(e, AmbientLight)) |l| {
         put.f(L, "energy", l.base.energy);
@@ -2513,12 +2755,25 @@ const environment_regs = [_]luaL_Reg{
     .{ .name = "set_bloom", .func = lua_environment_set_bloom },
     .{ .name = "set_tonemap", .func = lua_environment_set_tonemap },
     .{ .name = "set_fog", .func = lua_environment_set_fog },
-    .{ .name = "set_sky", .func = lua_environment_set_sky },
-    .{ .name = "set_gi", .func = lua_environment_set_gi },
-    .{ .name = "get_sky", .func = lua_environment_get_sky },
     .{ .name = "get_ambient", .func = lua_environment_get_ambient },
     .{ .name = "get_clear", .func = lua_environment_get_clear },
     .{ .name = "get_fog", .func = lua_environment_get_fog },
+    .{ .name = null, .func = null },
+};
+
+const scene_regs = [_]luaL_Reg{
+    .{ .name = "fade_out", .func = lua_scene_fade_out },
+    .{ .name = "fade_in", .func = lua_scene_fade_in },
+    .{ .name = "fade_covered", .func = lua_scene_fade_covered },
+    .{ .name = "fade_clear", .func = lua_scene_fade_clear },
+    .{ .name = "fade_amount", .func = lua_scene_fade_amount },
+    .{ .name = "fading", .func = lua_scene_fading },
+    .{ .name = null, .func = null },
+};
+
+const particles_regs = [_]luaL_Reg{
+    .{ .name = "burst", .func = lua_particles_burst },
+    .{ .name = "stats", .func = lua_particles_stats },
     .{ .name = null, .func = null },
 };
 
@@ -2755,6 +3010,7 @@ const sprite_regs = [_]luaL_Reg{
     .{ .name = "set_tint", .func = lua_sprite_set_tint },
     .{ .name = "set_uv", .func = lua_sprite_set_uv },
     .{ .name = "set_atlas", .func = lua_sprite_set_atlas },
+    .{ .name = "set_image", .func = lua_sprite_set_image },
     .{ .name = "set_shape", .func = lua_sprite_set_shape },
     .{ .name = "set_blend", .func = lua_sprite_set_blend },
     .{ .name = "get_size", .func = lua_sprite_get_size },
@@ -3220,6 +3476,582 @@ fn lua_vec2_clamped(L: ?*lua_State) callconv(.c) c_int {
 }
 
 
+// ── audio (M8) ───────────────────────────────────────────────────────────────
+//
+// Every call reaches the ONE `Audio` the runtime owns through the context,
+// exactly as `physics.*` reaches the solver's system — no module global, so the
+// editor and a test can each own one. When no system is wired, a call reports
+// failure (`false`/nil) rather than dereferencing null.
+//
+// A voice handle travels as LIGHT userdata with the same +1 bias the actor
+// `__entity` bridge uses: Lua hands back a NULL light userdata as NULL, and a
+// voice with index 0 and generation 0 IS NULL. A stale handle is a no-op, never
+// an error — the sound it named is genuinely gone.
+
+const audio_mod = @import("audio");
+const VoiceId = audio_mod.VoiceId;
+
+/// The audio system, or null when the runtime has none.
+fn audioOf(L: ?*lua_State) ?*audio_mod.Audio {
+    return ctxOf(L).audio;
+}
+
+/// A voice id as a Lua value: generation in the high 32 bits, index in the low,
+/// plus the +1 bias so handle 0 is not NULL.
+fn pushVoiceId(L: ?*lua_State, id: VoiceId) void {
+    const bits: u64 = (@as(u64, id.generation) << 32) | @as(u64, id.index);
+    lua.lua_pushlightuserdata(L, @ptrFromInt(bits + 1));
+}
+
+fn voiceOf(L: ?*lua_State, idx: c_int) ?VoiceId {
+    const p = lua.lua_topointer(L, idx) orelse return null;
+    const biased: u64 = @intFromPtr(p);
+    if (biased == 0) return null;
+    const bits = biased - 1;
+    return .{ .index = @truncate(bits), .generation = @truncate(bits >> 32) };
+}
+
+/// A 0..255 integer argument, clamped so a stray float cannot trap the cast.
+fn u8Arg(L: ?*lua_State, idx: c_int) u8 {
+    return @intFromFloat(std.math.clamp(lua.toF32(L, idx), 0, 255));
+}
+
+/// A bus id from either a number or a registered name.
+fn busIdOf(L: ?*lua_State, idx: c_int) ?u8 {
+    if (lua.isNumber(L, idx)) return u8Arg(L, idx);
+    const name = lua.toSlice(L, idx) orelse return null;
+    const sys = audioOf(L) orelse return null;
+    return sys.buses.idOfName(name);
+}
+
+/// Reads an options table (all fields optional).
+fn optsFrom(L: ?*lua_State, idx: c_int) audio_mod.PlayOpts {
+    var o = audio_mod.PlayOpts{};
+    if (!lua.isTable(L, idx)) return o;
+    lua.getField(L, idx, "volume");
+    if (lua.isNumber(L, -1)) o.volume = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "pitch");
+    if (lua.isNumber(L, -1)) o.pitch = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "max_distance");
+    if (lua.isNumber(L, -1)) o.max_distance = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "spread");
+    if (lua.isNumber(L, -1)) o.spread = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "loop");
+    if (!lua.isNil(L, -1)) o.loop = lua.toBool(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "priority");
+    if (lua.isNumber(L, -1)) o.priority = u8Arg(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "bus");
+    if (lua.isNumber(L, -1)) o.bus = u8Arg(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "bus_name");
+    if (lua.isString(L, -1)) {
+        if (audioOf(L)) |sys| {
+            if (sys.buses.idOfName(lua.toString(L, -1))) |id| o.bus = id;
+        }
+    }
+    lua.pop(L, 1);
+    return o;
+}
+
+/// `audio.play_file(path, opts?) -> voice`. Load-time / preview: it may decode,
+/// so it is NOT the frame-safe path (use a resident slot for gameplay).
+fn lua_audio_play_file(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    const path = lua.toSlice(L, 1) orelse return 0;
+    const opts = if (lua.getTop(L) >= 2) optsFrom(L, 2) else audio_mod.PlayOpts{};
+    const id = sys.playFile(path, opts) catch return 0;
+    pushVoiceId(L, id);
+    return 1;
+}
+
+/// `audio.play_stream(path, opts?) -> voice`. Like `play_file`, but the sound
+/// is STREAMED: only a small window is ever resident and the frame loop keeps it
+/// fed. This is the path for long music; `play_file` decodes the whole sound.
+fn lua_audio_play_stream(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    const path = lua.toSlice(L, 1) orelse return 0;
+    const opts = if (lua.getTop(L) >= 2) optsFrom(L, 2) else audio_mod.PlayOpts{};
+    const id = sys.playFileStream(path, opts, 0) catch return 0;
+    pushVoiceId(L, id);
+    return 1;
+}
+
+/// `audio.stop(voice)`.
+fn lua_audio_stop(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (voiceOf(L, 1)) |v| sys.stop(v);
+    return 0;
+}
+
+/// `audio.stop_all()` — the Play/Stop hook: leaves the mixer silent and exact.
+fn lua_audio_stop_all(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    sys.stopAll();
+    return 0;
+}
+
+/// `audio.set_volume(voice, volume)`.
+fn lua_audio_set_volume(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (voiceOf(L, 1)) |v| sys.setVolume(v, lua.toF32(L, 2));
+    return 0;
+}
+
+/// `audio.set_pitch(voice, pitch)`.
+fn lua_audio_set_pitch(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (voiceOf(L, 1)) |v| sys.setPitch(v, lua.toF32(L, 2));
+    return 0;
+}
+
+/// `audio.is_playing(voice) -> boolean`. False for a stale handle.
+fn lua_audio_is_playing(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse {
+        lua.lua_pushboolean(L, 0);
+        return 1;
+    };
+    const playing = if (voiceOf(L, 1)) |v| sys.isPlaying(v) else false;
+    lua.lua_pushboolean(L, @intFromBool(playing));
+    return 1;
+}
+
+/// `audio.set_master_volume(gain)`.
+fn lua_audio_set_master_volume(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    sys.setMasterGain(lua.toF32(L, 1));
+    return 0;
+}
+
+/// `audio.set_listener(x, y, rotation?)`.
+///
+/// The rotation is which way the ears face, in radians; it turns the stereo
+/// field with the listener. Omitted (or 0) keeps the pre-rotation behaviour.
+fn lua_audio_set_listener(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    const rot: f32 = if (lua.getTop(L) >= 3) lua.toF32(L, 3) else 0;
+    sys.setListener(lua.toF32(L, 1), lua.toF32(L, 2), rot);
+    return 0;
+}
+
+/// `audio.solo_bus(bus, solo)`. A soloed bus silences every other non-master
+/// bus, so the mixer panel's "S" button is one call.
+fn lua_audio_solo_bus(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (busIdOf(L, 1)) |id| sys.setBusSolo(id, lua.toBool(L, 2));
+    return 0;
+}
+
+/// `audio.set_bus_send(bus, target, amount)`. Routes `amount` of `bus`'s signal
+/// into `target`'s gain path (a reverb/duck aux). A nil `target` clears it.
+fn lua_audio_set_bus_send(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    const id = busIdOf(L, 1) orelse return 0;
+    const target = busIdOf(L, 2) orelse {
+        sys.setBusSend(id, audio_mod.no_send, 0);
+        return 0;
+    };
+    sys.setBusSend(id, target, lua.toF32(L, 3));
+    return 0;
+}
+
+/// `audio.bus_gain(bus) -> number`. A missing name reads as 1 (full), which is
+/// what a project with no audio section wants.
+fn lua_audio_bus_gain(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse {
+        lua.pushF32(L, 1);
+        return 1;
+    };
+    const id = busIdOf(L, 1) orelse {
+        lua.pushF32(L, 1);
+        return 1;
+    };
+    lua.pushF32(L, sys.busGain(id));
+    return 1;
+}
+
+/// `audio.set_bus_volume(bus, gain)`.
+fn lua_audio_set_bus_volume(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (busIdOf(L, 1)) |id| sys.setBusGain(id, lua.toF32(L, 2));
+    return 0;
+}
+
+/// `audio.mute_bus(bus, muted)`.
+fn lua_audio_mute_bus(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    if (busIdOf(L, 1)) |id| sys.setBusMuted(id, lua.toBool(L, 2));
+    return 0;
+}
+
+/// `audio.buses() -> table`. An ARRAY of `{ name, gain, muted }`, in bus order
+/// (bus 1 is master), so the mixer panel iterates rather than looks up by a
+/// name it would have to know.
+fn lua_audio_buses(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    lua.lua_createtable(L, audio_mod.bus.bus_count, 0);
+    var n: c_int = 0;
+    for (0..audio_mod.bus.bus_count) |i| {
+        const name = sys.buses.buses[i].name;
+        if (name.len == 0) continue;
+        lua.lua_createtable(L, 0, 4);
+        lua.pushSlice(L, name);
+        lua.setField(L, -2, "name");
+        lua.pushF32(L, sys.busGain(@intCast(i)));
+        lua.setField(L, -2, "gain");
+        lua.lua_pushboolean(L, @intFromBool(sys.bus_muted[i]));
+        lua.setField(L, -2, "muted");
+        lua.lua_pushboolean(L, @intFromBool(sys.busSolo(@intCast(i))));
+        lua.setField(L, -2, "solo");
+        lua.lua_pushinteger(L, @intCast(sys.busSendTo(@intCast(i))));
+        lua.setField(L, -2, "send_to");
+        lua.pushF32(L, sys.busSendAmount(@intCast(i)));
+        lua.setField(L, -2, "send_amount");
+        lua.lua_pushinteger(L, @intCast(i));
+        lua.setField(L, -2, "id");
+        n += 1;
+        lua.lua_rawseti(L, -2, n);
+    }
+    return 1;
+}
+
+/// `audio.stats() -> table` — the counters a debug overlay polls every frame.
+fn lua_audio_stats(L: ?*lua_State) callconv(.c) c_int {
+    const sys = audioOf(L) orelse return 0;
+    const s = sys.stats();
+    const bs = sys.bankStats();
+
+    lua.lua_createtable(L, 0, 10);
+    const put = struct {
+        fn num(state: ?*lua_State, k: [*:0]const u8, v: f64) void {
+            lua.lua_pushnumber(state, v);
+            lua.setField(state, -2, k);
+        }
+    };
+    put.num(L, "voices_active", @floatFromInt(s.voices_active));
+    put.num(L, "voices_peak", @floatFromInt(s.voices_peak));
+    put.num(L, "xruns", @floatFromInt(s.xruns));
+    put.num(L, "commands_dropped", @floatFromInt(s.commands_dropped));
+    put.num(L, "latency_ms", s.latencyMs());
+    put.num(L, "period_frames", @floatFromInt(s.period_frames));
+    put.num(L, "sample_rate", @floatFromInt(s.sample_rate));
+    put.num(L, "channels", @floatFromInt(s.channels));
+    put.num(L, "bank_bytes", @floatFromInt(bs.bytes_used));
+    put.num(L, "bank_budget", @floatFromInt(bs.budget_bytes));
+    return 1;
+}
+
+
+/// The `audio` table.
+const audio_regs = [_]luaL_Reg{
+    .{ .name = "play_file", .func = lua_audio_play_file },
+    .{ .name = "play_stream", .func = lua_audio_play_stream },
+    .{ .name = "stop", .func = lua_audio_stop },
+    .{ .name = "stop_all", .func = lua_audio_stop_all },
+    .{ .name = "set_volume", .func = lua_audio_set_volume },
+    .{ .name = "set_pitch", .func = lua_audio_set_pitch },
+    .{ .name = "is_playing", .func = lua_audio_is_playing },
+    .{ .name = "set_master_volume", .func = lua_audio_set_master_volume },
+    .{ .name = "set_listener", .func = lua_audio_set_listener },
+    .{ .name = "solo_bus", .func = lua_audio_solo_bus },
+    .{ .name = "set_bus_send", .func = lua_audio_set_bus_send },
+    .{ .name = "bus_gain", .func = lua_audio_bus_gain },
+    .{ .name = "set_bus_volume", .func = lua_audio_set_bus_volume },
+    .{ .name = "mute_bus", .func = lua_audio_mute_bus },
+    .{ .name = "buses", .func = lua_audio_buses },
+    .{ .name = "stats", .func = lua_audio_stats },
+    .{ .name = null, .func = null },
+};
+
+// ── sound: the per-actor `SoundEmitter2D` surface (M8) ──────────────────────
+//
+// `audio.*` is about SOUNDS (a UI click, music, an audition); `sound.*` is about
+// THIS ACTOR's emitter, and it is the half of the M8 Lua surface that a scene
+// actually uses. The component is plain data (a bank slot, a bus, a gain, a
+// radius), and these bindings are the verbs that turn it into a voice:
+//
+//   - the component is the CONFIGURATION and survives a save/hot-reload;
+//   - `sound.play` resolves it to a voice at the actor's transform;
+//   - the setters write the component AND push the live command, so an
+//     inspector and a gameplay tweak agree about what a field means.
+//
+// Everything here is one `world.get` plus, at most, one command-ring push —
+// the same shape as `sprite.*`, and reachable only through the `__entity`
+// bridge, so there is no per-call lookup. When no audio system is wired every
+// call reports failure (nil / false / a no-op) rather than dereferencing null.
+
+/// The emitter component, or null when this actor has none. A `self` with no
+/// emitter is a script asking a silent object to speak: not an error, a no-op.
+fn emitterOf(L: ?*lua_State) ?*components.SoundEmitter2D {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    return ctx.world.get(e, SoundEmitter2D);
+}
+
+/// The emitter, creating it when the actor has none.
+///
+/// Created rather than refused for the same reason `sprite_rect` adds a Sprite:
+/// a behavior that plays a sound should not first have to be told that a
+/// component exists. The one structural ECS change in this surface happens
+/// here, so it is the one call documented as load-time-only in spirit.
+fn emitterOfEnsure(L: ?*lua_State) ?*components.SoundEmitter2D {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    if (ctx.world.get(e, SoundEmitter2D) == null) {
+        _ = ctx.world.add(e, SoundEmitter2D{}) catch return null;
+    }
+    return ctx.world.get(e, SoundEmitter2D);
+}
+
+/// The actor's world position, or the origin when it has no Transform. A sound
+/// placed at (0,0) by accident is a sound in the corner; a sound refused because
+/// an actor has no Transform is a sound that never happens.
+fn emitterPosition(L: ?*lua_State, ctx: *Context) m.Vec2 {
+    const e = entityOf(L, 1) orelse return m.Vec2.zero;
+    const t = ctx.world.get(e, Transform) orelse return m.Vec2.zero;
+    return t.position;
+}
+
+/// `sound.play(self, path, opts?) -> voice` — the emitter's sound, at the
+/// emitter's position.
+///
+/// The argument list is deliberately `path` FIRST and the component second: a
+/// scene file writes the configuration, but the common call is "make this noise
+/// now", and that is a path. An emitter whose `bank_slot` is already resolved
+/// (the editor writes the id at load) is used when the path is omitted, which is
+/// the frame-safe spelling — no decode, one command push.
+///
+/// `opts` overrides the component's own fields for THIS play only; the ones
+/// absent keep whatever the scene (or a previous setter) configured.
+fn lua_sound_play(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const sys = ctx.audio orelse return 0;
+    const emitter = emitterOfEnsure(L) orelse return 0;
+
+    var slot: audio_mod.BankSlot = emitter.bank_slot;
+    if (lua.toSlice(L, 2)) |path| {
+        if (path.len > 0) {
+            // Load time: this MAY decode. `sound.play` with a path is a
+            // preview/authoring call; gameplay plays a resident slot.
+            slot = sys.load(path) catch return 0;
+            emitter.bank_slot = slot;
+        }
+    }
+    // Slot 0 is the bank's "nothing loaded" sentinel, and the component's
+    // `bank_slot` defaults to it — so this one test covers "no path given" and
+    // "given a path that resolved to nothing" in a single comparison.
+    if (slot == audio_mod.no_bank_slot) return 0;
+
+    var opts = audio_mod.PlayOpts{
+        .bus = emitter.bus,
+        .volume = emitter.volume,
+        .pitch = emitter.pitch,
+        .loop = emitter.loop,
+        .max_distance = emitter.max_distance,
+        .spread = emitter.spread,
+    };
+    if (lua.getTop(L) >= 3) mergeEmitterOpts(L, 3, &opts);
+
+    const p = emitterPosition(L, ctx);
+    opts.x = p.x;
+    opts.y = p.y;
+    const voice = sys.play(slot, opts);
+    emitter.playing = .{ .index = voice.index, .generation = voice.generation };
+    emitter.tick = sys.tick;
+    pushVoiceId(L, voice);
+    return 1;
+}
+
+/// Writes the opts-table fields that exist into `opts`. Separate from
+/// `optsFrom` (the `audio.*` form) because that one has no component to fall
+/// back on and this one must LEAVE the emitter's value alone when a field is
+/// absent — an empty `{}` means "as configured", not "as defaulted".
+fn mergeEmitterOpts(L: ?*lua_State, idx: c_int, opts: *audio_mod.PlayOpts) void {
+    if (!lua.isTable(L, idx)) return;
+    lua.getField(L, idx, "volume");
+    if (lua.isNumber(L, -1)) opts.volume = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "pitch");
+    if (lua.isNumber(L, -1)) opts.pitch = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "loop");
+    if (!lua.isNil(L, -1)) opts.loop = lua.toBool(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "max_distance");
+    if (lua.isNumber(L, -1)) opts.max_distance = @max(lua.toF32(L, -1), 0);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "spread");
+    if (lua.isNumber(L, -1)) opts.spread = @max(lua.toF32(L, -1), 0);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "priority");
+    if (lua.isNumber(L, -1)) opts.priority = u8Arg(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "bus");
+    if (lua.isNumber(L, -1)) opts.bus = u8Arg(L, -1);
+    lua.pop(L, 1);
+    lua.getField(L, idx, "bus_name");
+    if (lua.isString(L, -1)) {
+        if (audioOf(L)) |sys| {
+            if (sys.buses.idOfName(lua.toString(L, -1))) |id| opts.bus = id;
+        }
+    }
+    lua.pop(L, 1);
+}
+
+/// `sound.stop(self)` — stops the voice this emitter started. A no-op when the
+/// sound already ended, which is the normal case: the event that ended it
+/// travels on the signal bus, not back into the component.
+fn lua_sound_stop(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const sys = ctx.audio orelse return 0;
+    const emitter = emitterOf(L) orelse return 0;
+    if (emitter.playing.isNone()) return 0;
+    sys.stop(.{ .index = emitter.playing.index, .generation = emitter.playing.generation });
+    emitter.playing = .none;
+    return 0;
+}
+
+/// `sound.set_volume(self, volume)` — writes the emitter AND the live voice, so
+/// the component stays the truth an inspector reads while the sound changes now.
+fn lua_sound_set_volume(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const emitter = emitterOf(L) orelse return 0;
+    emitter.volume = @max(lua.toF32(L, 2), 0);
+    if (ctx.audio) |sys| applyLiveVoice(sys, emitter, .volume);
+    return 0;
+}
+
+/// `sound.set_pitch(self, pitch)`.
+fn lua_sound_set_pitch(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const emitter = emitterOf(L) orelse return 0;
+    emitter.pitch = @max(lua.toF32(L, 2), 0);
+    if (ctx.audio) |sys| applyLiveVoice(sys, emitter, .pitch);
+    return 0;
+}
+
+/// `sound.set_loop(self, on)` — configuration only.
+///
+/// There is no "set loop" command: a voice's loop flag is part of the PCM view
+/// the device thread built when it started, and changing it under a running
+/// voice is a click at the loop point. So this writes the component and takes
+/// effect on the next play. Said out loud because a setter that appears to do
+/// nothing is the bug report this paragraph prevents.
+fn lua_sound_set_loop(L: ?*lua_State) callconv(.c) c_int {
+    const emitter = emitterOf(L) orelse return 0;
+    emitter.loop = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `sound.set_radius(self, max_distance)` — 0 is GLOBAL: never attenuated,
+/// never panned (music, UI). Also next-play only, for the same reason as
+/// `set_loop`: placement is computed when the voice starts.
+fn lua_sound_set_radius(L: ?*lua_State) callconv(.c) c_int {
+    const emitter = emitterOf(L) orelse return 0;
+    emitter.max_distance = @max(lua.toF32(L, 2), 0);
+    return 0;
+}
+
+/// `sound.set_spread(self, units)` — how far from the listener reaches hard
+/// left/right. Next-play only, like the radius it belongs with.
+fn lua_sound_set_spread(L: ?*lua_State) callconv(.c) c_int {
+    const emitter = emitterOf(L) orelse return 0;
+    emitter.spread = @max(lua.toF32(L, 2), 0);
+    return 0;
+}
+
+/// `sound.is_playing(self) -> boolean` — asks the SYSTEM, not the component.
+///
+/// The component's `playing` is a handle the emitter believes is live; the
+/// system is what knows. When the two disagree the sound has ended, so the
+/// handle is cleared here rather than waiting for a despawn to notice — a
+/// stale handle is a no-op by design, and this keeps it from lingering.
+fn lua_sound_is_playing(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const emitter = emitterOf(L) orelse return pushFalse(L);
+    const sys = ctx.audio orelse return pushFalse(L);
+    const live = !emitter.playing.isNone() and sys.isPlaying(.{
+        .index = emitter.playing.index,
+        .generation = emitter.playing.generation,
+    });
+    if (!live) emitter.playing = .none;
+    return pushBool(L, live);
+}
+
+/// `sound.describe(self) -> table` — every readable field of this emitter, as
+/// one flat table.
+///
+/// The inspector's read-back, modelled on `light.describe`: a tool draws
+/// whatever the component has, and one table beats a getter per field that then
+/// has to be kept in step with it. An empty table (not nil) means "no
+/// emitter", because "no fields" and "the call failed" must not look alike.
+fn lua_sound_describe(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.lua_createtable(L, 8, 2);
+    const emitter = emitterOf(L) orelse return 1;
+    const sys = ctx.audio;
+
+    const put = struct {
+        fn n(St: ?*lua_State, key: [:0]const u8, v: f64) void {
+            lua.lua_pushnumber(St, v);
+            lua.setField(St, -2, key);
+        }
+        fn b(St: ?*lua_State, key: [:0]const u8, v: bool) void {
+            lua.lua_pushboolean(St, @intFromBool(v));
+            lua.setField(St, -2, key);
+        }
+        fn s(St: ?*lua_State, key: [:0]const u8, v: []const u8) void {
+            lua.pushSlice(St, v);
+            lua.setField(St, -2, key);
+        }
+    };
+
+    put.n(L, "bank_slot", @floatFromInt(emitter.bank_slot));
+    // The name behind the slot, from the bank that owns it. Empty when there is
+    // no system or the slot was evicted — never a guess.
+    put.s(L, "path", if (sys) |system| system.slotPath(emitter.bank_slot) else "");
+    put.n(L, "bus", @floatFromInt(emitter.bus));
+    put.n(L, "volume", emitter.volume);
+    put.n(L, "pitch", emitter.pitch);
+    put.b(L, "loop", emitter.loop);
+    put.n(L, "max_distance", emitter.max_distance);
+    put.n(L, "spread", emitter.spread);
+    put.b(L, "autoplay", emitter.autoplay);
+    put.b(L, "playing", !emitter.playing.isNone());
+    put.n(L, "tick", @floatFromInt(emitter.tick));
+    return 1;
+}
+
+/// Pushes the one live command a setter can change on a running voice. The
+/// fields that cannot change are not here, and neither is a comment explaining
+/// why — see `lua_sound_set_loop`.
+fn applyLiveVoice(sys: *audio_mod.Audio, emitter: *components.SoundEmitter2D, comptime field: enum { volume, pitch }) void {
+    if (emitter.playing.isNone()) return;
+    const id = audio_mod.VoiceId{ .index = emitter.playing.index, .generation = emitter.playing.generation };
+    switch (field) {
+        .volume => sys.setVolume(id, emitter.volume),
+        .pitch => sys.setPitch(id, emitter.pitch),
+    }
+}
+
+const sound_regs = [_]luaL_Reg{
+    .{ .name = "play", .func = lua_sound_play },
+    .{ .name = "stop", .func = lua_sound_stop },
+    .{ .name = "set_volume", .func = lua_sound_set_volume },
+    .{ .name = "set_pitch", .func = lua_sound_set_pitch },
+    .{ .name = "set_loop", .func = lua_sound_set_loop },
+    .{ .name = "set_radius", .func = lua_sound_set_radius },
+    .{ .name = "set_spread", .func = lua_sound_set_spread },
+    .{ .name = "is_playing", .func = lua_sound_is_playing },
+    .{ .name = "describe", .func = lua_sound_describe },
+    .{ .name = null, .func = null },
+};
+
 /// Installs every binding into `L`, closing each C function over `ctx` (a stable
 /// pointer the caller owns). Builds the `actor`, `input` and `log` global tables
 /// and stamps the entity bridge helpers the behavior layer uses.
@@ -3235,6 +4067,7 @@ pub const registered_names = [_][]const u8{
 
     // actor
     "actor.get_position",        "actor.set_position",
+    "actor.set_transform",       "actor.get_all",
     "actor.translate",           "actor.move_by",
     "actor.get_rotation",        "actor.set_rotation",
     "actor.get_name",            "actor.emit",
@@ -3293,6 +4126,35 @@ pub const registered_names = [_][]const u8{
     "physics.stats",
     "physics.set_view",
     "physics.set_focus",
+    // audio (M8)
+    "audio.play_file",
+    "audio.play_stream",
+    "audio.stop",
+    "audio.stop_all",
+    "audio.set_volume",
+    "audio.set_pitch",
+    "audio.is_playing",
+    "audio.set_master_volume",
+    "audio.set_listener",
+    "audio.solo_bus",
+    "audio.set_bus_send",
+    "audio.bus_gain",
+    "audio.set_bus_volume",
+    "audio.mute_bus",
+    "audio.buses",
+    "audio.stats",
+    // sound (M8): the per-actor `SoundEmitter2D` surface. Every one of these
+    // needs a `metadata.bindings` entry or `assertAllDocumented` fails to
+    // compile, which is the gate that keeps stubs, help panel and API aligned.
+    "sound.play",
+    "sound.stop",
+    "sound.set_volume",
+    "sound.set_pitch",
+    "sound.set_loop",
+    "sound.set_radius",
+    "sound.set_spread",
+    "sound.is_playing",
+    "sound.describe",
     "render.set_view",
     "render.stats",
     "render.set_resident",
@@ -3311,14 +4173,20 @@ pub const registered_names = [_][]const u8{
     "lighting.set_quality",
     "lighting.stats",
     "environment.new",
-    "environment.set_sky",
-    "environment.set_gi",
-    "environment.get_sky",
+    // M9: scene transitions (the fade)
+    "scene.fade_out",
+    "scene.fade_in",
+    "scene.fade_covered",
+    "scene.fade_clear",
+    "scene.fade_amount",
+    "scene.fading",
+    // M9: particles (the CPU pool)
+    "particles.burst",
+    "particles.stats",
     "light.set_color",
     "light.set_energy",
     "light.set_blend",
     "light.set_shadow",
-    "light.set_gi",
     "light.set_mask",
     "light.get_energy",
     // The M7 set: `light.new` is what a scene file and the acceptance test use,
@@ -3405,6 +4273,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
 
     installModule(L, ctx, "actor", &actor_regs);
     installModule(L, ctx, "math", &math_regs);
+    installModule(L, ctx, "audio", &audio_regs);
     installModule(L, ctx, "vec2", &vec2_regs);
     installModule(L, ctx, "input", &input_regs);
     installModule(L, ctx, "log", &log_regs);
@@ -3427,11 +4296,17 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "ambient", &ambient_regs);
     installModule(L, ctx, "occluder", &occluder_regs);
     installModule(L, ctx, "environment", &environment_regs);
+    // M9: scene transitions (the fade) and particle pool
+    installModule(L, ctx, "scene", &scene_regs);
+    installModule(L, ctx, "particles", &particles_regs);
     // M4.5: the camera is driven from the script on its OWN actor, and the
     // timer is a component that declares signal names. Neither needs a system
     // call per frame — the fixed step advances them.
     installModule(L, ctx, "camera", &camera_regs);
     installModule(L, ctx, "timer", &timer_regs);
+    // M8: the per-actor emitter. Beside `sprite` and `timer` because it is the
+    // same kind of surface — methods on `self` over a plain-data component.
+    installModule(L, ctx, "sound", &sound_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

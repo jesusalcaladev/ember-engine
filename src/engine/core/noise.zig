@@ -145,9 +145,9 @@ pub fn perlin(seed: u64, x: f32, y: f32) f32 {
     return std.math.clamp(n, -1.0, 1.0);
 }
 
-/// The 2D simplex skew factors (Gustavson's).
-const skew: f32 = 0.5 * (@as(f32, @sqrt(3.0)) - 1.0);
-const unskew: f32 = (3.0 - @as(f32, @sqrt(3.0))) / 6.0;
+/// The 2D simplex skew factors (Gustavson's) — comptime for constant folding.
+const skew: f32 = 0.3660254037844386;  // 0.5 * (sqrt(3) - 1)
+const unskew: f32 = 0.21132486540518714;  // (3 - sqrt(3)) / 6
 
 /// 2D simplex noise in `[-1, 1]`. The triangular lattice removes the axis bias
 /// of a square grid, so it stays isotropic when sampled along circles — the

@@ -567,7 +567,6 @@ render_mod.addImport("assets", assets_mod);
         "src/engine/render/shaders/sprite.wgsl",
         "src/engine/render/shaders/smaa.wgsl",
         "src/engine/render/shaders/light.wgsl",
-        "src/engine/render/shaders/radiance.wgsl",
         "src/engine/render/shaders/post.wgsl",
     }) |rel| {
         const run = b.addSystemCommand(&.{

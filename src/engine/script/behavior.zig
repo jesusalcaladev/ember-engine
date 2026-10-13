@@ -269,6 +269,11 @@ pub const Behaviors = struct {
         self.instances.deinit(self.allocator);
         if (self.driver_ref != no_ref) self.vm.unref(self.driver_ref);
         if (self.insts_table_ref != no_ref) self.vm.unref(self.insts_table_ref);
+        // The spatial grid is allocated by `init` (a cell table plus the
+        // self-ref array) and was never freed here: every `Behaviors` that was
+        // torn down leaked its grid, which the test runner reports as one leak
+        // per booted harness.
+        self.grid.deinit();
         self.scripts.deinit();
         self.vm.deinit();
     }
@@ -534,10 +539,38 @@ pub const Behaviors = struct {
         }
     }
 
+    /// One field of a signal payload, as Lua sees it: a name and a value.
+    ///
+    /// The engine side stays POD (a union of scalars and one borrowed string),
+    /// and building the Lua TABLE is this module's business — the runtime that
+    /// emits `sound_finished` must not have to reach into `lua_State`.
+    pub const PayloadField = struct {
+        name: [*:0]const u8,
+        value: Value,
+
+        pub const Value = union(enum) {
+            number: f64,
+            integer: i64,
+            boolean: bool,
+            /// Borrowed for the duration of the call; copied into the VM.
+            string: []const u8,
+        };
+    };
+
     /// Invokes `on_signal(name)` on every live instance that defines it. The
     /// runtime calls this from the signal drain so Lua handlers run in the same
     /// frame the signal fires, after the typed Zig listeners.
     pub fn dispatchSignal(self: *Behaviors, name: []const u8) void {
+        self.dispatchSignalPayload(name, &.{});
+    }
+
+    /// `dispatchSignal` with a payload: `on_signal(name, payload)`.
+    ///
+    /// An EMPTY payload passes `nil` rather than an empty table, so a handler
+    /// written as `function M:on_signal(name)` — every handler written before
+    /// payloads existed — keeps working unchanged, and one that wants the fields
+    /// gets them. The table is built on the Lua stack and never escapes the call.
+    pub fn dispatchSignalPayload(self: *Behaviors, name: []const u8, payload: []const PayloadField) void {
         const L = self.vm.state().?;
         for (self.instances.items) |*inst| {
             if (!inst.alive) continue;
@@ -546,7 +579,21 @@ pub const Behaviors = struct {
             self.vm.pushRef(inst.on_signal_ref); // [fn]
             self.vm.pushRef(inst.self_ref); // [fn, self]
             lua.pushSlice(L, name); // [fn, self, name]
-            self.callMethod(inst, 2); // fn(self, name)
+            if (payload.len == 0) {
+                lua.pushNil(L); // [fn, self, name, nil]
+            } else {
+                lua.lua_createtable(L, 0, @intCast(payload.len));
+                for (payload) |field| {
+                    switch (field.value) {
+                        .number => |v| lua.lua_pushnumber(L, v),
+                        .integer => |v| lua.lua_pushinteger(L, v),
+                        .boolean => |v| lua.lua_pushboolean(L, @intFromBool(v)),
+                        .string => |v| lua.pushSlice(L, v),
+                    }
+                    lua.setField(L, -2, field.name); // pops the value
+                }
+            }
+            self.callMethod(inst, 3); // fn(self, name, payload)
         }
     }
 
@@ -712,6 +759,54 @@ test "behavior lifecycle: start, update drives the ECS, signal dispatch" {
     // Signal dispatch calls on_signal with the event name.
     h.b.dispatchSignal("hit");
     try std.testing.expectEqualStrings("hit", readSelfString(&h.b, self_ref, "last_signal").?);
+}
+
+const payload_src =
+    \\local M = {}
+    \\function M:on_signal(name, payload)
+    \\  self.last_signal = name
+    \\  if payload then
+    \\    self.slot = payload.slot
+    \\    self.tick = payload.tick
+    \\    self.loop_n = payload.loop and 1 or 0
+    \\    self.path = payload.path
+    \\  else
+    \\    self.slot = -1
+    \\  end
+    \\end
+    \\return M
+;
+
+test "on_signal receives the payload as a table, and nil when there is none" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("payload.lua", payload_src);
+    const e = try h.world.spawn(.{components.Transform{ .position = .{ .x = 0, .y = 0 } }});
+    try h.b.attach(e, sid);
+    h.b.startAll();
+    const self_ref = h.b.instances.items[0].self_ref;
+
+    // No payload: `nil`, not an empty table — the handler above takes a
+    // two-argument `on_signal` and must keep working with one.
+    h.b.dispatchSignal("hit");
+    try std.testing.expectEqualStrings("hit", readSelfString(&h.b, self_ref, "last_signal").?);
+    try std.testing.expectEqual(@as(f64, -1), readSelfNumber(&h.b, self_ref, "slot").?);
+
+    // With one: exactly the fields handed over, each in its own Lua type.
+    const fields = [_]Behaviors.PayloadField{
+        .{ .name = "slot", .value = .{ .integer = 3 } },
+        .{ .name = "tick", .value = .{ .integer = 41 } },
+        .{ .name = "loop", .value = .{ .boolean = true } },
+        .{ .name = "path", .value = .{ .string = "boom.wav" } },
+    };
+    h.b.dispatchSignalPayload("sound_finished", &fields);
+    try std.testing.expectEqualStrings("sound_finished", readSelfString(&h.b, self_ref, "last_signal").?);
+    try std.testing.expectEqual(@as(f64, 3), readSelfNumber(&h.b, self_ref, "slot").?);
+    try std.testing.expectEqual(@as(f64, 41), readSelfNumber(&h.b, self_ref, "tick").?);
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, self_ref, "loop_n").?);
+    try std.testing.expectEqualStrings("boom.wav", readSelfString(&h.b, self_ref, "path").?);
 }
 
 test "hot-reload preserves self state while swapping methods (ROADMAP M3)" {

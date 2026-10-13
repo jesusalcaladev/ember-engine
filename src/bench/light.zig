@@ -118,7 +118,7 @@ fn measure(lights: u16, shadowed: u8, occluders_n: u16) !void {
             switch (i % 4) {
                 0 => _ = try world.spawn(.{
                     xf,
-                    components.PointLight2D{ .radius = 192, .base = .{ .cast_shadows = casts, .gi_contribution = 0.2 } },
+                    components.PointLight2D{ .radius = 192, .base = .{ .cast_shadows = casts } },
                 }),
                 1 => _ = try world.spawn(.{
                     xf,
@@ -126,7 +126,7 @@ fn measure(lights: u16, shadowed: u8, occluders_n: u16) !void {
                         .radius = 192,
                         .cone_angle = 1.2,
                         .penumbra = 0.25,
-                        .base = .{ .cast_shadows = casts, .gi_contribution = 0.2 },
+                        .base = .{ .cast_shadows = casts },
                     },
                 }),
                 2 => _ = try world.spawn(.{
@@ -138,7 +138,6 @@ fn measure(lights: u16, shadowed: u8, occluders_n: u16) !void {
                         .cone_angle = 1.2,
                         .penumbra = 0.25,
                         .cast_shadows = casts,
-                        .gi_contribution = 0.2,
                     },
                 }),
                 else => _ = try world.spawn(.{
@@ -353,8 +352,6 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
     // would prove nothing about the path a project actually uses.
     _ = try world.spawn(.{components.Environment{
         .sky_color = .{ 0.06, 0.07, 0.10, 1 },
-        .gi_enabled = true,
-        .gi_albedo = 0.85,
         .ambient_color = .{ 0.04, 0.04, 0.06, 1 },
     }});
 
@@ -404,7 +401,7 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
                 xf,
                 components.PointLight2D{
                     .radius = 256,
-                    .base = .{ .cast_shadows = k < 4, .gi_contribution = 0.3 },
+                    .base = .{ .cast_shadows = k < 4 },
                 },
             }),
             1 => _ = try world.spawn(.{
@@ -413,7 +410,7 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
                     .radius = 256,
                     .cone_angle = 1.2,
                     .penumbra = 0.25,
-                    .base = .{ .cast_shadows = k < 4, .gi_contribution = 0.3 },
+                    .base = .{ .cast_shadows = k < 4 },
                 },
             }),
             2 => _ = try world.spawn(.{
@@ -424,14 +421,13 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
                     .cone_angle = 1.2,
                     .penumbra = 0.25,
                     .cast_shadows = k < 4,
-                    .gi_contribution = 0.3,
                 },
             }),
             else => _ = try world.spawn(.{
                 xf,
                 components.DirectionalLight2D{
                     .height = 0.5,
-                    .base = .{ .cast_shadows = k < 4, .gi_contribution = 0.3 },
+                    .base = .{ .cast_shadows = k < 4 },
                 },
             }),
         }
@@ -451,116 +447,7 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
 /// is a DIFFERENT ANSWER, so a project can pick the model that matches its
 /// scene, and the cost column is what tells you what picking costs.
 fn sweepBackends(allocator: std.mem.Allocator) !void {
-    const lights_n: u16 = 20;
-    const occluders_n: u16 = 40;
-    const frames: u32 = 12;
-
-    log("GI BACKENDS — same scenes, both models", .{});
-
-    for ([_]EarlyOutScene{ .open, .room }) |which| {
-        try backendOne(allocator, which, .sky, lights_n, occluders_n, frames);
-        try backendOne(allocator, which, .bounce, lights_n, occluders_n, frames);
-        log("", .{});
-    }
-}
-
-fn backendOne(
-    allocator: std.mem.Allocator,
-    which: EarlyOutScene,
-    backend: engine.light.GiBackend,
-    lights_n: u16,
-    occluders_n: u16,
-    frames: u32,
-) !void {
-    var world = World.init(allocator);
-    defer world.deinit();
-    try buildAcceptanceScene(&world, lights_n, occluders_n);
-    if (which == .room) try sealTheRoom(&world);
-
-    var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
-    defer driver.deinit();
-    driver.default_backend = backend;
-    driver.lighting.gi_backend = backend;
-    driver.bounce_iterations = light.bounce_iterations;
-
-    const view = engine.lighting_driver.Driver.viewFor(
-        null,
-        @intFromFloat(acceptance_world_w),
-        @intFromFloat(acceptance_world_h),
-    );
-    try driver.resize(view);
-    driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
-    driver.sky = .{ 0.06, 0.07, 0.10 };
-
-    // The world's Environment must not override what this bench is measuring.
-    var it = world.query(.{components.Environment});
-    if (it.next()) |row| row.get(components.Environment).gi_backend = null;
-
-    // GI's own cost, not the frame's. The frame is dominated by the shadow
-    // sweep, which scales with the SCENE's geometry -- so comparing whole frames
-    // between two backends on two different scenes measures the rooms, not the
-    // GI. That mistake is what made the first version of this table say the
-    // bounce backend was more expensive than the cascade on identical input.
-    var gi_ns: u64 = 0;
-    var gi_events: u32 = 0;
-    var last_builds: u32 = 0;
-    var frame_ns: u64 = 0;
-    var f: u32 = 0;
-    while (f < frames) : (f += 1) {
-        var oit = world.query(.{components.LightOccluder2D, components.Transform});
-        var oe = oit.next();
-        var n: u32 = 0;
-        while (oe) |en| : (oe = oit.next()) {
-            if (n % 2 == 0) en.get(components.Transform).position.x += 1.0;
-            n += 1;
-        }
-        const t0 = monotonicNs();
-        driver.update(&world, @intCast(monotonicNs()));
-        frame_ns += monotonicNs() - t0;
-        if (backend == .bounce) {
-            gi_ns += driver.lighting.stats.bounce_ns;
-            gi_events += 1;
-        } else {
-            // The cascade is AMORTIZED, so its cost lands on a minority of
-            // frames. Dividing by all of them reports an average that is true of
-            // the average and false of the thing being compared -- and would make
-            // the bounce look dearer than it is purely by being called more
-            // often. Divided by the rebuilds, both columns are "per GI event".
-            if (driver.lighting.stats.sdf_builds != last_builds) {
-                gi_ns += driver.lighting.stats.pyramid_ns + driver.lighting.stats.sdf_ns;
-                gi_events += 1;
-                last_builds = driver.lighting.stats.sdf_builds;
-            }
-        }
-    }
-
-    // What each model actually believes about the middle of the scene, which is
-    // the number that says whether they are different models or the same one
-    // twice.
-    const enc = driver.lighting.sampleGi(0, 0);
-    // The PEAK of the field rather than one sample point. A single point is not
-    // evidence of anything in a scene made of a grid of walls: the first one
-    // tried was (0, 0), which is inside a wall, and it reported "no bounce" for
-    // a field that was in fact the brightest thing in the scene.
-    var bmax: f32 = 0;
-    for (driver.lighting.bounce.rgb) |v| {
-        if (v > bmax) bmax = v;
-    }
-
-    const n: f64 = @floatFromInt(frames);
-    const gi_us = @as(f64, @floatFromInt(gi_ns)) / @as(f64, @floatFromInt(@max(gi_events, 1))) / 1000.0;
-    const frame_us = @as(f64, @floatFromInt(frame_ns)) / n / 1000.0;
-    log("  {s:<5} {s:<7} GI {d:>8.2} us/event  (whole frame {d:>8.2} us)   enclosure {d:.3}  propagated {d:.3}", .{
-        @tagName(which),
-        @tagName(backend),
-        gi_us,
-        frame_us,
-        enc,
-        if (backend == .bounce) bmax else 0,
-    });
-}
-
-/// `shadow_resolution` swept, with the cost BROKEN DOWN rather than totalled.
+    /// `shadow_resolution` swept, with the cost BROKEN DOWN rather than totalled.
 ///
 /// The total was the wrong number to start from. Lighting's cost is three
 /// systems sharing one mask, and a single figure hides which one the dial is
@@ -578,14 +465,7 @@ fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
     const resolutions = [_]u32{ 256, 512, 1024, 2048, 4096 };
 
     log("SHADOW RESOLUTION — where the frame actually goes", .{});
-    log("  medium, 1920x1080 view, 21 lights, 40 occluders, GI active", .{});
-    // "Per rebuild", NOT "per frame". A rebuild is gated by `gi_interval_ns`,
-    // so consecutive frames of a moving scene do NOT each pay this; a resting
-    // frame pays ~12 us and a moving one pays it at most ten times a second.
-    // Labelling a per-rebuild figure "per frame" turns a real question ("why is
-    // my frame 40 ms?") into a false one ("my frame is 40 ms") and it is the
-    // same mistake as deriving a number and printing it beside a measured one.
-    log("  all figures PER REBUILD; how often that happens is `gi_interval_ns`", .{});
+    log("  medium, 1920x1080 view, 21 lights, 40 occluders", .{});
     log("", .{});
 
     for (resolutions) |res| {
@@ -607,8 +487,6 @@ fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
 
         var mask: u64 = 0;
         var sweep: u64 = 0;
-        var gi_field: u64 = 0;
-        var gi_pyr: u64 = 0;
         var rebuild: u64 = 0;
         var rebuilds: u32 = 0;
         var steps: u64 = 0;
@@ -628,10 +506,7 @@ fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
             if (driver.lighting.stats.sdf_builds != before) {
                 mask += driver.lighting.stats.raster_ns;
                 sweep += driver.lighting.stats.sweep_ns;
-                gi_field += driver.lighting.stats.sdf_ns;
-                gi_pyr += driver.lighting.stats.pyramid_ns;
-                rebuild += driver.lighting.stats.raster_ns + driver.lighting.stats.sweep_ns +
-                    driver.lighting.stats.sdf_ns + driver.lighting.stats.pyramid_ns;
+                rebuild += driver.lighting.stats.raster_ns + driver.lighting.stats.sweep_ns;
                 rebuilds += 1;
             }
         }
@@ -639,7 +514,6 @@ fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
         const n: f64 = @floatFromInt(@max(rebuilds, 1));
         const mask_us = @as(f64, @floatFromInt(mask)) / n / 1000.0;
         const sweep_us = @as(f64, @floatFromInt(sweep)) / n / 1000.0;
-        const field_us = @as(f64, @floatFromInt(gi_field)) / n / 1000.0;
         const pyr_us = @as(f64, @floatFromInt(gi_pyr)) / n / 1000.0;
         const total = mask_us + sweep_us + field_us + pyr_us;
         const gi_share = if (total > 0) 100.0 * (field_us + pyr_us) / total else 0;
@@ -652,9 +526,7 @@ fn sweepShadowResolution(allocator: std.mem.Allocator) !void {
         });
         log("      occluder mask {d:>8.2} us   {d:>5.1}%", .{ mask_us, pct(mask_us, total) });
         log("      shadow sweep  {d:>8.2} us   {d:>5.1}%", .{ sweep_us, pct(sweep_us, total) });
-        log("      GI field      {d:>8.2} us   {d:>5.1}%", .{ field_us, pct(field_us, total) });
-        log("      GI pyramid    {d:>8.2} us   {d:>5.1}%", .{ pyr_us, pct(pyr_us, total) });
-        log("      TOTAL         {d:>8.2} us   (GI is {d:.0}% of it)", .{ total, gi_share });
+        log("      TOTAL         {d:>8.2} us", .{ total });
         log("", .{});
     }
 }

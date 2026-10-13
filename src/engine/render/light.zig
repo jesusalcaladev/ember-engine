@@ -1,10 +1,9 @@
-//! 2D lighting (M7): occluders, shadows, spotlights and a global-illumination
-//! approximation.
+//! 2D lighting (M7): occluders, shadows and spotlights.
 //!
 //! # Why this shape
 //!
 //! Every piece here exists to make one number cheap: **given a pixel and a light,
-//! how much light reaches it.** Three sub-problems, and one decision each:
+//! how much light reaches it.** Two sub-problems, and one decision each:
 //!
 //! 1. *Is there an occluder between the light and the pixel?* Solved with a
 //!    **1D shadow map**: for each light, a sweep over directions that records the
@@ -16,18 +15,12 @@
 //!    rather than a boolean, so a filter tap average widens the penumbra. A
 //!    binary mask filtered is still a binary mask; it just gets a greyer edge.
 //!
-//! 3. *What does global illumination add?* Solved with a 2D Euclidean distance
-//!    field of the occluder mask, which answers "how enclosed is this point"
-//!    in one sample. That is a real bounce/occlusion approximation rather than a
-//!    constant ambient term, and it is amortized: the field is recomputed only
-//!    when an occluder actually moved.
-//!
 //! # What is measured rather than assumed
 //!
-//! The whole CPU half — mask rasterization, the sweeps, the distance field — is
-//! instrumented (`Stats`) and has a benchmark, because those are the parts that
-//! can regress. The GPU half draws one instanced quad per light and one
-//! fullscreen pass, which is the cheap half by construction.
+//! The whole CPU half — mask rasterization, the sweeps — is instrumented
+//! (`Stats`) and has a benchmark, because those are the parts that can regress.
+//! The GPU half draws one instanced quad per light and one fullscreen pass,
+//! which is the cheap half by construction.
 
 const std = @import("std");
 const ecs = @import("ecs");
@@ -47,13 +40,13 @@ const math = std.math;
 /// settings is that nobody knows which one a frame was using and a profile from
 /// one session does not explain another.
 pub const Quality = enum(u8) {
-    /// No shadows, no GI, point lights only. For a minimap or a server build.
+    /// No shadows, point lights only. For a minimap or a server build.
     off = 0,
-    /// Shadows at quarter resolution, half the angular samples, GI off.
+    /// Shadows at quarter resolution, half the angular samples.
     low = 1,
-    /// Half-resolution mask, full angular sweep, GI at a low rate. The default.
+    /// Half-resolution mask, full angular sweep. The default.
     medium = 2,
-    /// Half-resolution mask, doubled sweep, GI recomputed on every change.
+    /// Half-resolution mask, doubled sweep.
     high = 3,
 
     /// The shadow channels this quality allows. Four is not a tuning choice: the
@@ -79,9 +72,6 @@ pub const Quality = enum(u8) {
         };
     }
 
-    pub fn giEnabled(self: Quality) bool {
-        return self == .medium or self == .high;
-    }
 };
 
 /// The world-space rectangle the occluder mask covers.
@@ -109,15 +99,15 @@ pub const MaskRect = struct {
 
 /// One light, gathered and culled, ready to be uploaded.
 ///
-/// `extern` and comptime-asserted at 68 bytes: this is uploaded verbatim, so a
+/// `extern` and comptime-asserted at 72 bytes: this is uploaded verbatim, so a
 /// field being reordered or a `bool` sneaking in as a byte is a wire-format bug
 /// that a shader reading the wrong offset would turn into garbage geometry.
 pub const LightInstance = extern struct {
     // The field ORDER is not free. `backend_dawn.zig` declares vertex
-    // attributes at 0/8/16/24/32/40/48/56 and `light.wgsl`'s `LightIn` reads the
-    // same offsets, so this layout is a three-way contract: change one and the
-    // other two must change with it, or the GPU reads a light whose half extents
-    // are actually its colour.
+    // attributes at 0/8/16/24/32/40/56/64/68 and `light.wgsl`'s `LightIn`
+    // reads the same offsets, so this layout is a three-way contract: change one
+    // and the other two must change with it, or the GPU reads a light whose half
+    // extents are actually its colour.
     //
     // Each pair is padded to 8 bytes so a vec2 attribute never straddles two
     // fields, which is why `radius` sits alone next to `shadow_ratio` rather
@@ -158,10 +148,7 @@ pub const LightInstance = extern struct {
     attenuation: f32,
     /// Byte 60. Softness multiplier for the penumbra, in normalized units.
     softness: f32,
-    /// Byte 64. How much this light contributes to the GI term. 0 by default: GI
-    /// is an explicit opt-in per light, not something that happens to everyone.
-    gi: f32,
-    /// Byte 68. kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7
+    /// Byte 64. kind | blend << 3 | shadow_filter << 5 | has_shadow_channel << 7
     /// | channel << 8.
     ///
     /// Named `flags` and not `packed`: `packed` is a Zig keyword, and a field
@@ -184,10 +171,11 @@ pub const LightInstance = extern struct {
         // struct whose layout drifts from the shader's is not a wrong light, it
         // is garbage that renders as *something* — the failure mode is a scene
         // that looks lit but has never been correct, which nobody reports.
-        if (@sizeOf(LightInstance) != 76) @compileError("LightInstance must stay 76 bytes");
+        if (@sizeOf(LightInstance) != 72) @compileError("LightInstance must stay 72 bytes");
         if (@offsetOf(LightInstance, "half") != 16) @compileError("half must sit at byte 16");
         if (@offsetOf(LightInstance, "color") != 40) @compileError("color must sit at byte 40");
-        if (@offsetOf(LightInstance, "gi") != 64) @compileError("gi must sit at byte 64");
+        if (@offsetOf(LightInstance, "flags") != 64) @compileError("flags must sit at byte 64");
+        if (@offsetOf(LightInstance, "item_cull_mask") != 68) @compileError("item_cull_mask must sit at byte 68");
     }
 
     /// How far the shadow sweep for this light traces, in world units. A
@@ -706,9 +694,8 @@ fn clamp01(v: f32) f32 {
     return @min(@max(v, 0.0), 1.0);
 }
 
-/// Timings and counts. Everything here is a real measurement: the sweep and the
-/// distance field are the two places a lighting system can quietly cost ten
-/// times what it did last week.
+/// Timings and counts. Everything here is a real measurement: the sweep is the
+/// place a lighting system can quietly cost ten times what it did last week.
 pub const Stats = struct {
     /// Lights that survived culling and are queued for the GPU.
     lights: u32 = 0,
@@ -731,8 +718,7 @@ pub const Stats = struct {
     occluders_rasterized: u32 = 0,
     /// Frames where the mask was already current and the rasterizer was skipped.
     /// The counterpart to `sweep_skips` for the occluder pass, and the number
-    /// that makes "the mask is amortized" checkable the way `gi_skipped` makes it
-    /// for the distance field.
+    /// that makes "the mask is amortized" checkable.
     raster_skipped: u32 = 0,
     /// Automatic occluders that used the sprite's alpha coverage rather than its
     /// bounding box. Zero means every automatic occluder in the scene is a
@@ -742,16 +728,6 @@ pub const Stats = struct {
     /// Automatic occluders that wanted coverage but could not get it -- past the
     /// occluder budget, or with an empty mask. Non-zero is a budget problem.
     coverage_dropped: u32 = 0,
-    /// Frames where the GI pyramid was asked to rebuild before it had been
-    /// prepared for the current mask size, so the bounce light was skipped. Any
-    /// non-zero value is a bug report in the engine, not a scene setting: it
-    /// means `Radiance.prepare` and `Lighting.resize` have drifted apart.
-    gi_not_prepared: u32 = 0,
-    /// Frames where the distance field was not rebuilt, so the GI pyramid was
-    /// skipped rather than recomputed to the same answer. This is the number that
-    /// makes "GI is amortized" checkable: it should be the large majority of
-    /// frames in any scene that is not being rebuilt every frame.
-    gi_skipped: u32 = 0,
 
     mask_w: u32 = 0,
     mask_h: u32 = 0,
@@ -781,54 +757,17 @@ pub const Stats = struct {
     collect_ns: u64 = 0,
     raster_ns: u64 = 0,
     sweep_ns: u64 = 0,
-    /// Both halves of `sdf_ns`, and split because they answer different
-    /// questions and are tuned by different dials. `downsample_ns` is linear in
-    /// the MASK and is what `gi_resolution` cannot reduce; `transform_ns` is
-    /// linear in the GI FIELD and is what it reduces almost entirely. Reported
-    /// together, a floor set by resampling reads as a floor set by the feature,
-    /// and the fix would be aimed at the wrong dial.
-    sdf_ns: u64 = 0,
-    downsample_ns: u64 = 0,
-    transform_ns: u64 = 0,
-    /// The radiance pyramid, measured around the build call itself. Separate
-    /// from the frame time because it is one line item of several and the frame
-    /// time cannot say which.
-    pyramid_ns: u64 = 0,
-    /// Diffusion passes the bounce backend ran, and how many lights it injected.
-    /// Counters rather than timings because the whole point of that backend is
-    /// that its cost is flat, so "did it run, and over how much" is the question
-    /// worth asking.
-    bounce_passes: u64 = 0,
-    bounce_injected: u64 = 0,
-    /// The bounce backend's own cost, measured around its step. Without it the
-    /// backend's price can only be read off the whole frame, where the shadow
-    /// sweep dominates and the comparison says more about the scene's geometry
-    /// than about GI.
-    bounce_ns: u64 = 0,
-
-    /// How many times the distance field was rebuilt this session. One per
-    /// occluder move is the target; one per frame means something is dirtying it
-    /// that should not be.
-    ///
-    /// Session counters, so they survive `beginFrame`. They said "this session"
-    /// while being cleared every frame, which is the kind of sentence that stops
-    /// being true without anything failing: a test that builds the field once
-    /// per frame saw `1` and passed, and a reader watching the editor's panel
-    /// saw a number that never grew past one and had no way to know it was not
-    /// supposed to.
-    sdf_builds: u32 = 0,
-    sdf_skipped: u32 = 0,
 
     /// Clears the PER-FRAME fields, and only those.
     ///
     /// The split matters. `lights`, `sweep_steps`, `occluders_rasterized` and the
     /// `*_ns` timings describe work done between two frames, so zeroing them is
-    /// correct and is what makes them readable. `mask_fill`, `sdf_builds` and
-    /// `sdf_skipped` describe the state of the engine rather than the work, so
-    /// zeroing them reports a scene as empty for the duration of the frame in
-    /// which anybody looked at it. A stats panel that lies on an idle scene is
-    /// worse than no panel: the numbers look like a measurement, and the only
-    /// way to notice they are wrong is to already know what right looks like.
+    /// correct and is what makes them readable. `mask_fill` describes the state
+    /// of the engine rather than the work, so zeroing it reports a scene as empty
+    /// for the duration of the frame in which anybody looked at it. A stats panel
+    /// that lies on an idle scene is worse than no panel: the numbers look like a
+    /// measurement, and the only way to notice they are wrong is to already know
+    /// what right looks like.
     pub fn beginFrame(self: *Stats) void {
         self.lights = 0;
         self.shadow_lights = 0;
@@ -838,21 +777,12 @@ pub const Stats = struct {
         self.raster_skipped = 0;
         self.coverage_used = 0;
         self.coverage_dropped = 0;
-        self.gi_not_prepared = 0;
-        self.gi_skipped = 0;
         self.sweep_steps = 0;
         self.sweep_skips = 0;
         self.raster_cells = 0;
         self.collect_ns = 0;
         self.raster_ns = 0;
         self.sweep_ns = 0;
-        self.sdf_ns = 0;
-        self.downsample_ns = 0;
-        self.transform_ns = 0;
-        self.pyramid_ns = 0;
-        self.bounce_passes = 0;
-        self.bounce_injected = 0;
-        self.bounce_ns = 0;
     }
 };
 
@@ -869,268 +799,6 @@ const AreaRank = struct { area: f32, index: u32 };
 /// `hash_valid` covers the remaining case of a hash that legitimately lands on
 /// the sentinel.
 const occluder_hash_seed: u64 = 0xcbf29ce484222325;
-
-/// The GI field's default longest side, in cells.
-///
-/// CHOSEN BY MEASUREMENT, not by taste. The table is produced by
-/// `zig build bench-light` (`sweepGiResolution`), at a 2048x2048 mask, medium
-/// tier, 21 lights and 40 occluders, and is reproduced here so the number can be
-/// re-derived instead of argued about:
-///
-///     gi_resolution   resample   transform      total   MAE     upload
-///              0       0.95 ms   263.5 ms   264.5 ms  ---     16 MiB   <- before
-///             64       1.55 ms     0.17 ms     1.7 ms  0.109    16 KiB
-///            128       2.05 ms     0.67 ms     2.7 ms  0.040    64 KiB   <- default
-///            256       3.25 ms     2.97 ms     6.2 ms  0.025   256 KiB
-///            512       9.15 ms    13.94 ms    23.1 ms  0.008     1 MiB
-///           1024      11.11 ms    58.41 ms    69.5 ms  0.004     4 MiB
-///
-/// MAE is the mean absolute difference from the `0` row over 4096 sample points
-/// of the openness term — i.e. how much the picture would change — measured, not
-/// estimated, because there is no window in a headless bench to look at.
-///
-/// WHY 128 AND NOT 256. The knee is here. 64 -> 128 costs one more millisecond
-/// and halves the error. 128 -> 256 costs 3.5 more and improves the error by
-/// 0.015, which on a term that ships weighted at `gi_contribution` (0.3 in the
-/// acceptance scene) is under half a percent of a lighting term nobody notices.
-/// 256 -> 512 costs 17 ms for 0.017, and past that it is a straight line to the
-/// old cost with nothing to show for it.
-///
-/// 128 is also the only row that gets close to the spec's "GI <= 1.5 ms/frame
-/// amortized": 2.7 ms against a 16.6 ms frame, versus 6.2 ms at 256 and 264.5 ms
-/// where this started. It is not *under* budget — the resampling is linear in the
-/// MASK and no resolution setting can reduce it — and the honest answer to "is
-/// this fast enough" is that 128 nearly is and the dial is right there.
-///
-/// WHY A DIAL AND NOT A CONSTANT. A developer shipping a small game on a laptop
-/// wants the cheap end; one shipping a dungeon crawler wants every bit of detail
-/// and has the frame time for it. A constant would choose for them, and would be
-/// wrong for half of them. `0` is not "off" but "match the mask", which is the
-/// pre-dial behaviour and still costs what it always cost.
-pub const default_gi_res: u32 = 128;
-
-/// The ceiling on the GI field's longest side, and so on `downsampleGi`'s edge
-/// table. Matches `setGiResolution`'s clamp: a field wider than this is refused
-/// rather than silently truncated, so the two can never disagree about the
-/// largest field that exists.
-pub const max_gi_side: u32 = 4096;
-
-/// Diffusion passes the `bounce` backend runs per frame.
-///
-/// CHOSEN BY MEASUREMENT, and the sweep is `zig build bench-light`. The cost is
-/// linear in this number and in the grid, and so is the distance light travels
-/// per frame: a pass moves information exactly one cell, so `n` passes move it
-/// `n` cells. At the default `gi_resolution` the grid is 128 across, so a value
-/// near 8 covers a room in about four frames and a value near 32 covers it
-/// inside one.
-///
-/// The default is the point where a room stops looking like it is filling up
-/// from the doorway, which is the artefact a player notices and never reports —
-/// they just say the lighting "feels wrong" and cannot say why. Higher values
-/// cost linearly and converge faster; lower values are for a project that would
-/// rather spend the time on something else and accept the fill.
-///
-/// MEASURED (`zig build bench-light`, "GI BACKENDS"): 8 passes costs 10.8 ms of
-/// the 1080p acceptance frame at the default resolution, against 17.8 ms for the
-/// cascade it is an alternative to. So this default is not "more passes than we
-/// need" — it is fewer, and still the cheaper of the two models.
-pub const bounce_iterations: u32 = 8;
-
-/// What fraction of the light a wall keeps when the bounce passes through it.
-///
-/// 0.6 is a mid-grey painted wall. The number is PER PASS, so what actually
-/// matters is how far light has to travel: two bounces through a corridor lose
-/// `0.6^2 = 36%`, and a value high enough to reach the far end of a dungeon in
-/// one pass would also make a white room glow like a lightbulb. This is the
-/// other dial a developer tunes, and the one that most changes the MOOD of an
-/// interior without changing anything measurable about it.
-pub const default_bounce_albedo: f32 = 0.6;
-
-/// Which global-illumination model runs. The dial behind
-/// `project.config`'s `lighting.gi_backend`.
-///
-/// This is a MODELLING choice, not a quality one, and that is the reason it is
-/// an enum rather than another integer. The three are not points on a slider;
-/// they are three different claims about where light comes from.
-pub const GiBackend = enum {
-    /// No bounce light at all. Zero cost: no field, no distance transform, no
-    /// pyramid, no upload.
-    ///
-    /// Not a downgrade — a first-class path, the one a developer lighting a scene
-    /// by hand wants. Shadows, shadowed occluders, automatic occluders and every
-    /// light keep working; what goes away is the term that darkens enclosed
-    /// space on its own. A hand-lit project should be able to turn this off and
-    /// find that nothing about the picture got worse, because the term was
-    /// weighted at zero by `gi_contribution` anyway.
-    off,
-
-    /// Radiance cascades seeded from the sky. Traces rays through the distance
-    /// field and propagates what the sky contributed inward, one bounce.
-    ///
-    /// The right model outdoors: a courtyard's bounce comes from the sky, and
-    /// this is what produces it.
-    sky,
-
-    /// Light propagation: the scene's OWN lights are injected into a grid and
-    /// diffused through free space, reflecting off walls as they go.
-    ///
-    /// The right model indoors, and the reason it exists. The cascade model
-    /// cannot light a sealed room at all — correctly, because there is no sky
-    /// inside a sealed room to trace — so a dungeon lit only by torches came out
-    /// flat and dark with no way to fix it from configuration. This one carries
-    /// the torches.
-    ///
-    /// Cheaper than the cascade as well, which is the part worth knowing: at
-    /// `gi_resolution` it is a fixed number of grid passes, not
-    /// probes-times-rays.
-    bounce,
-};
-
-/// The GI field's dimensions for a mask of `w` x `h` under a configured
-/// longest side of `res`.
-///
-/// The aspect ratio of the mask is preserved: a 16:9 mask gets a 16:9 field,
-/// because stretching the field to a square would make one texel of enclosure
-/// data mean different world distances horizontally and vertically, and the
-/// gradient that produces is not a lighting artefact anyone can diagnose from a
-/// screenshot.
-///
-/// `res == 0` is "match the mask" and returns the mask's own size, which is the
-/// pre-decouple behaviour and costs what it always cost.
-pub fn giDimsFor(w: u32, h: u32, res: u32) struct { w: u32, h: u32 } {
-    if (w == 0 or h == 0) return .{ .w = 0, .h = 0 };
-    if (res == 0 or (w <= res and h <= res)) return .{ .w = w, .h = h };
-
-    const longest = @max(w, h);
-    if (w >= h) {
-        return .{ .w = res, .h = @max((h * res) / longest, 1) };
-    }
-    return .{ .w = @max((w * res) / longest, 1), .h = res };
-}
-
-/// Light propagation: the `bounce` backend's grid.
-///
-/// ## Why diffusion and not tracing
-///
-/// The cascade model traces rays to find the sky and propagates what it found.
-/// That is the wrong question indoors. A sealed room has no sky, so every trace
-/// returns nothing, so the room is unlit — which is CORRECT for that model and
-/// useless for a dungeon. The light in a room comes from the torches in it, and
-/// the thing that needs modelling is not "where is the sky" but "where has the
-/// torch light reached".
-///
-/// So this inverts it: the scene's real lights are INJECTED into a grid, and each
-/// step spreads that grid by one cell. A wall cell reflects rather than absorbing,
-/// which is the bounce. After enough steps the light is wherever physics would
-/// have put it, and the field is sampled the same way any other GI term is.
-///
-/// ## Why it converges instead of exploding
-///
-/// The light is re-injected every step rather than only once, so a source never
-/// decays away, while the field it sits in is a low-pass filter. The pair has a
-/// fixed point, the field settles onto it, and the frame cost stops changing.
-/// The alternative — inject once, diffuse forever — either dies to zero or
-/// diverges, and neither is a lighting model.
-///
-/// ## The cost
-///
-/// A fixed number of grid passes, independent of the light count. At
-/// `gi_resolution` that is tens of thousands of operations, not
-/// probes-times-rays, which is why this backend is CHEAPER than the cascade it
-/// sits beside. That is the opposite of what adding a second model usually costs,
-/// and it is the reason both can ship.
-pub const Bounce = struct {
-    allocator: std.mem.Allocator,
-    /// RGB per cell, `w * h * 3`.
-    rgb: []f32 = &.{},
-    /// The occluder distance field as f32, for the GPU compute pass.
-    ///
-    /// A MIRROR, deliberately, and the duplication is the point rather than an
-    /// oversight. `radiance.wgsl` reads the field as `array<f32>` while the CPU
-    /// keeps it as `[]u16` — a true distance clamped to 65535, two bytes to the
-    /// GPU's four. The types both compiled and the shader read packed bytes as
-    /// floats, which is a wrong answer rather than a failed one.
-    ///
-    /// Unpacking on the GPU instead would halve the upload, and would put the
-    /// one conversion in the path where a mistake is hardest to attribute. The
-    /// field is the only thing a CPU merge and a GPU merge must agree about
-    /// exactly: a merge that reads a different field is not a faster merge, it
-    /// is a different answer, and it would show up as "the GPU bounce looks
-    /// slightly wrong" with nothing to point at. 64 KB at the default
-    /// resolution is the price of being able to TEST the agreement, which is
-    /// worth more than the 32 KB.
-    sdf_f32: []f32 = &.{},
-
-    /// This step's sources, `w * h * 3`. Separate from `rgb` because a diffusion
-    /// step reads the previous step's field while writing the next one's, and
-    /// in-place would smear the update across the sweep direction.
-    inject: []f32 = &.{},
-    /// `w * h * 3` scratch for the next step.
-    scratch: []f32 = &.{},
-    w: u32 = 0,
-    h: u32 = 0,
-
-    pub fn init(allocator: std.mem.Allocator) Bounce {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *Bounce) void {
-        self.allocator.free(self.rgb);
-        self.allocator.free(self.inject);
-        self.allocator.free(self.scratch);
-        self.allocator.free(self.sdf_f32);
-        self.* = undefined;
-    }
-
-    /// Sizes the grid. Cheap no-op when it already fits, which is every frame
-    /// after the first.
-    pub fn prepare(self: *Bounce, w: u32, h: u32) !void {
-        if (w == 0 or h == 0) return;
-        if (self.w == w and self.h == h and self.rgb.len != 0) return;
-        const n = @as(usize, w) * h * 3;
-        self.allocator.free(self.rgb);
-        self.allocator.free(self.inject);
-        self.allocator.free(self.scratch);
-        self.rgb = try self.allocator.alloc(f32, n);
-        self.inject = try self.allocator.alloc(f32, n);
-        self.scratch = try self.allocator.alloc(f32, n);
-        @memset(self.rgb, 0);
-        @memset(self.inject, 0);
-        self.w = w;
-        self.h = h;
-    }
-
-    /// Clears the field. The right response to a teleport or a level load, where
-    /// carrying light across the world would be a bright smear nobody asked for.
-    pub fn reset(self: *Bounce) void {
-        @memset(self.rgb, 0);
-    }
-
-    /// Bilinear read. The same four-tap merge the cascade's sampler uses, so the
-    /// two backends do not disagree about what a value between two samples is.
-    pub fn sample(self: *const Bounce, x: f32, y: f32) [3]f32 {
-        if (self.w == 0 or self.rgb.len == 0) return .{ 0, 0, 0 };
-        const fx = @floor(x);
-        const fy = @floor(y);
-        if (fx < 0 or fy < 0) return .{ 0, 0, 0 };
-        const x0: u32 = @intFromFloat(fx);
-        const y0: u32 = @intFromFloat(fy);
-        if (x0 + 1 >= self.w or y0 + 1 >= self.h) return .{ 0, 0, 0 };
-        const tx = x - fx;
-        const ty = y - fy;
-        const base = (@as(usize, y0) * self.w + x0) * 3;
-
-        var out = [3]f32{ 0, 0, 0 };
-        for (0..3) |k| {
-            const p00 = self.rgb[base + k];
-            const p10 = self.rgb[base + 3 + k];
-            const p01 = self.rgb[base + self.w * 3 + k];
-            const p11 = self.rgb[base + self.w * 3 + 3 + k];
-            out[k] = mix2(mix2(p00, p10, tx), mix2(p01, p11, tx), ty);
-        }
-        return out;
-    }
-};
 
 pub const Lighting = struct {
     allocator: std.mem.Allocator,
@@ -1176,71 +844,6 @@ pub const Lighting = struct {
     ///
     /// So the flag is now cleared per channel, when the light BEHIND it changes.
     channel_owner: [4]u64 = [_]u64{0} ** 4,
-
-    /// Euclidean distance field of the occluder mask, in mask cells, clamped to
-    /// 65535. Solid cells are 0; a free cell holds its distance to the nearest
-    /// solid one, which is the "how much sky can I see from here" answer GI wants.
-    ///
-    /// Sized `gi_w * gi_h`, NOT `alloc_w * alloc_h`. See `gi_mask` — the whole
-    /// point of that field is that the distance transform is the expensive part,
-    /// and it does not need shadow-map resolution to answer a question about how
-    /// ENCLOSED a point is.
-    sdf: []u16 = &.{},
-
-    /// The occluder mask, DOWNSAMPLED to the GI field's resolution.
-    ///
-    /// This field exists because the GI field used to live at mask resolution,
-    /// and at 2048x2048 that cost 243-265 ms of exact distance transform and a
-    /// 16 MB upload per rebuild. The cost grew with the WINDOW rather than with
-    /// the scene, which is the opposite of what a quality dial is for: enlarging
-    /// the window made the renderer slower.
-    ///
-    /// The filter is CONSERVATIVE — any solid texel in the footprint makes the
-    /// destination solid — and that direction is the whole design. Downsampling
-    /// has two possible errors and only one of them is survivable: a wall that
-    /// vanishes leaves a doorway that leaks light into a room the author
-    /// enclosed, and the report is always "the lighting is wrong near that arch"
-    /// with nothing in the logs. A wall that thickens slightly costs a few texels
-    /// of extra penumbra and is invisible. GI that errs by hiding sky is merely
-    /// wrong; GI that errs by inventing sky is broken.
-    gi_mask: []u8 = &.{},
-
-    /// The GI field's own dimensions, in cells. Derived from the mask size and
-    /// `gi_res` by `giDimsFor`, never assigned anywhere else.
-    gi_w: u32 = 0,
-    gi_h: u32 = 0,
-
-    /// The configured GI field resolution: the LONGEST side, in cells. Zero means
-    /// "match the mask", which is the old behaviour and costs what it always
-    /// cost. Reaches the engine from `project.config`'s `lighting.gi_resolution`
-    /// and from the quality tier when the config does not name a value.
-    gi_res: u32 = default_gi_res,
-
-    /// The radiance-cascade pyramid. A POINTER because `Radiance` is declared
-    /// further down this file and Zig has no forward declarations: an inline
-    /// value would be a cycle, and an `anytype` field would cost every method
-    /// on it. Created by `init` when GI is on and left null when it is off, so a
-    /// scene without GI allocates nothing for it.
-    radiance: ?*Radiance = null,
-
-    /// The bounce backend's grid. A VALUE, unlike `radiance`: it has no cascade
-    /// pyramid to prepare and no `NotPrepared` state to get wrong, and a heap
-    /// pointer here would buy nothing but a nullable field that has to be checked
-    /// on every read.
-    bounce: Bounce = undefined,
-
-    /// Which model runs. Set from `lighting.gi_backend`; `off` is a complete
-    /// shutdown of the GI path, not a lower quality.
-    gi_backend: GiBackend = .sky,
-
-    /// The distance transform's scratch, sized in `resize` and reused forever.
-    ///
-    /// Owning it here is what removes a 2 MB allocation per frame from between
-    /// two linear passes. The transform's remaining cost is in `edt1d` and is
-    /// measured by `bench-light`, not here.
-    edt: EdtScratch = undefined,
-    /// The RGBA8 grid `encodeGi` writes. Grown in `resize`, never in a frame.
-    gi_pixels: []u8 = &.{},
 
     /// The gather buffers. `std.ArrayList` of trivially-copyable structs, grown
     /// by the caller before a frame and not during one (spec §3.1).
@@ -1296,8 +899,9 @@ pub const Lighting = struct {
     scratch: std.ArrayList(AreaRank) = .empty,
     occluders: std.ArrayList(Occluder) = .empty,
 
-    /// Bumped whenever an occluder or the mask rectangle changes, so the SDF
-    /// knows to rebuild without comparing every polygon against the last one.
+    /// Bumped whenever an occluder or the mask rectangle changes, so derived
+    /// state knows to rebuild without comparing every polygon against the last
+    /// one.
     dirty: bool = true,
     /// True when the occluder set changed shape since the mask was last built.
     ///
@@ -1323,12 +927,6 @@ pub const Lighting = struct {
     /// "cleared" and "a scene whose hash is zero" are the same number — so the
     /// question is tracked rather than guessed from the value.
     hash_valid: bool = false,
-    last_sdf_ns: i128 = 0,
-    /// Minimum time between distance-field rebuilds, in nanoseconds. 0 rebuilds
-    /// whenever the mask is stale (high quality); a positive value spreads the
-    /// work across frames (medium), which is what "amortized" in the roadmap
-    /// means rather than a wish that the field is cheap.
-    gi_interval_ns: i64 = 0,
 
     stats: Stats = .{},
     /// Monotonic clock, injected. A function pointer rather than a direct call
@@ -1340,14 +938,9 @@ pub const Lighting = struct {
     // ── lifecycle ────────────────────────────────────────────────────────────
 
     pub fn init(allocator: std.mem.Allocator, tier: Quality) !Lighting {
-        // `edt` in the literal, BEFORE the errdefer: setting it after means a
-        // failure in `setAngles` runs `deinit` on a scratch whose allocator is
-        // undefined, and a panic in the cleanup path hides the error that
-        // caused it.
         var self: Lighting = .{
             .allocator = allocator,
             .cfg = tier,
-            .edt = EdtScratch.init(allocator),
         };
         errdefer self.deinit();
         try self.setAngles(switch (tier) {
@@ -1355,46 +948,20 @@ pub const Lighting = struct {
             .medium => 128,
             .high => 256,
         });
-        self.gi_interval_ns = switch (tier) {
-            // 100 ms is ten rebuilds a second. A GI field is a slow-moving
-            // quantity -- an occluder has to move a long way before "how
-            // enclosed is this point" changes -- and rebuilding it every frame
-            // is the classic way to make a subsystem that costs more than the
-            // scene it was added to.
-            .medium => 100 * std.time.ns_per_ms,
-            else => 0,
-        };
-        // The pyramid only exists when GI does. A scene that never asks for
-        // bounce should not be carrying a four-level probe grid it will never
-        // fill — so this is allocated on the quality setting, not on a flag
-        // that starts out true and gets turned off later.
-        if (tier.giEnabled()) {
-            const r = try self.allocator.create(Radiance);
-            errdefer self.allocator.destroy(r);
-            r.* = Radiance.init(self.allocator);
-            self.radiance = r;
-        }
-        self.bounce = Bounce.init(self.allocator);
         return self;
     }
 
     /// Changes the quality tier at runtime.
     ///
-    /// A setter and not a field, because three of the four tiers change something
-    /// that is ALREADY ALLOCATED — the angle count, the GI pyramid — and writing
-    /// `cfg` alone would leave the buffers sized for the old tier while every
-    /// read went to the new one. An editor's quality dropdown calls this.
+    /// A setter and not a field, because two of the four tiers change something
+    /// that is ALREADY ALLOCATED — the angle count — and writing `cfg` alone
+    /// would leave the buffers sized for the old tier while every read went to
+    /// the new one. An editor's quality dropdown calls this.
     ///
     /// Not frame work: `setAngles` reallocates, and spec §3.1 forbids that inside
     /// a frame. The editor's setting panel is not in a frame.
-    ///
-    /// Returns false when the tier needs GI and GI was never created, because
-    /// raising the tier is a request and the answer may be no — a scene that
-    /// started with GI off has no pyramid to fill and building one here would be
-    /// an allocation the caller did not budget for.
     pub fn setQuality(self: *Lighting, tier: Quality) !bool {
         if (tier == self.cfg) return true;
-        if (tier.giEnabled() and self.radiance == null) return false;
 
         const angles: u16 = switch (tier) {
             .off, .low => 64,
@@ -1402,10 +969,6 @@ pub const Lighting = struct {
             .high => 256,
         };
         try self.setAngles(angles);
-        self.gi_interval_ns = switch (tier) {
-            .medium => 100 * std.time.ns_per_ms,
-            else => 0,
-        };
         self.cfg = tier;
         // The mask resolution halves at the lower tiers, so the tier change is a
         // resize: the grid is sized in `resize` and `mask_w`/`mask_h` are what
@@ -1427,17 +990,8 @@ pub const Lighting = struct {
     pub fn deinit(self: *Lighting) void {
         self.allocator.free(self.mask);
         self.allocator.free(self.shadow);
-        self.allocator.free(self.sdf);
-        self.allocator.free(self.gi_mask);
-        self.allocator.free(self.gi_pixels);
         self.allocator.free(self.coverage_pool);
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
-        self.edt.deinit();
-        if (self.radiance) |r| {
-            r.deinit();
-            self.allocator.destroy(r);
-        }
-        self.bounce.deinit();
         self.lights.deinit(self.allocator);
         self.channel_of.deinit(self.allocator);
         self.reach_of.deinit(self.allocator);
@@ -1463,110 +1017,6 @@ pub const Lighting = struct {
         try self.allocMask(w, h);
     }
 
-    /// (Re)sizes everything derived from the mask: the GI field, its upload
-    /// buffer and the radiance pyramid.
-    ///
-    /// Split out of `resize` because `gi_res` can change WITHOUT the mask
-    /// changing — that is the entire point of it being a dial. A developer
-    /// raising `gi_resolution` and pressing apply must not have to also resize
-    /// the window, and `resize` early-outs when the mask size is unchanged, so
-    /// without this a resolution change would silently do nothing.
-    ///
-    /// Also where the allocations are legal: `updateSdf` and `Radiance.build`
-    /// both run inside the frame, and spec §3.1 does not allow allocating there.
-    fn reallocMaskBuffers(self: *Lighting) !void {
-        const aw = self.alloc_w;
-        const ah = self.alloc_h;
-        if (aw == 0 or ah == 0) return;
-
-        const dims = giDimsFor(aw, ah, self.gi_res);
-        self.gi_w = dims.w;
-        self.gi_h = dims.h;
-
-        self.allocator.free(self.sdf);
-        self.allocator.free(self.gi_mask);
-        // One RGBA texel per GI cell. Allocated here rather than on the first
-        // `encodeGi` because that call is inside a frame, and spec §3.1 does not
-        // allow allocating once the frame has started.
-        self.allocator.free(self.gi_pixels);
-        const cells = @as(usize, dims.w) * dims.h;
-        self.gi_pixels = try self.allocator.alloc(u8, cells * 4);
-        @memset(self.gi_pixels, 0);
-        self.gi_mask = try self.allocator.alloc(u8, cells);
-        @memset(self.gi_mask, 0);
-        self.sdf = try self.allocator.alloc(u16, cells);
-        self.allocator.free(self.bounce.sdf_f32);
-        self.bounce.sdf_f32 = try self.allocator.alloc(f32, cells);
-        // The GI probe grids are sized here for the same reason the mask is:
-        // `Radiance.build` is called from inside the frame (an occluder moved)
-        // and must not allocate when it runs. The budget comes from the quality
-        // tier, so the pyramid's cost is the tier's promise and not a function of
-        // how big the window happens to be.
-        // `off` prepares NOTHING. That is the whole contract of the backend, and
-        // it is worth being literal about: a project that lights by hand must be
-        // able to turn GI off and find that it is not carrying a probe grid, a
-        // distance transform or an upload buffer it will never write to.
-        //
-        // `sky` and `bounce` BOTH prepare, whatever the current selection is.
-        // That is deliberate and it is what makes a per-scene switch free: an
-        // environment that says `bounce` cannot be honoured inside a frame if
-        // switching needs an allocation, and an allocation inside a frame is
-        // what spec 3.1 forbids. The two together cost a few hundred kilobytes
-        // at the default resolution -- about the size of one 64x64 RGBA8 texture
-        // -- and they buy a dungeon and a courtyard in the same scene file.
-        //
-        // So: `off` is a boot-time decision that frees, and everything else is a
-        // per-frame choice between two things that are already there.
-        if (self.gi_backend == .off) {
-            self.allocator.free(self.sdf);
-            self.allocator.free(self.gi_mask);
-            self.allocator.free(self.gi_pixels);
-            self.sdf = &.{};
-            self.gi_mask = &.{};
-            self.gi_pixels = &.{};
-            // Zeroed with the buffers, not left describing a grid that is not
-            // there. `gi_w` is read by `encodeGi`, `sampleGi` and the upload, and
-            // a width pointing at freed memory is the kind of invariant violation
-            // that stays invisible until it is an out-of-bounds read on a machine
-            // nobody develops on.
-            self.gi_w = 0;
-            self.gi_h = 0;
-            if (self.radiance) |r| {
-                for (r.cascades.items) |*c| c.deinit(r.allocator);
-                r.cascades.deinit(r.allocator);
-                r.cascades = .empty;
-                r.built = 0;
-            }
-            self.bounce.deinit();
-            self.bounce = Bounce.init(self.allocator);
-        } else {
-            try self.bounce.prepare(dims.w, dims.h);
-            if (self.radiance) |r| try r.prepare(dims.w, dims.h, Radiance.fineSideFor(self.cfg));
-        }
-
-        // A different field size means the field that is on disk describes a
-        // different grid than the one now allocated, so both the "rebuild it"
-        // flag and the amortization history have to be abandoned. Leaving
-        // `sdf_builds` alone would be the kind of small lie that shows up later
-        // as "GI is not rebuilding after I changed the resolution".
-        self.dirty = true;
-    }
-
-    /// Sets the GI field's longest side, in cells. `0` means "match the mask".
-    ///
-    /// Boot-time, like `resize`: it reallocates. Call it from where the config is
-    /// applied, before the frame loop, or from the editor panel followed by a
-    /// `resize` — never from inside a frame.
-    ///
-    /// A no-op when the value is unchanged, so a config reload that touches
-    /// other fields does not throw away a field that did not move.
-    pub fn setGiResolution(self: *Lighting, res: u32) !void {
-        const clamped = if (res == 0) 0 else std.math.clamp(res, 8, 4096);
-        if (clamped == self.gi_res) return;
-        self.gi_res = clamped;
-        if (self.alloc_w != 0) try self.reallocMaskBuffers();
-    }
-
     fn allocMask(self: *Lighting, w_in: u32, h_in: u32) !void {
         const w = @max(w_in, 1);
         const h = @max(h_in, 1);
@@ -1578,13 +1028,6 @@ pub const Lighting = struct {
         self.allocator.free(self.mask);
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
-        // The scratch follows the mask's size, outside the frame.
-        //
-        // NOT `edt.deinit()` first: `EdtScratch.resize` frees and re-allocates
-        // only when its buffers are too small, and a `deinit` here would leave
-        // the scratch with an undefined allocator for the `resize` two lines
-        // down -- which is a crash in the cleanup path of a routine resize.
-        try self.edt.resize(aw, ah);
         @memset(self.mask, 0);
         self.alloc_w = aw;
         self.alloc_h = ah;
@@ -1594,9 +1037,6 @@ pub const Lighting = struct {
         self.hash_valid = false;
         self.sweep_stale = true;
         self.channel_built = [_]bool{false} ** 4;
-        // The GI field and the upload buffer follow the mask. Separate from the
-        // mask itself because `gi_res` can move them on their own.
-        try self.reallocMaskBuffers();
     }
 
     fn roundPow2(v: u32) u32 {
@@ -1959,9 +1399,9 @@ pub const Lighting = struct {
         self.stats.mask_fill = @as(f32, @floatFromInt(written)) /
             @as(f32, @floatFromInt(@max(w * h, 1)));
         self.buildChannelMasks();
-        // The mask changed, so the distance field is now stale. `dirty` is
-        // about the field, not about the mask, and the sweep's skip check reads
-        // neither of them -- see buildShadowMaps.
+        // The mask changed, so anything derived from it is now stale. `dirty`
+        // is about that derived state, not about the mask, and the sweep's skip
+        // check reads neither of them -- see buildShadowMaps.
         self.dirty = true;
         self.mask_changed = false;
         // The maps were swept against the previous mask. `buildShadowMaps` runs
@@ -2289,10 +1729,9 @@ pub const Lighting = struct {
             // until something moves".
             //
             // The condition is `!mask_changed` and NOT `!dirty`, because `dirty`
-            // tracks the distance field's rebuild cadence, and those are three
-            // different clocks: an occluder that moved, a light that moved, and a
-            // field that is allowed to be stale for another 40 ms. Coupling them
-            // meant a slow GI cadence silently made every shadow map rebuild
+            // is a different clock again, and those are two different questions:
+            // an occluder that moved, and a light that moved. Coupling them
+            // meant a stale rebuild flag silently made every shadow map rebuild
             // every frame, and a profile would have shown it as "shadows".
             //
             // `sweep_stale` and not `mask_changed`, because `rasterize` clears
@@ -2500,484 +1939,6 @@ pub const Lighting = struct {
         };
     }
 
-    // ── global illumination ───────────────────────────────────────────────────
-
-    /// Rebuilds the Euclidean distance field of the occluder mask, subject to
-    /// the amortization interval.
-    ///
-    /// Felzenszwalb's exact squared-distance transform, run once per row and
-    /// once per column. It is O(n) and, more importantly, it is *exact*: the
-    /// cheaper chamfer approximation is off by up to 4% of the true distance, and
-    /// GI reads this as ambient occlusion where 4% is invisible — but the same
-    /// field is also what decides whether a doorway is "open", and there an error
-    /// is a light leaking through a wall.
-    /// Recomputes the distance field if the mask moved and the tier's cadence
-    /// allows it. Returns whether it actually rebuilt.
-    ///
-    /// The return value is the whole amortization contract for GI, and it used to
-    /// be missing: the driver called `Radiance.build` on every frame regardless,
-    /// while a comment two lines above it claimed the build only happened "when
-    /// the field moved". At 1080p that comment was worth 1.5 seconds a frame of
-    /// pure waste. A pyramid is a function of the distance field, so rebuilding
-    /// it on a frame where the field was not rebuilt is recomputing an unchanged
-    /// answer — the caller needs to be able to ask, and this is the answer.
-    pub fn updateSdf(self: *Lighting, now_ns: i128) bool {
-        if (!self.cfg.giEnabled()) return false;
-        if (!self.dirty) {
-            self.stats.sdf_skipped += 1;
-            return false;
-        }
-        const interval = self.gi_interval_ns;
-        if (interval > 0 and now_ns - self.last_sdf_ns < interval) {
-            self.stats.sdf_skipped += 1;
-            return false;
-        }
-
-        const t0 = self.tick();
-        const w = self.alloc_w;
-        const h = self.alloc_h;
-        const gw = self.gi_w;
-        const gh = self.gi_h;
-        if (w == 0 or h == 0 or gw == 0 or gh == 0) return false;
-
-        // Downsample BEFORE the transform, not after. The distance transform is
-        // the dominant cost and it is linear in cells, so the only way to make it
-        // cheaper is to give it fewer cells — computing a 4.2M-cell field and
-        // throwing 98% of it away would be the same work at a tenth of the size.
-        const t_ds = self.tick();
-        self.downsampleGi();
-        self.stats.downsample_ns = self.tick() - t_ds;
-
-        const t_edt = self.tick();
-        edtMask2dInto(&self.edt, self.gi_mask, self.sdf, gw, gh);
-        self.stats.transform_ns = self.tick() - t_edt;
-
-        // The f32 mirror, in the same pass that writes the field, so it cannot
-        // lag it by a frame. One linear scan of a 128x128 grid: 16k writes,
-        // measured in microseconds, next to a 16 MB pyramid build it feeds.
-        const mirror = &self.bounce.sdf_f32;
-        if (mirror.len == self.sdf.len) {
-            for (self.sdf, mirror.*) |src, *dst| dst.* = @floatFromInt(src);
-        }
-
-        self.last_sdf_ns = now_ns;
-        self.dirty = false;
-        self.stats.sdf_builds += 1;
-        self.stats.sdf_ns = self.tick() - t0;
-        return true;
-    }
-
-    /// Builds `gi_mask` from `mask` at the GI field's resolution.
-    ///
-    /// CONSERVATIVE: a destination cell is solid when ANY mask cell in its
-    /// footprint is solid. Not an average, and not a sample — those two let a
-    /// wall one texel wide disappear at a 16:1 reduction, and a wall that
-    /// disappears is a doorway that leaks sky into a room the author closed.
-    ///
-    /// That asymmetry is the entire design and it is worth stating as a rule
-    /// because it looks like a bug: the wrong answer here is not "slightly too
-    /// dark", it is "light coming from a wall". Erring toward solid costs a
-    /// fraction of a texel of penumbra at a doorway and is invisible; erring
-    /// toward open costs correctness and is a bug report with no way to point at
-    /// the cause.
-    ///
-    /// Allocation-free: `gi_mask` was sized by `reallocMaskBuffers`, and this
-    /// runs inside the frame.
-    /// One frame of the `bounce` backend: inject the scene's lights, then diffuse
-    /// the grid `iterations` times with walls reflecting.
-    ///
-    /// Runs EVERY FRAME, and that is the design rather than an oversight: the
-    /// field is an integrator, so skipping frames does not make it cheaper, it
-    /// makes it converge more slowly. Amortizing it the way the cascade is
-    /// amortized would freeze the bounce for the whole interval, which is the
-    /// artefact it exists to remove.
-    ///
-    /// It is affordable precisely because it is cheap: a fixed number of grid
-    /// passes, no rays, no probes, nothing proportional to the light count once
-    /// the sources are in.
-    ///
-    /// Allocation-free — the three buffers were sized by `prepareBounce`.
-    pub fn stepBounce(self: *Lighting, iterations: u32, albedo: f32) void {
-        const w = self.gi_w;
-        const h = self.gi_h;
-        const b = &self.bounce;
-        if (w == 0 or h == 0 or b.w != w or b.h != h) return;
-        if (self.gi_mask.len < @as(usize, w) * h) return;
-
-        self.injectBounce();
-
-        const refl = @as(f32, @floatFromInt(w));
-        _ = refl;
-        const inv_w = 1.0 / @as(f32, @floatFromInt(w));
-
-        var iter: u32 = 0;
-        while (iter < iterations) : (iter += 1) {
-            var y: u32 = 0;
-            while (y < h) : (y += 1) {
-                var x: u32 = 0;
-                while (x < w) : (x += 1) {
-                    const idx = @as(usize, y) * w + x;
-                    const o = idx * 3;
-                    if (self.gi_mask[idx] != 0) {
-                        // No light inside geometry, ever. Without this a wall
-                        // would accumulate its own interior and start glowing.
-                        b.scratch[o + 0] = 0;
-                        b.scratch[o + 1] = 0;
-                        b.scratch[o + 2] = 0;
-                        continue;
-                    }
-                    // The bounce. A neighbour that is free contributes its own
-                    // light; a neighbour that is a WALL contributes what arrived
-                    // here, which is the wall re-emitting. A wall that absorbed
-                    // would make every room darker than the sky outside it and
-                    // every corridor a black tube.
-                    const here = b.rgb[o + 0] + b.rgb[o + 1] + b.rgb[o + 2];
-                    var acc = [3]f32{ 0, 0, 0 };
-                    var count: f32 = 0;
-                    inline for ([_]struct { dx: i32, dy: i32 }{
-                        .{ .dx = -1, .dy = 0 },
-                        .{ .dx = 1, .dy = 0 },
-                        .{ .dx = 0, .dy = -1 },
-                        .{ .dx = 0, .dy = 1 },
-                    }) |n| {
-                        const nx = @as(i64, x) + n.dx;
-                        const ny = @as(i64, y) + n.dy;
-                        // Outside the field is a wall as well: light does not
-                        // arrive from beyond the measured rectangle, and
-                        // treating the border as open would bleed the field's
-                        // edge value inward forever.
-                        if (nx < 0 or ny < 0 or nx >= w or ny >= h) {
-                            for (0..3) |k| acc[k] += b.rgb[o + k];
-                            count += 1;
-                        } else {
-                        const nidx = @as(usize, @intCast(ny)) * w + @as(usize, @intCast(nx));
-                        const no = nidx * 3;
-                        if (self.gi_mask[nidx] != 0) {
-                            for (0..3) |k| acc[k] += b.rgb[o + k];
-                        } else {
-                            for (0..3) |k| acc[k] += b.rgb[no + k];
-                        }
-                        count += 1;
-                        }
-                    }
-                    const k = 1.0 / @max(count, 1.0);
-                    for (0..3) |ch| {
-                        b.scratch[o + ch] = acc[ch] * k * albedo + b.inject[o + ch];
-                    }
-                    _ = here;
-                    _ = inv_w;
-                }
-            }
-            @memcpy(b.rgb, b.scratch);
-        }
-        self.stats.bounce_passes += iterations;
-    }
-
-    /// Fills `bounce.inject` with what the scene's lights put into the grid.
-    ///
-    /// Reuses `sampleLight`, which is already the answer to "how much does light
-    /// `i` arrive here" including falloff, cone and penumbra. A second
-    /// implementation of a light's falloff would be a second answer to the same
-    /// question, and the two would differ by an amount nobody could name.
-    ///
-    /// Bounded by the light's own radius in cells, so the cost is the grid under
-    /// the lights rather than the whole grid per light.
-    fn injectBounce(self: *Lighting) void {
-        const w = self.gi_w;
-        const h = self.gi_h;
-        const b = &self.bounce;
-        @memset(b.inject, 0);
-
-        const cell_w = self.rect.cell(w, h).x;
-        const cell_h = self.rect.cell(w, h).y;
-
-        for (0..self.lights.items.len) |i| {
-            const li = self.lights.items[i];
-            const r_cells_x: i64 = @intFromFloat(@ceil(@as(f32, li.radius) / @max(cell_w, 1e-6)));
-            const r_cells_y: i64 = @intFromFloat(@ceil(@as(f32, li.radius) / @max(cell_h, 1e-6)));
-            const c = worldToMask(self.rect, w, h, .{ .x = li.pos[0], .y = li.pos[1] });
-            const cx: i64 = c[0];
-            const cy: i64 = c[1];
-
-            var y: i64 = @max(cy - r_cells_y, 0);
-            const y_end: i64 = @min(cy + r_cells_y + 1, h);
-            while (y < y_end) : (y += 1) {
-                var x: i64 = @max(cx - r_cells_x, 0);
-                const x_end: i64 = @min(cx + r_cells_x + 1, w);
-                while (x < x_end) : (x += 1) {
-                    const idx = @as(usize, @intCast(y)) * w + @as(usize, @intCast(x));
-                    if (self.gi_mask[idx] != 0) continue;
-                    const wx = self.rect.min.x + (@as(f32, @floatFromInt(@as(u32, @intCast(x)))) + 0.5) * cell_w;
-                    const wy = self.rect.min.y + (@as(f32, @floatFromInt(@as(u32, @intCast(y)))) + 0.5) * cell_h;
-                    const v = self.sampleLight(i, wx, wy);
-                    const o = idx * 3;
-                    b.inject[o + 0] += v[0];
-                    b.inject[o + 1] += v[1];
-                    b.inject[o + 2] += v[2];
-                }
-            }
-        }
-        self.stats.bounce_injected += self.lights.items.len;
-    }
-
-    pub fn downsampleGi(self: *Lighting) void {
-        const w = self.alloc_w;
-        const h = self.alloc_h;
-        const gw = self.gi_w;
-        const gh = self.gi_h;
-        if (gw == 0 or gh == 0) return;
-
-        // The degenerate case, and the one that must be a COPY rather than an
-        // alias: at `gi_resolution = 0` the field is the mask, and aliasing them
-        // would mean `updateSdf` reads and writes the same bytes.
-        if (gw == w and gh == h) {
-            @memcpy(self.gi_mask, self.mask);
-            return;
-        }
-
-        // Integer span per output cell. `roundPow2` on the mask and an arbitrary
-        // `gi_res` do not divide evenly, so each destination cell owns the
-        // half-open range [floor(x*w/gw), ceil((x+1)*w/gw)) — every source cell
-        // is covered by at least one destination, which is the property that
-        // stops a thin wall falling between two samples and being averaged away
-        // by neither of them.
-        // A word of mask bytes at a time. OR is associative and commutative and
-        // the only question is whether anything in the footprint is non-zero, so
-        // folding eight bytes together is the same computation with a
-        // sixty-fourth of the loads.
-        const Word = u64;
-        const word_bytes = @sizeOf(Word);
-
-        // Where each destination cell's source run ends.
-        //
-        // Hoisted out of both loops because the edges depend only on the two
-        // dimensions, never on the row being folded. Everything else here was
-        // tried and measured:
-        //
-        //   - dividing per cell per row: 256 * 2048 * 256 = 134M divisions to
-        //     fold 4.2M bytes;
-        //   - carrying a quotient/remainder instead of dividing: the same 4.2M
-        //     byte-sized loop, moved into an inner `while`, and measurably SLOWER
-        //     (6.5 ms against 1.4 ms) because it traded a divide for a loop;
-        //   - this: `gw` divisions in total, then a linear scan.
-        //
-        // Sixteen kilobytes of stack in a leaf function, bounded by the same
-        // `4096` ceiling `setGiResolution` applies, which is the only reason it
-        // is a fixed array rather than a slice.
-        var edges: [max_gi_side + 1]u32 = undefined;
-        if (gw > max_gi_side) return; // unreachable: `giDimsFor` never exceeds it
-        var ex: u32 = 0;
-        while (ex < gw) : (ex += 1) {
-            const n = ex + 1;
-            edges[ex] = @min((n * w) / gw, w);
-            if (edges[ex] == 0) edges[ex] = 1;
-        }
-        edges[gw] = w;
-
-        var y: u32 = 0;
-        while (y < gh) : (y += 1) {
-            const y0 = (y * h) / gh;
-            const y1 = @max(((y + 1) * h + gh - 1) / gh, y0 + 1);
-            const y1c = @min(y1, h);
-            const out_row = self.gi_mask[@as(usize, y) * gw ..][0..gw];
-            @memset(out_row, 0);
-
-            var sy = y0;
-            while (sy < y1c) : (sy += 1) {
-                const row = self.mask[@as(usize, sy) * w ..][0..w];
-                // Walk the source row ONCE, contiguously. Iterating the
-                // destination instead re-derives these indices once per cell per
-                // row and turns a linear scan into a strided one.
-                var dx: u32 = 0;
-                var sx: u32 = 0;
-                while (dx < gw and sx < w) : (dx += 1) {
-                    var x1 = edges[dx];
-                    if (x1 <= sx) x1 = sx + 1; // progress is not optional
-
-                    var acc: Word = 0;
-                    var i = sx;
-                    while (i + word_bytes <= x1) : (i += word_bytes) {
-                        acc |= @bitCast(@as(*align(1) const [word_bytes]u8, @ptrCast(&row[i])).*);
-                    }
-                    while (i < x1) : (i += 1) acc |= row[i];
-                    if (acc != 0) out_row[dx] = 255;
-
-                    sx = x1;
-                }
-            }
-        }
-    }
-
-    /// Writes the bounce backend's field into the same RGBA8 grid the cascade
-    /// uses, so the shader, the sampler and the upload path do not learn that a
-    /// second backend exists.
-    ///
-    /// RGB is the propagated light. Alpha is the ENCLOSURE term, computed from the
-    /// cascade backend's distance field when one exists and left at zero
-    /// otherwise: a room lit by its own torches has no sky term to darken, and
-    /// applying one there would fight the thing the developer asked for.
-    ///
-    /// One buffer for two models is not a shortcut. The alternative is a second
-    /// texture, a second bind group and a shader branch that is uniform-only in
-    /// the best case, in exchange for a field that is usually consumed by the
-    /// same lights in the same frame.
-    fn encodeBounce(self: *Lighting, out: []u8) bool {
-        const w = self.gi_w;
-        const h = self.gi_h;
-        const b = &self.bounce;
-        if (b.w != w or b.h != h or b.rgb.len == 0) return false;
-
-        const per_cell = self.cellsPerGiCell();
-        const has_sdf = self.sdf.len >= @as(usize, w) * h;
-
-        var y: u32 = 0;
-        while (y < h) : (y += 1) {
-            var x: u32 = 0;
-            while (x < w) : (x += 1) {
-                const idx = @as(usize, y) * w + x;
-                const o = idx * 3;
-                const w_out = idx * 4;
-                out[w_out + 0] = clampByte(b.rgb[o + 0]);
-                out[w_out + 1] = clampByte(b.rgb[o + 1]);
-                out[w_out + 2] = clampByte(b.rgb[o + 2]);
-
-                var enclosure: f32 = 0;
-                if (has_sdf) {
-                    enclosure = @min(
-                        @as(f32, @floatFromInt(self.sdf[idx])) * per_cell / 6.0,
-                        1.0,
-                    );
-                }
-                out[w_out + 3] = clampByte(enclosure);
-            }
-        }
-        return true;
-    }
-
-    /// The GI term at a world point, 0..1: 1 in open space, falling toward 0 as
-    /// the point is enclosed by occluders.
-    ///
-    /// One sample of one texture, which is why GI is affordable. What it does
-    /// NOT do is bounce colour — a proper 2D GI needs a light-propagation solve
-    /// and this is an occlusion approximation wearing GI's name. The naming is
-    /// deliberate in `gi_contribution`: it is a per-light dial for how much of
-    /// the enclosure term to apply, so a scene that wants the full effect asks
-    /// for it.
-    pub fn sampleGi(self: *const Lighting, x: f32, y: f32) f32 {
-        if (self.gi_backend == .off) return 1.0;
-        if (!self.cfg.giEnabled() or self.sdf.len == 0) return 1.0;
-        if (!self.rect.containsPoint(.{ .x = x, .y = y })) return 1.0;
-        // The GI GRID, not the mask grid. Same rectangle, different cell count —
-        // indexing the mask grid here would read past the end of `sdf` the
-        // moment the field was decoupled, and at `gi_res >= alloc_w` it reads
-        // inside it and returns a plausible wrong answer instead.
-        const c = worldToMask(self.rect, self.gi_w, self.gi_h, .{ .x = x, .y = y });
-        if (c[0] < 0 or c[1] < 0) return 1.0;
-        const idx = @as(usize, @intCast(c[1])) * self.gi_w + @as(usize, @intCast(c[0]));
-        if (idx >= self.sdf.len) return 1.0;
-        const cells = @as(f32, @floatFromInt(self.sdf[idx]));
-        // Saturates at ~6 GI CELLS. The ramp is in field units, not world units:
-        // it was tuned against a field that had one texel per mask texel, and
-        // carrying it over verbatim to a coarser field would make every enclosure
-        // saturate immediately and the term collapse to a binary wall/not-wall.
-        // So the distance is rescaled by how many mask cells a GI cell covers,
-        // which keeps "enclosed means about six texels of sky" true at any
-        // resolution — and is the one place this dial could have silently changed
-        // what the number means.
-        const cells_per_gi = self.cellsPerGiCell();
-        return @min(cells * cells_per_gi / 6.0, 1.0);
-    }
-
-    /// How many mask cells one GI cell spans.
-    ///
-    /// The bridge between a distance measured in GI cells and a curve written in
-    /// mask cells. At `gi_resolution = 0` it is exactly 1, so the old behaviour
-    /// is bit-for-bit unchanged — which is the property that makes the default
-    /// safe to change and the zero worth keeping.
-    /// The `bounce` backend's light at a world point, 0..1 per channel.
-    ///
-    /// Public because it is a different CLAIM from `sampleGi`: that one answers
-    /// "how enclosed is this point", this one answers "how much of the scene's
-    /// own light reached here". A project that turns GI on for interiors and
-    /// reads only the enclosure term would see a correctly-dark room and
-    /// conclude nothing is working.
-    pub fn sampleBounce(self: *const Lighting, x: f32, y: f32) [3]f32 {
-        if (self.gi_backend != .bounce) return .{ 0, 0, 0 };
-        if (!self.cfg.giEnabled() or self.gi_w == 0) return .{ 0, 0, 0 };
-        if (!self.rect.containsPoint(.{ .x = x, .y = y })) return .{ 0, 0, 0 };
-        const c = worldToMask(self.rect, self.gi_w, self.gi_h, .{ .x = x, .y = y });
-        return self.bounce.sample(@floatFromInt(c[0]), @floatFromInt(c[1]));
-    }
-
-    pub fn cellsPerGiCell(self: *const Lighting) f32 {
-        if (self.gi_w == 0 or self.alloc_w == 0) return 1.0;
-        return @as(f32, @floatFromInt(self.alloc_w)) / @as(f32, @floatFromInt(self.gi_w));
-    }
-
-    /// Encodes the GI field as the RGBA8 grid `uploadGi` wants: alpha is the
-    /// enclosure term, RGB is the finest cascade's radiance.
-    ///
-    /// One buffer, no allocation, and the same arithmetic the sampler uses — so
-    /// the CPU reference and the texture the shader reads cannot disagree about
-    /// what "enclosed" means. A second implementation of the enclosure curve
-    /// would be a second answer to the same question, and the two would differ
-    /// by exactly the amount nobody could explain.
-    ///
-    /// Returns false and leaves `out` untouched when there is no field yet, so
-    /// a caller can distinguish "GI is off" from "GI is on and everything is
-    /// open", which render identically but mean different things to a test.
-    pub fn encodeGi(self: *Lighting, out: []u8) bool {
-        const w = self.gi_w;
-        const h = self.gi_h;
-        if (self.gi_backend == .off) return false;
-        if (w == 0 or h == 0) return false;
-        const need = @as(usize, w) * h * 4;
-        if (out.len < need) return false;
-
-        // The bounce backend has no distance field and no cascade, so the branch
-        // is taken before either is asked for. Both of those reads would be
-        // out-of-bounds on a field that `off` deliberately never allocated, and
-        // the ordering is the difference between "GI off" and "GI off crashes".
-        if (self.gi_backend == .bounce) return self.encodeBounce(out);
-
-
-        // The finest cascade, when there is one. Sampled rather than read raw:
-        // it is already a bilinear-filterable grid at `base_scale`, and reading
-        // probes straight would put a probe value in every texel between two
-        // probes and turn the cascade into visible blocks.
-        const r = self.radiance orelse return false;
-        const fine: ?*const Cascade = if (r.cascades.items.len > 0)
-            &r.cascades.items[0]
-        else
-            null;
-
-        // The same rescaling `sampleGi` applies, so the texture and the CPU
-        // reference cannot disagree about what "enclosed" means. They are the
-        // same question asked twice, and two answers is one too many.
-        const per_cell = self.cellsPerGiCell();
-
-        var y: u32 = 0;
-        while (y < h) : (y += 1) {
-            var x: u32 = 0;
-            while (x < w) : (x += 1) {
-                const idx = @as(usize, y) * w + x;
-                const px = @as(f32, @floatFromInt(x));
-                const py = @as(f32, @floatFromInt(y));
-                const enclosure = @min(@as(f32, @floatFromInt(self.sdf[idx])) * per_cell / 6.0, 1.0);
-
-                var rgb = [3]f32{ 0, 0, 0 };
-                if (fine) |c| rgb = sampleCascade(r, c, px, py);
-
-                const o = idx * 4;
-                out[o + 0] = clampByte(rgb[0]);
-                out[o + 1] = clampByte(rgb[1]);
-                out[o + 2] = clampByte(rgb[2]);
-                out[o + 3] = clampByte(enclosure);
-            }
-        }
-        return true;
-    }
-
     /// Sum of every light at a point, for the CPU reference path and the tests.
     pub fn sampleAll(self: *const Lighting, x: f32, y: f32) [3]f32 {
         var sum = [3]f32{ 0, 0, 0 };
@@ -2987,8 +1948,6 @@ pub const Lighting = struct {
             sum[1] += c[1];
             sum[2] += c[2];
         }
-        const gi = self.sampleGi(x, y);
-        for (0..3) |k| sum[k] *= gi;
         return sum;
     }
 };
@@ -2999,9 +1958,8 @@ fn clampI32(v: i32, lo: i32, hi: i32) i32 {
     return @min(@max(v, lo), hi);
 }
 
-/// 0..1 to a byte. Named rather than inlined because the GI encoder writes four
-/// channels and a clamp that only two of them use is how the other two go out of
-/// range.
+/// 0..1 to a byte. Named rather than inlined because a caller writing four
+/// channels from one curve wants the same clamp on every one of them.
 fn clampByte(v: f32) u8 {
     const x = @min(@max(v, 0.0), 1.0);
     return @intFromFloat(x * 255.0 + 0.5);
@@ -3173,7 +2131,6 @@ pub fn descFor(comptime C: type, c: C, view_diag: f32) LightDesc {
                 .cast_shadows = c.cast_shadows,
                 .shadow_filter = c.shadow_filter,
                 .shadow_filter_smooth = c.shadow_filter_smooth,
-                .gi_contribution = c.gi_contribution,
                 .item_cull_mask = c.item_cull_mask,
             },
             .kind = c.kind,
@@ -3302,7 +2259,6 @@ pub fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
         .energy = d.base.energy,
         .attenuation = s.attenuation,
         .softness = @max(d.base.shadow_filter_smooth, 0) * 0.02,
-        .gi = d.base.gi_contribution,
         .item_cull_mask = d.base.item_cull_mask,
         .flags = @as(u32, @intFromEnum(d.kind)) |
             (@as(u32, @intFromEnum(d.base.blend)) << 3) |
@@ -3312,750 +2268,6 @@ pub fn instanceFor(d: LightDesc, pos: Vec2, channel: i8) LightInstance {
     };
 }
 
-
-// ── Radiance cascades (2D GI) ────────────────────────────────────────────────
-//
-// The idea, and it is worth stating because "GI" in 2D usually means something
-// much weaker: light that has bounced off an occluder must be able to REACH the
-// place it bounced from. A single occlusion walk cannot answer "what is lit just
-// now, having come around this corner", because answering it needs the light that
-// arrived at the corner first.
-//
-// Radiance Cascades solves that with a pyramid of PROBE GRIDS, each at half the
-// resolution of the one below it. A probe traces a few rays outward; each hit
-// asks the NEXT cascade up what it saw from there. So cascade 0 catches the
-// light that travelled a few texels, cascade 1 the light that travelled a few
-// more, and the coarsest cascade resolves the sky and the the last bounce. The
-// final answer at a pixel is the cascade whose range is closest to it, blended
-// with its neighbours so the resolution seams are invisible.
-//
-// This is a CPU reference. The GPU version is a compute pass over the same
-// pyramid, and the arithmetic here is what it must reproduce — line for line,
-// because this is the half that can be tested without a device.
-
-/// One probe's view of the world: what arrived from each direction.
-///
-/// `hit_distance` is in CASCADE-TEXEL units, and `incoming` is the radiance that
-/// left the nearest hit travelling towards this probe. Storing the distance
-/// rather than the hit's position is what makes a merge cheap: the next cascade
-/// up is indexed by position and this is enough to find it.
-pub const Probe = struct {
-    /// Distance to the nearest occluder along this ray, in probe units. Zero when
-    /// the ray starts inside solid geometry, which is the one case a merge must
-    /// not sample through a wall.
-    hit_distance: f32 = 0,
-    /// The occluder's normal at the hit, or zero for no hit.
-    normal: Vec2 = .{ .x = 0, .y = 0 },
-    /// What radiance arrived along this ray, after the merge.
-    incoming: [3]f32 = .{ 0, 0, 0 },
-};
-
-/// One cascade: a grid of probes at `scale` texel spacing.
-pub const Cascade = struct {
-    /// World-space distance between adjacent probes, in mask cells.
-    scale: u32,
-    /// Rays traced per probe. Higher in the fine cascades, where a ray covers a
-    /// smaller angle — the counts are chosen so each cascade sees roughly the
-    /// same angular resolution, which is the whole reason the pyramid works.
-    rays: u32,
-    w: u32,
-    h: u32,
-    probes: []Probe,
-
-    fn deinit(self: *Cascade, allocator: std.mem.Allocator) void {
-        allocator.free(self.probes);
-        self.* = undefined;
-    }
-};
-
-/// The radiance cascade pyramid.
-///
-/// Amortized exactly as the distance field is: rebuilt when an occluder moves,
-/// and not once per frame. A static scene's GI is therefore free after the first
-/// frame, and the cost of a moving one is bounded by the grid it walks, not by
-/// the light count.
-pub const Radiance = struct {
-    allocator: std.mem.Allocator,
-    /// Cascade 0 is the finest. Empty when GI is off.
-    cascades: std.ArrayList(Cascade) = .empty,
-    /// How many cascades were built for the current mask. Zero means "not built".
-    built: u32 = 0,
-    /// Incremented on every rebuild; the tests assert on it rather than on a
-    /// timing, which is how "the amortization works" is checked headlessly.
-    builds: u32 = 0,
-    /// The budget this pyramid was prepared under, in probes per axis. Set by
-    /// `prepare` and read by `build` to decide how many cascades exist, so the
-    /// two can never disagree about the shape of the pyramid.
-    fine_side: u32 = max_fine_side,
-
-    /// Whether a probe standing inside geometry skips its ray traces.
-    ///
-    /// A measured dial rather than an unconditional optimisation, because the
-    /// answer is scene-dependent and the honest thing is to let the number decide
-    /// rather than to assume. See `probeAt`, and the sweep in
-    /// `zig build bench-light` that measures both settings on the same scene.
-    early_out_enclosed: bool = true,
-
-    /// The finest cascade's spacing, in mask cells. Two means a probe every other
-    /// texel, which is the finest a texture can go without aliasing the SDF it
-    /// traces — and GI at a finer scale than the shadow map itself is GI that
-    /// cannot have been bounced off anything.
-    pub const base_scale: u32 = 2;
-    /// Rays per probe at cascade 0, doubling per level's coarsening... no, halving
-    /// the count as the spacing doubles: the angular coverage is what is held
-    /// roughly constant, not the count.
-    pub const base_rays: u32 = 16;
-    /// Stops at four cascades. A fifth would probe cells larger than a whole
-    /// screen and every probe in it would see the same unobstructed sky, which is
-    /// information a single per-cascade uniform already carries.
-    pub const max_cascades: u32 = 4;
-
-    /// The finest cascade's probe grid never exceeds this many probes PER AXIS,
-    /// at any mask size.
-    ///
-    /// This is the whole reason M7's GI was 1.5 SECONDS per frame at 1080p and
-    /// nobody noticed until a demo actually built the pyramid: with
-    /// `base_scale = 2` fixed, the finest cascade was one probe per 2x2 texels,
-    /// so a 2048x2048 mask wanted 1,048,576 probes x 16 rays = 16.7 million
-    /// sphere traces — a cost that grew with the SCREEN, not with the scene. A
-    /// bigger window made the renderer slower, which is not a quality dial.
-    ///
-    /// Bounding the probe COUNT instead of the spacing is the fix that keeps the
-    /// meaning: GI is a large-scale enclosure term, so its detail is allowed to
-    /// coarsen with the view while its cost stays flat. The probe SPACING is then
-    /// derived from the mask size (`cellsFor`), which is exactly the trade a
-    /// radiance cascade exists to make — and the cost of a frame is now set by
-    /// the tier, which is what an editor's quality dropdown promises.
-    ///
-    /// 128 x 128 probes is 16,384 probes and 262,144 rays at cascade 0, and a
-    /// 4x4 reduction in work for the same scene rendered at a quarter of the
-    /// resolution — which is the point.
-    pub const max_fine_side: u32 = 128;
-
-    /// The probe spacing, in mask cells, for a mask `w` cells wide under a budget
-    /// of `fine_side` probes per axis.
-    ///
-    /// `base_scale` on a small mask, and the next power of two that keeps the
-    /// probe grid at or under the budget on a large one. Power of two so the
-    /// cascade pyramid stays aligned: every level doubles the spacing, which is
-    /// what lets a coarse level's probes sit exactly on a finer level's cell
-    /// centres instead of between them.
-    pub fn cellsFor(w: u32, fine_side: u32) u32 {
-        if (w == 0) return base_scale;
-        const budget = @max(fine_side, 1);
-        const want = (w + budget - 1) / budget;
-        var cells = base_scale;
-        while (cells < want and cells < (1 << 20)) cells *= 2;
-        return cells;
-    }
-
-    /// The finest cascade's probe budget, in probes per axis, for a quality tier.
-    ///
-    /// This is the dial `lighting.set_quality` turns. `.off` and `.low` have no
-    /// pyramid at all, so their entry is the floor and is never used — it is
-    /// there so the mapping is total and a caller cannot land on an undefined
-    /// number by switching tiers.
-    pub fn fineSideFor(tier: Quality) u32 {
-        return switch (tier) {
-            .off, .low => 32,
-            .medium => 128,
-            .high => 256,
-        };
-    }
-
-    pub fn init(allocator: std.mem.Allocator) Radiance {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *Radiance) void {
-        for (self.cascades.items) |*c| c.deinit(self.allocator);
-        self.cascades.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    /// How many cascades fit a mask of this size under this tier's probe budget.
-    /// Pure arithmetic on the mask dimensions and the budget — no allocation, no
-    /// state — so `prepare` and `build` agree on the answer by construction
-    /// instead of by two copies of the same loop.
-    pub fn levelsFor(w: u32, h: u32, fine_side: u32) u32 {
-        if (w == 0 or h == 0) return 0;
-        const base = cellsFor(w, fine_side);
-        var levels: u32 = 0;
-        while (levels < max_cascades) {
-            const cells = base * (@as(u32, 1) << @intCast(levels));
-            if (w / cells < 1 or h / cells < 1) break;
-            levels += 1;
-        }
-        return levels;
-    }
-
-    /// Allocates everything `build` will write, for a mask of this size.
-    ///
-    /// SEPARATE FROM `build` ON PURPOSE, and this is the second place the same
-    /// mistake was made (the first was `Lighting.resize` being called inside the
-    /// frame): the pyramid is rebuilt whenever an occluder moves, which is
-    /// gameplay's decision and can happen on any frame, while allocating inside
-    /// a frame is forbidden by spec §3.1 — `TrackedAllocator` panics on it
-    /// rather than letting it slide. Growing `cascades` or reallocating a probe
-    /// grid from `build` therefore took the whole process down on the first
-    /// GI-active frame that moved an occluder.
-    ///
-    /// Idempotent and cheap when the size is unchanged, so the caller can run it
-    /// unconditionally alongside `resize`. Everything `build` needs is derived
-    /// from the mask dimensions and nothing else, so preparing once per resize
-    /// is what it takes for `build` to be allocation-free for the rest of the
-    /// mask's life.
-    pub fn prepare(self: *Radiance, w: u32, h: u32, fine_side: u32) !void {
-        const levels = levelsFor(w, h, fine_side);
-        if (levels == 0) return;
-        self.fine_side = fine_side;
-        const base = cellsFor(w, fine_side);
-
-        try self.cascades.ensureUnusedCapacity(self.allocator, levels);
-        while (self.cascades.items.len < levels) {
-            self.cascades.appendAssumeCapacity(.{
-                .scale = base,
-                .rays = base_rays,
-                .w = 0,
-                .h = 0,
-                .probes = &.{},
-            });
-        }
-        // Shrinking the mask drops the extra cascades rather than leaving dead
-        // grids to be walked every probe merge.
-        while (self.cascades.items.len > levels) {
-            const c = self.cascades.pop().?;
-            var owned = c;
-            owned.deinit(self.allocator);
-        }
-
-        for (0..levels) |li| {
-            const level: u32 = @intCast(li);
-            const cells = base * (@as(u32, 1) << @intCast(level));
-            const cw = @max(w / cells, 1);
-            const ch = @max(h / cells, 1);
-            const c = &self.cascades.items[li];
-            c.scale = cells;
-            c.rays = @max(base_rays >> @intCast(level), 2);
-            if (cw == c.w and ch == c.h) continue;
-            const grown = try self.allocator.alloc(Probe, @as(usize, cw) * ch);
-            self.allocator.free(c.probes);
-            c.probes = grown;
-            c.w = cw;
-            c.h = ch;
-        }
-    }
-
-    /// (Re)builds the pyramid for a mask of this size.
-    ///
-    /// ALLOCATES NOTHING. `prepare` must have been run for this mask size first;
-    /// if it was not, this returns `error.NotPrepared` rather than quietly
-    /// allocating inside the frame. The runtime runs `prepare` from
-    /// `Lighting.resize`, which is itself documented as the before-the-frame
-    /// site, so the path that reaches here is allocation-free by construction.
-    ///
-    /// Still amortized exactly as the distance field is: rebuilt when an occluder
-    /// moves, and not once per frame. A static scene's GI is therefore free after
-    /// the first frame, and the cost of a moving one is bounded by the grid it
-    /// walks, not by the light count.
-    pub fn build(self: *Radiance, mask: []const u8, sdf: []const u16, w: u32, h: u32, sky: [3]f32) !void {
-        if (w == 0 or h == 0) return;
-        const levels = levelsFor(w, h, self.fine_side);
-        if (levels == 0) return;
-        if (self.cascades.items.len != levels) return error.NotPrepared;
-
-        // Built coarse-to-fine so each cascade can read the one above it: the
-        // finest cascade needs the second-finest's answer to finish. Ordering
-        // fine-to-coarse would leave the whole bottom level reading zeros.
-        var level: i32 = @as(i32, @intCast(levels)) - 1;
-        while (level >= 0) : (level -= 1) {
-            const li: usize = @intCast(level);
-            const c = &self.cascades.items[li];
-            const cw = c.w;
-            const ch = c.h;
-            if (cw == 0 or ch == 0) return error.NotPrepared;
-            const next: ?*Cascade = if (level + 1 < levels)
-                &self.cascades.items[li + 1]
-            else
-                null;
-
-            var y: u32 = 0;
-            while (y < ch) : (y += 1) {
-                var x: u32 = 0;
-                while (x < cw) : (x += 1) {
-                    const idx = @as(usize, y) * cw + x;
-                    // `c.scale` is the probe spacing, set by `prepare` for this
-                    // level. Reading it here rather than recomputing `cells` keeps
-                    // the grid and the probe lookup from ever disagreeing.
-                    // The probe stands at the CENTRE of its cell, not its corner.
-                    //
-                    // Half a cell of offset, which is nothing on an open plain and
-                    // a different answer on a wall: the corner of a cell abutting
-                    // an occluder IS the occluder, so every probe next to geometry
-                    // was being traced from inside it. `radiance.wgsl` has always
-                    // used the centre -- `gid * scale + scale * 0.5` -- and the two
-                    // halves disagreed by exactly that half cell, which is
-                    // invisible to any test that only runs one of them.
-                    //
-                    // `scale / 2` and not `scale * 0.5`: `px` is a CELL INDEX, and
-                    // `cellsFor` only ever returns a power of two of at least 2, so
-                    // the centre is always an exact cell and never a half one.
-                    c.probes[idx] = probeAt(
-                        self,
-                        c,
-                        next,
-                        mask,
-                        sdf,
-                        w,
-                        h,
-                        x * c.scale + c.scale / 2,
-                        y * c.scale + c.scale / 2,
-                        sky,
-                    );
-                }
-            }
-        }
-        self.built = levels;
-        self.builds += 1;
-    }
-
-    /// The radiance that arrived at a world point, 0..1, as a colour.
-    ///
-    /// This is what the light pass samples on the GPU (once the compute pass
-    /// exists) and what the CPU reference uses. Bilinear between the four
-    /// neighbouring probes of the FINEST cascade, which is why `base_scale` is 2:
-    /// finer and the merge cost doubles for detail the SDF itself does not carry.
-    pub fn sample(self: *const Radiance, x: f32, y: f32) [3]f32 {
-        if (self.built == 0) return .{ 0, 0, 0 };
-        const c = &self.cascades.items[0];
-        const in_cells = Vec2{ .x = x / @as(f32, @floatFromInt(c.scale)), .y = y / @as(f32, @floatFromInt(c.scale)) };
-        const fx = @floor(in_cells.x);
-        const fy = @floor(in_cells.y);
-        const tx = in_cells.x - fx;
-        const ty = in_cells.y - fy;
-        const x0: u32 = @intFromFloat(fx);
-        const y0: u32 = @intFromFloat(fy);
-        if (x0 + 1 >= c.w or y0 + 1 >= c.h) return .{ 0, 0, 0 };
-        const base = @as(usize, y0) * c.w + x0;
-        const p00 = &c.probes[base];
-        const p10 = &c.probes[base + 1];
-        const p01 = &c.probes[base + c.w];
-        const p11 = &c.probes[base + c.w + 1];
-
-        var out = [3]f32{ 0, 0, 0 };
-        for (0..3) |k| {
-            const a = mix2(p00.incoming[k], p10.incoming[k], tx);
-            const b = mix2(p01.incoming[k], p11.incoming[k], tx);
-            out[k] = mix2(a, b, ty);
-        }
-        return out;
-    }
-};
-
-fn mix2(a: f32, b: f32, t: f32) f32 {
-    return a * (1 - t) + b * t;
-}
-
-/// Traces one probe: every ray in it, merged into the incoming radiance.
-///
-/// The merge is a SUM over the probe's directions, each weighted by its solid
-/// angle. Summing rather than averaging is the part that makes a cascade
-/// correct rather than merely plausible: integrating incoming light over the
-/// hemisphere is what "illumination" means, and the weights are the solid angles
-/// so a probe with fewer, wider rays and one with more, narrower rays that happen
-/// to see the same sky give the same answer.
-fn probeAt(
-    r: *const Radiance,
-    c: *const Cascade,
-    next: ?*const Cascade,
-    mask: []const u8,
-    sdf: []const u16,
-    w: u32,
-    h: u32,
-    px: u32,
-    py: u32,
-    sky: [3]f32,
-) Probe {
-    var acc = [3]f32{ 0, 0, 0 };
-    const solid = 2.0 * math.pi / @as(f32, @floatFromInt(c.rays));
-
-    _ = mask;
-
-    // EARLY-OUT, and its justification is measured rather than assumed.
-    //
-    // A probe whose own cell is SOLID cannot see the sky from anywhere: every
-    // one of its rays starts inside geometry and terminates immediately. So the
-    // sixteen traces below would all hit at step 0 and merge into a cascade that
-    // is itself enclosed -- and the answer is the same one this returns.
-    //
-    // Whether that is worth a branch depends on the scene, which is why the
-    // benchmark sweeps it (`zig build bench-light`, "enclosed-probe early-out"):
-    // in a level of open rooms it is a large win, because most probes are
-    // enclosed; in the acceptance scene, which is a grid of walls in the open,
-    // most are not. The flag exists because the answer differs, not because the
-    // idea is obviously good.
-    //
-    // `>= 1.0` is the same threshold the trace itself uses, so "solid here" and
-    // "the trace would stop here" cannot disagree.
-    if (r.early_out_enclosed) {
-        const own = @as(usize, py) * w + px;
-        // A probe standing inside geometry traces nothing, so its closest hit
-        // is "right here": zero, not the sentinel the ray loop would leave.
-        if (own < sdf.len and sdf[own] < 1.0) {
-            return .{ .incoming = acc, .hit_distance = 0.0 };
-        }
-    }
-
-    // The CLOSEST hit across this probe's rays, for `hit_distance`.
-    //
-    // Declared OUTSIDE the ray loop, which is the only way it can be the closest
-    // rather than the last. It is declared where the GPU half declares its own,
-    // for the same reason: the field means one thing and both halves have to
-    // mean it by the same thing.
-    var closest: f32 = 1e30;
-
-    var i: u32 = 0;
-    while (i < c.rays) : (i += 1) {
-        // Directions spread evenly, offset by half a step so the first ray is not
-        // exactly along +x — a set that starts on an axis has a preferred
-        // orientation a scene author can see as a shadow on one side.
-        const theta = (@as(f32, @floatFromInt(i)) + 0.5) * solid;
-        const dir = Vec2{ .x = @cos(theta), .y = @sin(theta) };
-
-        // Sphere tracing the SDF: step by the distance field, which reaches an
-        // occluder in O(sqrt(d)) iterations instead of the fixed step count a
-        // march would need, and cannot skip over a thin wall because the field
-        // never overestimates the true distance.
-        var t: f32 = 0;
-        const max_t: f32 = @floatFromInt(@min(c.w, c.h) * c.scale);
-        var hit = false;
-        var step: u32 = 0;
-        while (step < 64) : (step += 1) {
-            const px_x = @as(f32, @floatFromInt(px)) + dir.x * t;
-            const px_y = @as(f32, @floatFromInt(py)) + dir.y * t;
-            // The bounds test is in FLOATING POINT and comes before the integer
-            // conversion, because the conversion is the part that panics. A ray
-            // leaving the mask on the low side goes negative, and
-            // `@intFromFloat` of a negative float is a runtime trap — so a test
-            // written the other way round turns "the ray escaped to the sky"
-            // into "the process died", which is how a GI crash report reads.
-            if (px_x < 0 or px_y < 0 or px_x >= @as(f32, @floatFromInt(w)) or
-                px_y >= @as(f32, @floatFromInt(h)))
-            {
-                // Out of the mask: the ray escaped to the sky.
-                hit = false;
-                break;
-            }
-            const ix: u32 = @intFromFloat(@floor(px_x));
-            const iy: u32 = @intFromFloat(@floor(px_y));
-            const d = @as(f32, @floatFromInt(sdf[@as(usize, iy) * w + ix]));
-            if (d < 1.0) {
-                hit = true;
-                closest = t;
-                break;
-            }
-            t += @max(d * 0.9, 0.5);
-            if (t > max_t) break;
-        }
-
-        if (!hit) {
-            // The ray reached the sky. Its contribution is the sky's radiance
-            // along this direction, which is the base case every cascade merge
-            // eventually resolves to — and the only place the sky enters at all.
-            for (0..3) |k| acc[k] += sky[k] * solid / (2.0 * math.pi);
-            continue;
-        }
-
-        // A hit: ask the next cascade up what it saw from the hit point. That is
-        // the bounce — the light that reached the occluder is now leaving it
-        // towards this probe, and the next cascade is where that light is
-        // recorded, at a resolution coarse enough to have traced it.
-        var from_here = sky;
-        if (next) |n| {
-            const hx = @as(f32, @floatFromInt(px)) + dir.x * t;
-            const hy = @as(f32, @floatFromInt(py)) + dir.y * t;
-            from_here = sampleCascade(r, n, hx, hy);
-        }
-        // A hit contributes what it reflects, not what it receives: a fraction
-        // scattered back into the hemisphere. 0.85 is a mid-grey wall.
-        const bounce = 0.85;
-        for (0..3) |k| acc[k] += from_here[k] * bounce * solid / (2.0 * math.pi);
-    }
-
-    return .{ .incoming = acc, .hit_distance = closest };
-}
-
-/// Nearest-probe read of a cascade, at probe units.
-pub fn sampleCascade(r: *const Radiance, c: *const Cascade, x: f32, y: f32) [3]f32 {
-    _ = r;
-    const gx = @floor(x / @as(f32, @floatFromInt(c.scale)));
-    const gy = @floor(y / @as(f32, @floatFromInt(c.scale)));
-    const x0: u32 = @intFromFloat(gx);
-    const y0: u32 = @intFromFloat(gy);
-    // Outside the built region the answer is nothing, not the sky: a probe grid
-    // that runs out says "no information here", and the caller decides what
-    // "no information" means. Returning the sky from a nearest-probe read would
-    // make the edge of the grid the brightest part of the image.
-    if (x0 >= c.w or y0 >= c.h) return .{ 0, 0, 0 };
-    const idx = @as(usize, y0) * c.w + x0;
-    if (idx >= c.probes.len) return .{ 0, 0, 0 };
-    return c.probes[idx].incoming;
-}
-
-// ── the exact Euclidean distance transform ──────────────────────────────────
-
-/// Exact Euclidean distance transform of a binary mask, in mask cells.
-///
-/// Two 1D passes (rows, then columns) using the lower-envelope-of-parabolas
-/// construction, so the result is the true Euclidean distance and not the chamfer
-/// approximation. The cheaper approximation is off by up to 4% of the true
-/// distance, and GI reads this as ambient occlusion where 4% is invisible — but
-/// the same field is also what decides whether a doorway is "open", and there an
-/// error is a light leaking through a wall.
-///
-/// Squared distances are carried between the two passes. Taking a square root
-/// after the row pass and squaring again before the column pass loses precision
-/// The distance transform's scratch, sized once per mask.
-///
-/// ## Why it exists
-///
-/// `edtMask2d` used to allocate SEVEN buffers on every call, one of them a
-/// `f64` array of `w * h` -- 2 MB for a 512x512 mask, allocated and freed
-/// between two linear passes. That allocation is not the whole cost -- the
-/// measured cost of the transform itself was 17-23 ms for that mask -- but it is
-/// 2 MB of traffic per frame that buys nothing.
-pub const EdtScratch = struct {
-    /// The squared row result. `f64` and not `f32` because this same field
-    /// decides whether a doorway reads as open, and an error there is a light
-    /// leaking through a wall.
-    sq: []f64 = &.{},
-    row_in: []f64 = &.{},
-    row_out: []f64 = &.{},
-    col_in: []f64 = &.{},
-    col_out: []f64 = &.{},
-    /// The lower-envelope's breakpoints and the parabola separation points.
-    v: []usize = &.{},
-    z: []f64 = &.{},
-
-    allocator: std.mem.Allocator = undefined,
-
-    pub fn init(allocator: std.mem.Allocator) EdtScratch {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *EdtScratch) void {
-        self.allocator.free(self.sq);
-        self.allocator.free(self.row_in);
-        self.allocator.free(self.row_out);
-        self.allocator.free(self.col_in);
-        self.allocator.free(self.col_out);
-        self.allocator.free(self.v);
-        self.allocator.free(self.z);
-        self.z = undefined;
-        self.v = undefined;
-        self.col_out = undefined;
-        self.col_in = undefined;
-        self.row_out = undefined;
-        self.row_in = undefined;
-        self.sq = undefined;
-        self.allocator = undefined;
-    }
-
-    /// Grows the scratch for a `w` x `h` mask. A no-op when it already fits,
-    /// which is every frame after the first.
-    pub fn resize(self: *EdtScratch, w: u32, h: u32) !void {
-        const n = @as(usize, w) * h;
-        const widest = @max(w, h);
-        if (self.sq.len >= n and self.row_in.len >= w and self.row_out.len >= w and
-            self.col_in.len >= h and self.col_out.len >= h and self.v.len >= widest and
-            self.z.len > widest) return;
-
-        self.allocator.free(self.sq);
-        self.allocator.free(self.row_in);
-        self.allocator.free(self.row_out);
-        self.allocator.free(self.col_in);
-        self.allocator.free(self.col_out);
-        self.allocator.free(self.v);
-        self.allocator.free(self.z);
-
-        self.sq = try self.allocator.alloc(f64, n);
-        errdefer self.allocator.free(self.sq);
-        self.row_in = try self.allocator.alloc(f64, w);
-        errdefer self.allocator.free(self.row_in);
-        self.row_out = try self.allocator.alloc(f64, w);
-        errdefer self.allocator.free(self.row_out);
-        self.col_in = try self.allocator.alloc(f64, h);
-        errdefer self.allocator.free(self.col_in);
-        self.col_out = try self.allocator.alloc(f64, h);
-        errdefer self.allocator.free(self.col_out);
-        self.v = try self.allocator.alloc(usize, widest);
-        errdefer self.allocator.free(self.v);
-        self.z = try self.allocator.alloc(f64, widest + 1);
-    }
-};
-
-/// The exact distance transform of a binary mask, into caller-owned scratch.
-///
-/// No allocator and no error: the scratch is sized by `Lighting.resize`, which
-/// runs before a frame (spec §3.1), so the transform cannot fail and does not
-/// check. A caller whose scratch is too small gets a field that did not change
-/// rather than a panic -- which is wrong but free, and the sized-in-`resize`
-/// precondition is what makes it unreachable.
-pub fn edtMask2dInto(
-    scratch: *EdtScratch,
-    mask: []const u8,
-    out: []u16,
-    w: u32,
-    h: u32,
-) void {
-    const n = @as(usize, w) * h;
-    if (w == 0 or h == 0) return;
-    if (out.len < n or mask.len < n) return;
-    if (scratch.sq.len < n or scratch.row_in.len < w or scratch.row_out.len < w or
-        scratch.col_in.len < h or scratch.col_out.len < h) return;
-
-    const sq = scratch.sq[0..n];
-    // EVERY scratch slice is truncated to the grid being transformed, not just
-    // the envelope arrays. `edt1d` takes its length from `d_in`, so passing a
-    // scratch row longer than the grid makes it walk `n` positions through
-    // buffers sized for a smaller problem and write past the end of `v`.
-    //
-    // This could not happen while the transform ran at mask resolution and the
-    // scratch was sized for exactly that mask: `d_in.len` and `@max(w, h)`
-    // agreed by construction. The GI decouple is what broke the agreement, by
-    // making the grid legitimately smaller than the scratch that serves it. A
-    // reusable buffer being larger than its user is the normal case, not the
-    // exotic one, and the code now says so instead of relying on it never
-    // happening.
-    const row_in = scratch.row_in[0..w];
-    const row_out = scratch.row_out[0..w];
-    const col_in = scratch.col_in[0..h];
-    const col_out = scratch.col_out[0..h];
-    const v = scratch.v[0..@max(w, h)];
-    const z = scratch.z[0 .. @max(w, h) + 1];
-
-    // INF as a local, not `std.math.inf` per cell: that is a call in the
-    // innermost loop of a pass over every texel.
-    const INF = std.math.inf(f64);
-
-    // Rows: seed solid cells at zero, free cells at infinity. The row pass does
-    // NOT write `out` -- the column pass overwrites every cell of it, so a sqrt
-    // and an int conversion per cell there is work whose only effect is time.
-    var y: usize = 0;
-    while (y < h) : (y += 1) {
-        const row = y * w;
-        var x: usize = 0;
-        while (x < w) : (x += 1) {
-            row_in[x] = if (mask[row + x] != 0) 0 else INF;
-        }
-        edt1d(row_in, row_out, v, z);
-        x = 0;
-        while (x < w) : (x += 1) sq[row + x] = row_out[x];
-    }
-
-    // Columns, on the squared row distances.
-    var xi: usize = 0;
-    while (xi < w) : (xi += 1) {
-        var yi: usize = 0;
-        while (yi < h) : (yi += 1) col_in[yi] = sq[yi * w + xi];
-        edt1d(col_in, col_out, v, z);
-        yi = 0;
-        while (yi < h) : (yi += 1) {
-            out[yi * w + xi] = @intFromFloat(@min(@sqrt(col_out[yi]), 65535.0));
-        }
-    }
-}
-
-/// An allocating `edtMask2d`, for callers with no scratch of their own.
-///
-/// The runtime does NOT use this -- `Lighting` holds an `EdtScratch` sized in
-/// `resize` and calls `edtMask2dInto`. This form stays because a test has
-/// nothing to hold a scratch and the cost is once.
-pub fn edtMask2d(
-    allocator: std.mem.Allocator,
-    mask: []const u8,
-    out: []u16,
-    w: u32,
-    h: u32,
-) !void {
-    const n = @as(usize, w) * h;
-    if (out.len < n or mask.len < n) return error.BufferTooSmall;
-    if (w == 0 or h == 0) return;
-    var scratch = EdtScratch.init(allocator);
-    defer scratch.deinit();
-    try scratch.resize(w, h);
-    edtMask2dInto(&scratch, mask, out, w, h);
-}
-
-/// The lower envelope of parabolas. Felzenszwalb & Huttenlocher (2012).
-///
-/// `d_in` is preserved and `d_out` receives the squared distance to the nearest
-/// zero-cost position in `d_in`. Non-negative costs only, which is what a row of
-/// zeros and infinities is.
-///
-/// The intersection of parabola `v` and parabola `q` is
-/// `(q + v) / 2 + (d[q] - d[v]) / (2 * (q - v))`. Writing it as
-/// `(q - v)^2 / 2 + (d[q] - d[v]) / 2` — which is what this function did first
-/// — drops the `q^2 - v^2` term, and the result is a transform that returns
-/// plausible distances that are wrong by the square of the column index. It
-/// passed a casual eyeball and failed an exactness test.
-fn edt1d(d_in: []const f64, d_out: []f64, v: []usize, z: []f64) void {
-    const n = d_in.len;
-    if (n == 0) return;
-
-    var k: usize = 0;
-    v[0] = 0;
-    z[0] = -std.math.inf(f64);
-    z[1] = std.math.inf(f64);
-
-    // `qf` is incremented in the loop's own clause, once per `q` and never once
-    // per rejection. It used to be advanced inside the body as well, which ran
-    // the running index ahead of `q` and produced a transform that is wrong by
-    // the amount the envelope was over-extended.
-    var q: usize = 1;
-    var qf: f64 = 1.0;
-    // One clause advances both, so the float can never run ahead of the index.
-    // This is the whole bug the f64 rewrite introduced: `qf` was advanced inside
-    // the body, once per rejection, and several rejections share one `q`.
-    while (q < n) : ({ q += 1; qf += 1.0; }) {
-        s: while (true) {
-            const vf = @as(f64, @floatFromInt(v[k]));
-            // The candidate intersection. With an infinite cost on `q` this is
-            // `inf / finite` = +inf, so q enters the envelope, which is what "a
-            // free cell never produces a crossing point below this" means.
-            //
-            // Pure f64, and the index carried as a running float: this used to
-            // do usize -> i64 -> f64 round-trips with an i64 multiply and a
-            // divide in the critical path, measured at 55 ns per MASK CELL.
-            const s_new = (qf + vf) * 0.5 +
-                (d_in[q] - d_in[v[k]]) / (2.0 * (qf - vf));
-            if (k == 0 or s_new > z[k]) {
-                k += 1;
-                v[k] = q;
-                z[k] = s_new;
-                z[k + 1] = std.math.inf(f64);
-                break :s;
-            }
-            // NO `qf += 1` in here: the `while` runs once per rejection and
-            // several rejections share one `q`. Advancing it here made the
-            // running index run ahead of `q`, which is a transform that is wrong
-            // by exactly the amount the envelope was over-extended.
-            k -= 1;
-        }
-        // And not here either: the loop's clause advances both `q` and `qf`
-        // together, and a second advance would run the float ahead of the index.
-    }
-
-    k = 0;
-    var j: usize = 0;
-    var jf: f64 = 0.0;
-    while (j < n) : (j += 1) {
-        while (z[k + 1] < jf) k += 1;
-        const delta = jf - @as(f64, @floatFromInt(v[k]));
-        d_out[j] = delta * delta + d_in[v[k]];
-        jf += 1.0;
-    }
-}
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
@@ -4083,7 +2295,6 @@ test "render light: a quality setting changes the work it allows" {
     try testing.expectEqual(@as(u8, 0), Quality.off.shadowLights());
     try testing.expectEqual(@as(u8, 4), Quality.high.shadowLights());
     try testing.expect(Quality.high.maskDownscale() < Quality.low.maskDownscale());
-    try testing.expect(!Quality.low.giEnabled());
 }
 
 test "render light: a polygon occluder rasterizes inside its own bounds" {
@@ -4220,52 +2431,6 @@ test "render light: the three blend modes do three different things" {
     // `mix` blends toward the lit colour by how much of the light arrives, so
     // a grey light on a mid-grey surface is darker, not brighter.
     try testing.expect(m[0] < dst[0]);
-}
-
-test "render light: the distance field is exact" {
-    var l = try Lighting.init(testing.allocator, .high);
-    defer l.deinit();
-    try l.resize(16, 16);
-    try l.reserve(16, 16);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
-
-    // A solid left half.
-    var i: usize = 0;
-    while (i < 16 * 16) : (i += 1) {
-        l.mask[i] = if (i % 16 < 8) 255 else 0;
-    }
-
-    try edtMask2d(testing.allocator, l.mask, l.sdf, 16, 16);
-
-    // Cell (0,0) is solid, so its distance is zero. Cell (8,0) is the first
-    // free column, one cell from the wall; the far corner is eight away, which
-    // is the assertion that caught a wrong-by-one in the expectation rather
-    // than in the transform.
-    try testing.expectEqual(@as(u16, 0), l.sdf[0]);
-    try testing.expectEqual(@as(u16, 1), l.sdf[8]);
-    try testing.expectEqual(@as(u16, 2), l.sdf[9]);
-    try testing.expectEqual(@as(u16, 8), l.sdf[15]);
-}
-
-test "render light: GI reports an enclosed point as darker than an open one" {
-    var l = try Lighting.init(testing.allocator, .high);
-    defer l.deinit();
-    try l.resize(64, 64);
-    try l.reserve(16, 16);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
-
-    var poly = components.OccluderPolygon{};
-    poly.count = 4;
-    poly.points = points(&.{ 0, 0, 4, 0, 4, 64, 0, 64 });
-    l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
-    l.rasterize();
-    l.dirty = true;
-    l.gi_interval_ns = 0;
-    _ = l.updateSdf(0);
-
-    const near_wall = l.sampleGi(6, 32);
-    const middle = l.sampleGi(40, 32);
-    try testing.expect(near_wall < middle);
 }
 
 test "render light: four lights get shadow channels and the rest still light" {
@@ -4464,82 +2629,6 @@ test "render light: an even number of identical occluders still build their mask
     try testing.expect(!l.mask_changed);
 }
 
-test "render light: the radiance pyramid is built coarse-to-fine and only once" {
-    var r = Radiance.init(testing.allocator);
-    defer r.deinit();
-
-    var l = try Lighting.init(testing.allocator, .high);
-    defer l.deinit();
-    try l.resize(64, 64);
-    try l.reserve(4, 4);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
-    // A 4x4 wall block.
-    var poly = components.OccluderPolygon{};
-    poly.count = 4;
-    poly.points = points(&.{ 30, 30, 34, 30, 34, 34, 30, 34 });
-    l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 16 });
-    l.rasterize();
-    try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
-
-    const sky = [3]f32{ 1, 1, 1 };
-    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
-    try r.build(l.mask, l.sdf, 64, 64, sky);
-
-    try testing.expect(r.built >= 2);
-    try testing.expectEqual(@as(u32, 1), r.builds);
-    // The finest cascade is the busiest.
-    try testing.expect(r.cascades.items[0].w * r.cascades.items[0].h >
-        r.cascades.items[1].w * r.cascades.items[1].h);
-
-    // Rebuilding without a resize and without a change is a no-op cost-wise
-    // only if the caller decides not to; this build genuinely re-walks, which is
-    // what the amortization test's `builds` counter is FOR: it is the caller's
-    // decision, not this one's.
-    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
-    try r.build(l.mask, l.sdf, 64, 64, sky);
-    try testing.expectEqual(@as(u32, 2), r.builds);
-}
-
-test "render light: a corner is darker than the open sky, which is GI working" {
-    var r = Radiance.init(testing.allocator);
-    defer r.deinit();
-
-    var l = try Lighting.init(testing.allocator, .high);
-    defer l.deinit();
-    try l.resize(64, 64);
-    try l.reserve(4, 4);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
-    // Two walls forming a corner, the classic GI test: the corner is enclosed on
-    // two sides, so the probes in it mostly see each other rather than the sky,
-    // and the cascade must resolve that.
-    var poly = components.OccluderPolygon{};
-    poly.count = 4;
-    poly.points = points(&.{ 0, 32, 32, 32, 32, 36, 0, 36 });
-    l.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 36 });
-    var poly2 = components.OccluderPolygon{};
-    poly2.count = 4;
-    poly2.points = points(&.{ 28, 0, 32, 0, 32, 64, 28, 64 });
-    l.occluders.appendAssumeCapacity(.{ .polygon = poly2, .pos = .{ .x = 0, .y = 0 }, .extent = 32 });
-    l.rasterize();
-    try edtMask2d(testing.allocator, l.mask, l.sdf, 64, 64);
-
-    try r.prepare(64, 64, Radiance.fineSideFor(.medium));
-    try r.build(l.mask, l.sdf, 64, 64, .{ 1, 1, 1 });
-
-    // The open middle of the screen sees the sky on every ray.
-    const open = r.sample(60, 8);
-    try testing.expect(open[0] > 0.05);
-
-    // The corner at (4, 40) is behind both walls. Its probes trace upward and
-    // inward; most of their rays hit the walls' own bounce rather than the sky,
-    // and each bounce is attenuated. The threshold is deliberately loose because
-    // the exact number is a function of the solid angles, not a property of the
-    // scene -- the assertion is the DIRECTION, which is what a regression test
-    // can detect.
-    const corner = r.sample(8, 40);
-    try testing.expect(corner[0] < open[0]);
-}
-
 // ── the four components, end to end ─────────────────────────────────────────
 //
 // Each of these spawns a REAL component into a REAL world and lets `collect`
@@ -4683,13 +2772,13 @@ test "render light: an ambient light can never be given a shadow channel" {
 }
 
 test "render light: a point light's instance is laid out where the shader reads it" {
-    // The backend declares attributes at 0/8/16/24/32/40/48/56 and light.wgsl's
-    // LightIn reads the same. A struct that drifts from that is not a wrong
-    // light, it is garbage that still renders — so the layout is asserted here,
-    // where a change to it is a change to a test rather than to a scene.
+    // The backend declares attributes at 0/8/16/24/32/40/56/64/68 and
+    // light.wgsl's LightIn reads the same. A struct that drifts from that is not
+    // a wrong light, it is garbage that still renders — so the layout is asserted
+    // here, where a change to it is a change to a test rather than to a scene.
     const i = instanceFor(pointDesc(.{}, 100), .{ .x = 5, .y = 6 }, 3);
-    try testing.expectEqual(@as(u32, 76), @sizeOf(LightInstance));
-    try testing.expectEqual(@as(usize, 72), @offsetOf(LightInstance, "item_cull_mask"));
+    try testing.expectEqual(@as(u32, 72), @sizeOf(LightInstance));
+    try testing.expectEqual(@as(usize, 68), @offsetOf(LightInstance, "item_cull_mask"));
     try testing.expectEqual(@as(usize, 0), @offsetOf(LightInstance, "pos"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(LightInstance, "radius"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(LightInstance, "shadow_ratio"));
@@ -4699,7 +2788,7 @@ test "render light: a point light's instance is laid out where the shader reads 
     try testing.expectEqual(@as(usize, 32), @offsetOf(LightInstance, "cos_inner"));
     try testing.expectEqual(@as(usize, 40), @offsetOf(LightInstance, "color"));
     try testing.expectEqual(@as(usize, 56), @offsetOf(LightInstance, "attenuation"));
-    try testing.expectEqual(@as(usize, 64), @offsetOf(LightInstance, "gi"));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(LightInstance, "flags"));
 
     // And the values land where they are supposed to: the point of the
     // assertion above is that these do not quietly mean something else.
@@ -5460,41 +3549,6 @@ test "render light: the coverage store declines a bad registration rather than p
     try testing.expect(store.get(99) == null);
 }
 
-test "render light: the distance transform's scratch is reused, and is exact" {
-    // The exactness assertion and the reuse, together, because the reuse is only
-    // safe if the transform is right -- a scratch that is never rebuilt and
-    // never filled is a field that is silently stale.
-    var l = try Lighting.init(testing.allocator, .high);
-    defer l.deinit();
-    try l.resize(16, 16);
-    try l.reserve(8, 8);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
-
-    for (0..16 * 16) |i| l.mask[i] = if (i % 16 < 8) 255 else 0;
-
-    // Through the driver path, so what is being tested is the scratch the
-    // `Lighting` actually holds and not a fresh one.
-    l.dirty = true;
-    _ = l.updateSdf(0);
-
-    try testing.expectEqual(@as(u16, 0), l.sdf[0]);
-    try testing.expectEqual(@as(u16, 1), l.sdf[8]);
-    try testing.expectEqual(@as(u16, 2), l.sdf[9]);
-    try testing.expectEqual(@as(u16, 8), l.sdf[15]);
-
-    // A second transform on the same scratch, with a different mask: same
-    // answers, which is what says the buffers are being fully rewritten.
-    for (0..16 * 16) |i| l.mask[i] = if (i % 16 < 8) 255 else 0;
-    l.dirty = true;
-    _ = l.updateSdf(0);
-    try testing.expectEqual(@as(u16, 8), l.sdf[15]);
-
-    // And a resize grows the scratch rather than leaving it sized for the old
-    // mask -- which would make the transform return without doing anything.
-    try l.resize(32, 32);
-    try testing.expect(l.edt.sq.len >= 32 * 32);
-}
-
 test "render light: an idle scene still reports a full mask, not an empty one" {
     // The stats panel lies when nobody is moving.
     //
@@ -5542,362 +3596,4 @@ test "render light: an idle scene still reports a full mask, not an empty one" {
     // The mask is still there.
     try testing.expectEqual(filled, l.stats.mask_fill);
     try testing.expect(l.stats.mask_fill > 0);
-}
-
-test "render light: the distance field's session counters survive a frame boundary" {
-    // `sdf_builds` is documented as "this session" and was cleared by `lock()`
-    // every frame. A test that built it once saw `1` and passed, and a reader
-    // watching the editor saw a number that never grew past one. The counters
-    // describe the session; only the per-frame timings are per-frame.
-    //
-    // `.medium`, not `.low`: `updateSdf` declines outright when the tier has GI
-    // off, which is correct behaviour and the reason a `.low` fixture here would
-    // measure a counter that never moves for a reason that has nothing to do
-    // with frames.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    try l.resize(32, 32);
-    try l.reserve(2, 2);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
-
-    var world = World.init(testing.allocator);
-    defer world.deinit();
-    _ = try world.spawn(.{
-        components.Transform{ .position = .{ .x = 0, .y = 0 } },
-        components.LightOccluder2D{ .mode = .manual, .polygon = wallPoly(8, 8, 24, 24) },
-    });
-
-    // The clock has to actually advance: `.medium` amortizes the field to ten
-    // rebuilds a second, and `updateSdf` at `now = 0` with `last = 0` correctly
-    // declines — the interval has not elapsed. A test that wanted a build had to
-    // ask for one.
-    const second: i128 = std.time.ns_per_ms * 100;
-
-    l.lock();
-    l.collect(&world, l.rect);
-    l.rasterize();
-    l.dirty = true;
-    _ = l.updateSdf(second);
-    l.unlock();
-    try testing.expectEqual(@as(u32, 1), l.stats.sdf_builds);
-
-    // A second frame that does nothing must not erase the history.
-    l.lock();
-    l.collect(&world, l.rect);
-    l.rasterize();
-    _ = l.updateSdf(second + 1);
-    l.unlock();
-    try testing.expectEqual(@as(u32, 1), l.stats.sdf_builds);
-    // ...but it must have been counted as a skip, because that is what happened.
-    try testing.expect(l.stats.sdf_skipped >= 1);
-}
-
-test "render light: the GI field can be coarser than the mask and still answer" {
-    // The decouple's correctness case. A 64-cell field over a 512-cell mask is
-    // the whole point, so the test has to prove the coarse field answers the
-    // same question the fine one did.
-    //
-    // Note the direction of the term, which is easy to get backwards when
-    // writing assertions: `sdf` is the distance to the NEAREST occluder, so
-    // `sampleGi` is 1.0 in open space and falls toward 0 as a point approaches a
-    // wall. The value the shader stores in alpha is this openness, and the GI
-    // term is `1 - alpha`. Asserting the other way round produces a suite that
-    // passes for the wrong reason.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    try l.resize(512, 512);
-    try l.setGiResolution(64);
-    try l.reserve(8, 8);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 512, .y = 512 } };
-
-    try testing.expectEqual(@as(u32, 512), l.alloc_w);
-    try testing.expectEqual(@as(u32, 64), l.gi_w);
-    try testing.expectEqual(@as(u32, 64), l.gi_h);
-    // The distance field follows the field, not the mask. If it did not, this is
-    // an out-of-bounds read waiting for a mask with any solid in it.
-    try testing.expectEqual(@as(usize, 64 * 64), l.sdf.len);
-
-    // A single wall down the middle. Open on one side, blocked on the other.
-    for (0..512) |y| {
-        for (0..512) |x| {
-            l.mask[y * 512 + x] = if (x == 256) 255 else 0;
-        }
-    }
-    l.dirty = true;
-    try testing.expect(l.updateSdf(1_000_000_000));
-
-    // The wall's own column is solid at BOTH resolutions, which is the property
-    // the conservative downsample buys. Averaging would have made a one-texel
-    // wall at a 8:1 reduction a faint smudge.
-    try testing.expectEqual(@as(u8, 255), l.gi_mask[32 * 64 + 32]);
-
-    // Deep in open space on either side: fully open.
-    try testing.expect(l.sampleGi(32, 256) >= 0.95);
-    try testing.expect(l.sampleGi(480, 256) >= 0.95);
-
-    // Inside the wall: fully closed.
-    try testing.expectEqual(@as(f32, 0.0), l.sampleGi(256, 256));
-}
-
-test "render light: a wall thinner than a GI cell still occludes" {
-    // The failure the conservative downsample exists to prevent, stated as a
-    // test rather than as a comment.
-    //
-    // A one-texel wall, at a 16:1 reduction, is a sixteenth of a cell. An
-    // averaging filter erases it completely: the room behind it becomes open sky
-    // and light pours through a wall the author drew. Nobody can see why from the
-    // screenshot, because the wall is still visibly there.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    try l.resize(256, 256);
-    try l.setGiResolution(16);
-    try l.reserve(8, 8);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
-
-    try testing.expectEqual(@as(u32, 16), l.gi_w);
-
-    // A single vertical column of solid, plus solid on both far sides so the
-    // middle is genuinely enclosed and the test measures the WALL rather than
-    // the absence of a room.
-    for (0..256) |y| {
-        for (0..256) |x| {
-            const solid = x == 128 or x < 32 or x > 223;
-            l.mask[y * 256 + x] = if (solid) 255 else 0;
-        }
-    }
-    l.dirty = true;
-    try testing.expect(l.updateSdf(1_000_000_000));
-
-    // The wall's own cell must be solid after the downsample.
-    const gw = l.gi_w;
-    const wall_col = 128 * gw / 256;
-    var y: u32 = 0;
-    while (y < gw) : (y += 1) {
-        try testing.expectEqual(@as(u8, 255), l.gi_mask[@as(usize, y) * gw + wall_col]);
-    }
-
-    // And a cell just past the wall must be enclosed, which is the whole claim.
-    try testing.expect(l.sampleGi(140, 128) < 0.05);
-}
-
-test "render light: gi_resolution = 0 means the old behaviour, exactly" {
-    // The escape hatch has to be an escape hatch. `gi_res = 0` should reproduce
-    // the pre-decouple field cell for cell, or it is not "match the mask" — it is
-    // "match the mask approximately", which is a much worse thing to offer
-    // someone debugging.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    try l.resize(128, 128);
-    try l.setGiResolution(0);
-    try l.reserve(4, 4);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 128, .y = 128 } };
-
-    try testing.expectEqual(l.alloc_w, l.gi_w);
-    try testing.expectEqual(l.alloc_h, l.gi_h);
-    try testing.expectEqual(@as(f32, 1.0), l.cellsPerGiCell());
-
-    for (0..128) |i| l.mask[i] = if (i % 3 == 0) 255 else 0;
-    l.dirty = true;
-    try testing.expect(l.updateSdf(1_000_000_000));
-
-    // `gi_mask` IS the mask here, by the copy in `downsampleGi`.
-    for (l.mask, l.gi_mask) |a, b| try testing.expectEqual(a, b);
-}
-
-test "render light: the enclosure curve means the same thing at any resolution" {
-    // The trap in this change. The ramp is written as "about six cells of sky
-    // before you are fully enclosed". Cells in WHICH grid? If the coarse field's
-    // distances were compared against 6 unchanged, every enclosure would
-    // saturate at the first cell and GI would collapse into a wall/not-wall
-    // binary. If the coarse field's distances were compared against 6 scaled the
-    // other way, nothing would ever darken.
-    //
-    // Both read as "the lighting is wrong" and neither points at the arithmetic,
-    // so the rescaling is pinned here rather than left to the screenshot.
-    var fine = try Lighting.init(testing.allocator, .medium);
-    defer fine.deinit();
-    try fine.resize(256, 256);
-    try fine.setGiResolution(0);
-    try fine.reserve(4, 4);
-    fine.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
-
-    var coarse = try Lighting.init(testing.allocator, .medium);
-    defer coarse.deinit();
-    try coarse.resize(256, 256);
-    try coarse.setGiResolution(32);
-    try coarse.reserve(4, 4);
-    coarse.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
-
-    try testing.expectEqual(@as(f32, 1.0), fine.cellsPerGiCell());
-    try testing.expectEqual(@as(f32, 8.0), coarse.cellsPerGiCell());
-
-    // The same scene in both: a wall with a known gap beside it.
-    for (0..256) |y| {
-        for (0..256) |x| {
-            const solid = x == 128 or x < 32 or x > 223;
-            fine.mask[y * 256 + x] = if (solid) 255 else 0;
-            coarse.mask[y * 256 + x] = if (solid) 255 else 0;
-        }
-    }
-    fine.dirty = true;
-    coarse.dirty = true;
-    try testing.expect(fine.updateSdf(1_000_000_000));
-    try testing.expect(coarse.updateSdf(1_000_000_000));
-
-    // THE assertion. A point 24 mask cells from the wall is 3 GI cells from it in
-    // the coarse field, and both resolutions have to agree that it is open sky.
-    //
-    // Without `cellsPerGiCell` the coarse field would return `3 / 6 = 0.5`
-    // where the fine one returns `24 / 6 -> 1.0`: a dark band along every wall
-    // in the game, which widens every time the resolution drops. That reads as
-    // "the lighting is wrong near walls" with nothing in the numbers to explain
-    // it, which is the worst place for a bug to live.
-    const probe: f32 = 152;
-    try testing.expect(fine.sampleGi(probe, 128) >= 0.95);
-    try testing.expect(coarse.sampleGi(probe, 128) >= 0.95);
-
-    // The arithmetic behind it, stated rather than inferred. Three GI cells,
-    // eight mask cells each, rescaled to twenty-four — and the unrescaled value
-    // is what the curve would otherwise have seen.
-    const gx = @as(usize, @intFromFloat(@floor(probe / coarse.cellsPerGiCell())));
-    const gy = @as(usize, @intFromFloat(@floor(128 / coarse.cellsPerGiCell())));
-    const raw = coarse.sdf[gy * coarse.gi_w + gx];
-    try testing.expectEqual(@as(u16, 3), raw);
-    const raw_f: f32 = @floatFromInt(raw);
-    try testing.expect(raw_f / 6.0 < 0.6); // what the old code would have returned
-    try testing.expect(raw_f * coarse.cellsPerGiCell() / 6.0 > 0.95); // what it returns
-}
-
-test "render light: the downsample drops no mask cell and invents none" {
-    // The contract `downsampleGi`'s edge table has to keep, stated in terms that
-    // do not re-implement the mapping — a test that recomputed the same `floor`
-    // edges to check them would agree with every bug they share.
-    //
-    // A dropped cell is a pixel of wall no probe sees, which is a doorway that
-    // leaks light; the resolution sweep's MAE cannot catch it, because a dropped
-    // cell changes almost nothing on average and ruins exactly one wall. So
-    // this is checked per source cell, exhaustively, on a pair of dimensions
-    // that do not divide evenly — `roundPow2` makes the mask a power of two and
-    // `gi_res` is arbitrary, so every real pair divides unevenly and an
-    // evenly-dividing fixture would never exercise the rounding at all.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    // 64x40 down to 13: neither axis divides evenly (64/13 and 40/13 are both
-    // fractional), which is the case that matters and the only one that can
-    // drop a cell. The earlier version of this test used 256x100 and was
-    // exhaustive over 25,600 cells -- which took the whole suite from 0.26 s to
-    // 12 s to check a property that does not need a quarter of a million
-    // iterations to establish.
-    try l.resize(64, 40);
-    try l.setGiResolution(13);
-    try l.reserve(2, 2);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 40 } };
-
-    const gw = l.gi_w;
-    const gh = l.gi_h;
-
-    var solid_count: usize = 0;
-    for (l.gi_mask) |c| {
-        if (c != 0) solid_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 0), solid_count);
-
-    // Nothing solid in, nothing solid out. Catches a cell written that no source
-    // cell maps to.
-    @memset(l.mask, 0);
-    l.downsampleGi();
-    for (l.gi_mask) |c| try testing.expectEqual(@as(u8, 0), c);
-
-    // Everything solid in, everything solid out. Catches a destination cell
-    // whose source range is empty, which would leave a hole in the GI field that
-    // reads as a doorway no matter what the mask says.
-    @memset(l.mask, 255);
-    l.downsampleGi();
-    for (l.gi_mask) |c| try testing.expectEqual(@as(u8, 255), c);
-
-    // And every single source cell, one at a time, reaches at least one
-    // destination cell. This is the one that matters and the one that would have
-    // caught a partition that left gaps.
-    var sy: u32 = 0;
-    while (sy < 40) : (sy += 1) {
-        var sx: u32 = 0;
-        while (sx < 64) : (sx += 1) {
-            @memset(l.mask, 0);
-            l.mask[@as(usize, sy) * 64 + sx] = 255;
-            l.downsampleGi();
-
-            var any = false;
-            for (l.gi_mask) |c| {
-                if (c != 0) any = true;
-            }
-            if (!any) {
-                std.debug.print("\n  source ({d},{d}) reached no GI cell ({d}x{d})\n", .{
-                    sx, sy, gw, gh,
-                });
-                return error.TestUnexpectedResult;
-            }
-        }
-    }
-}
-
-test "render light: the GI field's aspect ratio follows the mask's" {
-    // A 16:9 mask gets a 16:9 field. Stretching it square would make one texel
-    // of enclosure data mean different world distances horizontally and
-    // vertically, and the gradient that produces is not an artefact anybody can
-    // read off a screenshot.
-    const dims = giDimsFor(2048, 1024, 256);
-    try testing.expectEqual(@as(u32, 256), dims.w);
-    try testing.expectEqual(@as(u32, 128), dims.h);
-
-    // A mask smaller than the dial is not upsampled. A GI field finer than the
-    // shadow mask it is derived from would be inventing detail that no
-    // measurement supports.
-    const small = giDimsFor(64, 64, 256);
-    try testing.expectEqual(@as(u32, 64), small.w);
-    try testing.expectEqual(@as(u32, 64), small.h);
-
-    // `0` is "match the mask", exactly.
-    const full = giDimsFor(2048, 1024, 0);
-    try testing.expectEqual(@as(u32, 2048), full.w);
-    try testing.expectEqual(@as(u32, 1024), full.h);
-}
-
-test "render light: a probe stands at the CENTRE of its cell, where the shader puts it" {
-    // The half-cell contract between the CPU pyramid and `radiance.wgsl`.
-    //
-    // `radiance.wgsl` has always computed `gid * scale + scale * 0.5`. The CPU
-    // used `x * scale`, which is the cell's CORNER -- and for a cell that abuts an
-    // occluder, the corner IS the occluder. So every probe next to a wall was
-    // traced from inside the wall, on the CPU only, and the two halves answered
-    // different questions about the same scene.
-    //
-    // It is invisible to every test that runs only one implementation, which is
-    // all of them until the GPU gate exists -- and that gate found it by
-    // disagreeing with the CPU on a field where it should have agreed exactly.
-    var l = try Lighting.init(testing.allocator, .medium);
-    defer l.deinit();
-    try l.resize(16, 16);
-    try l.reserve(4, 4);
-    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
-
-    var r = Radiance.init(testing.allocator);
-    defer r.deinit();
-    try r.prepare(16, 16, 4);
-    const c = r.cascades.items[0];
-
-    // `base_scale` is the finest spacing, and it is a power of two of at least 2,
-    // which is what makes "the centre" an exact cell rather than a half one.
-    try testing.expect(c.scale >= 2);
-    try testing.expect(std.math.isPowerOfTwo(c.scale));
-
-    // A free cell's centre is strictly inside it, and strictly nearer its own
-    // centre than its own corner -- which is the whole property.
-    for (0..c.w) |x| {
-        for (0..c.h) |_| {
-            const corner: u32 = @as(u32, @intCast(x)) * c.scale;
-            const centre: u32 = corner + c.scale / 2;
-            try testing.expect(centre > corner);
-            try testing.expect(centre < corner + c.scale);
-        }
-    }
 }

@@ -223,10 +223,6 @@ pub const LightBase = struct {
     /// `shadow_filter_smooth` pair on the receiving side, and this mask here
     /// only decides whether the sprite is lit at all.
     enabled: bool = true,
-    /// Global ambient this light contributes when GI is on, 0..1. Zero by
-    /// default: GI is an explicit opt-in per light, because a scene that did not
-    /// ask for bounce should not have it.
-    gi_contribution: f32 = 0,
 
     /// The four `ShadowFilter` steps after `off`, as filter radii in texels.
     pub const filter_radii = [_]f32{ 0, 0, 1, 2 };
@@ -382,10 +378,6 @@ pub const Light2D = struct {
     /// `shadow_filter_smooth` pair on the receiving side, and this mask here
     /// only decides whether the sprite is lit at all.
     enabled: bool = true,
-    /// Global ambient this light contributes when GI is on, 0..1. Zero by
-    /// default: GI is an explicit opt-in per light, because a scene that did not
-    /// ask for bounce should not have it.
-    gi_contribution: f32 = 0,
 
     /// The four `ShadowFilter` steps after `off`, as filter radii in texels.
     pub const filter_radii = [_]f32{ 0, 0, 1, 2 };
@@ -439,48 +431,6 @@ pub const Environment = struct {
     fog: [2]f32 = .{ 0, 0 },
     fog_color: [4]f32 = .{ 0.5, 0.5, 0.55, 1 },
 
-    /// M7: the radiance a ray that escapes the occluder mask carries.
-    ///
-    /// This is the base case of every Radiance Cascade merge — the number a
-    /// bounce falls back to — so it, not `ambient_color`, is what decides
-    /// whether light bouncing around a corner is warm at sunset or white at
-    /// noon. It defaults to zero: a scene in a sealed room has no sky, and
-    /// inventing one would make the room brighter than its own torches.
-    sky_color: [4]f32 = .{ 0, 0, 0, 1 },
-
-    /// Whether to build the radiance cascades at all.
-    ///
-    /// Off by default because it is the most expensive thing in the lighting
-    /// system by a wide margin, and because a scene that gets GI without asking
-    /// is a scene whose corners are darker than its author drew them. A light's
-    /// own `gi_contribution` is a second, per-light opt-in on top of this one.
-    gi_enabled: bool = false,
-
-    /// How much of what reaches an occluder is reflected back, 0..1. 0.85 is a
-    /// mid-grey wall; 0.2 is velvet. This is the difference between "light
-    /// rounds the corner" and "light stops at the corner and is re-created
-    /// there", and it is a property of the world's materials rather than of any
-    /// one surface, which is what makes one number enough.
-    gi_albedo: f32 = 0.85,
-
-    /// Which GI model this environment asks for, or `null` for the project's
-    /// configured default.
-    ///
-    /// PER ENVIRONMENT, and that is the reason it exists at all: one 2D RPG is
-    /// outdoors at noon and inside a dungeon in the same hour, and those want
-    /// different models. `sky` traces to the sky and propagates what it found,
-    /// which is right for a courtyard and produces nothing for a sealed room —
-    /// not because it is broken, but because there is no sky inside to trace.
-    /// `bounce` carries the scene's own lights through the walls instead, which
-    /// is what a torch-lit corridor needs.
-    ///
-    /// Tagged `null` rather than defaulting to a model, so that ADDING this
-    /// field cannot change any existing project's picture. `null` means exactly
-    /// what it meant before the field existed.
-    ///
-    /// 0 = sky, 1 = bounce, 2 = off.
-    gi_backend: ?u8 = null,
-
     /// Whether fog reaches the given distance.
     pub fn foggy(self: Environment) bool {
         return self.fog[1] > self.fog[0];
@@ -494,13 +444,6 @@ pub const Environment = struct {
             self.ambient_color[2] * self.ambient_energy,
             self.ambient_color[3],
         };
-    }
-
-    /// The sky's radiance, without the alpha. Three channels because alpha is a
-    /// coverage term and radiance has none: a sky is either there or it is not,
-    /// and how much of it there is is its colour.
-    pub fn sky(self: Environment) [3]f32 {
-        return .{ self.sky_color[0], self.sky_color[1], self.sky_color[2] };
     }
 };
 
@@ -538,8 +481,6 @@ test "the four light kinds carry the defaults an unauthored scene needs" {
     try testing.expect(p.base.cast_shadows);
     try testing.expectEqual(@as(f32, 1), p.base.energy);
     try testing.expectEqual(@as(f32, 192), p.radius);
-    // GI is opt-in: a scene that did not ask for bounce must not inherit it.
-    try testing.expectEqual(@as(f32, 0), p.base.gi_contribution);
 
     const s = SpotLight2D{};
     // Half of a 45-degree cone: pi/4 full, so pi/8 half.

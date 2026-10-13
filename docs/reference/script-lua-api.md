@@ -15,6 +15,8 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`noise`](#noise) | Procedural noise (value, Perlin, simplex, fBm, ridged) |
 | [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit) |
 | [`physics`](#physics) | Rigid-body queries: raycasts, line of sight, solver counters, activity tiers |
+| [`audio`](#audio) | The mixer: play_file, play_stream, buses, solo/sends, stats |
+| [`sound`](#sound) | This actor's `SoundEmitter2D`: play, stop, volume/pitch, radius, is_playing, describe |
 | [`world`](#world) | World-level queries (neighborhood search) |
 | [`steer`](#steer) | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 
@@ -1732,4 +1734,390 @@ acc:cohere(100, 0.5)
 ```lua
 local vx, vy = acc:apply(self.max_speed)
 actor.move_by(self, vx * dt, vy * dt)
+```
+
+---
+
+## `audio`
+
+The mixer. Every call reaches the one `Audio` the runtime owns through the
+binding context — the same way `physics.*` reaches the solver — so the editor
+and a test can each own one. With no system wired (a headless tool, a game with
+`audio.enabled = false`) a call reports failure rather than reaching through
+null: `play_file` returns nil, `is_playing` returns false, `stats()` returns an
+empty table.
+
+A **voice handle** is returned by the play functions and accepted by stop and the
+live controls. It travels as light userdata, so keep it in a variable and never
+arithmetic on it. A STALE handle is a no-op, never an error: the sound it named
+is genuinely gone.
+
+The full contract — the two threads, the bank's byte budget, the steal policy,
+what may decode and when — is in [audio-system](../reference/audio-system.md).
+Buses, solo and sends are in [audio-buses](../reference/audio-buses.md).
+
+### `audio.play_file(path, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `audio.play_file(path, opts?) -> voice\|nil` |
+| **Parameters** | `path` — `string` — sound file relative to the project root |
+| | `opts` — `table` — `{ bus, bus_name, volume, pitch, max_distance, spread, loop, priority }`, all optional |
+| **Returns** | a voice handle, or nil when it could not load |
+| **Description** | Plays a sound at the LISTENER (non-positional: UI clicks, music, auditions). It may decode, so it is load-time/preview — gameplay should play a resolved slot (see `sound.play` and `SoundEmitter2D`). |
+
+```lua
+local boom = audio.play_file("assets/audio/boom.wav", { bus_name = "sfx", volume = 0.8 })
+if boom then log.info("boom is playing") end
+```
+
+### `audio.play_stream(path, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `audio.play_stream(path, opts?) -> voice\|nil` |
+| **Parameters** | `path` — `string` — sound file relative to the project root |
+| | `opts` — `table` — same fields as `audio.play_file` |
+| **Returns** | a voice handle, or nil when it could not open |
+| **Description** | Like `play_file`, but STREAMED: only a small window is ever resident and the frame loop keeps it fed. This is the path for long music; `play_file` decodes the whole sound and is charged to the bank's byte budget in one go. |
+
+```lua
+local music = audio.play_stream("assets/music/theme.ogg", { loop = true, bus_name = "music" })
+```
+
+### `audio.stop(voice)`
+
+| | |
+|---|---|
+| **Signature** | `audio.stop(voice)` |
+| **Parameters** | `voice` — a handle from a play function |
+| **Returns** | *(nothing)* |
+| **Description** | Stops one playing sound. A stale handle is a no-op. |
+
+```lua
+audio.stop(boom)
+```
+
+### `audio.stop_all()`
+
+| | |
+|---|---|
+| **Signature** | `audio.stop_all()` |
+| **Returns** | *(nothing)* |
+| **Description** | Stops every playing sound. The Play/Stop hook: leaves the mixer silent and exact, so a re-simulated frame re-triggers its own sounds instead of inheriting the old ones. |
+
+```lua
+audio.stop_all()
+```
+
+### `audio.set_volume(voice, volume)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_volume(voice, volume)` |
+| **Parameters** | `voice` — a handle |
+| | `volume` — `number` — 1 is full; above 1 is allowed and soft-clipped |
+| **Returns** | *(nothing)* |
+| **Description** | Changes a playing sound's own volume, BEFORE bus gain. |
+
+```lua
+audio.set_volume(boom, 0.5)
+```
+
+### `audio.set_pitch(voice, pitch)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_pitch(voice, pitch)` |
+| **Parameters** | `voice` — a handle |
+| | `pitch` — `number` — the resample ratio; 1 is original, 2 is an octave up |
+| **Returns** | *(nothing)* |
+| **Description** | Changes a playing sound's pitch. 0.8 is the usual "lower and slower". |
+
+```lua
+audio.set_pitch(boom, 0.8)
+```
+
+### `audio.is_playing(voice)`
+
+| | |
+|---|---|
+| **Signature** | `audio.is_playing(voice) -> boolean` |
+| **Parameters** | `voice` — a handle |
+| **Returns** | `boolean` — true while the sound is audible |
+| **Description** | Whether a voice is still playing. False for a stale handle and false when the system is absent. |
+
+```lua
+if not audio.is_playing(boom) then log.info("done") end
+```
+
+### `audio.set_master_volume(gain)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_master_volume(gain)` |
+| **Parameters** | `gain` — `number` — 1 is full |
+| **Returns** | *(nothing)* |
+| **Description** | Sets the master volume (bus 0). Applies to everything. |
+
+```lua
+audio.set_master_volume(0.6)
+```
+
+### `audio.set_listener(x, y, rotation?)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_listener(x, y, rotation?)` |
+| **Parameters** | `x` — `number` — ear position x |
+| | `y` — `number` — ear position y |
+| | `rotation` — `number` — radians; 0 (default) faces +x |
+| **Returns** | *(nothing)* |
+| **Description** | Where the ears are and which way they face. The rotation turns the stereo field: a sound to the world-east pans right when the ears face +x. The runtime sets this from the camera every frame, so a script only needs it to override. |
+
+```lua
+local px, py = actor.get_position(self)
+audio.set_listener(px, py, 0)
+```
+
+### `audio.solo_bus(bus, solo)`
+
+| | |
+|---|---|
+| **Signature** | `audio.solo_bus(bus, solo)` |
+| **Parameters** | `bus` — bus name or id |
+| | `solo` — `boolean` |
+| **Returns** | *(nothing)* |
+| **Description** | Solos or unsolos a bus. While any bus is soloed, every other bus except master is silent. Master is never a solo target — it is where the soloed signal ends up. |
+
+```lua
+audio.solo_bus("music", true)   -- listen to the music alone
+audio.solo_bus("music", false)
+```
+
+### `audio.set_bus_send(bus, target, amount)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_bus_send(bus, target, amount)` |
+| **Parameters** | `bus` — source bus name or id |
+| | `target` — destination bus name or id, or nil to clear |
+| | `amount` — `number` — fraction of the source signal, 0..4 |
+| **Returns** | *(nothing)* |
+| **Description** | Routes part of a bus into another bus's gain path: a reverb or duck aux. One level only — a send of a send is not followed, which is what keeps the frame cost a fixed two passes over 16 buses. |
+
+```lua
+audio.set_bus_send("sfx", "reverb", 0.25)
+audio.set_bus_send("sfx", nil)       -- clear it
+```
+
+### `audio.bus_gain(bus)`
+
+| | |
+|---|---|
+| **Signature** | `audio.bus_gain(bus) -> number` |
+| **Parameters** | `bus` — bus name (`"music"`) or id (number) |
+| **Returns** | `number` — 0 when muted, otherwise the gain |
+| **Description** | A bus's current gain. A name that resolves to nothing reads as 1 (full), which is what a project with no audio section wants. |
+
+```lua
+log.info("music is at " .. audio.bus_gain("music"))
+```
+
+### `audio.set_bus_volume(bus, gain)`
+
+| | |
+|---|---|
+| **Signature** | `audio.set_bus_volume(bus, gain)` |
+| **Parameters** | `bus` — bus name or id |
+| | `gain` — `number` — 1 is full, clamped 0..10 |
+| **Returns** | *(nothing)* |
+| **Description** | Sets a bus gain. What a mixer panel's slider writes. The device applies it at the next buffer, so dragging a slider does not click. |
+
+```lua
+audio.set_bus_volume("music", 0.4)
+```
+
+### `audio.mute_bus(bus, muted)`
+
+| | |
+|---|---|
+| **Signature** | `audio.mute_bus(bus, muted)` |
+| **Parameters** | `bus` — bus name or id |
+| | `muted` — `boolean` |
+| **Returns** | *(nothing)* |
+| **Description** | Mutes or unmutes a bus. Muted voices keep PLAYING and are simply silent, so unmuting resumes them instead of restarting them. Mute wins over solo. |
+
+```lua
+audio.mute_bus("sfx", true)
+```
+
+### `audio.buses()`
+
+| | |
+|---|---|
+| **Signature** | `audio.buses() -> table` |
+| **Returns** | an array of bus records, in bus order |
+| **Description** | Every named bus as `{ name, id, gain, muted, solo, send_to, send_amount }`. This is what the mixer panel iterates, and why it needs no hard-coded channel list. |
+
+```lua
+for _, bus in ipairs(audio.buses()) do panel:add(bus.name, bus.gain) end
+```
+
+### `audio.stats()`
+
+| | |
+|---|---|
+| **Signature** | `audio.stats() -> table` |
+| **Returns** | a table of counters |
+| **Description** | The engine's own numbers: `voices_active`, `voices_peak`, `xruns`, `commands_dropped`, `latency_ms`, `period_frames`, `sample_rate`, `channels`, `bank_bytes`, `bank_budget`. Everything is a measurement, so polling it every frame from a debug overlay is safe. |
+
+```lua
+local s = audio.stats()
+if s.xruns > 0 then log.warn("audio is glitching: " .. s.xruns) end
+```
+
+---
+
+## `sound`
+
+This actor's `SoundEmitter2D`. Where `audio.*` is about sounds, `sound.*` is
+about the EMITTER: the component says what the actor sounds like (a bank slot, a
+bus, a gain, a radius) and survives a save and a hot-reload, while these bindings
+are the verbs that turn it into a voice at the actor's transform.
+
+The component, the placement rules and the asset hot-reload are in
+[audio-emitters](../reference/audio-emitters.md).
+
+### `sound.play(self, path?, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `sound.play(self, path?, opts?) -> voice\|nil` |
+| **Parameters** | `self` — `Actor` |
+| | `path` — `string` — optional: the sound file to load (may decode). Omit it to play the emitter's already-resolved slot, which is the frame-safe form |
+| | `opts` — `table` — `{ bus, bus_name, volume, pitch, loop, max_distance, spread, priority }`; an ABSENT field keeps the component's value |
+| **Returns** | a voice handle, or nil when there was nothing to play |
+| **Description** | Plays this actor's emitter at its transform, so panning and attenuation follow the actor's position relative to the listener. Creates the emitter component if the actor does not have one. |
+
+```lua
+function M:start()
+  BOOM = sound.play(self, "assets/audio/boom.wav", { volume = 0.8, max_distance = 600 })
+end
+
+function M:update(dt)
+  -- frame-safe: no decode, one command push
+  if not sound.is_playing(self) then sound.play(self) end
+end
+```
+
+### `sound.stop(self)`
+
+| | |
+|---|---|
+| **Signature** | `sound.stop(self)` |
+| **Parameters** | `self` — `Actor` |
+| **Returns** | *(nothing)* |
+| **Description** | Stops the voice this emitter started. A no-op when the sound already ended, which is the normal case: the end travels on the `sound_finished` signal, not back into the component. |
+
+```lua
+sound.stop(self)
+```
+
+### `sound.set_volume(self, volume)`
+
+| | |
+|---|---|
+| **Signature** | `sound.set_volume(self, volume)` |
+| **Parameters** | `self` — `Actor` |
+| | `volume` — `number` — 1 is full |
+| **Returns** | *(nothing)* |
+| **Description** | Sets the emitter's gain and applies it to the voice already playing. The component is the truth an inspector reads; the change is audible now. |
+
+```lua
+sound.set_volume(self, 0.5)
+```
+
+### `sound.set_pitch(self, pitch)`
+
+| | |
+|---|---|
+| **Signature** | `sound.set_pitch(self, pitch)` |
+| **Parameters** | `self` — `Actor` |
+| | `pitch` — `number` — 1 is original |
+| **Returns** | *(nothing)* |
+| **Description** | Sets the emitter's resample ratio and applies it to the running voice. |
+
+```lua
+sound.set_pitch(self, 0.8)
+```
+
+### `sound.set_loop(self, on)`
+
+| | |
+|---|---|
+| **Signature** | `sound.set_loop(self, on)` |
+| **Parameters** | `self` — `Actor` |
+| | `on` — `boolean` |
+| **Returns** | *(nothing)* |
+| **Description** | Makes the emitter loop (music, ambience). Takes effect on the NEXT play: a running voice keeps the flag it started with, because changing it mid-voice is a click at the loop point. Said out loud so a setter that appears to do nothing is not reported as a bug. |
+
+```lua
+sound.set_loop(self, true)
+sound.play(self, "assets/audio/cave.ogg")
+```
+
+### `sound.set_radius(self, max_distance)`
+
+| | |
+|---|---|
+| **Signature** | `sound.set_radius(self, max_distance)` |
+| **Parameters** | `self` — `Actor` |
+| | `max_distance` — `number` — world units; **0 is GLOBAL** (never attenuated, never panned) |
+| **Returns** | *(nothing)* |
+| **Description** | How far this sound carries. Next play, not the running one: placement is computed when the voice starts. |
+
+```lua
+sound.set_radius(self, 900)   -- audible across half the arena
+```
+
+### `sound.set_spread(self, units)`
+
+| | |
+|---|---|
+| **Signature** | `sound.set_spread(self, units)` |
+| **Parameters** | `self` — `Actor` |
+| | `units` — `number` — world units to full hard-pan |
+| **Returns** | *(nothing)* |
+| **Description** | How far off-centre the sound reaches hard left/right. Next play, like the radius it belongs with. |
+
+```lua
+sound.set_spread(self, 400)
+```
+
+### `sound.is_playing(self)`
+
+| | |
+|---|---|
+| **Signature** | `sound.is_playing(self) -> boolean` |
+| **Parameters** | `self` — `Actor` |
+| **Returns** | `boolean` — true while this emitter's voice is audible |
+| **Description** | Asks the SYSTEM rather than the component, and clears a stale handle when the two disagree. |
+
+```lua
+if not sound.is_playing(self) then sound.play(self) end
+```
+
+### `sound.describe(self)`
+
+| | |
+|---|---|
+| **Signature** | `sound.describe(self) -> table` |
+| **Parameters** | `self` — `Actor` |
+| **Returns** | a table of the emitter's fields, or an EMPTY table when the actor has no emitter |
+| **Description** | Every readable field: `bank_slot`, `path` (the name behind the slot, from the bank), `bus`, `volume`, `pitch`, `loop`, `max_distance`, `spread`, `autoplay`, `playing`, `tick`. This is what an inspector draws, which is why it returns a table instead of one getter per field — a field list in two places drifts. |
+
+```lua
+local d = sound.describe(self)
+log.info(d.path .. " on bus " .. d.bus .. " at " .. d.volume)
 ```

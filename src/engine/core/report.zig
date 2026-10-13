@@ -323,6 +323,33 @@ pub fn writeJson(w: *json.Writer, prof: *const Profiler, ctr: *const Counters, o
     w.raw(",");
     w.field("rss_bytes");
     w.num(ctr.rss_bytes);
+    w.raw(",");
+
+    // audio (M8). Every value is a measurement, not an estimate: the mixer
+    // counts its own overruns and the device reports the period it negotiated,
+    // so a report can say "the audio glitched" with a number rather than a
+    // feeling. Zero across the board means "no audio in this run" (a bench, a
+    // tool), which the gate treats as absent rather than perfect.
+    w.field("audio_voices_peak");
+    w.num(ctr.audio_voices_peak);
+    w.raw(",");
+    w.field("audio_xruns");
+    w.num(ctr.audio_xruns);
+    w.raw(",");
+    w.field("audio_commands_dropped");
+    w.num(ctr.audio_commands_dropped);
+    w.raw(",");
+    w.field("audio_latency_us");
+    w.num(ctr.audio_latency_us);
+    w.raw(",");
+    w.field("audio_mix_ns");
+    w.num(ctr.audio_mix_ns);
+    w.raw(",");
+    w.field("audio_bank_bytes");
+    w.num(ctr.audio_bank_bytes);
+    w.raw(",");
+    w.field("audio_bank_budget");
+    w.num(ctr.audio_bank_budget);
     w.endObject();
     w.raw(",");
 

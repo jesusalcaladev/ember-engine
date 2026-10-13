@@ -361,6 +361,34 @@ pub const Renderer2D = struct {
         self.run_count += 1;
     }
 
+    /// Appends one already-built instance.
+    ///
+    /// The particle system's path: it integrates its own pool and knows its own
+    /// quads, so it does not come from the entity query. It goes through THIS
+    /// function rather than writing `instances[count]` itself, because the
+    /// capacity accounting, the layer-monotonic tracking and the overflow report
+    /// are properties of the FRAME and not of who produced the instance — a
+    /// particle that bypassed them would silently overflow the buffer the `.zson`
+    /// scene was reserved for, and would be invisible in the stats that say how.
+    ///
+    /// Returns false when the frame budget is spent (locked, full): the caller
+    /// counts the drop instead of growing anything (spec §3.1).
+    pub fn pushInstance(self: *Renderer2D, inst: render.SpriteInstance) bool {
+        if (self.count >= self.capacity) {
+            self.stats.overflowed += 1;
+            return false;
+        }
+        self.instances[self.count] = inst;
+        self.layers[self.count] = inst.layer;
+        self.count += 1;
+        // Same monotonic tracking the sprite walk does, with the same meaning:
+        // a particle on a lower layer than the last one means the frame is no
+        // longer layer-ordered and the sort has work to do.
+        if (inst.layer < self.max_layer_seen) self.layers_monotonic = false;
+        if (inst.layer > self.max_layer_seen) self.max_layer_seen = inst.layer;
+        return true;
+    }
+
     /// Submits the frame's instances to the backend. The instance buffer is
     /// uploaded ONCE (spec §4: 32 B per sprite, 1.6 MB at 50k).
     pub fn submit(self: *Renderer2D, r: render.Renderer) void {
@@ -381,12 +409,6 @@ pub const Renderer2D = struct {
         shadow: []const u8 = &.{},
         angles: u32 = 0,
         env: render.SceneEnvironment = .{},
-        /// The GI cascade. Only uploaded when `gi_dirty`, because the pyramid is
-        /// amortized and uploading an unchanged grid every frame would turn an
-        /// amortized cost back into a per-frame one — which is the entire reason
-        /// it is amortized.
-        gi: render.GiUpload = .{},
-        gi_dirty: bool = false,
     };
 
     /// Submits the frame's lights, with the shadow map the CPU half built.
@@ -409,12 +431,6 @@ pub const Renderer2D = struct {
         if (f.angles != 0 and f.shadow.len >= shadow_len) {
             _ = r.createShadowMap(f.angles);
             r.uploadShadowMap(f.shadow[0..shadow_len]);
-        }
-        if (f.gi_dirty) {
-            const want = @as(usize, f.gi.width) * f.gi.height * 4;
-            if (f.gi.width != 0 and f.gi.height != 0 and f.gi.pixels.len >= want) {
-                r.uploadGi(f.gi);
-            }
         }
         if (f.lights.len == 0) return 0;
         r.drawLights(f.lights, f.lights.len);

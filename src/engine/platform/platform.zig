@@ -157,3 +157,35 @@ pub fn init() !void {
 pub fn deinit() void {
     glfw.glfwTerminate();
 }
+
+// ── File watcher (Linux inotify) ──────────────────────────────────────
+//
+// Minimal single-file watcher for hot-reload. Uses inotify directly
+// (no extra deps, no thread). Poll once per frame with `poll()`.
+
+const inotify = @import("inotify.zig");
+
+pub const FileWatcher = inotify.FileWatcher;
+pub const FileWatchError = inotify.FileWatchError;
+/// A directory watch: the asset hot-reload shape. One watch covers every entry
+/// in the directory and reports WHICH one changed, which is what the audio
+/// bank's `reload` needs (M8).
+pub const DirectoryWatcher = inotify.DirectoryWatcher;
+
+/// Creates a watcher for `path`. Returns the watcher; call `poll()` each frame.
+pub fn watchFile(allocator: std.mem.Allocator, path: []const u8) !FileWatcher {
+    return inotify.watchFile(allocator, path);
+}
+
+/// Creates a watcher for a directory of assets. Each frame, `pollNames` fills a
+/// caller-owned array with the entries that changed (borrowed slices, valid
+/// until the next call).
+pub fn watchDirectory(allocator: std.mem.Allocator, path: []const u8) !DirectoryWatcher {
+    return inotify.watchDirectory(allocator, path);
+}
+
+/// True when a changed entry is a sound file the audio backend can decode.
+/// Shared so the editor, the runtime and the asset importer agree on the list.
+pub fn isAudioAsset(name: []const u8) bool {
+    return inotify.isAudioAsset(name);
+}

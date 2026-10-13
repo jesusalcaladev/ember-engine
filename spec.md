@@ -22,6 +22,7 @@ All numbers are measured there. On superior hardware they may only improve; on i
 | ECS: 100k transform updates over SoA queries | 2.0 ms — **M1: 0.484 ms p50 measured** |
 | ECS: parent-chain resolution (10k entities) | 2.0 ms — **M1: 0.586 ms p50 measured** |
 | Signals + framework | 0.8 ms |
+| Audio: main-thread command path (play + bus gains + event drain) | 0.1 ms — **M8: 0.15 µs per `play()`, 0 commands dropped** |
 | Headroom | the rest |
 
 **On the Lua budget, measured**: `zig build bench` reports two rows, because the
@@ -64,7 +65,8 @@ on gameplay: 0.015 % of the frame budget.
 5. No import/bake inside the frame: everything async or budgeted (SDF, atlas, GI full bake).
 6. Pipelines/buffers/shaders/textures are created only at load time; assert if anything GPU is created in-frame.
 7. Audio on its own RT-safe thread: no long locks in the callback.
-8. Workers: spin only within the frame window; parked after 2 idle frames.
+9. Audio: the mix callback is a fixed, pre-reserved set of voices and a fixed command ring — it never allocates, never locks and never touches the filesystem. Decoding is load-time (or a hot-reload outside the frame); the device thread reads PCM it was handed.
+10. Workers: spin only within the frame window; parked after 2 idle frames.
 
 ## 4. GPU
 - **Draw calls ≤ 32** in a typical frame (batching per material/atlas); ≤ 64 with lights + GI (compute passes count).
@@ -93,12 +95,31 @@ Rules:
 - Allocators tagged per subsystem; high-water marks visible in the report.
 - Growth > 5% between consecutive frames is logged in debug (never silent).
 
+### Audio reservations (M8)
+
+Everything the mixer holds is reserved once, at load, and is in the memory
+report by name — the byte budget rule above applies to it like any other cache.
+
+| Reservation | Default | Notes |
+|---|---|---|
+| Voice pool | `audio.voices` × `sizeof(Voice)` | 256 voices by default (`project.config`) |
+| Command ring (main→device) | `audio.command_capacity` | drop-and-count when full; a dropped command is a sound that never played |
+| Event ring (device→main) | `audio.event_capacity` | the reverse direction, same discipline |
+| Decoded PCM bank | `audio.budget_bytes` (32 MiB) | **one** owner per sound's bytes, LRU eviction, `audio.stats().bank_bytes` |
+| Stream windows | charged to the same budget | a stream cannot smuggle memory past the bank |
+
+Output latency is `period_frames / sample_rate` of the NEGOTIATED device, not
+the requested one: 480 frames at 48 kHz is **10 ms**, and the budget is
+**≤ 20 ms**. A device that underruns (`xruns > 0`) is a spec failure, not a
+cosmetic one: it is the audio equivalent of a dropped frame.
+
 ## 6. Determinism
 - Physics at a fixed 60 Hz; gameplay only uses `engine.time` (never wall-clock).
 - Same binary + same inputs → same final state (hash test in CI).
 - Stable signal order (by spawn order).
 - Play→Stop snapshot is **bit-exact** (hash test in CI) — that is what makes editing during play safe.
 - Scene serialization is canonical and **bit-exact**: same world → same bytes → same hash (`.zson`), float formatting round-trips every bit.
+- **Audio never feeds the simulation.** It runs on a thread the simulation does not control, so no gameplay state may branch on it (`is_playing` for a visual is fine; for a rule is not). The fixed step stays a function of the fixed step.
 
 ## 7. Invariant architecture
 - **One process, one window.** The game ALWAYS renders to an offscreen target; the editor composes. Godot-style play in a separate window is forbidden by design.

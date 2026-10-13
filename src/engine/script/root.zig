@@ -42,6 +42,8 @@ pub const context = @import("context.zig");
 pub const statemachine = @import("statemachine.zig");
 pub const spatial = @import("spatial.zig");
 pub const steer = @import("steer.zig");
+pub const batch = @import("batch.zig");
+pub const render = @import("render");
 
 // Short names for what the runtime imports constantly.
 pub const Vm = vm.Vm;

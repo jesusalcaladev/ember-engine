@@ -105,7 +105,13 @@ test "Sprite is POD with sane defaults (the .zson baseline)" {
     try testing.expectEqual(Blend.alpha, s.blend);
     try testing.expect(s.visible);
     // Kept small on purpose: the 50k canonical scene multiplies this by 50000,
-    // so 52 B/sprite is 2.6 MB of column data (spec §5 allows it, but it is
+    // so 56 B/sprite is 2.8 MB of column data (spec §5 allows it, but it is
     // pure cache pressure in the render walk).
-    try testing.expectEqual(@as(usize, 52), @sizeOf(Sprite));
+    //
+    // 56 and not the 52 this used to pin: M7 added `coverage_index` (an i32
+    // index into the lighting coverage store), and the pinned size was not
+    // updated with it. The field is real data, so the number moves and the
+    // comment follows it rather than the field being packed away to keep a
+    // stale constant.
+    try testing.expectEqual(@as(usize, 56), @sizeOf(Sprite));
 }

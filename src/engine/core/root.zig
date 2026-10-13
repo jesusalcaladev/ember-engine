@@ -17,6 +17,7 @@ pub const loop = @import("loop.zig");
 pub const math = @import("math.zig");
 pub const random = @import("random.zig");
 pub const noise = @import("noise.zig");
+pub const global_noise = @import("global_noise.zig");
 
 /// Reads a whole (small) file into `buf`. Fixed-buffer, no allocation: the
 /// CI gate uses it to read a report.json.

@@ -112,6 +112,11 @@ pub const ParticleEmitter2D = struct {
     /// Emit `capacity` particles once and then stop (`playing` goes false), the
     /// `particles.burst` path: one explosion, not a fountain.
     one_shot: bool = false,
+    /// System-owned: the one-shot has already fired. A script that clears the
+    /// particles and sets `playing` again therefore gets a CONTINUING emitter
+    /// rather than a second detonation, which is the difference between "reset
+    /// the explosion" and "explode twice".
+    started_once: bool = false,
     /// Per-emitter playing flag. The scene-file default is `true` so an emitter
     /// declared in `.zson` runs without a script telling it to.
     playing: bool = true,
@@ -209,8 +214,12 @@ test "ParticleEmitter2D is plain data with sane defaults" {
 
 test "the component fits the .zson decode stride" {
     // `max_stride` is the registry's decode buffer; the bound is enforced there
-    // at comptime and pinned here next to the type it protects, next to the
-    // number that made it necessary (108 is what it is, with the colours packed).
+    // at comptime and pinned here next to the type it protects. 108 and not the
+    // 112 the field list suggests: the four bools and the three small enums
+    // pack into padding the u32 fields already force, so the component is
+    // exactly the size of its real data. The pin exists so a field that DOES
+    // push it over 128 fails HERE, named, instead of failing in the registry
+    // with a message about a file.
     try testing.expect(@sizeOf(ParticleEmitter2D) <= 128);
     try testing.expectEqual(@as(usize, 108), @sizeOf(ParticleEmitter2D));
 }

@@ -139,7 +139,6 @@ light.set_color(actor, r, g, b, a)   -- alpha IS the opacity
 light.set_energy(actor, n)
 light.set_blend(actor, 0|1|2)        -- add / subtract / mix
 light.set_shadow(actor, on, filter, smoothness)
-light.set_gi(actor, 0..1)            -- default 0: bounce is opt-in per light
 light.set_mask(actor, bitmask)       -- which sprite layers this light affects
 ```
 
@@ -159,8 +158,7 @@ occluder.get_polygon(actor) -> table -- an editor that drags vertices reads this
 environment.new(actor)                        -- without this the rest is unreachable
 environment.set_ambient(actor, r, g, b, a)
 environment.set_clear(actor, r, g, b, a)
-environment.set_sky(actor, r, g, b)            -- the radiance a GI ray escapes with
-environment.set_gi(actor, enabled, albedo)     -- the cascades; off by default
+environment.set_sky(actor, r, g, b)
 environment.set_bloom(actor, intensity, threshold)
 environment.set_tonemap(actor, on)
 environment.set_fog(actor, near, far)
@@ -174,10 +172,8 @@ lighting.set_quality(tier) -> bool   -- false when a GI tier is refused
 lighting.stats() -> table            -- counts and per-pass ns, empty if unwired
 ```
 
-`lighting.set_quality` returns **false in exactly one case**: a GI-on tier on a
-system created with GI off. The pyramid is a startup budget decision, so it
-declines rather than allocating during what the user believes is a settings
-change. `lighting.quality()` returns **-1**, not 0, when nothing is wired —
+`lighting.set_quality` returns **false** when a tier cannot be taken.
+`lighting.quality()` returns **-1**, not 0, when nothing is wired —
 "there is no lighting system" and "it is switched off" send a user looking for
 different bugs.
 

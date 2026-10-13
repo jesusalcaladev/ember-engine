@@ -12,6 +12,7 @@ the budgets are checked with.
 - [The report: log, JSON, trace](#the-report-log-json-trace)
 - [The CI gate: `ember-profile`](#the-ci-gate-ember-profile)
 - [Budgets and verdicts](#budgets-and-verdicts)
+- [Reading an audio regression](#reading-an-audio-regression)
 - [Instrumenting your own code](#instrumenting-your-own-code)
 - [Design notes and cost](#design-notes-and-cost)
 
@@ -44,6 +45,7 @@ links neither Dawn nor GLFW, so it runs on a headless CI container.
 | Frame rings | exact `beginFrame..endFrame` and work-frame durations, 4096-frame rings | 2 stores |
 | GPU timestamps | WebGPU `QuerySet` + non-blocking `mapAsync` readback (2 frames of latency) | ~0 when off |
 | Counters | draw calls, passes, uploads, allocs, arena high-water, steps, drops | plain adds |
+| Audio (M8) | the mixer's own counters: peak voices, xruns, commands dropped, latency, mix cost per buffer, bank bytes | plain adds, read once per frame |
 | RSS + CPU% | background thread reading `/proc/self/stat`, 250 ms period | 0 (other thread, no locks in the frame) |
 
 Every run ends in a **verdict** against `spec.md`, not in a pretty table: PASS,
@@ -113,12 +115,18 @@ spec.md verdicts: all pass
 `ember-profile run.json [--baseline base.json] [--tolerance 0.05]`:
 
 - prints the same report from the JSON (so CI logs show real numbers);
-- with `--baseline`, compares 14 metrics (frame work p50/p99/p99.9/max, wall
+- with `--baseline`, compares 20 metrics (frame work p50/p99/p99.9/max, wall
   p50/p99, GPU ms, draw calls, uploads, allocs in frame, GPU resources in
-  frame, arena high-water, RSS, frames) and **fails (exit 1)** when any of them
-  regresses more than the tolerance (default 5%, spec §9 / ROADMAP M11);
+  frame, arena high-water, RSS, frames, **audio voices peak, audio xruns, audio
+  commands dropped, audio latency, audio mix cost per buffer, audio bank
+  bytes** — M8) and **fails (exit 1)** when any of them regresses more than the
+  tolerance (default 5%, spec §9 / ROADMAP M11);
 - also fails when the run itself breaks a spec.md budget, with or without a
   baseline.
+
+A metric that is `0` in either report is skipped: a bench or a tool with no
+audio in it must not gate the mixer, and "no audio in this run" is not "the
+audio regressed".
 
 Exit codes: `0` pass, `1` regression or failed verdict, `2` unreadable input.
 
@@ -139,8 +147,26 @@ pinned governor for stable numbers, and prefer p50/p99 for decisions.
 The budgets live in `src/engine/core/budget.zig`, copied verbatim from
 `spec.md`: p50 ≤ 7 ms, p99 ≤ 10 ms, p99.9 ≤ 16.6 ms (work frame), GPU ≤ 6 ms,
 ≤ 32 draw calls, ≤ 2 MB uploads/frame, 0 allocations in the frame, RSS ≤ 48 MB
-(export, empty). If spec.md changes, that file changes: one edit, every verdict
-follows.
+(export, empty), audio latency ≤ 20 ms, 0 audio xruns, 0 dropped commands,
+mix cost inside the device period. If spec.md changes, that file changes: one
+edit, every verdict follows.
+
+The audio verdicts report `unknown` — not `pass` — when a run has no audio
+system, because "no audio" and "audio that never glitched" must not look alike
+in a CI log.
+
+## Reading an audio regression
+
+Audio's failure mode is not a crash, it is a crackle, so its metrics are the
+ones to read first:
+
+| Metric | Meaning | First thing to check |
+|---|---|---|
+| `audio_xruns` | the mix did not finish inside its period | `audio_mix_ns`: the callback is too expensive, or `period_frames` is too small |
+| `audio_commands_dropped` | the ring was full | how many sounds fire in one frame — a spawn of 200 emitters is one decision, not 200 pushes |
+| `audio_mix_ns` | device-thread cost per buffer | voice count (`audio_voices_peak`) and resampling: a sound at a different rate is resampled every sample |
+| `audio` zone | the main-thread cost | `play()` is one ring push; the rest is `beginFrame`'s stream refills |
+| `audio_bank_bytes` | decoded PCM vs its budget | an LRU eviction storm means sounds are decoded twice |
 
 ## Instrumenting your own code
 

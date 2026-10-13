@@ -243,7 +243,13 @@ pub const Grid = struct {
                 var i = start;
                 while (i < end) : (i += 1) {
                     const e = self.entries[i];
-                    const t: *Transform = world.get(e, Transform) orelse continue;
+                    // Direct access without world.get overhead: read entity from world slots
+                    if (e.index >= world.slots.items.len) continue;
+                    const slot = world.slots.items[e.index];
+                    if (!slot.occupied or slot.generation != e.generation) continue;
+                    const arch = &world.archetypes.items[slot.archetype];
+                    const col = arch.findColumn(ecs.components.componentId(Transform)) orelse continue;
+                    const t: *Transform = arch.cellPtr(Transform, col, slot.row);
                     const px = t.position.x;
                     const py = t.position.y;
                     const dx = px - x;

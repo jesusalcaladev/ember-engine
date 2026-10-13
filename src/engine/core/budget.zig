@@ -46,6 +46,11 @@ pub const Budget = struct {
     upload_bytes_per_frame: u64 = 2 << 20,
     gpu_resources_per_frame: u64 = 0,
 
+    // M8 audio (§2 and §5): the device period the mixer must fit inside, and
+    // the one counter that is allowed to be exactly zero and nothing else.
+    audio_latency_ms: f64 = 20.0,
+    audio_mix_ms: f64 = 10.0, // the mix must fit well inside the period
+
     // §5 RAM (MB)
     rss_export_empty_mb: u64 = 48,
     rss_export_demo_mb: u64 = 128,
@@ -238,6 +243,54 @@ pub fn evaluate(b: Budget, prof: *const Profiler, ctr: *const Counters, mode: Mo
         .status = statusFor(@floatFromInt(ctr.upload_bytes), @floatFromInt(b.upload_bytes_per_frame), true),
     });
 
+    // ── M8 audio ────────────────────────────────────────────────────────────
+    // Verdicts, not decoration: the mixer's own counters are the only honest
+    // way to know the RT thread kept up. An absent system (no counters filled)
+    // reports `unknown` rather than passing, because "no audio" and "audio
+    // that never glitched" must not look alike in a CI log.
+    const audio_present = ctr.audio_latency_us != 0 or ctr.audio_voices_peak != 0;
+    rep.add(.{
+        .name = "audio latency",
+        .value = @as(f64, @floatFromInt(ctr.audio_latency_us)) / 1000.0,
+        .limit = b.audio_latency_ms,
+        .unit = .ms,
+        .status = if (!audio_present) .unknown else statusFor(
+            @as(f64, @floatFromInt(ctr.audio_latency_us)) / 1000.0,
+            b.audio_latency_ms,
+            true,
+        ),
+        .note = if (!audio_present) "no audio system in this run" else "",
+    });
+    rep.add(.{
+        .name = "audio xruns",
+        .value = @floatFromInt(ctr.audio_xruns),
+        .limit = 0,
+        .unit = .count,
+        // Zero is the ONLY passing value: one underrun is one audible glitch.
+        .status = if (!audio_present) .unknown else if (ctr.audio_xruns == 0) .pass else .fail,
+        .note = if (!audio_present) "no audio system in this run" else "",
+    });
+    rep.add(.{
+        .name = "audio commands dropped",
+        .value = @floatFromInt(ctr.audio_commands_dropped),
+        .limit = 0,
+        .unit = .count,
+        .status = if (!audio_present) .unknown else if (ctr.audio_commands_dropped == 0) .pass else .fail,
+        .note = if (!audio_present) "no audio system in this run" else "",
+    });
+    rep.add(.{
+        .name = "audio mix per buffer",
+        .value = @as(f64, @floatFromInt(ctr.audio_mix_ns)) / 1_000_000.0,
+        .limit = b.audio_mix_ms,
+        .unit = .ms,
+        .status = if (!audio_present) .unknown else statusFor(
+            @as(f64, @floatFromInt(ctr.audio_mix_ns)) / 1_000_000.0,
+            b.audio_mix_ms,
+            true,
+        ),
+        .note = if (!audio_present) "no audio system in this run" else "",
+    });
+
     // ── §5 RAM ──────────────────────────────────────────────────────────────
     const rss_mb: f64 = @as(f64, @floatFromInt(ctr.rss_bytes)) / (1024.0 * 1024.0);
     const rss_limit: f64 = switch (mode) {
@@ -265,6 +318,38 @@ fn findZone(prof: *const Profiler, name: []const u8) ?usize {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+test "audio verdicts are unknown without a system and fail on an xrun" {
+    const b = Budget{};
+    var prof = Profiler{};
+    prof.beginFrame(true);
+    prof.endFrame();
+    prof.pushWorkFrame(1_000_000);
+
+    // No counters: audio simply is not part of this run, and saying so is
+    // different from saying it passed.
+    var ctr = Counters{};
+    var rep = evaluate(b, &prof, &ctr, .game);
+    for (rep.results[0..rep.count]) |r| {
+        if (std.mem.startsWith(u8, r.name, "audio")) try std.testing.expectEqual(Status.unknown, r.status);
+    }
+
+    // A live system: latency inside the period and zero xruns pass.
+    ctr = Counters{ .audio_latency_us = 10_000, .audio_voices_peak = 64, .audio_mix_ns = 1_000_000 };
+    rep = evaluate(b, &prof, &ctr, .game);
+    for (rep.results[0..rep.count]) |r| {
+        if (std.mem.startsWith(u8, r.name, "audio")) try std.testing.expectEqual(Status.pass, r.status);
+    }
+
+    // One underrun: exactly one audible glitch, and exactly one FAIL.
+    ctr.audio_xruns = 1;
+    rep = evaluate(b, &prof, &ctr, .game);
+    var saw_fail = false;
+    for (rep.results[0..rep.count]) |r| {
+        if (std.mem.eql(u8, r.name, "audio xruns")) saw_fail = r.status == .fail;
+    }
+    try std.testing.expect(saw_fail);
+}
+
 test "the spec's per-system budget constants are the ones spec.md states" {
     // Checked here, exactly, because the timing test below cannot check them
     // exactly: it can only measure. §2's numbers are the whole point of the
@@ -283,6 +368,10 @@ test "the spec's per-system budget constants are the ones spec.md states" {
     try std.testing.expectEqual(@as(u64, 32), b.draw_calls);
     try std.testing.expectEqual(@as(u64, 64), b.draw_calls_with_gi);
     try std.testing.expectEqual(@as(u64, 2 << 20), b.upload_bytes_per_frame);
+    // M8: the audio numbers spec.md states. Pinned here so a widened threshold
+    // has to be a conscious edit of this list too.
+    try std.testing.expectEqual(@as(f64, 20.0), b.audio_latency_ms);
+    try std.testing.expectEqual(@as(f64, 10.0), b.audio_mix_ms);
 }
 
 test "a fast run passes the frame budget" {

@@ -334,6 +334,35 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "actor.set_transform",
+        .module = "actor",
+        .signature = "actor.set_transform(self, x, y, rot?, scale?)",
+        .summary = "Batch set: position, rotation and scale in one call.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x", .kind = .number },
+            .{ .name = "y", .kind = .number },
+            .{ .name = "rot", .kind = .number },
+            .{ .name = "scale", .kind = .number },
+        },
+        .returns = &.{},
+        .example =
+        \\actor.set_transform(self, 100, 200, 1.57, 1.0)
+        ,
+    },
+    .{
+        .name = "actor.get_all",
+        .module = "actor",
+        .signature = "actor.get_all(self) -> table",
+        .summary = "Batch get: all actor components as one table (replaces N bindings).",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .table, .doc = "table of component values" }},
+        .example =
+        \\local data = actor.get_all(self)
+        \\local pos = data.transform.position
+        ,
+    },
+    .{
         .name = "actor.direction_to",
         .module = "actor",
         .signature = "actor.direction_to(self, other) -> number, number",
@@ -560,6 +589,345 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\local hit = physics.contains_point(mx, my)
+        ,
+    },
+    // ── audio (M8) ──────────────────────────────────────────────────────────
+    .{
+        .name = "audio.play_file",
+        .module = "audio",
+        .signature = "audio.play_file(path, opts?) -> voice",
+        .summary = "Plays a sound file and returns a handle. Load-time/preview: it may decode, so keep gameplay on a resident slot.",
+        .params = &.{
+            .{ .name = "path", .kind = .string, .doc = "path to the sound file, relative to the project root" },
+            .{ .name = "opts", .kind = .table, .doc = "{ bus, bus_name, volume, pitch, max_distance, spread, loop, priority }" },
+        },
+        .returns = &.{
+            .{ .kind = .any, .doc = "a voice handle, or nil when it could not load" },
+        },
+        .example =
+        \\local boom = audio.play_file("sfx/boom.wav", { bus_name = "sfx", volume = 0.8 })
+        \\if boom then log.info("boom is playing") end
+        ,
+    },
+    .{
+        .name = "audio.play_stream",
+        .module = "audio",
+        .signature = "audio.play_stream(path, opts?) -> voice",
+        .summary = "Plays a sound STREAMED from disk: only a small window is resident and the frame loop keeps it fed. Use it for long music.",
+        .params = &.{
+            .{ .name = "path", .kind = .string, .doc = "path to the sound file, relative to the project root" },
+            .{ .name = "opts", .kind = .table, .doc = "{ bus, bus_name, volume, pitch, max_distance, spread, loop, priority }" },
+        },
+        .returns = &.{
+            .{ .kind = .any, .doc = "a voice handle, or nil when it could not open" },
+        },
+        .example =
+        \\local music = audio.play_stream("music/theme.ogg", { loop = true, bus_name = "music" })
+        ,
+    },
+    .{
+        .name = "audio.stop",
+        .module = "audio",
+        .signature = "audio.stop(voice)",
+        .summary = "Stops one playing sound. A stale handle is a no-op.",
+        .params = &.{.{ .name = "voice", .kind = .any }},
+        .returns = &.{},
+        .example =
+        \\audio.stop(boom)
+        ,
+    },
+    .{
+        .name = "audio.stop_all",
+        .module = "audio",
+        .signature = "audio.stop_all()",
+        .summary = "Stops every playing sound. The Play/Stop hook: leaves the mixer silent and exact.",
+        .params = &.{},
+        .returns = &.{},
+        .example =
+        \\audio.stop_all()
+        ,
+    },
+    .{
+        .name = "audio.set_volume",
+        .module = "audio",
+        .signature = "audio.set_volume(voice, volume)",
+        .summary = "Changes a playing sound's own volume (before bus gain).",
+        .params = &.{
+            .{ .name = "voice", .kind = .any },
+            .{ .name = "volume", .kind = .number, .doc = "1 is full; >1 is allowed and soft-clipped" },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.set_volume(boom, 0.5)
+        ,
+    },
+    .{
+        .name = "audio.set_pitch",
+        .module = "audio",
+        .signature = "audio.set_pitch(voice, pitch)",
+        .summary = "Changes a playing sound's pitch (the resample ratio): 2 is an octave up.",
+        .params = &.{
+            .{ .name = "voice", .kind = .any },
+            .{ .name = "pitch", .kind = .number, .doc = "1 is original" },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.set_pitch(boom, 0.8)  -- lower and slower
+        ,
+    },
+    .{
+        .name = "audio.is_playing",
+        .module = "audio",
+        .signature = "audio.is_playing(voice) -> boolean",
+        .summary = "Whether a voice is still playing. False for a stale handle.",
+        .params = &.{.{ .name = "voice", .kind = .any }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true while the sound is audible" }},
+        .example =
+        \\if not audio.is_playing(boom) then log.info("done") end
+        ,
+    },
+    .{
+        .name = "audio.set_master_volume",
+        .module = "audio",
+        .signature = "audio.set_master_volume(gain)",
+        .summary = "Sets the master volume (bus 0). Applies to everything.",
+        .params = &.{.{ .name = "gain", .kind = .number, .doc = "1 is full" }},
+        .returns = &.{},
+        .example =
+        \\audio.set_master_volume(0.6)
+        ,
+    },
+    .{
+        .name = "audio.set_listener",
+        .module = "audio",
+        .signature = "audio.set_listener(x, y, rotation?)",
+        .summary = "Where the ears are and which way they face. The rotation turns the stereo field: a sound to the world-east pans right when the ears face +x.",
+        .params = &.{
+            .{ .name = "x", .kind = .number },
+            .{ .name = "y", .kind = .number },
+            .{ .name = "rotation", .kind = .number, .doc = "radians; 0 (default) faces +x" },
+        },
+        .returns = &.{},
+        .example =
+        \\local px, py = actor.get_position(self)
+        \\audio.set_listener(px, py, 0)  -- ears face +x
+        ,
+    },
+    .{
+        .name = "audio.solo_bus",
+        .module = "audio",
+        .signature = "audio.solo_bus(bus, solo)",
+        .summary = "Solos or unsolos a bus. While any bus is soloed, every other bus except master is silent.",
+        .params = &.{
+            .{ .name = "bus", .kind = .any, .doc = "bus name or id" },
+            .{ .name = "solo", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.solo_bus("music", true)
+        ,
+    },
+    .{
+        .name = "audio.set_bus_send",
+        .module = "audio",
+        .signature = "audio.set_bus_send(bus, target, amount)",
+        .summary = "Routes part of a bus into another bus's gain path (an aux/reverb send). A nil target clears it.",
+        .params = &.{
+            .{ .name = "bus", .kind = .any, .doc = "source bus name or id" },
+            .{ .name = "target", .kind = .any, .doc = "destination bus name or id, or nil to clear" },
+            .{ .name = "amount", .kind = .number, .doc = "fraction of the source signal, 0..4" },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.set_bus_send("sfx", "reverb", 0.25)
+        ,
+    },
+    .{
+        .name = "audio.bus_gain",
+        .module = "audio",
+        .signature = "audio.bus_gain(bus) -> number",
+        .summary = "A bus's current gain, by name or id. A missing name reads as 1.",
+        .params = &.{.{ .name = "bus", .kind = .any, .doc = "bus name ('music') or id (number)" }},
+        .returns = &.{.{ .kind = .number, .doc = "0 when muted, otherwise the gain" }},
+        .example =
+        \\log.info("music is at " .. audio.bus_gain("music"))
+        ,
+    },
+    .{
+        .name = "audio.set_bus_volume",
+        .module = "audio",
+        .signature = "audio.set_bus_volume(bus, gain)",
+        .summary = "Sets a bus gain by name or id. What a mixer slider writes.",
+        .params = &.{
+            .{ .name = "bus", .kind = .any, .doc = "bus name or id" },
+            .{ .name = "gain", .kind = .number, .doc = "1 is full" },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.set_bus_volume("music", 0.4)
+        ,
+    },
+    .{
+        .name = "audio.mute_bus",
+        .module = "audio",
+        .signature = "audio.mute_bus(bus, muted)",
+        .summary = "Mutes or unmutes a bus. Muted voices keep playing but are silent.",
+        .params = &.{
+            .{ .name = "bus", .kind = .any, .doc = "bus name or id" },
+            .{ .name = "muted", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\audio.mute_bus("sfx", true)
+        ,
+    },
+    .{
+        .name = "audio.buses",
+        .module = "audio",
+        .signature = "audio.buses() -> table",
+        .summary = "Every named bus as { name, id, gain, muted, solo, send_to, send_amount }, in bus order. What the mixer panel iterates.",
+        .params = &.{},
+        .returns = &.{.{ .kind = .table, .doc = "an array of bus records" }},
+        .example =
+        \\for _, bus in ipairs(audio.buses()) do panel:add(bus.name, bus.gain) end
+        ,
+    },
+    .{
+        .name = "audio.stats",
+        .module = "audio",
+        .signature = "audio.stats() -> table",
+        .summary = "Engine counters: voices active/peak, xruns, latency, the negotiated rate, and the bank's bytes.",
+        .params = &.{},
+        .returns = &.{.{ .kind = .table, .doc = "voices_active, voices_peak, xruns, commands_dropped, latency_ms, period_frames, sample_rate, channels, bank_bytes, bank_budget" }},
+        .example =
+        \\local s = audio.stats()
+        \\if s.xruns > 0 then log.warn("audio is glitching: " .. s.xruns) end
+        ,
+    },
+    // ── sound (M8): the per-actor `SoundEmitter2D` surface ───────────────────
+    .{
+        .name = "sound.play",
+        .module = "sound",
+        .signature = "sound.play(self, path?, opts?) -> voice",
+        .summary = "Plays this actor's emitter at its transform. Omitting `path` plays the slot the scene already resolved (the frame-safe form).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "path", .kind = .string, .doc = "sound file to load, relative to the project root; omit to use the emitter's own bank slot" },
+            .{ .name = "opts", .kind = .table, .doc = "{ bus, bus_name, volume, pitch, loop, max_distance, spread, priority }; absent fields keep the component's values" },
+        },
+        .returns = &.{
+            .{ .kind = .any, .doc = "a voice handle, or nil when there was nothing to play" },
+        },
+        .example =
+        \\function M:start()
+        \\  -- author-time / preview: the path may decode
+        \\  BOOM = sound.play(self, "sfx/boom.wav", { volume = 0.8, max_distance = 600 })
+        \\end
+        ,
+    },
+    .{
+        .name = "sound.stop",
+        .module = "sound",
+        .signature = "sound.stop(self)",
+        .summary = "Stops the voice this emitter started. A no-op when it already ended.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\sound.stop(self)
+        ,
+    },
+    .{
+        .name = "sound.set_volume",
+        .module = "sound",
+        .signature = "sound.set_volume(self, volume)",
+        .summary = "Sets the emitter's gain and applies it to the voice already playing.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "volume", .kind = .number, .doc = "1 is full; >1 is allowed and soft-clipped" },
+        },
+        .returns = &.{},
+        .example =
+        \\sound.set_volume(self, 0.5)  -- the sound already playing gets quieter now
+        ,
+    },
+    .{
+        .name = "sound.set_pitch",
+        .module = "sound",
+        .signature = "sound.set_pitch(self, pitch)",
+        .summary = "Sets the emitter's resample ratio and applies it to the voice already playing.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "pitch", .kind = .number, .doc = "1 is original; 2 is an octave up" },
+        },
+        .returns = &.{},
+        .example =
+        \\sound.set_pitch(self, 0.8)  -- lower and slower
+        ,
+    },
+    .{
+        .name = "sound.set_loop",
+        .module = "sound",
+        .signature = "sound.set_loop(self, on)",
+        .summary = "Makes the emitter loop. Takes effect on the next play: a running voice keeps the flag it started with.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "on", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\sound.set_loop(self, true)
+        \\sound.play(self, "ambience/cave.ogg")
+        ,
+    },
+    .{
+        .name = "sound.set_radius",
+        .module = "sound",
+        .signature = "sound.set_radius(self, max_distance)",
+        .summary = "How far this sound carries. 0 means global: never attenuated, never panned (music, UI). Next play, not the running one.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "max_distance", .kind = .number, .doc = "world units; 0 = global" },
+        },
+        .returns = &.{},
+        .example =
+        \\sound.set_radius(self, 900)  -- audible across half the arena
+        ,
+    },
+    .{
+        .name = "sound.set_spread",
+        .module = "sound",
+        .signature = "sound.set_spread(self, units)",
+        .summary = "How far off-centre the sound reaches hard left/right. Next play, not the running one.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "units", .kind = .number, .doc = "world units to full pan" },
+        },
+        .returns = &.{},
+        .example =
+        \\sound.set_spread(self, 400)  -- default: hard-pan a screen away
+        ,
+    },
+    .{
+        .name = "sound.is_playing",
+        .module = "sound",
+        .signature = "sound.is_playing(self) -> boolean",
+        .summary = "Whether this emitter's voice is still audible. Asks the system, and clears a stale handle.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true while the sound is playing" }},
+        .example =
+        \\if not sound.is_playing(self) then sound.play(self) end
+        ,
+    },
+    .{
+        .name = "sound.describe",
+        .module = "sound",
+        .signature = "sound.describe(self) -> table",
+        .summary = "Every readable field of this emitter: bank slot, its path, bus, volume, pitch, loop, radius, spread, autoplay, playing, tick.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .table, .doc = "an empty table when the actor has no emitter" }},
+        .example =
+        \\local d = sound.describe(self)
+        \\log.info(d.path .. " on bus " .. d.bus .. " at " .. d.volume)
         ,
     },
     .{
@@ -1177,37 +1545,116 @@ pub const bindings = [_]Binding{
         \\\environment.set_sky(actor, 0.4, 0.45, 0.6)
         ,
     },
+    // ── M9: scene transitions (the fade) ──────────────────────────────────────
     .{
-        .name = "environment.set_gi",
-        .module = "environment",
-        .signature = "environment.set_gi(self, enabled, albedo)",
-        .summary = "Whether to build the radiance cascades, and how much an occluder reflects back. Off by default: it is the most expensive thing in the lighting system, and a scene that gets GI without asking has corners darker than its author drew.",
+        .name = "scene.fade_out",
+        .module = "scene",
+        .signature = "scene.fade_out(duration, r, g, b)",
+        .summary = "Covers the screen with the given colour over `duration` real seconds. Zero duration is an instant cover. Restarting an existing fade replaces it.",
         .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "enabled", .kind = .boolean, .doc = "build the cascades" },
-            .{ .name = "albedo", .kind = .number, .doc = "0..1 bounce; 0.85 is a mid-grey wall" },
+            .{ .name = "duration", .kind = .number, .doc = "seconds; 0 = instant" },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
         },
-        .returns = &.{
-        },
+        .returns = &.{},
         .example =
-        \\\environment.set_gi(actor, true, 0.8)
+        \\scene.fade_out(1.0, 0, 0, 0)
         ,
     },
     .{
-        .name = "environment.get_sky",
-        .module = "environment",
-        .signature = "environment.get_sky(self) -> r, g, b",
-        .summary = "The sky's radiance as three numbers.",
+        .name = "scene.fade_in",
+        .module = "scene",
+        .signature = "scene.fade_in(duration)",
+        .summary = "Uncovers from wherever the curtain currently is. Zero duration is an instant clear.",
         .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "duration", .kind = .number, .doc = "seconds; 0 = instant" },
         },
+        .returns = &.{},
+        .example =
+        \\scene.fade_in(0.5)
+        ,
+    },
+    .{
+        .name = "scene.fade_covered",
+        .module = "scene",
+        .signature = "scene.fade_covered(r, g, b)",
+        .summary = "Jumps straight to a fully covered screen (a loading screen's first frame).",
+        .params = &.{
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+        },
+        .returns = &.{},
+        .example =
+        \\scene.fade_covered(0, 0, 0)
+        ,
+    },
+    .{
+        .name = "scene.fade_clear",
+        .module = "scene",
+        .signature = "scene.fade_clear()",
+        .summary = "Jumps straight back to a clear screen.",
+        .params = &.{},
+        .returns = &.{},
+        .example =
+        \\scene.fade_clear()
+        ,
+    },
+    .{
+        .name = "scene.fade_amount",
+        .module = "scene",
+        .signature = "scene.fade_amount() -> 0..1",
+        .summary = "Current curtain coverage.",
+        .params = &.{},
         .returns = &.{
-            .{ .kind = .number, .doc = "red" },
-            .{ .kind = .number, .doc = "green" },
-            .{ .kind = .number, .doc = "blue" },
+            .{ .kind = .number, .doc = "coverage 0..1" },
         },
         .example =
-        \\\local r, g, b = environment.get_sky(actor)
+        \\local a = scene.fade_amount()
+        ,
+    },
+    .{
+        .name = "scene.fading",
+        .module = "scene",
+        .signature = "scene.fading() -> boolean",
+        .summary = "True while a transition is running.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true = fading" },
+        },
+        .example =
+        \\if scene.fading() then return end
+        ,
+    },
+    // ── M9: particles (the CPU pool) ──────────────────────────────────────────
+    .{
+        .name = "particles.burst",
+        .module = "particles",
+        .signature = "particles.burst(self, count) -> emitted",
+        .summary = "Emits `count` particles NOW from this actor's ParticleEmitter2D. Returns how many were actually emitted (may be less if the emitter's slab is full).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "count", .kind = .integer, .doc = "how many to emit" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "how many were emitted" },
+        },
+        .example =
+        \\particles.burst(self, 32)
+        ,
+    },
+    .{
+        .name = "particles.stats",
+        .module = "particles",
+        .signature = "particles.stats() -> { simulated, live, spawned, drawn, culled, dropped_spawn, slab_denied, sim_ms, collect_ms }",
+        .summary = "Per-frame particle counters. `dropped_spawn` or `slab_denied` > 0 means the pool was too small at load time.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .table, .doc = "counters" },
+        },
+        .example =
+        \\local s = particles.stats()\nif s.dropped_spawn > 0 then log.warn("particle pool too small") end
         ,
     },
     .{
@@ -1355,21 +1802,6 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\light.set_shadow(self, true, 2, 2)
-        ,
-    },
-    .{
-        .name = "light.set_gi",
-        .module = "light",
-        .signature = "light.set_gi(self, contribution)",
-        .summary = "How much of the global-illumination enclosure term this light applies. Zero by default: a scene that did not ask for bounce should not have it.",
-        .params = &.{
-            .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "contribution", .kind = .number, .doc = "0..1" },
-        },
-        .returns = &.{
-        },
-        .example =
-        \\light.set_gi(self, 0.3)
         ,
     },
     .{

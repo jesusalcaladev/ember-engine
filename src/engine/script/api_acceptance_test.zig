@@ -21,6 +21,7 @@ const statemachine = @import("statemachine.zig");
 const spatial = @import("spatial.zig");
 const steer = @import("steer.zig");
 const physics = @import("physics");
+const audio = @import("audio");
 const build_options = @import("options");
 
 /// One named check. `text` is Lua source that must evaluate to `true`; the
@@ -477,7 +478,6 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             \\light.new(self, 0, 192, 1.0, 0.69, 0.41, 1)
             \\light.set_cone(self, 45, 0.25)
             \\light.set_shadow(self, true, 2, 2)
-            \\light.set_gi(self, 0.3)
             \\light.set_mask(self, 255)
             \\local r, e = light.get_radius(self), light.get_energy(self)
             \\local degs, pen = light.get_cone(self)
@@ -531,7 +531,7 @@ fn checkPhysics(allocator: std.mem.Allocator) bool {
             \\environment.set_sky(self, 0.4, 0.45, 0.6)
             \\local r, g, b = environment.get_sky(self)
             \\if r ~= 0.4 or g ~= 0.45 or b ~= 0.6 then return false end
-            \\environment.set_gi(self, true, 0.8)
+            
             \\environment.set_bloom(self, 0.4, 0.85)
             \\local amb = environment.get_ambient(self)
             \\return amb ~= nil and r == 0.4
@@ -972,6 +972,306 @@ fn checkSteering(allocator: std.mem.Allocator) bool {
     return all_ok;
 }
 
+// ── Audio (M8) ───────────────────────────────────────────────────────────────
+// The audio bindings' correctness depends on state that lives outside Lua: the
+// system owns whether a voice is live. An `audio.is_playing` stub that always
+// returned true would pass a pure-Lua test and break every one-shot, so these
+// drive a real `Audio` on the null backend and read the answer back out.
+
+/// Runs a chunk that returns one boolean. Separate from `runCheck` because the
+/// audio check needs the SAME VM across steps (it pumps the device between
+/// them), which `runCheck`'s fresh VM per call cannot provide.
+///
+/// The result is read from the TOP and POPPED, which is the fix for a bug that
+/// made every check below vacuous: `loadBuffer` leaves the compiled function on
+/// the stack and `lua_pcall` leaves its result on top of it, so with the result
+/// never popped, check N read whatever check 1 left at index 1 — a `true` that
+/// had nothing to do with the code that had just run. A check whose assertions
+/// all failed still reported `ok`. The stack is the state here; index -1 is the
+/// answer to THIS call.
+fn runSrcBool(vm: *vm_mod.Vm, src: [:0]const u8, label: [*:0]const u8) bool {
+    const L = vm.state() orelse return false;
+    vm.loadBuffer(src, label) catch |e| {
+        std.debug.print("  loadBuffer failed: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) {
+        var msg_buf: [256]u8 = undefined;
+        if (vm.readError(&msg_buf)) |msg| std.debug.print("  lua error: {s}\n", .{msg});
+        lua.pop(L, 1); // the error message, so the next check starts clean
+        return false;
+    }
+    const ok = lua.toBool(L, -1);
+    lua.pop(L, 1);
+    return ok;
+}
+
+fn checkAudio(allocator: std.mem.Allocator) bool {
+    var vm = vm_mod.Vm.init(allocator) catch {
+        std.debug.print("  Vm.init failed\n", .{});
+        return false;
+    };
+    defer vm.deinit();
+    const L = vm.state() orelse {
+        std.debug.print("  Vm has no state\n", .{});
+        return false;
+    };
+
+    var world = ecs.World.init(allocator);
+    defer world.deinit();
+    const input = context_mod.Input{};
+    var ctx = bindings.Context.init(&world, &input);
+
+    // The one line that makes audio reachable from Lua at all.
+    const sys = audio.Audio.create(allocator, .null, .{ .voices = 16, .budget_bytes = 1 << 20 }) catch {
+        std.debug.print("  Audio.create failed\n", .{});
+        return false;
+    };
+    defer sys.destroy();
+    // Named buses beyond master, so the mixer-panel surface (solo, sends) has
+    // something to point at. Load time only, which is where this runs.
+    sys.defineBuses(&.{ "master", "music", "sfx" }) catch {
+        std.debug.print("  defineBuses failed\n", .{});
+        return false;
+    };
+    ctx.audio = sys;
+    bindings.registerAll(L, &ctx);
+
+    // 1. A play returns a handle synchronously (the device fills it in later).
+    if (!runSrcBool(
+        &vm,
+        \\V = audio.play_file("boom:100", { loop = true, bus_name = "master" })
+        \\return V ~= nil
+    , "audio_play")) {
+        std.debug.print("  FAIL audio.play_file did not return a handle\n", .{});
+        return false;
+    }
+
+    // The device thread starts the sound on its next buffer. The headless
+    // backend is pumped by hand, exactly as the bench does.
+    sys.pump(64);
+
+    // 2. It is playing; buses, gains and stats are all readable; the controls
+    //    write and the stop lands.
+    if (!runSrcBool(
+        &vm,
+        \\if not audio.is_playing(V) then return false end
+        \\audio.set_bus_volume("master", 0.5)
+        \\if math.abs(audio.bus_gain("master") - 0.5) > 0.001 then return false end
+        \\audio.set_master_volume(0.8)
+        \\audio.set_listener(10, 20, 1.2)  -- rotation is accepted
+        \\local s = audio.stats()
+        \\if s.xruns ~= 0 then return false end
+        \\if s.latency_ms > 20 then return false end
+        \\if s.voices_active ~= 1 then return false end
+        \\local b = audio.buses()
+        \\if #b < 1 then return false end
+        \\if b[1].name ~= "master" then return false end
+        \\audio.solo_bus("sfx", true)
+        \\local soloed = false
+        \\for _, bus in ipairs(audio.buses()) do
+        \\  if bus.name == "sfx" and bus.solo then soloed = true end
+        \\end
+        \\if not soloed then return false end
+        \\audio.solo_bus("sfx", false)
+        \\audio.set_bus_send("sfx", "music", 0.25)
+        \\local sent = false
+        \\for _, bus in ipairs(audio.buses()) do
+        \\  if bus.name == "sfx" and bus.send_amount > 0.2 then sent = true end
+        \\end
+        \\if not sent then return false end
+        \\audio.set_volume(V, 0.5)
+        \\audio.set_pitch(V, 0.5)
+        \\audio.stop(V)
+        \\return true
+    , "audio_state")) {
+        std.debug.print("  FAIL audio state / buses / stats / stop\n", .{});
+        return false;
+    }
+
+    sys.pump(64);
+
+    // 3. The stopped handle is stale: is_playing is false and a second stop is
+    //    a no-op, not an error.
+    if (!runSrcBool(
+        &vm,
+        \\if audio.is_playing(V) then return false end
+        \\audio.stop(V)
+        \\audio.stop_all()
+        \\return true
+    , "audio_stale")) {
+        std.debug.print("  FAIL a stopped voice still reads as playing\n", .{});
+        return false;
+    }
+
+    // 4. A STREAMED sound: `play_stream` opens a window instead of decoding the
+    //    whole file. It starts like any other voice and the window is fed by
+    //    `beginFrame`/`refillStreams` (called just below).
+    if (!runSrcBool(
+        &vm,
+        \\local S = audio.play_stream("long:4000", { volume = 1.0 })
+        \\if S == nil then return false end
+        \\STREAMV = S
+        \\return true
+    , "audio_stream_start")) {
+        std.debug.print("  FAIL audio.play_stream did not return a handle\n", .{});
+        return false;
+    }
+    // The frame loop's refill, then a buffer: the stream becomes live.
+    sys.beginFrame(1);
+    sys.pump(480);
+    if (!runSrcBool(
+        &vm,
+        \\if not audio.is_playing(STREAMV) then return false end
+        \\return true
+    , "audio_stream_playing")) {
+        std.debug.print("  FAIL a streamed voice never became live\n", .{});
+        return false;
+    }
+    // Let it drain and stop it: a streaming voice stops like any other.
+    sys.beginFrame(2);
+    sys.pump(480);
+    if (!runSrcBool(
+        &vm,
+        \\audio.stop(STREAMV)
+        \\return true
+    , "audio_stream_stop")) {
+        std.debug.print("  FAIL could not stop a streamed voice\n", .{});
+        return false;
+    }
+
+    // 5. `sound.*`: the per-actor emitter. Two things this checks that
+    //    `audio.*` cannot: the voice carries the ACTOR's transform (a
+    //    positional play is the whole point of the component), and the
+    //    component is the configuration an inspector reads back.
+    const actor = world.spawn(.{ecs.components.Transform{ .position = .{ .x = 300, .y = 40 } }}) catch {
+        std.debug.print("  spawn failed\n", .{});
+        return false;
+    };
+    // A behaviour-shaped `self`: one table with the entity stamped in, exactly
+    // what `behavior.zig` does for a real instance.
+    _ = lua.lua_createtable(L, 0, 1);
+    bindings.stampEntityForTest(L, actor);
+    lua.setGlobal(L, "SELF");   // pops the table: [..] -> [..]
+
+    if (!runSrcBool(
+        &vm,
+        \\local V = sound.play(SELF, "boom:100", { volume = 0.5 })
+        \\if V == nil then return false end
+        \\SOUNDV = V
+        \\return true
+    , "sound_play")) {
+        std.debug.print("  FAIL sound.play did not return a handle\n", .{});
+        return false;
+    }
+    sys.pump(64);
+
+    // The Zig half of the check: the voice the binding started must sit at the
+    // actor's coordinates, which is the difference between `audio.play_file`
+    // and an emitter. Read back through the component the binding wrote.
+    if (world.get(actor, ecs.components.SoundEmitter2D)) |em| {
+        const id = audio.VoiceId{ .index = em.playing.index, .generation = em.playing.generation };
+        const v = sys.pool.resolve(id) orelse {
+            std.debug.print("  FAIL the emitter's voice does not resolve\n", .{});
+            return false;
+        };
+        if (v.x != 300 or v.y != 40) {
+            std.debug.print("  FAIL the voice is at ({d}, {d}), expected (300, 40)\n", .{ v.x, v.y });
+            return false;
+        }
+        if (v.base_volume != 0.5) {
+            std.debug.print("  FAIL the voice's volume is {d}, expected 0.5\n", .{v.base_volume});
+            return false;
+        }
+    } else {
+        std.debug.print("  FAIL sound.play did not add a SoundEmitter2D\n", .{});
+        return false;
+    }
+
+    if (!runSrcBool(
+        &vm,
+        \\if not sound.is_playing(SELF) then return false end
+        \\sound.set_volume(SELF, 0.25)
+        \\sound.set_pitch(SELF, 1.5)
+        \\local d = sound.describe(SELF)
+        \\if d.volume ~= 0.25 then return false end
+        \\if d.pitch ~= 1.5 then return false end
+        \\if d.path ~= "boom:100" then return false end
+        \\if d.max_distance ~= 0 then return false end   -- 0 is global, the default
+        \\if not d.playing then return false end
+        \\return true
+    , "sound_state")) {
+        std.debug.print("  FAIL sound state / describe\n", .{});
+        return false;
+    }
+
+    // The setters that are NEXT-play only must not pretend otherwise: the voice
+    // keeps the radius it started with, and the component still reports what
+    // the next play will use.
+    if (!runSrcBool(
+        &vm,
+        \\sound.set_radius(SELF, 900)
+        \\sound.set_spread(SELF, 200)
+        \\sound.set_loop(SELF, true)
+        \\local d = sound.describe(SELF)
+        \\if d.max_distance ~= 900 then return false end
+        \\if d.spread ~= 200 then return false end
+        \\if not d.loop then return false end
+        \\if not sound.is_playing(SELF) then return false end
+        \\return true
+    , "sound_next_play")) {
+        std.debug.print("  FAIL sound configuration fields\n", .{});
+        return false;
+    }
+
+    sys.pump(64);
+    if (!runSrcBool(
+        &vm,
+        \\sound.stop(SELF)
+        \\if sound.is_playing(SELF) then return false end
+        \\sound.stop(SELF)   -- a second stop is a no-op, not an error
+        \\return true
+    , "sound_stop")) {
+        std.debug.print("  FAIL sound.stop / is_playing\n", .{});
+        return false;
+    }
+
+    // With no audio system wired, the same surface reports failure rather than
+    // reaching through null: a headless tool gets nil/false, not a crash.
+    {
+        var quiet_world = ecs.World.init(allocator);
+        defer quiet_world.deinit();
+        const quiet_input = context_mod.Input{};
+        var quiet_ctx = bindings.Context.init(&quiet_world, &quiet_input);
+        bindings.registerAll(L, &quiet_ctx);
+        _ = lua.lua_createtable(L, 0, 1);
+        bindings.stampEntityForTest(L, actor);
+        lua.setGlobal(L, "SELF");   // pops the table: it is now _G.SELF
+        if (!runSrcBool(
+            &vm,
+            \\local a = sound.play(SELF, "boom:100")
+            \\local b = sound.is_playing(SELF)
+            \\local d = sound.describe(SELF)
+            \\if a ~= nil then return false end          -- no system: nil, not a crash
+            \\if b then return false end
+            \\if type(d) ~= "table" then return false end
+            \\if d.volume ~= nil then return false end   -- an empty table: this world has no emitter
+            \\return true
+        , "sound_no_system")) {
+            std.debug.print("  FAIL sound.* with no audio system\n", .{});
+            return false;
+        }
+        // Put the real context back: the checks below must keep working.
+        bindings.registerAll(L, &ctx);
+        _ = lua.lua_createtable(L, 0, 1);
+        bindings.stampEntityForTest(L, actor);
+        lua.setGlobal(L, "SELF");   // pops the table: it is now _G.SELF
+    }
+
+    std.debug.print("  ok    emitters: positional play, live control, describe, stop\n", .{});
+    return true;
+}
+
 pub fn main() !void {
     // A page allocator: each check builds and tears down its own VM and world,
     // and the process is short-lived, so there is nothing to interleave and no
@@ -1000,6 +1300,13 @@ pub fn main() !void {
     // only check that exercises a binding whose answer comes from outside Lua.
     std.debug.print("\nphysics (M4):\n", .{});
     if (!checkPhysics(allocator)) failed += 1;
+
+    std.debug.print("\naudio (M8):\n", .{});
+    if (checkAudio(allocator)) {
+        std.debug.print("  ok    play/stop/bus/stats through a real system\n", .{});
+    } else {
+        failed += 1;
+    }
 
     // Behind the same flag as the code: with steering off there is no `world`
     // table, and a check that fails for "the feature is compiled out" trains

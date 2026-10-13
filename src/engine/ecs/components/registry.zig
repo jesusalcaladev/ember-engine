@@ -30,6 +30,9 @@ const camera_mod = @import("camera.zig");
 const timer_mod = @import("timer.zig");
 const physics_mod = @import("physics.zig");
 const light_mod = @import("light.zig");
+const sound_emitter_mod = @import("sound_emitter.zig");
+const particle_mod = @import("particle.zig");
+const animation_mod = @import("animation.zig");
 
 pub const Name = name_mod.Name;
 pub const Transform = transform_mod.Transform;
@@ -44,6 +47,21 @@ pub const StateMachine = script_mod.StateMachine;
 pub const Camera2D = camera_mod.Camera2D;
 pub const Timer = timer_mod.Timer;
 pub const TimerType = timer_mod.TimerType;
+pub const SoundEmitter2D = sound_emitter_mod.SoundEmitter2D;
+pub const VoiceRef = sound_emitter_mod.VoiceRef;
+/// M9: the particle emitter (config only — the pool lives in the system).
+pub const ParticleEmitter2D = particle_mod.ParticleEmitter2D;
+pub const EmitShape = particle_mod.EmitShape;
+pub const ParticleBackend = particle_mod.Backend;
+pub const ParticleSpace = particle_mod.Space;
+pub const no_particle_slab = particle_mod.no_slab;
+pub const packParticleColor = particle_mod.packColor;
+pub const unpackParticleColor = particle_mod.unpackColor;
+/// M13: the animation player component (plain data).
+pub const AnimationPlayer = animation_mod.AnimationPlayer;
+pub const anim_clip_loop = animation_mod.clip_loop;
+pub const anim_clip_ping_pong = animation_mod.clip_ping_pong;
+pub const anim_clip_root_motion = animation_mod.clip_root_motion;
 pub const RigidBody2D = physics_mod.RigidBody2D;
 pub const Collider2D = physics_mod.Collider2D;
 pub const CollisionLayers = physics_mod.CollisionLayers;
@@ -138,9 +156,21 @@ const component_list = [_]struct { name: []const u8, type: type }{
     // ── M4.5 — appended, never inserted ────────────────────────────────────
     .{ .name = "Camera2D", .type = Camera2D },
     .{ .name = "Timer", .type = Timer },
+    // ── M8 — appended, never inserted ──────────────────────────────────────
+    .{ .name = "SoundEmitter2D", .type = SoundEmitter2D },
+    // ── M9 — appended, never inserted ──────────────────────────────────────
+    .{ .name = "ParticleEmitter2D", .type = ParticleEmitter2D },
+    // -- M13 -- appended, never inserted
+    .{ .name = "AnimationPlayer", .type = AnimationPlayer },
 };
 
 comptime {
+    // The rule checks below recurse through every field of every component.
+    // The default comptime branch quota (1000) is not enough once the registry
+    // carries nested structs like `SoundEmitter2D.VoiceRef`, so it is raised
+    // here rather than per call site: a component that trips it is a compile
+    // error about the quota, not about the component.
+    @setEvalBranchQuota(20000);
     if (entries.len > max_components)
         @compileError("component registry exceeds max_components (" ++ std.fmt.comptimePrint("{d}", .{max_components}) ++ ")");
     for (entries) |entry| {
@@ -295,7 +325,11 @@ test "the components were APPENDED, not inserted" {
     try testing.expectEqual(@as(ComponentId, 17), componentId(AmbientLight2D));
     try testing.expectEqual(@as(ComponentId, 18), componentId(Camera2D));
     try testing.expectEqual(@as(ComponentId, 19), componentId(Timer));
-    try testing.expectEqual(@as(usize, 20), entries.len);
+    // M8's emitter is the next append: id 20, after Timer's 19.
+    try testing.expectEqual(@as(ComponentId, 20), componentId(SoundEmitter2D));
+    // M9's emitter follows it: id 21. Same rule — append, never insert.
+    try testing.expectEqual(@as(ComponentId, 21), componentId(ParticleEmitter2D));
+    try testing.expectEqual(@as(usize, 23), entries.len);
 }
 
 test "default baseline bytes match a default value" {

@@ -19,6 +19,10 @@ const render2d = engine.render2d;
 /// M7: the lighting driver. The one owner of the mask, the shadow channels and
 /// the GI pyramid — see the note where it is constructed.
 const lighting_driver = engine.lighting_driver;
+/// M9: the scene-transition fader.
+const fader_mod = engine.fade;
+/// M9: the CPU particle system.
+const particles_mod = engine.particles;
 const batcher_mod = engine.batcher;
 const backend_null = engine.render.backend_null;
 const backend_dawn = engine.render.backend_dawn;
@@ -33,8 +37,7 @@ const log = core.log.scoped("runtime");
 const fixed_dt: f32 = 1.0 / 60.0;
 const rotation_speed: f32 = 1.5; // rad/s
 
-/// Where a project's sound files live, relative to the project root.
-///
+/// Where a project's sound files live, relative to the project root.///
 /// The runtime is launched FROM the project root — that is where
 /// `project.config` is read from (`project.config.default_path`) — so the path
 /// a script plays (`audio.play_file("assets/audio/boom.wav")`) is spelled
@@ -162,7 +165,6 @@ var lighting_hooks = script.context.LightingHooks{
                 @floatFromInt(s.collect_ns),
                 @floatFromInt(s.sweep_ns),
                 @floatFromInt(s.raster_ns),
-                @floatFromInt(s.sdf_ns),
             };
             const n = @min(v.len, out.len);
             @memcpy(out[0..n], v[0..n]);
@@ -238,9 +240,8 @@ fn applyPhysics(_: *anyopaque, p: *const project.config.Physics) void {
 
 /// The `lighting` section, applied to the live driver.
 ///
-/// This callback is the ONLY path by which `lighting.gi_backend`,
-/// `gi_resolution`, `shadow_resolution`, `bounce_iterations` and `bounce_albedo`
-/// ever reach the lighting system. Without it the whole section is inert and the
+/// This callback is the ONLY path by which `shadow_resolution`
+/// ever reaches the lighting system. Without it the whole section is inert and the
 /// driver runs on its constructor's guesses — which is how `shadow_resolution`
 /// stayed at 2048 for a release while the config file said 1024.
 ///
@@ -250,8 +251,8 @@ fn applyPhysics(_: *anyopaque, p: *const project.config.Physics) void {
 /// see is one you tune once and forget.
 ///
 /// `applyLightingConfig` can allocate (a resolution change resizes the field),
-/// so the error is logged rather than propagated: a project that asks for a GI
-/// grid too large to allocate gets the driver's previous settings and a warning,
+/// so the error is logged rather than propagated: a project that asks for a grid
+/// too large to allocate gets the driver's previous settings and a warning,
 /// rather than no window.
 fn applyLighting(ctx: *anyopaque, l: *const project.config.Lighting) void {
     const driver: *lighting_driver.Driver = @ptrCast(@alignCast(ctx));
@@ -285,6 +286,17 @@ fn applyInputMap(_: *anyopaque, actions: []const project.config.InputAction) voi
     // Currently: input_state.set(action_name, key_down, key_pressed)
     _ = actions;
 }
+
+/// M9: the payload a finished scene transition carries on the world bus.
+///
+/// The signal is what a Lua `on_signal("scene_faded")` handler and a Zig
+/// listener both receive; the amount says WHICH transition settled (1 = covered,
+/// 0 = clear), which is the difference between "swap the level now" and "the
+/// screen is clear again".
+const FadeSignal = struct {
+    /// The settled coverage, 0..1.
+    amount: f32 = 0,
+};
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(init);
@@ -321,6 +333,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Kept so the smoke gate can reach the device the backend made. Null in
     // headless, where the smoke gate refuses to claim a verdict it cannot earn.
     var dawn_device: ?backend_dawn.wgpu.WGPUDevice = null;
+    var dawn_handle: ?*anyopaque = null;
     if (args.headless) {
         renderer = null_backend.renderer();
     } else {
@@ -336,6 +349,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             },
         );
         dawn_device = dawn.gpuDevice();
+        dawn_handle = @ptrCast(dawn);
         renderer = dawn.renderer();
     }
     defer renderer.deinit();
@@ -510,7 +524,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // backend, the pool size, the PCM budget and the bus map. In headless mode
     // nothing was applied, so the defaults stand and the NULL backend is forced:
     // CI has no sound card and must not need one to exercise the mixer.
-    if (args.headless) audio_hook.section.backend = .@"null";
+    if (args.headless) audio_hook.section.backend = .null;
     var audio_system: ?*engine.audio.Audio = audio_hook.create(boot_alloc) catch |err| blk: {
         // No device, no mixer: the engine keeps running silent (spec: a missing
         // sound card must not stop a game) and the log says which it was.
@@ -530,6 +544,108 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Published before the first script runs, so an `audio.*` call in a
     // behavior's `start()` sees the real system rather than null.
     behaviors.ctx.audio = audio_system;
+
+    // ── M9: the scene-transition fader. Owned by the runtime like the camera:
+    // it is engine state that outlives a script, and the `scene.*` bindings
+    // reach it through the hook struct below. A transition advances on REAL
+    // time (see `fade.zig` for why it must not be the fixed step), so it is
+    // updated in the render section with the frame's real dt.
+    var fader = fader_mod.Fader{};
+
+    // ── M9: the CPU particle system. A pool reserved at boot like the sprite
+    // instance buffer, with the same discipline: `reserve` sizes it, `lock`
+    // freezes it, and a frame that asks for more than was reserved DROPS and
+    // reports instead of allocating (spec §3.1). The pool is not part of the
+    // scene: it is a cache the system owns, and `.zson` never sees it.
+    var particles = particles_mod.System.init(boot_alloc);
+    particles.reserve(.{
+        .max_particles = 65_536,
+        .max_emitters = 256,
+        .max_per_emitter = 4096,
+    }) catch |err| {
+        log.err("particle pool reserve failed: {s} — emitters will emit nothing", .{@errorName(err)});
+    };
+    defer particles.deinit();
+    particles.setFixedDt(fixed_dt);
+    particles.lock();
+
+    var anim_system = ecs.animation.System.init(boot_alloc);
+    defer anim_system.deinit();
+
+    // ── M9: the scene-transition fader hooks ────────────────────────────────
+    var scene_hooks = script.context.SceneHooks{
+        .ctx = &fader,
+        .fade_out = struct {
+            fn fade_out_fn(ctx: ?*anyopaque, duration: f32, r: f32, g: f32, b: f32) void {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                fd.fadeOut(duration, .{ r, g, b });
+            }
+        }.fade_out_fn,
+        .fade_in = struct {
+            fn fade_in_fn(ctx: ?*anyopaque, duration: f32) void {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                fd.fadeIn(duration);
+            }
+        }.fade_in_fn,
+        .fade_covered = struct {
+            fn fade_covered_fn(ctx: ?*anyopaque, r: f32, g: f32, b: f32) void {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                fd.snapCovered(.{ r, g, b });
+            }
+        }.fade_covered_fn,
+        .fade_clear = struct {
+            fn fade_clear_fn(ctx: ?*anyopaque) void {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                fd.snapClear();
+            }
+        }.fade_clear_fn,
+        .amount = struct {
+            fn amount_fn(ctx: ?*anyopaque) f32 {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                return fd.amount;
+            }
+        }.amount_fn,
+        .fading = struct {
+            fn fading_fn(ctx: ?*anyopaque) bool {
+                const fd: *fader_mod.Fader = @ptrCast(@alignCast(ctx.?));
+                return !fd.isIdle();
+            }
+        }.fading_fn,
+    };
+    behaviors.ctx.scene = &scene_hooks;
+
+    // ── M9: the particle pool hooks ──────────────────────────────────────────
+    var particles_hooks = script.context.ParticleHooks{
+        .ctx = &particles,
+        .burst = struct {
+            fn burst_fn(ctx: ?*anyopaque, entity_bits: u64, count: u32) u32 {
+                const ps: *particles_mod.System = @ptrCast(@alignCast(ctx.?));
+                const e = ecs.Entity{ .index = @intCast(entity_bits), .generation = @intCast(entity_bits >> 32) };
+                return ps.burst(e, count);
+            }
+        }.burst_fn,
+        .stats = struct {
+            fn stats_fn(ctx: ?*anyopaque, out: *[16]f64) u32 {
+                const ps: *particles_mod.System = @ptrCast(@alignCast(ctx.?));
+                const s = ps.getStats();
+                const v = [_]f64{
+                    @floatFromInt(s.simulated),
+                    @floatFromInt(s.live),
+                    @floatFromInt(s.spawned),
+                    @floatFromInt(s.drawn),
+                    @floatFromInt(s.culled),
+                    @floatFromInt(s.dropped_spawn),
+                    @floatFromInt(s.slab_denied),
+                    @as(f64, @floatFromInt(s.sim_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(s.collect_ns)) / 1_000_000.0,
+                };
+                const n = @min(v.len, out.len);
+                @memcpy(out[0..n], v[0..n]);
+                return @intCast(n);
+            }
+        }.stats_fn,
+    };
+    behaviors.ctx.particles = &particles_hooks;
 
     // ── M8: audio asset hot-reload (inotify on the sound directory) ─────────
     // `project.config` has its own watcher above; this one is per-ASSET, which
@@ -566,6 +682,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             };
         }
     }
+
+    // M9: the fade's completion signal, interned for the same reason as the
+    // audio ones — `emit` panics on a name it has never seen, because
+    // interning allocates and the frame loop forbids it.
+    world.signals.preintern("scene_faded") catch |err| {
+        log.warn("could not reserve the 'scene_faded' signal: {s}", .{@errorName(err)});
+    };
 
     const AudioSignals = struct {
         world: *ecs.World,
@@ -788,9 +911,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // bridge forwards the fired names to Lua `on_signal`, which the
             // typed bus cannot reach by itself.
             ecs.timer.tick(&world, fixed_dt, timer_bridge);
+            anim_system.update(&world, fixed_dt, timer_bridge);
             // M3: behaviors run at the fixed 60 Hz tick. `startAll` already ran,
             // so this is the gameplay itself: Lua -> actor.* bindings -> ECS.
             behaviors.fixedUpdate(fixed_dt);
+            // M9: particle simulation, AFTER gameplay so a behavior that moves
+            // or bursts an emitter this tick is honoured by the same tick's
+            // integration rather than the next one. Same fixed dt, same order
+            // every frame, which is what makes a particle scene deterministic.
+            particles.fixedUpdate(&world, fixed_dt);
         }
         // ── M4.5: the Camera2D system, once per fixed window (not per step).
         // The camera is what the player LOOKS at, so it belongs to the rendered
@@ -825,6 +954,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         // ── M2: ECS → GPU instances via render2d.
         var z_batch = prof.zone("batch");
+        // M9: the particles go into the SAME instance list as the sprites, so
+        // they batch with them: one atlas, one draw call, and the ≤ 32 draw-call
+        // budget (spec §4) counts them the same way it counts every other quad.
+        particles.beginFrame();
+        particles.collect(
+            &r2d,
+            &world,
+            loop.alpha(),
+            if (camera_view) |v| render2d.ViewRect.around(
+                v.cx,
+                v.cy,
+                v.viewport_w / v.zoom * 0.5,
+                v.viewport_h / v.zoom * 0.5,
+                64,
+            ) else null,
+        );
         // The camera's view, translated from `camera.View` into the renderer's
         // `ViewRect`. The margin is the sprite-extent insurance the culler asks
         // for: a sprite walking right must not pop out one frame before it is
@@ -844,6 +989,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
         );
         z_batch.end();
 
+        // ── M9: advance the scene transition, then fold it into the
+        // environment the post pass reads. A finished transition fires
+        // `scene_faded` exactly once — the Lua bridge first, so a behavior's
+        // `on_signal` can swap the level, then the typed bus for any Zig
+        // listener. Gates on `hasListeners` like physics contacts: a signal
+        // nobody subscribed to must not enqueue.
+        fader.update(real_dt);
+        if (fader.just_finished) {
+            const amount = fader.amount;
+            timer_bridge.fire("scene_faded");
+            if (world.signals.hasListeners("scene_faded")) {
+                world.signals.emit(FadeSignal, "scene_faded", .{ .amount = amount });
+            }
+        }
+
         // ── M2: render into the offscreen target, SMAA, compose to swapchain.
         var z_render = prof.zone("render");
         // Counter reset + publish the GPU timestamps resolved 2 frames ago,
@@ -857,7 +1017,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // mid-run, and reading it is two field loads. The sky follows it, since
         // the GI cascades measure against whatever the sky is right now.
         lighting_env = lighting_driver.Driver.environmentOf(&world, .{});
-        lighting.sky = lighting_env.sky;
+        // M9: the curtain. Merged here rather than passed through the light
+        // driver because it belongs to the TRANSITION and not to the scene's
+        // Environment component: a `environment.new` actor still gets its fog
+        // and bloom, and a fade does not need a component to exist.
+        lighting_env.fade_color = fader.rgba();
 
         // The mask is already sized by `sync_lighting_buffers` above, OUTSIDE
         // the tracker guard, because `resize` allocates and `Lighting.resize`
@@ -930,6 +1094,31 @@ pub fn main(init: std.process.Init.Minimal) !void {
         lighting.lighting.cfg.shadowLights(),
         lighting.lighting.stats.sweep_steps,
     });
+    // M9: the particle numbers, beside the renderer's. A pool reporting
+    // `dropped_spawn` or `slab_denied` is the M9 equivalent of a clipped batch:
+    // the scene asked for more than was reserved, and the counters say which of
+    // the two limits was hit (a slab at capacity, or the pool out of room).
+    const pstats = particles.getStats();
+    core.log.info("particles: {d} emitters simulated, {d} live, {d} spawned, {d} drawn (culled {d})", .{
+        pstats.simulated,
+        pstats.live,
+        pstats.spawned,
+        pstats.drawn,
+        pstats.culled,
+    });
+    if (pstats.dropped_spawn > 0 or pstats.slab_denied > 0) {
+        core.log.warn("particles: {d} spawns dropped at emitter capacity, {d} emitters denied a slab (reserve too small)", .{
+            pstats.dropped_spawn,
+            pstats.slab_denied,
+        });
+    }
+    core.log.info("particles: sim {d:.3} ms/tick, collect {d:.3} ms/frame (last frame)", .{
+        @as(f64, @floatFromInt(pstats.sim_ns)) / 1_000_000.0,
+        @as(f64, @floatFromInt(pstats.collect_ns)) / 1_000_000.0,
+    });
+    // M9: the transition state at exit, which is how a CI run says "the demo
+    // ended mid-fade" instead of a screenshot nobody looks at.
+    core.log.info("scene fade: {s}, amount {d:.2}", .{ @tagName(fader.state), fader.amount });
     // M8: the audio numbers, next to the renderer's. A mixer reporting xruns or
     // dropped commands is the one failure mode audio has — it does not crash, it
     // crackles — so the counters are printed where a run's report already is.
@@ -961,23 +1150,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // not anything rendered, because a benchmark that fails for being slow gets
     // muted -- but a VALIDATION ERROR is not slowness. It is the driver saying
     // "I did not build that pipeline", and the frame that follows is drawn with
-    // an invalid pipeline, which means the picture on screen is not the picture
-    // the code describes.
-    //
-    // Five such defects shipped before this flag existed (see `12c9062`), each
-    // one printing a red line while the process exited 0.
     if (args.gpu_smoke) {
-        const shader_failures = if (dawn_device) |d| backend_dawn.Backend.checkShaders(d) else 0;
-        const gpu_errors = backend_dawn.gpu_error_count;
-        core.log.info("== GPU SMOKE ==", .{});
-        core.log.info("  shaders refused by the device: {d} of 6", .{shader_failures});
-        core.log.info("  uncaptured GPU errors this run: {d}", .{gpu_errors});
-        core.log.info("  frames rendered: {d}", .{frame_count});
-        if (shader_failures != 0 or gpu_errors != 0) {
-            core.log.err("GPU SMOKE FAILED: the device did not accept everything we sent it", .{});
-            std.process.exit(1);
+        if (dawn_device != null) {
+            const shader_failures = if (dawn_device) |d| backend_dawn.Backend.checkShaders(d) else 0;
+            const gpu_errors = backend_dawn.gpu_error_count;
+            core.log.info("== GPU SMOKE ==", .{});
+            core.log.info("  shaders refused by the device: {d} of 6", .{shader_failures});
+            core.log.info("  uncaptured GPU errors this run: {d}", .{gpu_errors});
+            core.log.info("  frames rendered: {d}", .{frame_count});
+            if (shader_failures != 0 or gpu_errors != 0) {
+                core.log.err("GPU SMOKE FAILED: the device did not accept everything we sent it", .{});
+                std.process.exit(1);
+            }
+            core.log.info("  OK: the device compiled every shader and raised nothing.", .{});
         }
-        core.log.info("  OK: the device compiled every shader and raised nothing.", .{});
     }
     prof.report("== PERF (frames) ==");
     core.log.info("mem: frame arena high-water: {d} bytes", .{frame_arena.high_water});

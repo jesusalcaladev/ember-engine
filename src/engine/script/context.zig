@@ -24,6 +24,9 @@ const core_random = @import("core").random;
 const statemachine = @import("statemachine.zig");
 const spatial = @import("spatial.zig");
 const physics_mod = @import("physics");
+const assets = @import("assets");
+const audio_mod = @import("audio");
+const render = @import("render");
 
 /// The three operations the M7 `lighting.*` bindings need, as function pointers.
 ///
@@ -41,6 +44,46 @@ pub const LightingHooks = struct {
     set_quality: *const fn (ctx: ?*anyopaque, tier: u8) bool,
     /// Writes the per-frame stats into `out` and returns how many it wrote.
     /// A fixed array and not a struct so the two modules cannot disagree about a
+    /// layout: the count is what pairs each number with its name.
+    stats: *const fn (ctx: ?*anyopaque, out: *[16]f64) u32,
+};
+
+/// The M9 `scene.*` bindings, as a vtable over the runtime's `Fader`.
+///
+/// Same shape as `LightingHooks` and for the same reason: the `script` module
+/// is its own build module and cannot import `render`, so what a transition is
+/// crosses the boundary as behaviour and not as a type. The `ctx` is whatever
+/// the runtime's closures need (`*Fader`), which keeps the editor and a test
+/// from sharing one transition.
+pub const SceneHooks = struct {
+    ctx: ?*anyopaque,
+    /// Begins covering the screen over `duration` real seconds.
+    fade_out: *const fn (ctx: ?*anyopaque, duration: f32, r: f32, g: f32, b: f32) void,
+    /// Begins uncovering from wherever the curtain currently is.
+    fade_in: *const fn (ctx: ?*anyopaque, duration: f32) void,
+    /// Jumps straight to a covered screen (a loading screen's first frame).
+    fade_covered: *const fn (ctx: ?*anyopaque, r: f32, g: f32, b: f32) void,
+    /// Jumps straight back to a clear screen.
+    fade_clear: *const fn (ctx: ?*anyopaque) void,
+    /// Current coverage, 0..1.
+    amount: *const fn (ctx: ?*anyopaque) f32,
+    /// True while a transition is running.
+    fading: *const fn (ctx: ?*anyopaque) bool,
+};
+
+/// The M9 `particles.*` bindings that need the pool rather than a component.
+///
+/// Configuring an emitter is a plain component write and goes through
+/// `ctx.world` like every other per-actor surface. BURSTING and reading STATS
+/// need the system that owns the pool, and those two cross as function pointers
+/// for the same module-boundary reason `LightingHooks` does.
+pub const ParticleHooks = struct {
+    ctx: ?*anyopaque,
+    /// Emits `count` particles NOW. `entity_bits` is `Entity.bits()`, so the
+    /// runtime can recover the handle without the script module naming it.
+    burst: *const fn (ctx: ?*anyopaque, entity_bits: u64, count: u32) u32,
+    /// Writes the per-frame counters into `out`, returns how many it wrote. A
+    /// fixed array and not a struct, so the two modules cannot disagree about a
     /// layout: the count is what pairs each number with its name.
     stats: *const fn (ctx: ?*anyopaque, out: *[16]f64) u32,
 };
@@ -144,6 +187,30 @@ pub const Context = struct {
     /// line-of-sight test, and a guard the AI reads as "clear shot" is worse
     /// than a hard failure. The bindings report the failure instead.
     physics: ?*PhysicsSystem = null,
+    /// The asset manager for loading images and audio (M3). Null when the
+    /// runtime has no asset system wired (a headless tool, a test).
+    assets: ?*assets.AssetManager = null,
+    /// The renderer for atlas management and sprite rendering. Null when the
+    /// runtime has no renderer wired (a headless tool, a test).
+    renderer: ?*render.Renderer = null,
+    /// Persistent atlas manager handle, so `sprite.set_image` reuses one atlas
+    /// across calls instead of creating a new one per image. Null until the
+    /// first image is set; the binding creates it lazily.
+    atlas_manager: ?*anyopaque = null,
+    /// The audio system (M8). Null means the `audio.*` bindings report failure
+    /// rather than dereferencing null — a headless tool with no device, or an
+    /// editor with sound disabled, both reach every call and get `false`/nil.
+    audio: ?*audio_mod.Audio = null,
+
+    /// M9: the scene-transition fader. Null when the runtime has no renderer
+    /// wired (a headless tool, a test): the `scene.*` bindings then report
+    /// failure rather than reaching through a null pointer, the same rule every
+    /// other optional system here follows.
+    scene: ?*const SceneHooks = null,
+    /// M9: the particle pool, for `particles.burst` and `particles.stats`.
+    /// Null for the same reason; the CONFIGURE half of the API is component
+    /// writes and works without it.
+    particles: ?*const ParticleHooks = null,
 
     /// The camera's view for RENDER culling, which is a different rectangle from
     /// the physics one on purpose: the renderer asks "can I see it", physics asks
@@ -169,6 +236,7 @@ pub const Context = struct {
             // determinism contract from the first frame.
             .rng = core_random.Rng.init(core_random.Rng.default_seed),
             .noise_seed = 0,
+            .assets = null,
         };
     }
 

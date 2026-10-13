@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "description": "Batch configuration for behavior updates — enables grouping by script_id to reduce C bindings. This file allows designers to enable batch behavior updates without changing engine code. When modified, the engine picks up changes at load time (not hot reload, by design).",
+  "groups_enabled": true,
+  "batch_by_script_id": true,
+  "batch_by_nearby_radius": 80.0,
+  "max_group_size": 100,
+  "batch_eable_terms": ["seek", "flee", "arrive", "wander", "pursue", "evade", "apply"],
+  "batch_nearby_terms": ["separate", "align", "cohere"],
+  "data_driven_note": "This file allows designers to enable batch behavior updates without changing engine code. When modified, the engine picks up changes at load time (not hot reload, by design)."
+}

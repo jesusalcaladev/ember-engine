@@ -233,7 +233,7 @@ Two things the M4.5 close found and fixed rather than papered over:
 ### M5 — Base Editor + Integrated Play-in-editor
 **Goal**: the Unity moment. Play and edit in the same window.
 
-- ImGui shell (docking): viewport, actor hierarchy, component inspector, console, asset browser.
+- ImGui shell (docking) with a **central workspace tab bar** (the Godot `2D → Script` pattern, designed in M5.7): scene viewport, actor hierarchy, component inspector, console, asset browser.
 - **Play/Stop**: bit-exact snapshot on entry (infra already exists since M1) → game systems run inside the viewport → Stop restores the exact state.
 - Editing during Play allowed with explicit rules (what persists and what does not).
 - ImGuizmo for transforms; undo/redo on top of serialization; crash-safe autosave.
@@ -243,7 +243,7 @@ Two things the M4.5 close found and fixed rather than papered over:
 ### M5.5 — Code editor + integrated documentation (Godot-style)
 **Goal**: comfortable Lua writing inside the engine and the whole API one Ctrl+Click away.
 
-- In-engine ImGui editor: tabs, Lua syntax highlight, find/replace, parse-error markers.
+- In-engine ImGui editor as the **`Script` workspace** (M5.7): file tabs inside the workspace, Lua syntax highlight, find/replace, parse-error markers.
 - Autocomplete + contextual signatures + tooltips from the binding metadata (M3).
 - **Ctrl+Click → Help panel**: description, typed parameters, return value and example of the function (like Godot's documentation).
 - Browsable Help panel: index of the whole API + search.
@@ -251,6 +251,57 @@ Two things the M4.5 close found and fixed rather than papered over:
 - (LSP server with real go-to-def → post-1.0, see Post-1.0.)
 
 **Criteria**: whole API navigable with Ctrl+Click from the in-engine editor; autocomplete popup < 10 ms; the editor stays within its budget (≤ 2 ms, spec §2); stubs are generated in CI and the build fails if they drift from the metadata.
+
+### M5.7 — Editor workspaces: one editor, one tab bar
+**Goal**: ONE editor, ONE window — a Godot-style top tab bar (`2D → Script → …`) switches the central view. The Sprite Editor, the Curve Editor, the Graphics Compositor and every other specialized editor this engine will ever need get a **slot in that bar**, never a window of their own.
+
+The shell is shared and permanent; workspaces are pluggable and cheap.
+
+**The rules — this is what keeps it clean:**
+
+- **One central tab bar, top of the window.** Switching tabs swaps **only the central widget**. Hierarchy, inspector, console, asset browser and profiler are docks that stay put across every workspace — Godot's `2D/Script/AssetLib` and Unity's `Scene/Game`, minus the 3D we do not have.
+- **Editor state is not workspace state.** Selection, open scene, undo stack and the running Play session belong to the editor: `2D → Script → 2D` comes back to the same selection, same camera, same undo history. Dropping them on a switch is how an editor starts feeling cheap.
+- **A workspace is a row, not a type**: name, icon, shortcut, build/teardown of one central widget. Adding the Sprite Editor later must not touch the shell — if it does, the model is wrong.
+- **Play is global, not a tab.** Play/Pause/Stop is one toolbar over everything; the game renders to the offscreen target (M2) and composes into the `2D` viewport, exactly as M5 requires.
+- **Cost**: a tab switch does zero scene work (no reload, no re-instantiation), and the editor never exceeds its ≤ 2 ms overlay budget with any workspace open (spec §2).
+
+**v1.0 is exactly two tabs** — the long-tail list below exists to say *no* until its subsystem does:
+
+| Tab | Central view | Lands with |
+|---|---|---|
+| **2D** — the Scene Editor | viewport: pan/zoom, click- and drag-select, ImGuizmo move/rotate/scale, handles over `physics.reshape` / `occluder.set_polygon` | M5 |
+| **Script** | in-engine Lua editor: file tabs, syntax highlight, autocomplete, Ctrl+Click → help | M5.5 |
+
+Docks shared by both tabs: actor hierarchy, component inspector, console, asset browser, profiler + the Play/Pause/Stop toolbar.
+
+**Still missing before that v1 editor is honest** (from [docs/EDITOR-SURFACE.md](docs/EDITOR-SURFACE.md)):
+
+- [ ] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state).
+- [ ] **Undo/redo** — an engine-side command journal on top of bit-exact serialization (M1). The single biggest gap.
+- [ ] **Project file + file dialogs** — open/save `.zson`, no ad-hoc paths.
+- [ ] **Flat prefab authoring** — create from selection, instantiate, overrides visible and revertable. Storage exists since M1; the UI does not.
+- [ ] **Save/load UI + crash-safe autosave** (M5 bullet, still open).
+- [ ] **Hot reload** of scenes and assets while a tab is open (M6).
+
+**The long tail** — one workspace per subsystem, in subsystem order, none before v1.0 and none before the thing it edits exists:
+
+| Tab | What it edits | Gated on |
+|---|---|---|
+| **Sprite Editor** | pivot, atlas region, occluder polygon, blend mode | M6 import + M7 occluders |
+| **Mixer** | bus tree, per-bus volume, sends | M8 buses (already in the runtime) |
+| **Particles** | GPU emitter params, curves, live preview | M9 |
+| **Animation** | `AnimationClip` tracks, keyframes, `AnimationTree` graph | M13 |
+| **Curve Editor** | easing/key curves shared by animation, camera and light params | a serialized `Curve` asset; first consumer M13 |
+| **UI Editor** | `Canvas`/`Control` anchors, containers, focus order | M14 |
+| **TileMap Editor** | brush/erase, per-tile properties, autotiling + collision paint | M15 data format |
+| **Timeline / Dialogue** | cutscene tracks (anim, audio, camera, signal), branch graph | M16 |
+| **l10n** | translation tables, missing-key report | M17 |
+| **Material / Shader** | node graph → WGSL, uniform editing | M18 (see Backlog) |
+| **Input map** | actions, devices, runtime rebinding | M19 (see Backlog) |
+| **Graphics Compositor** | node graph of render/post-FX passes over the M2 offscreen target | a render graph that exposes its passes (post-1.0) |
+| **Nested Prefabs** | nested tree, override diff, apply/revert | flat prefabs proven in real projects first (post-1.0) |
+
+**Criteria**: `2D ↔ Script` preserves selection, camera and undo history; a throwaway workspace registers as a single row with no shell change; the editor holds ≤ 2 ms (spec §2) with any workspace open; the "still missing" list is fully checked before v1.0 is called done.
 
 ### M6 — Asset pipeline
 - Importers: PNG (→ atlas), WAV/OGG (→ audio), `.lua` (scripts), with stable GUIDs.
@@ -272,6 +323,46 @@ Two things the M4.5 close found and fixed rather than papered over:
 - Buses + per-bus volume; audio events → Signals.
 
 **Criteria**: 64 simultaneous emitters with no main-thread spikes; latency ≤ 20 ms.
+
+**Status: closed.** `zig build test` (538 tests, the inotify directory watcher
+included) covers the port, the mixer maths, the generation-checked voice pool,
+the byte-budgeted bank, both backends, the command/event rings and the bus
+registry; `zig build bench-audio` measures the criteria below; `zig build
+test-api` drives `audio.*` and `sound.*` from real Lua against a real system;
+the runtime wires the mixer, its signal bridge and the asset hot-reload.
+
+Measured (`zig build bench-audio`, null backend, 64 emitters, 480-frame period at
+48 kHz):
+
+| Criterion | Budget | Measured |
+|---|---|---|
+| Simultaneous emitters | 64 | **64** (`voices_peak`) |
+| Output latency | ≤ 20 ms | **10.0 ms** (480 frames @ 48 kHz) |
+| `play()` on the main thread | one ring push, no allocation | **0.15 µs/voice**, 0 allocations |
+| Mix per buffer | inside the 10 ms period | **1.12 ms** |
+| xruns | 0 | **0** |
+| Commands dropped | 0 | **0** |
+
+The two threads never share mutable state: the main thread reserves pool slots
+and pushes commands, the device thread fills a reserved slot and advances it —
+which is what makes the frame path a fixed number of ring pushes with no
+allocation, and what `bench-audio` proves with a counting allocator.
+
+Notes on what shipped beyond the criteria:
+- **Bank slot 0 is the "nothing loaded" sentinel** and the bank never hands it
+  out, so `SoundEmitter2D.bank_slot = 0` is unambiguously "no sound".
+- **A streaming slot refuses a hot-reload** (`error.StreamNotReloadable`): its
+  PCM is a window into a refill ring, so re-decoding it would free an interior
+  pointer.
+- **`Audio.mixNsPerBuffer()`** exists because overruns are a symptom and the
+  mix cost is the cause; the run report prints it.
+- Audio never feeds the simulation (spec §6): no gameplay rule may branch on
+  `is_playing`.
+
+Docs: [audio-system](docs/reference/audio-system.md),
+[audio-buses](docs/reference/audio-buses.md),
+[audio-emitters](docs/reference/audio-emitters.md),
+[audio-config](docs/reference/audio-config.md).
 
 ### M9 — FX
 - GPU particles (compute): 100k particles ≤ 1 ms GPU.
@@ -329,25 +420,48 @@ Instead of three small samples, v1.0 ships **one complete game** that exercises 
 
 ---
 
-### M13 — Animation system
+### M13 — Animation system (data-driven, component-based)
 **Goal**: characters and objects move believably. Today the engine cannot animate anything; this is the largest missing subsystem.
 
-- **`AnimationClip`** — an asset (GUID in the M6 registry): a list of tracks with keys `(time, value)`.
-  - **Value track**: animates any field of any component (`Transform.position`, `Sprite.tint`) — this is what makes the system general instead of sprite-only.
-  - **Sprite track**: animates `uv` frame by frame over a sprite sheet.
-  - **Method track**: calls Lua at a keyframe (footsteps, VFX, sounds).
-  - Loop modes: none, linear, ping-pong; per-key interpolation (step/linear/cubic).
-- **`AnimationPlayer` component** — handle-based (`u32 clip_id` + `f32 time/prev_time/speed` + flags), staying within the plain-data rules (`components.zig`).
-  - Lua: `anim.play(name, { blend, speed, from_end })`, `stop`, `pause`, `seek(t)`, `is_playing()`, `get_length()`, `set_speed`, `queue`, `advance(t)`, signals `animation_finished` / `animation_started`.
-- **`AnimationTree` — blending** (Godot's model, which is the right one):
-  - `AnimationNodeBlendSpace1D` — blend N clips by a parameter (`speed` 0→1: walk→run) with no popping.
-  - `AnimationNodeOneShot` — temporary overlay (dash over run).
-  - `AnimationNodeStateMachine` — an **animation** state machine (idle→run→jump), distinct from the logical FSM of M4.5.
-  - `AnimationNodeBlendTree` — composition of the above.
-  - Parameters are set from Lua at runtime (`anim.set_param("speed", 5.5)`), so a behavior drives the blend.
-- **Root motion**: per-clip option where the clip drives `Transform` (precise platformer jumps).
+- **`AnimationClip`** — asset (GUID in the M6 registry): fixed set of tracks that animate component fields over time. Cada clip tiene un ID handle (`u32`) y un conjunto definido de `track_ids` que saben qué field animan y cómo.
+  - **Value track**: anima cualquier field `f32` o `v2` de cualquier componente (Transform.position, Sprite.tint, Light2D.energy, etc.). Es el track "general" que hace el sistema válido para cualquier component.
+  - **Sprite track**: anima los `uv` de un sprite sheet frame a frame. Usa el GUID del sprite atlas asociado.
+  - **Method track**: dispara un evento `call_lua` en un keyframe concreto (para footsteps, VFX, sounds). El evento lleva el `script_id` y el nombre de la función; el runtime Lua lo maneja.
+  - **Flags por clip** (bitfield u8): `loop` (bit 0), `ping_pong` (bit 1), `root_motion` (bit 2). Estos flags son leídos por el sistema de reproducción y no hay código por pieza por clip.
 
-**Criteria**: a clip imported from a sprite sheet plays and loops; sweeping `speed` 0→10 produces no visible pop; root motion moves the actor deterministically; hot-reloading a clip keeps playback position.
+- **`AnimationPlayer` component** — componente plain-data (`components.zig`): hold the state actual de reproducción de un clip por entity.
+  - `clip_id: u32` — handle GUID al clip AnimationClip que se está reproduciendo (0 = nada).
+  - `time: f32` — tiempo actual dentro del clip (0 → length).
+  - `speed: f32` — multiplicador de tiempo (1.0 = normal, >0 = forward, <0 = reverse).
+  - `flags: u8` — flags del clip (loop, ping_pong, root_motion) combinados con `|`.
+  - `blend_factor: f32` — para crossfade suave al cambiar de clip (0 = nada, 1 = cambio instantáneo).
+  - `state: u32` — state machine simple interna (0=idle, 1=run, 2=jump, etc.). Solo usado por el sistema de reproducción, no por designers.
+
+- **`AnimationTree` system** — system fijo que procesa todas las entities con `AnimationPlayer` cada frame. **No hay nodes visuales.** El system hace esto por cada entity:
+  1. **Leer config**: toma `clip_id`, `time`, `speed`, `flags`, `blend_factor` y `state` del componente `AnimationPlayer`.
+  2. **Actualizar tiempo**: `time += speed * delta_time`. Aplica `loop`, `ping_pong` y boundary checking usando solo los flags del clip (sin código por clip).
+  3. **Root motion** (si `root_motion` flag está set): el system lee los `Δposition` y `Δrotation` pre-calculados del clip en el keyframe actual y los **agrega al Transform component entity después de integrar la física Box2D M4**. Eso permite que el personaje siga su camino de animación aunque la física lo empuje. El clip tiene los datos de root motion "baked" — no hay cálculo runtime.
+  4. **Emitting signals**: Si `time` llega al `end` del clip → emite signal `animation_finished` (drenado una vez por frame como todas las signals M3). Si `blend_factor` > 0 → crossfade al clip siguiente durante `blend_factor * length` frames (interpolación lineal de `time`, sin pop).
+  5. **State machine**: el `state u32` del player cambia por signals (`animation_finished`) o por escritura directa desde Lua (`anim.state = 2`). Es un state machine simple, no un árbol complejo.
+
+- **Integración con root-motion**: Cuando un clip tiene el flag `root_motion` set, el sistema `AnimationTree` aplica automáticamente el desplazamiento del clip al `Transform` entity cada frame. El desplazamiento viene "baked" en los keyframes del clip (el herramientas de autoría lo establece), así no hay cálculo costoso en tiempo de ejecución. Esto permite platformers precisos, personajes que caminan por caminos definidos en la animación, etc., y se integra transparente con el sistema de física M4.
+
+### Criteria
+- Clip importado de sprite sheet reproduce y hace loop sin pop.
+- `anim.set_param` (usando metadata registry) modifica playback al frame siguiente.
+- Root motion mueve actor determinísticamente cuando clip tiene flag `root_motion`.
+- Hot-reload clip mantiene posición de playback (time actual se preserva).
+- `animation_finished` signal se drena una vez por frame.
+- Sistema cuesta ≤ 0.05 ms/frame para 100 clips simultaneously.
+- Zero allocations por frame en el loop principal.
+
+### Dependency actualizada
+Ahora **M13 depende solo de**:
+1. **M6 Asset pipeline** — clips son assets con GUID → ya completado.
+2. **M3 Lua bindings + metadata registry** — para `set_param` y signals → ya completado.
+3. **M4 Physics** — para root motion integration → ya completado.
+
+**Por esto, M13 puede entregarse inmediatamente después de M6 sin esperar M14 o M15.** El roadmap lo tiene en posición M13 pero su implementation es liviana y no tiene bloqueos nuevos.
 
 ### M14 — Text rendering + Game UI
 **Goal**: a game can show text and a HUD. **There is no font or text rendering anywhere in the engine today** — this milestone starts with it, and that is a hidden dependency for M17 too.

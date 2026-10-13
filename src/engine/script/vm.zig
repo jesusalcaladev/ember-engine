@@ -38,7 +38,23 @@ const luaL_Reg = lua.luaL_Reg;
 
 /// Alignment Lua's heap must satisfy: room for a double and any pointer, with
 /// slack for LuaJIT's SIMD paths. 16 on x86-64.
-const heap_align = std.mem.Alignment.fromByteUnits(16);
+const heap_align_bytes: usize = 16;
+const heap_align = std.mem.Alignment.fromByteUnits(heap_align_bytes);
+
+/// Frees a block that was handed out by `alignedAlloc(u8, heap_align, ...)`
+/// with the SAME alignment it was allocated with.
+///
+/// `Allocator.free` derives the alignment from the slice's type, so freeing a
+/// `[]u8` (alignment 1) a block that was allocated at 16 is a mismatch — and
+/// Zig's debug allocator aborts on exactly that ("Allocation alignment 16 does
+/// not match free alignment 1"). LuaJIT's `lua_Alloc` protocol carries no
+/// alignment, so the align is re-attached here, at the one place the VM hands
+/// memory back.
+fn freeAligned(a: std.mem.Allocator, p: *anyopaque, len: usize) void {
+    const many: [*]u8 = @ptrCast(p);
+    const aligned: [*]align(heap_align_bytes) u8 = @alignCast(many);
+    a.free(aligned[0..len]);
+}
 
 /// A registry ref that means "nothing". Stored in place of an absent method so
 /// the hot path is a single compare, not a type check.
@@ -58,8 +74,7 @@ const LuaHeap = struct {
         const self: *LuaHeap = @ptrCast(@alignCast(ud.?));
         if (nsize == 0) {
             if (ptr) |p| {
-                const buf = @as([*]u8, @ptrCast(p))[0..osize];
-                self.child.free(buf);
+                freeAligned(self.child, p, osize);
                 self.live_bytes -= osize;
             }
             return null;
@@ -71,11 +86,12 @@ const LuaHeap = struct {
             return mem.ptr;
         }
         // Realloc: alloc + copy + free, ALWAYS. See the note below.
-        const old = @as([*]u8, @ptrCast(ptr))[0..osize];
         const new = self.child.alignedAlloc(u8, heap_align, nsize) catch return null;
         const n = @min(osize, nsize);
-        @memcpy(new[0..n], old[0..n]);
-        self.child.free(old);
+        const old_many: [*]u8 = @ptrCast(ptr.?);
+        const old_aligned: [*]align(heap_align_bytes) u8 = @alignCast(old_many);
+        @memcpy(new[0..n], old_aligned[0..n]);
+        freeAligned(self.child, ptr.?, osize);
         self.live_bytes = self.live_bytes - osize + nsize;
         if (self.live_bytes > self.peak_bytes) self.peak_bytes = self.live_bytes;
         return new.ptr;

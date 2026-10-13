@@ -124,7 +124,10 @@ fn writeBinding(writer: anytype, b: Binding) !void {
 
     // `self`-taking actor methods are emitted as `Actor:method` so LuaLS
     // offers them on the colon-call form gameplay uses.
-    const has_self = b.params.len > 0 and std.mem.eql(u8, b.params[0].name, "self");
+    // Only the ACTOR module's methods are Actor: — sound.* also takes self
+    // but lives in its own module table, so it stays as `sound.play` etc.
+    const is_actor_module = std.mem.eql(u8, b.module, "actor");
+    const has_self = b.params.len > 0 and std.mem.eql(u8, b.params[0].name, "self") and is_actor_module;
     if (has_self) {
         try writer.writeAll("function Actor:");
         try writer.writeAll(shortName(b.name));

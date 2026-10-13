@@ -51,6 +51,8 @@ const builtin = @import("builtin");
 pub const batcher = @import("batcher.zig");
 pub const atlas = @import("atlas.zig");
 pub const two_d = @import("2d.zig");
+pub const particles = @import("particles.zig");
+pub const fade = @import("fade.zig");
 pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
 pub const backend_null = @import("backend_null.zig");
@@ -60,6 +62,8 @@ test {
     _ = batcher;
     _ = atlas;
     _ = two_d;
+    _ = particles;
+    _ = fade;
     _ = light;
     _ = lighting_driver;
     _ = backend_null;
@@ -158,5 +162,9 @@ test "the renderer's tests are in this binary, not just its code" {
             @compileError("atlas.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(two_d.Renderer2D))
             @compileError("2d.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(particles.System))
+            @compileError("particles.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(fade.Fader))
+            @compileError("fade.zig is reachable as a module, so its tests are compiled and never run");
     }
 }

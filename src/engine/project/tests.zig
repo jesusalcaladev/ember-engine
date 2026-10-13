@@ -640,7 +640,7 @@ test "project.config: bindingsFor finds an action by name" {
 }
 
 test "project.config: the lighting section round-trips and its range is enforced" {
-    // The GI resolution dial, end to end through the file.
+    // The shadow resolution dial, end to end through the file.
     //
     // A section that parses but does not round-trip is worse than one that does
     // not exist: the editor shows a control, the developer changes it, saves,
@@ -648,7 +648,6 @@ test "project.config: the lighting section round-trips and its range is enforced
     // path rather than checking that the struct has the field.
     const src =
         \\lighting {
-        \\  gi_resolution 256
         \\  shadow_resolution 1024
         \\}
     \\
@@ -656,7 +655,6 @@ test "project.config: the lighting section round-trips and its range is enforced
     var cfg = try parser.parse(std.testing.allocator, src);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(i32, 256), cfg.lighting.gi_resolution);
     try std.testing.expectEqual(@as(i32, 1024), cfg.lighting.shadow_resolution);
 
     const encoded = try parser.encodeToString(std.testing.allocator, &cfg);
@@ -664,7 +662,6 @@ test "project.config: the lighting section round-trips and its range is enforced
 
     var again = try parser.parse(std.testing.allocator, encoded);
     defer again.deinit();
-    try std.testing.expectEqual(@as(i32, 256), again.lighting.gi_resolution);
     try std.testing.expectEqual(@as(i32, 1024), again.lighting.shadow_resolution);
 
     // And the encoder is canonical: same input, same bytes.
@@ -672,25 +669,12 @@ test "project.config: the lighting section round-trips and its range is enforced
     defer std.testing.allocator.free(reencoded);
     try std.testing.expectEqualStrings(encoded, reencoded);
 
-    // `0` is legal and means something specific -- "match the shadow mask" --
-    // so it must not be rejected as a missing value, and must not be confused
-    // with the default. It is the finest field the hardware can carry.
-    var zero = try parser.parse(std.testing.allocator, "lighting { gi_resolution 0 }");
-    defer zero.deinit();
-    try std.testing.expectEqual(@as(i32, 0), zero.lighting.gi_resolution);
-    try std.testing.expect(zero.lighting.gi_resolution != cfg_default_gi_resolution());
-
     // And the bound is real. A slider whose far end the validator rejects is a
     // slider that hands the developer a config the engine will refuse.
-    var too_big = try parser.parse(std.testing.allocator, "lighting { gi_resolution 99999 }");
+    var too_big = try parser.parse(std.testing.allocator, "lighting { shadow_resolution 99999 }");
     defer too_big.deinit();
     try std.testing.expectError(
         error.OutOfRange,
         schema.validate(&too_big),
     );
-}
-
-fn cfg_default_gi_resolution() i32 {
-    const c = config.Config{};
-    return c.lighting.gi_resolution;
 }

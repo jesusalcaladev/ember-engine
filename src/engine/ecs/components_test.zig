@@ -45,9 +45,15 @@ test "the existing component sizes are unchanged" {
     try testing.expectEqual(@as(usize, 40), @sizeOf(c.Transform));
     try testing.expectEqual(@as(usize, 8), @sizeOf(c.Parent));
     try testing.expectEqual(@as(usize, 12), @sizeOf(c.Velocity));
-    try testing.expectEqual(@as(usize, 52), @sizeOf(c.Sprite));
+    // 56: M7's `coverage_index` (an i32) is part of the Sprite now. See the
+    // matching note in `components/sprite.zig`.
+    try testing.expectEqual(@as(usize, 56), @sizeOf(c.Sprite));
     try testing.expectEqual(@as(usize, 4), @sizeOf(c.Script));
     try testing.expectEqual(@as(usize, 8), @sizeOf(c.StateMachine));
+    // M8: 8 (tick) + 8 (VoiceRef, two u32) + 4 f32 + u16 + 2 bools, padded to
+    // the u64's alignment. Pinned so a field added for a future feature is a
+    // failing number here rather than a silent extra 8 bytes per emitter.
+    try testing.expectEqual(@as(usize, 40), @sizeOf(c.SoundEmitter2D));
 }
 
 test "a component field is never left uninitialized" {

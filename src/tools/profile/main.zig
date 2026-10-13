@@ -43,6 +43,15 @@ const Metric = enum {
     arena_high_water,
     rss_bytes,
     frames,
+    // M8: the mixer's own counters. "Lower is better" holds for every one of
+    // them — xruns and dropped commands have a limit of ZERO, which is not a
+    // target to beat but a line not to cross.
+    audio_voices_peak,
+    audio_xruns,
+    audio_commands_dropped,
+    audio_latency_us,
+    audio_mix_ns,
+    audio_bank_bytes,
 
     fn key(self: Metric) []const u8 {
         return switch (self) {
@@ -60,6 +69,12 @@ const Metric = enum {
             .arena_high_water => "arena_high_water",
             .rss_bytes => "rss_bytes",
             .frames => "frames",
+            .audio_voices_peak => "audio_voices_peak",
+            .audio_xruns => "audio_xruns",
+            .audio_commands_dropped => "audio_commands_dropped",
+            .audio_latency_us => "audio_latency_us",
+            .audio_mix_ns => "audio_mix_ns",
+            .audio_bank_bytes => "audio_bank_bytes",
         };
     }
 
@@ -68,6 +83,7 @@ const Metric = enum {
         return switch (self) {
             .work_p50, .work_p99, .work_p999, .work_max, .wall_p50, .wall_p99 => "frame_ms",
             .draw_calls, .upload_bytes, .allocs_in_frame, .gpu_resources_in_frame, .arena_high_water, .gpu_ns, .rss_bytes => "counters",
+            .audio_voices_peak, .audio_xruns, .audio_commands_dropped, .audio_latency_us, .audio_mix_ns, .audio_bank_bytes => "counters",
             .frames => "",
         };
     }
@@ -77,7 +93,9 @@ const Metric = enum {
             .work_p50, .work_p99, .work_p999, .work_max, .wall_p50, .wall_p99 => "ms",
             .gpu_ns => "ns",
             .draw_calls, .allocs_in_frame, .gpu_resources_in_frame, .frames => " ",
-            .upload_bytes, .arena_high_water, .rss_bytes => "B",
+            .upload_bytes, .arena_high_water, .rss_bytes, .audio_bank_bytes => "B",
+            .audio_voices_peak, .audio_xruns, .audio_commands_dropped => " ",
+            .audio_latency_us, .audio_mix_ns => "us",
         };
     }
 };
@@ -271,6 +289,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     out("  arena high-water {d} B   rss {d:.1} MiB", .{
         report.intField2("arena_high_water"),
         @as(f64, @floatFromInt(report.intField2("rss_bytes"))) / (1024.0 * 1024.0),
+    });
+    // M8: the mixer's counters. Printed even when zero, because "no audio in
+    // this run" is a fact worth seeing in a CI log rather than an absence.
+    out("  audio: {d} voices peak, {d} xruns, {d} commands dropped, {d:.1} ms latency, mix {d:.2} ms/buffer, bank {d} B of {d} B", .{
+        report.intField2("audio_voices_peak"),
+        report.intField2("audio_xruns"),
+        report.intField2("audio_commands_dropped"),
+        report.value(.audio_latency_us) / 1000.0,
+        report.value(.audio_mix_ns) / 1000.0,
+        report.intField2("audio_bank_bytes"),
+        report.intField2("audio_bank_budget"),
     });
 
     var names_buf: [256]u8 = undefined;

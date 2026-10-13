@@ -81,6 +81,19 @@ pub const PointLight2D = registry.PointLight2D;
 pub const SpotLight2D = registry.SpotLight2D;
 pub const DirectionalLight2D = registry.DirectionalLight2D;
 pub const AmbientLight2D = registry.AmbientLight2D;
+pub const SoundEmitter2D = registry.SoundEmitter2D;
+pub const VoiceRef = registry.VoiceRef;
+pub const ParticleEmitter2D = registry.ParticleEmitter2D;
+pub const EmitShape = registry.EmitShape;
+pub const ParticleBackend = registry.ParticleBackend;
+pub const ParticleSpace = registry.ParticleSpace;
+pub const no_particle_slab = registry.no_particle_slab;
+pub const packParticleColor = registry.packParticleColor;
+pub const unpackParticleColor = registry.unpackParticleColor;
+pub const AnimationPlayer = registry.AnimationPlayer;
+pub const anim_clip_loop = registry.anim_clip_loop;
+pub const anim_clip_ping_pong = registry.anim_clip_ping_pong;
+pub const anim_clip_root_motion = registry.anim_clip_root_motion;
 
 // Pull the per-file tests into the suite: `zig build test` runs the tests of
 // every file reachable from the root under test, and these are only reachable
@@ -98,5 +111,8 @@ test {
     _ = @import("components/light.zig");
     _ = @import("components/camera.zig");
     _ = @import("components/timer.zig");
+    _ = @import("components/sound_emitter.zig");
+    _ = @import("components/particle.zig");
+    _ = @import("components/animation.zig");
     _ = @import("components/registry.zig");
 }

@@ -129,6 +129,27 @@ pub const Counters = struct {
     alloc_bytes_in_frame: u64 = 0,
     rss_bytes: u64 = 0,
 
+    // --- audio (M8; filled by the runtime from `Audio.stats()`) ---
+    /// Peak simultaneous voices over the run. The M8 criterion is "64
+    /// simultaneous emitters", and the PEAK is the number that answers it —
+    /// the instantaneous count says nothing about whether they overlapped.
+    audio_voices_peak: u64 = 0,
+    /// Device underruns: the mix did not finish inside its period. The ONE
+    /// failure mode audio has that is not a crash — it crackles.
+    audio_xruns: u64 = 0,
+    /// Commands the main thread pushed past a full ring. A dropped command is
+    /// a sound that never played, which is worse than a late one.
+    audio_commands_dropped: u64 = 0,
+    /// Output latency in microseconds: what the device holds
+    /// (`period_frames / sample_rate`). The M8 budget is 20 ms.
+    audio_latency_us: u64 = 0,
+    /// Device-thread mix cost per buffer, in nanoseconds (averaged over the
+    /// run). The number that says whether the callback fits inside its period.
+    audio_mix_ns: u64 = 0,
+    /// Decoded PCM resident in the bank, and the budget it is held to (§5).
+    audio_bank_bytes: u64 = 0,
+    audio_bank_budget: u64 = 0,
+
     // --- threads (from the sampler) ---
     cpu_ticks_total: u64 = 0,
     cpu_ticks_main: u64 = 0,

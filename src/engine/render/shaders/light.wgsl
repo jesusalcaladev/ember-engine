@@ -39,11 +39,11 @@ struct LightIn {
     @location(4) cos_inner_energy: vec2f,
     /// Byte 40: rgb + opacity.
     @location(5) color: vec4f,
-    /// Byte 48: attenuation exponent, shadow softness.
+    /// Byte 56: attenuation exponent, shadow softness.
     @location(6) atten_soft: vec2f,
-    /// Byte 56: gi contribution, packed flags.
-    @location(7) gi_flags: vec2f,
-    /// Byte 64: the sprite layers this light affects, as a bitmask.
+    /// Byte 64: the packed flags (kind, blend, filter, shadow, channel).
+    @location(7) flags: u32,
+    /// Byte 68: the sprite layers this light affects, as a bitmask.
     ///
     /// A separate attribute and not part of the packed flags because it is 32
     /// bits of its own: cramming it in would mean either a second vertex buffer
@@ -72,14 +72,6 @@ struct Globals {
     inv_screen: vec2f,
     // Ambient colour and the global light energy: the Environment (M7).
     ambient: vec4f,
-    // The GI cascade's world-space rectangle, so a lookup can turn a world
-    // position into a texel. `xy` is the min corner and `zw` the max.
-    mask_rect: vec4f,
-    // Sky colour and the bounce albedo, matching `CascadeParams` in
-    // radiance.wgsl. The two shaders read the same numbers because they are
-    // solving the same problem; a divergence here shows up as bounce light that
-    // changes colour when the GI cascades are rebuilt.
-    sky: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -89,19 +81,6 @@ struct Globals {
 // not a coordinate: a filtered sample would blend two directions and produce a
 // shadow that leaks on one side and darkens the other.
 @group(0) @binding(1) var shadow_map: texture_2d<f32>;
-
-// The GI cascade: a pyramid of probe grids, each half the resolution of the one
-// below. SAMPLED WITH A SAMPLER rather than texelFetch, and that is the
-// opposite decision from the shadow map one line up, on purpose.
-//
-// A shadow map is indexed by an ANGLE BUCKET, which is not a position: a
-// filtered sample blends two directions and leaks on one side while darkening
-// the other. The cascade is indexed by a POSITION, a grid at `base_scale`
-// spacing, so it is exactly the case filtering is for — and a probe grid
-// sampled with texelFetch looks like a grid of hard squares, which is the thing
-// GI must never look like.
-@group(0) @binding(2) var gi_tex: texture_2d<f32>;
-@group(0) @binding(3) var gi_smp: sampler;
 
 /// Which sprite layer each pixel of the scene is on, written by the sprite pass
 /// as a SECOND colour target.
@@ -121,7 +100,7 @@ struct Globals {
 ///
 /// One byte per pixel, written for free by a pass that already runs, and read
 /// once by a fragment that already runs. The cost is a second attachment.
-@group(0) @binding(4) var layer_tex: texture_2d<f32>;
+@group(0) @binding(2) var layer_tex: texture_2d<f32>;
 
 /// The layer a pixel with NO sprite carries.
 ///
@@ -144,12 +123,11 @@ struct VSOut {
     @location(6) si_cos_outer: f32,
     @location(7) si_cos_inner: f32,
     @location(8) si_angle: f32,
-    @location(9) si_gi: f32,
-    @location(10) si_shadow_ratio: f32,
-    @location(11) @interpolate(flat) si_flags: u32,
-    @location(12) @interpolate(flat) si_filter: u32,
-    @location(13) @interpolate(flat) si_color: vec4f,
-    @location(14) @interpolate(flat) si_cull_mask: u32,
+    @location(9) si_shadow_ratio: f32,
+    @location(10) @interpolate(flat) si_flags: u32,
+    @location(11) @interpolate(flat) si_filter: u32,
+    @location(12) @interpolate(flat) si_color: vec4f,
+    @location(13) @interpolate(flat) si_cull_mask: u32,
 };
 
 @vertex
@@ -160,7 +138,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, in: LightIn) -> VSOut {
     let cx = f32(vi & 1u);
     let cy = f32((vi >> 1u) & 1u);
     let corner = vec2f(cx, cy) * 2.0 - 1.0;
-    let flags = bitcast<u32>(in.gi_flags.y);
+    let flags = in.flags;
 
     var out: VSOut;
     out.clip = globals.vp * vec4f(in.pos + corner * in.half, 0.0, 1.0);
@@ -174,7 +152,6 @@ fn vs_main(@builtin(vertex_index) vi: u32, in: LightIn) -> VSOut {
     out.si_cos_outer = in.angle_cos.y;
     out.si_cos_inner = in.cos_inner_energy.x;
     out.si_angle = in.angle_cos.x;
-    out.si_gi = in.gi_flags.x;
     out.si_flags = flags;
     out.si_filter = (flags >> 5) & 3u;
     out.si_color = in.color;
@@ -311,47 +288,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         }
     }
 
-    // GI. The cascade's alpha channel is the ENCLOSURE term — how much of the
-    // hemisphere this point can see — and `si_gi` is how much of it this light
-    // is allowed to apply.
-    //
-    // `si_gi` defaults to zero, and that default is the whole design: a scene
-    // that never asked for bounce must not get it, even though the texture is
-    // bound and the sampler is bound and the code is right here. A GI term that
-    // arrives unasked for darkens every enclosed room in every project that
-    // added the subsystem, and the report is always "my lights look wrong" with
-    // no way to point at the cause.
-    var gi: f32 = 1.0;
-    if (in.si_gi > 0.0) {
-        // Normalized UV over `mask_rect`, NOT over the texture's own dimensions.
-        // That is what lets `lighting.gi_resolution` change the field's size
-        // without touching this shader: the texture covers the same world
-        // rectangle whatever its resolution, so the field's cell count is the
-        // CPU's business and the GPU's only business is where to sample it.
-        let span = max(globals.mask_rect.zw - globals.mask_rect.xy, vec2f(1e-4));
-        // Outside the cascade's rectangle there is no enclosure data, and the
-        // honest answer for "how enclosed is somewhere we never measured" is
-        // zero: unenclosed. Guessing anything else makes the border of a
-        // measured region pop, which is worse than having no GI there.
-        let uv = (in.world - globals.mask_rect.xy) / span;
-        if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
-            // `textureSampleLevel`, not `textureSample`: the branch is keyed on
-            // a per-instance value, so it is not uniform control flow and the
-            // implicit-derivative form is illegal here. Level 0 is not a
-            // downgrade — the cascade is a probe grid with no mip chain, so
-            // there is no other level to take and the derivative would only
-            // have picked 0 anyway.
-            gi = 1.0 - in.si_gi * (1.0 - textureSampleLevel(gi_tex, gi_smp, uv, 0.0).a);
-        } else {
-            gi = 1.0 - in.si_gi;
-        }
-    }
-
     // `energy` and the colour's alpha BOTH scale what arrives. Alpha is the
     // light's opacity, which is why fading a light needs no extra attribute and
     // no extra blend mode — and why `mix` can lerp by the amount that arrives
     // rather than by the colour.
-    let a = falloff * vis * in.si_energy * color.a * gi;
+    let a = falloff * vis * in.si_energy * color.a;
     return vec4f(color.rgb * a, a);
 }
 

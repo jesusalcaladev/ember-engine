@@ -88,6 +88,19 @@ function Actor:is_within_radius(other, radius) end
 ---@return boolean true if point is within radius
 function Actor:is_within_radius_of_point(x, y, radius) end
 
+---Batch set: position, rotation and scale in one call.
+---@param self Actor 
+---@param x number 
+---@param y number 
+---@param rot number 
+---@param scale number 
+function Actor:set_transform(x, y, rot, scale) end
+
+---Batch get: all actor components as one table (replaces N bindings).
+---@param self Actor 
+---@return table table of component values
+function Actor:get_all() end
+
 ---Unit vector pointing from this actor to the other.
 ---@param self Actor 
 ---@param other Actor 
@@ -166,42 +179,42 @@ function physics.set_focus(x, y) end
 ---@param kind integer 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon
 ---@param half_w number half width in world units
 ---@param half_h number half height in world units
-function Actor:create_shape(kind, half_w, half_h) end
+function physics.create_shape(self, kind, half_w, half_h) end
 
 ---Replaces an actor's shape in place. Safe to call every frame while dragging a handle.
 ---@param self Actor 
 ---@param kind integer 0 box, 1 circle, 2 capsule, 3 cylinder, 4 polygon
 ---@param half_w number half width in world units
 ---@param half_h number half height in world units
-function Actor:reshape(kind, half_w, half_h) end
+function physics.reshape(self, kind, half_w, half_h) end
 
 ---Sets an actor's surface material.
 ---@param self Actor 
 ---@param friction number 0 slippery to 1 grippy
 ---@param restitution number 0 no bounce to 1 full bounce
 ---@param density number mass per area
-function Actor:set_material(friction, restitution, density) end
+function physics.set_material(self, friction, restitution, density) end
 
 ---Turns a shape into a trigger volume: reports overlaps, generates no contact response.
 ---@param self Actor 
 ---@param is_sensor boolean true for a trigger
-function Actor:set_sensor(is_sensor) end
+function physics.set_sensor(self, is_sensor) end
 
 ---Assigns collision layers as bitmasks. Two shapes interact only if each is on a layer the other's mask has.
 ---@param self Actor 
 ---@param layer_mask integer which layers this actor is on
 ---@param collide_mask integer which layers it is willing to interact with
-function Actor:set_layers(layer_mask, collide_mask) end
+function physics.set_layers(self, layer_mask, collide_mask) end
 
 ---Changes how an actor is simulated: 0 fixed, 1 kinematic, 2 dynamic.
 ---@param self Actor 
 ---@param kind integer 0 fixed, 1 kinematic, 2 dynamic
-function Actor:set_body_type(kind) end
+function physics.set_body_type(self, kind) end
 
 ---Turns collision on or off without destroying the shape. The editor's eye toggle.
 ---@param self Actor 
 ---@param enabled boolean false to make it intangible
-function Actor:set_body_enabled(enabled) end
+function physics.set_body_enabled(self, enabled) end
 
 ---Every actor overlapping a box. The selection query. Approximate: a shape is found when a ray crosses it.
 ---@param cx number box centre x
@@ -240,6 +253,134 @@ function physics.cast_ray(x1, y1, x2, y2) end
 function physics.line_of_sight(x1, y1, x2, y2) end
 
 
+-- ── audio ──
+---Plays a sound file and returns a handle. Load-time/preview: it may decode, so keep gameplay on a resident slot.
+---@param path string path to the sound file, relative to the project root
+---@param opts table { bus, bus_name, volume, pitch, max_distance, spread, loop, priority }
+---@return any a voice handle, or nil when it could not load
+function audio.play_file(path, opts) end
+
+---Plays a sound STREAMED from disk: only a small window is resident and the frame loop keeps it fed. Use it for long music.
+---@param path string path to the sound file, relative to the project root
+---@param opts table { bus, bus_name, volume, pitch, max_distance, spread, loop, priority }
+---@return any a voice handle, or nil when it could not open
+function audio.play_stream(path, opts) end
+
+---Stops one playing sound. A stale handle is a no-op.
+---@param voice any 
+function audio.stop(voice) end
+
+---Stops every playing sound. The Play/Stop hook: leaves the mixer silent and exact.
+function audio.stop_all() end
+
+---Changes a playing sound's own volume (before bus gain).
+---@param voice any 
+---@param volume number 1 is full; >1 is allowed and soft-clipped
+function audio.set_volume(voice, volume) end
+
+---Changes a playing sound's pitch (the resample ratio): 2 is an octave up.
+---@param voice any 
+---@param pitch number 1 is original
+function audio.set_pitch(voice, pitch) end
+
+---Whether a voice is still playing. False for a stale handle.
+---@param voice any 
+---@return boolean true while the sound is audible
+function audio.is_playing(voice) end
+
+---Sets the master volume (bus 0). Applies to everything.
+---@param gain number 1 is full
+function audio.set_master_volume(gain) end
+
+---Where the ears are and which way they face. The rotation turns the stereo field: a sound to the world-east pans right when the ears face +x.
+---@param x number 
+---@param y number 
+---@param rotation number radians; 0 (default) faces +x
+function audio.set_listener(x, y, rotation) end
+
+---Solos or unsolos a bus. While any bus is soloed, every other bus except master is silent.
+---@param bus any bus name or id
+---@param solo boolean 
+function audio.solo_bus(bus, solo) end
+
+---Routes part of a bus into another bus's gain path (an aux/reverb send). A nil target clears it.
+---@param bus any source bus name or id
+---@param target any destination bus name or id, or nil to clear
+---@param amount number fraction of the source signal, 0..4
+function audio.set_bus_send(bus, target, amount) end
+
+---A bus's current gain, by name or id. A missing name reads as 1.
+---@param bus any bus name ('music') or id (number)
+---@return number 0 when muted, otherwise the gain
+function audio.bus_gain(bus) end
+
+---Sets a bus gain by name or id. What a mixer slider writes.
+---@param bus any bus name or id
+---@param gain number 1 is full
+function audio.set_bus_volume(bus, gain) end
+
+---Mutes or unmutes a bus. Muted voices keep playing but are silent.
+---@param bus any bus name or id
+---@param muted boolean 
+function audio.mute_bus(bus, muted) end
+
+---Every named bus as { name, id, gain, muted, solo, send_to, send_amount }, in bus order. What the mixer panel iterates.
+---@return table an array of bus records
+function audio.buses() end
+
+---Engine counters: voices active/peak, xruns, latency, the negotiated rate, and the bank's bytes.
+---@return table voices_active, voices_peak, xruns, commands_dropped, latency_ms, period_frames, sample_rate, channels, bank_bytes, bank_budget
+function audio.stats() end
+
+
+-- ── sound ──
+---Plays this actor's emitter at its transform. Omitting `path` plays the slot the scene already resolved (the frame-safe form).
+---@param self Actor 
+---@param path string sound file to load, relative to the project root; omit to use the emitter's own bank slot
+---@param opts table { bus, bus_name, volume, pitch, loop, max_distance, spread, priority }; absent fields keep the component's values
+---@return any a voice handle, or nil when there was nothing to play
+function sound.play(self, path, opts) end
+
+---Stops the voice this emitter started. A no-op when it already ended.
+---@param self Actor 
+function sound.stop(self) end
+
+---Sets the emitter's gain and applies it to the voice already playing.
+---@param self Actor 
+---@param volume number 1 is full; >1 is allowed and soft-clipped
+function sound.set_volume(self, volume) end
+
+---Sets the emitter's resample ratio and applies it to the voice already playing.
+---@param self Actor 
+---@param pitch number 1 is original; 2 is an octave up
+function sound.set_pitch(self, pitch) end
+
+---Makes the emitter loop. Takes effect on the next play: a running voice keeps the flag it started with.
+---@param self Actor 
+---@param on boolean 
+function sound.set_loop(self, on) end
+
+---How far this sound carries. 0 means global: never attenuated, never panned (music, UI). Next play, not the running one.
+---@param self Actor 
+---@param max_distance number world units; 0 = global
+function sound.set_radius(self, max_distance) end
+
+---How far off-centre the sound reaches hard left/right. Next play, not the running one.
+---@param self Actor 
+---@param units number world units to full pan
+function sound.set_spread(self, units) end
+
+---Whether this emitter's voice is still audible. Asks the system, and clears a stale handle.
+---@param self Actor 
+---@return boolean true while the sound is playing
+function sound.is_playing(self) end
+
+---Every readable field of this emitter: bank slot, its path, bus, volume, pitch, loop, radius, spread, autoplay, playing, tick.
+---@param self Actor 
+---@return table an empty table when the actor has no emitter
+function sound.describe(self) end
+
+
 -- ── render ──
 ---What the camera can see. Turning this on makes the renderer cull.
 ---@param x number camera centre x
@@ -273,7 +414,7 @@ function render.all_resident() end
 ---@param g number green 0..1
 ---@param b number blue 0..1
 ---@param a number alpha 0..1
-function Actor:rect(w, h, r, g, b, a) end
+function sprite.rect(self, w, h, r, g, b, a) end
 
 ---A circle, no texture needed. One quad and one comparison in the shader.
 ---@param self Actor 
@@ -282,7 +423,7 @@ function Actor:rect(w, h, r, g, b, a) end
 ---@param g number green 0..1
 ---@param b number blue 0..1
 ---@param a number alpha 0..1
-function Actor:circle(diameter, r, g, b, a) end
+function sprite.circle(self, diameter, r, g, b, a) end
 
 ---The same shape, sampling a real atlas region. The 'now give it art' call.
 ---@param self Actor 
@@ -293,23 +434,23 @@ function Actor:circle(diameter, r, g, b, a) end
 ---@param v0 number atlas v0
 ---@param u1 number atlas u1
 ---@param v1 number atlas v1
-function Actor:texture(w, h, atlas_slot, u0, v0, u1, v1) end
+function sprite.texture(self, w, h, atlas_slot, u0, v0, u1, v1) end
 
 ---Draw order. Lower draws first; equal layers batch into one draw call.
 ---@param self Actor 
 ---@param layer integer 0 draws first
-function Actor:set_layer(layer) end
+function sprite.set_layer(self, layer) end
 
 ---Draw nothing without despawning. The editor's eye toggle.
 ---@param self Actor 
 ---@param visible boolean false to stop drawing it
-function Actor:set_visible(visible) end
+function sprite.set_visible(self, visible) end
 
 ---The sprite's size in world units.
 ---@param self Actor 
 ---@param w number width
 ---@param h number height
-function Actor:set_size(w, h) end
+function sprite.set_size(self, w, h) end
 
 ---Colour, multiplied with the texel.
 ---@param self Actor 
@@ -317,7 +458,7 @@ function Actor:set_size(w, h) end
 ---@param g number green 0..1
 ---@param b number blue 0..1
 ---@param a number alpha 0..1
-function Actor:set_tint(r, g, b, a) end
+function sprite.set_tint(self, r, g, b, a) end
 
 ---The atlas region to sample.
 ---@param self Actor 
@@ -325,28 +466,28 @@ function Actor:set_tint(r, g, b, a) end
 ---@param v0 number top
 ---@param u1 number right
 ---@param v1 number bottom
-function Actor:set_uv(u0, v0, u1, v1) end
+function sprite.set_uv(self, u0, v0, u1, v1) end
 
 ---Which texture in the table.
 ---@param self Actor 
 ---@param slot integer index into the texture table; 0 is the white texture
-function Actor:set_atlas(slot) end
+function sprite.set_atlas(self, slot) end
 
 ---How the quad is masked: 0 quad, 1 circle.
 ---@param self Actor 
 ---@param kind integer 0 quad, 1 circle
-function Actor:set_shape(kind) end
+function sprite.set_shape(self, kind) end
 
 ---Blending mode: 0 solid, 1 alpha, 2 additive.
 ---@param self Actor 
 ---@param kind integer 0 solid, 1 alpha, 2 additive
-function Actor:set_blend(kind) end
+function sprite.set_blend(self, kind) end
 
 ---The sprite's size. The inspector reads as well as writes.
 ---@param self Actor 
 ---@return number width
 ---@return number height
-function Actor:get_size() end
+function sprite.get_size(self) end
 
 ---The sprite's tint.
 ---@param self Actor 
@@ -354,145 +495,122 @@ function Actor:get_size() end
 ---@return number green
 ---@return number blue
 ---@return number alpha
-function Actor:get_tint() end
+function sprite.get_tint(self) end
 
 
 -- ── point ──
 ---Adds a PointLight2D: a lamp, torch or candle. Falls off in every direction.
 ---@param self Actor 
 ---@param radius number reach in world units
-function Actor:new(radius) end
+function point.new(self, radius) end
 
 ---How far the light reaches. Clamped to at least 1: a zero radius is a divide-by-zero in every falloff, not a hard edge.
 ---@param self Actor 
 ---@param radius number reach
-function Actor:set_radius(radius) end
+function point.set_radius(self, radius) end
 
 
 -- ── spot ──
 ---Adds a SpotLight2D: a cone with a soft edge.
 ---@param self Actor 
 ---@param radius number beam reach
-function Actor:new(radius) end
+function spot.new(self, radius) end
 
 ---How far the beam reaches.
 ---@param self Actor 
 ---@param radius number reach
-function Actor:set_radius(radius) end
+function spot.set_radius(self, radius) end
 
 ---The cone's opening and its soft edge. Two numbers in one call because nothing ever sets one without the other, and a spotlight whose opening moved but whose soft edge did not is a mis-configured light nobody can explain.
 ---@param self Actor 
 ---@param degrees number full opening
 ---@param penumbra number 0..1 soft-edge fraction
-function Actor:set_cone(degrees, penumbra) end
+function spot.set_cone(self, degrees, penumbra) end
 
 ---The direction the cone points.
 ---@param self Actor 
 ---@param radians number angle
-function Actor:set_angle(radians) end
+function spot.set_angle(self, radians) end
 
 
 -- ── directional ──
 ---Adds a DirectionalLight2D: the sun. No falloff at all, which is why it exists -- a point light at 4000 units is dark at the far end of the screen because its falloff is measured from where it IS, and a sun is not anywhere.
 ---@param self Actor 
-function Actor:new() end
+function directional.new(self) end
 
 ---The direction the light TRAVELS, not the direction it points. A sun at 0 shines to the right, which makes shadows run to the left of every object.
 ---@param self Actor 
 ---@param radians number angle
-function Actor:set_angle(radians) end
+function directional.set_angle(self, radians) end
 
 ---0..1. How high above the scene the light sits, which scales shadow LENGTH. A 2D scene needs a z coordinate for exactly this.
 ---@param self Actor 
 ---@param h number 0..1
-function Actor:set_height(h) end
+function directional.set_height(self, h) end
 
 
 -- ── ambient ──
 ---Adds an AmbientLight2D. Its own type rather than one number on the Environment, because a scene often wants TWO ambients -- a sky colour and a ground bounce.
 ---@param self Actor 
-function Actor:new() end
+function ambient.new(self) end
 
 ---A local ambient. 0 restores the scene-wide kind. A lantern's pool of warm air differs from the night around it, and one number cannot hold both.
 ---@param self Actor 
 ---@param distance number reach; 0 for scene-wide
-function Actor:set_local(distance) end
-
-
--- ── material ──
----Attaches a shader material to an actor. Shader 0 is the stock sprite shader.
----@param self Actor 
----@param shader integer index into the shader table
-function Actor:new(shader) end
-
----The material's four floats. Enough for a colour, a threshold, a time.
----@param self Actor 
----@param p0 number param 0
----@param p1 number param 1
----@param p2 number param 2
----@param p3 number param 3
-function Actor:set_params(p0, p1, p2, p3) end
-
----The material's four floats. The inspector reads as well as writes.
----@param self Actor 
----@return number param 0
----@return number param 1
----@return number param 2
----@return number param 3
-function Actor:get_params() end
-
----Which shader this material uses.
----@param self Actor 
----@return number shader index
-function Actor:get_shader() end
+function ambient.set_local(self, distance) end
 
 
 -- ── light ──
+---Which light component this actor carries: point, spot, directional, ambient or legacy. nil when it carries none.
+---@param self Actor 
+---@return any the kind's name as a string, or nil for no light
+function light.kind_of(self) end
+
+---Every readable field of whichever light component is present, as one flat string-keyed table. An empty table when there is no light.
+---@param self Actor 
+---@return table field name to value
+function light.describe(self) end
+
 ---Colour. Alpha is the light's opacity, so a light fades out by its alpha and not a separate field.
 ---@param self Actor 
 ---@param r number red
 ---@param g number green
 ---@param b number blue
 ---@param a number alpha
-function Actor:set_color(r, g, b, a) end
+function light.set_color(self, r, g, b, a) end
 
 ---Brightness multiplier.
 ---@param self Actor 
 ---@param e number multiplier
-function Actor:set_energy(e) end
+function light.set_energy(self, e) end
 
 ---A spot's opening and its soft edge. The penumbra is the fraction of the cone given over to a fade: 0.2 means full strength to 80% and a fade over the last 20%.
 ---@param self Actor 
 ---@param degrees number full opening
 ---@param penumbra number 0..1 soft-edge fraction
-function Actor:set_cone(degrees, penumbra) end
+function light.set_cone(self, degrees, penumbra) end
 
 ---0 add, 1 subtract, 2 mix. `mix` is the energy-conserving one: a white surface under it stays white.
 ---@param self Actor 
 ---@param kind integer 0 add, 1 subtract, 2 mix
-function Actor:set_blend(kind) end
+function light.set_blend(self, kind) end
 
 ---Whether this light casts shadows, how the edge is filtered, and how wide the filter's taps are. Only four lights in a scene can get shadow channels, ranked by area.
 ---@param self Actor 
 ---@param enabled boolean cast shadows
 ---@param filter integer 0 off, 1 one tap, 2 three, 3 five
 ---@param smoothness number tap radius in mask texels
-function Actor:set_shadow(enabled, filter, smoothness) end
-
----How much of the global-illumination enclosure term this light applies. Zero by default: a scene that did not ask for bounce should not have it.
----@param self Actor 
----@param contribution number 0..1
-function Actor:set_gi(contribution) end
+function light.set_shadow(self, enabled, filter, smoothness) end
 
 ---Which sprite layers this light affects, as a bitmask of `Sprite.layer`. A light on layer 2 lights only layer 2, which is how a scene gets a lamp that does not brighten its own interface.
 ---@param self Actor 
 ---@param bitmask integer mask of layer bits
-function Actor:set_mask(bitmask) end
+function light.set_mask(self, bitmask) end
 
 ---The inspector reads as well as writes, and its field list is generated from this same registry.
 ---@param self Actor 
 ---@return number brightness multiplier
-function Actor:get_energy() end
+function light.get_energy(self) end
 
 ---Adds a light of `kind` (0 point, 1 spot, 2 directional, 3 ambient) with its colour, radius and energy in one call.
 ---@param self Actor 
@@ -502,105 +620,97 @@ function Actor:get_energy() end
 ---@param g number green
 ---@param b number blue
 ---@param energy number brightness multiplier
-function Actor:new(kind, radius, r, g, b, energy) end
+function light.new(self, kind, radius, r, g, b, energy) end
 
 ---A spotlight's opening and soft edge. Degrees in, because that is how a cone is authored; the penumbra is 0..1.
 ---@param self Actor 
 ---@param degrees number full opening angle
 ---@param penumbra number 0..1; 0.2 is a typical flashlight
-function Actor:set_cone(degrees, penumbra) end
+function light.set_cone(self, degrees, penumbra) end
 
 ---How far the light reaches. 0 for a directional or ambient light, which reach everywhere.
 ---@param self Actor 
 ---@return number radius in world units
-function Actor:get_radius() end
+function light.get_radius(self) end
 
 ---A spotlight's opening in degrees and its penumbra, for the inspector.
 ---@param self Actor 
 ---@return number opening in degrees
 ---@return number penumbra 0..1
-function Actor:get_cone() end
+function light.get_cone(self) end
 
 ---Whether this light casts shadows, the filter step and its smoothness — in the order `light.set_shadow` takes them.
 ---@param self Actor 
 ---@return boolean casts shadows
 ---@return number filter: 0 off, 1 pcf3, 2 pcf5, 3 soft
 ---@return number smoothness in texels
-function Actor:get_shadow() end
+function light.get_shadow(self) end
 
 
--- ── occluder ──
----Adds a light occluder to an actor.
----@param self Actor 
----@param mode integer 0 auto from the sprite's alpha, 1 manual polygon, 2 none
-function Actor:new(mode) end
+-- ── lighting ──
+---The lighting quality tier: 0 off, 1 low, 2 medium, 3 high. -1 when no lighting system is wired.
+---@return number the tier, or -1
+function lighting.quality() end
 
----0 derives the shape from the sprite's alpha at `set_threshold`, 1 uses the polygon, 2 blocks nothing. Mode 2 is how a sprite that looks like it occludes says it must not.
----@param self Actor 
----@param mode integer 0 auto, 1 manual, 2 none
-function Actor:set_mode(mode) end
+---Changes the lighting quality tier. False when it could not be taken, which is one case: a GI-on tier on a driver created with GI off declines, because the pyramid is a startup budget decision.
+---@param tier number 0 off, 1 low, 2 medium, 3 high
+---@return boolean whether the tier was taken
+function lighting.set_quality(tier) end
 
----The alpha at which the automatic shape decides a texel is solid. Raising it is the fix for most 'my sprite has a fringe of shadow' reports.
----@param self Actor 
----@param alpha number 0..1
-function Actor:set_threshold(alpha) end
-
----Which lights this occluder blocks. 0 blocks everything, which is what a wall wants; a pane that blocks the sun but not the lamps sets it.
----@param self Actor 
----@param bitmask integer 0 for all lights
-function Actor:set_mask(bitmask) end
-
----The manual shape, as a flat list of coordinates. Read from a table because eight positional arguments are unreadable and an editor dragging vertices produces a list anyway.
----@param self Actor 
----@param points table flat x/y pairs
-function Actor:set_polygon(points) end
-
----The inspector reads as well as writes.
----@param self Actor 
----@return integer 0 auto, 1 manual, 2 none
-function Actor:get_mode() end
-
----The automatic shape's alpha threshold.
----@param self Actor 
----@return number alpha 0..1
-function Actor:get_threshold() end
-
----Which lights this occluder blocks.
----@param self Actor 
----@return integer the mask
-function Actor:get_mask() end
-
----The manual shape as a flat list of coordinates. An editor that lets a user drag vertices reads this back to draw them.
----@param self Actor 
----@return table flat x/y pairs
-function Actor:get_polygon() end
+---What the lighting system cost this frame: light counts, shadow channels, sweep steps, occluder counts and the per-pass timings in nanoseconds. Empty when no system is wired.
+---@return table stat name to value
+function lighting.stats() end
 
 
 -- ── environment ──
+---Adds an Environment to this actor. Without it the other environment.* functions are unreachable in a scene that has no actor carrying one.
+---@param self Actor 
+function environment.new(self) end
+
+---How much bloom is added, and the luminance above which a pixel contributes to it. Zero intensity skips the four-pass chain entirely rather than running it with a zero multiplier.
+---@param self Actor 
+---@param intensity number 0..1; 0 disables the chain
+---@param threshold number 0..1 luminance
+function environment.set_bloom(self, intensity, threshold) end
+
+---The radiance a ray that escapes the occluder mask carries. This is the base case of every GI merge, so it decides whether light bouncing around a corner is warm at sunset or white at noon.
+---@param self Actor 
+---@param r number red
+---@param g number green
+---@param b number blue
+function environment.set_sky(self, r, g, b) end
+
+---The sky's radiance as three numbers.
+---@param self Actor 
+---@return number red
+---@return number green
+---@return number blue
+function environment.get_sky(self) end
+
 ---What 'dark' means in this world. One per world, not per actor: a dungeon and a meadow differ in what their shadows are made of.
 ---@param self Actor 
 ---@param r number red 0..1
 ---@param g number green 0..1
 ---@param b number blue 0..1
 ---@param energy number multiplier, 0 removes global light
-function Actor:set_ambient(r, g, b, energy) end
+function environment.set_ambient(self, r, g, b, energy) end
 
 ---What nothing lights at all resolves to. Separate from the ambient colour: one is what the world does to what it touches, the other is the empty case.
 ---@param self Actor 
 ---@param r number red
 ---@param g number green
 ---@param b number blue
-function Actor:set_clear(r, g, b) end
+function environment.set_clear(self, r, g, b) end
 
 ---A wash over the whole scene, which is how a bright room stops looking like a dark room with five torches in it. 0 disables it.
 ---@param self Actor 
 ---@param threshold number 0..0.2
-function Actor:set_bloom(threshold) end
+function environment.set_bloom(self, threshold) end
 
 ---For HDR scenes, where a light at energy 3 otherwise clips to white and a colour ramp nobody chose.
 ---@param self Actor 
 ---@param enabled boolean 
-function Actor:set_tonemap(enabled) end
+function environment.set_tonemap(self, enabled) end
 
 ---The cheapest depth cue a 2D game has. `far <= near` disables it, and that is the documented way to remove it rather than a special zero case.
 ---@param self Actor 
@@ -609,7 +719,7 @@ function Actor:set_tonemap(enabled) end
 ---@param r number red
 ---@param g number green
 ---@param b number blue
-function Actor:set_fog(near, far, r, g, b) end
+function environment.set_fog(self, near, far, r, g, b) end
 
 ---The ambient colour with the energy applied, for the inspector.
 ---@param self Actor 
@@ -617,7 +727,7 @@ function Actor:set_fog(near, far, r, g, b) end
 ---@return number green
 ---@return number blue
 ---@return number alpha
-function Actor:get_ambient() end
+function environment.get_ambient(self) end
 
 ---The clear colour.
 ---@param self Actor 
@@ -625,34 +735,109 @@ function Actor:get_ambient() end
 ---@return number green
 ---@return number blue
 ---@return number alpha
-function Actor:get_clear() end
+function environment.get_clear(self) end
 
 ---Fog's near and far.
 ---@param self Actor 
 ---@return number near
 ---@return number far
-function Actor:get_fog() end
+function environment.get_fog(self) end
+
+
+-- ── material ──
+---Attaches a shader material to an actor. Shader 0 is the stock sprite shader.
+---@param self Actor 
+---@param shader integer index into the shader table
+function material.new(self, shader) end
+
+---The material's four floats. Enough for a colour, a threshold, a time.
+---@param self Actor 
+---@param p0 number param 0
+---@param p1 number param 1
+---@param p2 number param 2
+---@param p3 number param 3
+function material.set_params(self, p0, p1, p2, p3) end
+
+---The material's four floats. The inspector reads as well as writes.
+---@param self Actor 
+---@return number param 0
+---@return number param 1
+---@return number param 2
+---@return number param 3
+function material.get_params(self) end
+
+---Which shader this material uses.
+---@param self Actor 
+---@return number shader index
+function material.get_shader(self) end
+
+
+-- ── occluder ──
+---Adds a light occluder to an actor.
+---@param self Actor 
+---@param mode integer 0 auto from the sprite's alpha, 1 manual polygon, 2 none
+function occluder.new(self, mode) end
+
+---0 derives the shape from the sprite's alpha at `set_threshold`, 1 uses the polygon, 2 blocks nothing. Mode 2 is how a sprite that looks like it occludes says it must not.
+---@param self Actor 
+---@param mode integer 0 auto, 1 manual, 2 none
+function occluder.set_mode(self, mode) end
+
+---The alpha at which the automatic shape decides a texel is solid. Raising it is the fix for most 'my sprite has a fringe of shadow' reports.
+---@param self Actor 
+---@param alpha number 0..1
+function occluder.set_threshold(self, alpha) end
+
+---Which lights this occluder blocks. 0 blocks everything, which is what a wall wants; a pane that blocks the sun but not the lamps sets it.
+---@param self Actor 
+---@param bitmask integer 0 for all lights
+function occluder.set_mask(self, bitmask) end
+
+---The manual shape, as a flat list of coordinates. Read from a table because eight positional arguments are unreadable and an editor dragging vertices produces a list anyway.
+---@param self Actor 
+---@param points table flat x/y pairs
+function occluder.set_polygon(self, points) end
+
+---The inspector reads as well as writes.
+---@param self Actor 
+---@return integer 0 auto, 1 manual, 2 none
+function occluder.get_mode(self) end
+
+---The automatic shape's alpha threshold.
+---@param self Actor 
+---@return number alpha 0..1
+function occluder.get_threshold(self) end
+
+---Which lights this occluder blocks.
+---@param self Actor 
+---@return integer the mask
+function occluder.get_mask(self) end
+
+---The manual shape as a flat list of coordinates. An editor that lets a user drag vertices reads this back to draw them.
+---@param self Actor 
+---@return table flat x/y pairs
+function occluder.get_polygon(self) end
 
 
 -- ── camera ──
 ---Adds a Camera2D to this actor. The FIRST enabled camera in the world is the one that renders, so a second one is a cut waiting to happen.
 ---@param self Actor 
-function Actor:new() end
+function camera.new(self) end
 
 ---Makes this camera follow another actor. Passing an actor rather than a position means it stays correct without being told again every frame.
 ---@param self Actor 
 ---@param other Actor the actor to follow
-function Actor:follow(other) end
+function camera.follow(self, other) end
 
 ---The zoom the camera eases toward. 2 shows half the world at twice the detail; it is reached through a spring, not snapped.
 ---@param self Actor 
 ---@param zoom number target zoom, > 0
-function Actor:zoom_to(zoom) end
+function camera.zoom_to(self, zoom) end
 
 ---Adds screen shake. Trauma accumulates and then decays, so repeated hits build on each other instead of restarting.
 ---@param self Actor 
 ---@param trauma number 0..1; 1 is a hard hit
-function Actor:shake(trauma) end
+function camera.shake(self, trauma) end
 
 ---The rectangle the camera may not leave — how a level stops you from seeing past its own edges. A zero width or height disables the limits.
 ---@param self Actor 
@@ -660,18 +845,18 @@ function Actor:shake(trauma) end
 ---@param y number top edge
 ---@param w number width; 0 disables
 ---@param h number height; 0 disables
-function Actor:set_limits(x, y, w, h) end
+function camera.set_limits(self, x, y, w, h) end
 
 ---How lazily the camera chases its target. 0 welds it (a fixed-view platformer); higher trails behind.
 ---@param self Actor 
 ---@param damping number 0 = instant, ~8 = smooth
-function Actor:set_damping(damping) end
+function camera.set_damping(self, damping) end
 
 ---Where the camera is, in world units — the same number the renderer uses.
 ---@param self Actor 
 ---@return number centre x
 ---@return number centre y
-function Actor:get_centre() end
+function camera.get_centre(self) end
 
 
 -- ── timer ──
@@ -679,31 +864,31 @@ function Actor:get_centre() end
 ---@param self Actor 
 ---@param seconds number cycle length
 ---@param kind number 0 once, 1 loop, 2 during
-function Actor:new(seconds, kind) end
+function timer.new(self, seconds, kind) end
 
 ---The signals this timer fires. `on_done` runs at the end of each cycle; `on_tick` runs every tick and only matters for kind 2 (during).
 ---@param self Actor 
 ---@param on_tick string empty fires nothing
 ---@param on_done string empty fires nothing
-function Actor:set_signals(on_tick, on_done) end
+function timer.set_signals(self, on_tick, on_done) end
 
 ---Starts the timer from zero. 0 loops means forever.
 ---@param self Actor 
 ---@param loops number 0 = infinite
-function Actor:start(loops) end
+function timer.start(self, loops) end
 
 ---Pauses the timer WITHOUT losing its progress, so starting again resumes where it was. `timer.kill` ends it for good.
 ---@param self Actor 
-function Actor:stop() end
+function timer.stop(self) end
 
 ---Finishes the timer: no more signals, ever.
 ---@param self Actor 
-function Actor:kill() end
+function timer.kill(self) end
 
 ---How far through the current cycle, 0..1 — what a cooldown bar draws.
 ---@param self Actor 
 ---@return number 0 at the start, 1 at the end of the cycle
-function Actor:progress() end
+function timer.progress(self) end
 
 
 -- ── math ──
@@ -1077,40 +1262,40 @@ function noise.ridged(x, y, octaves, basis) end
 ---@param name string state name, unique within the machine
 ---@param hooks any? #{}# table with optional enter/update/exit functions
 ---@return boolean true when the state was declared
-function Actor:add_state(name, hooks) end
+function sm.add_state(self, name, hooks) end
 
 ---Moves from one state to another when an event is fired.
 ---@param self Actor 
 ---@param from string state the transition starts in
 ---@param event string event name that triggers it
 ---@param to string state to enter
-function Actor:add_transition(from, event, to) end
+function sm.add_transition(self, from, event, to) end
 
 ---Sets the state entered when the machine starts.
 ---@param self Actor 
 ---@param name string state to start in
-function Actor:set_initial(name) end
+function sm.set_initial(self, name) end
 
 ---Requests a transition; applied before the next update.
 ---@param self Actor 
 ---@param event string event name
-function Actor:fire(event) end
+function sm.fire(self, event) end
 
 ---Jumps to a state immediately, running exit then enter.
 ---@param self Actor 
 ---@param name string state to enter now
-function Actor:set_state(name) end
+function sm.set_state(self, name) end
 
 ---The active state's name; empty before the first update.
 ---@param self Actor 
 ---@return string the current state name
-function Actor:state() end
+function sm.state(self) end
 
 ---True when the machine is currently in that state.
 ---@param self Actor 
 ---@param name string state name to test
 ---@return boolean true when the active state is `name`
-function Actor:is_in(name) end
+function sm.is_in(self, name) end
 
 
 -- ── world ──
@@ -1120,7 +1305,7 @@ function Actor:is_in(name) end
 ---@param y number centre y in world units
 ---@param radius number search radius in world units
 ---@param fn any visitor called as fn(other_self)
-function Actor:nearby(x, y, radius, fn) end
+function world.nearby(self, x, y, radius, fn) end
 
 
 -- ── input ──

@@ -25,6 +25,7 @@ pub const signals = @import("signals.zig");
 pub const collision_layers = @import("collision_layers.zig");
 pub const timer = @import("timer.zig");
 pub const camera = @import("camera.zig");
+pub const animation = @import("animation.zig");
 pub const actor = @import("actor.zig");
 
 // Short names for what the runtime and the actor code import constantly.
@@ -48,4 +49,5 @@ test {
     // keep their tests in the suite.
     _ = @import("timer.zig");
     _ = @import("camera.zig");
+    _ = @import("animation.zig");
 }

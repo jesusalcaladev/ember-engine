@@ -53,6 +53,10 @@ New to Ember? Follow this path. Each step builds on the previous one.
 - [Rendering](reference/render-pipeline.md) — Pipeline, batching, atlas
 - [Scripting](reference/script-behaviors.md) — Behaviors, state machines, hot-reload
 - [Physics](reference/physics-overview.md) — Port, bodies, shapes, the sync contract
+- [Audio: the mixer](reference/audio-system.md) — The two threads, the port, voices, the bank, latency
+- [Audio: buses](reference/audio-buses.md) — Sixteen named gains, solo, sends, the mixer-panel API
+- [Audio: emitters](reference/audio-emitters.md) — `SoundEmitter2D` and the `sound.*` surface
+- [Audio: config](reference/audio-config.md) — The `audio` section of `project.config`
 
 ### Level 4 — I want to build real games
 
@@ -77,6 +81,10 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | Entities, actors, queries, signals, hierarchy, serialization | [ecs-entities](reference/ecs-entities.md) and siblings |
 | Math, random, noise, time | `core-*` |
 | Rendering | `render-*` |
+| Audio: mixer, threads, voices, bank | [audio-system](reference/audio-system.md) |
+| Audio: buses, solo, sends | [audio-buses](reference/audio-buses.md) |
+| Audio: emitters, `sound.*`, hot-reload | [audio-emitters](reference/audio-emitters.md) |
+| Audio: the `audio` config section | [audio-config](reference/audio-config.md) |
 
 ---
 
@@ -94,6 +102,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | Copy-paste patterns | [Common Patterns](guides/common-patterns.md) |
 | Understand the engine | [Architecture](architecture/overview.md) |
 | Look up a function | [Lua API Reference](reference/script-lua-api.md) |
+| Play or mix a sound | [Audio: emitters](reference/audio-emitters.md) and [buses](reference/audio-buses.md) |
 | Debug a problem | [Troubleshooting](getting-started/troubleshooting.md) |
 
 ---
@@ -128,6 +137,8 @@ Ember exposes a small set of global tables to Lua scripts:
 | `noise` | Procedural noise: value, perlin, simplex, fbm, ridged |
 | `sm` | Declarative state machines: add_state, add_transition, fire, state |
 | `physics` | Rigid-body queries: cast_ray, line_of_sight, stats, set_view, set_focus |
+| `audio` | The mixer: play_file, play_stream, buses, solo/sends, stats |
+| `sound` | This actor's `SoundEmitter2D`: play, stop, volume/pitch, radius, is_playing, describe |
 | `world` | Spatial queries: `world.nearby` |
 | `steer` | Steering behaviors: seek, flee, arrive, pursue, evade, wander, avoid, flock |
 

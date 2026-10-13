@@ -47,6 +47,10 @@ struct PostParams {
     /// The world-space point the camera is looking at, xy, and its z/w spare.
     focus: vec2f,
     focus_pad: vec2f,
+    /// M9: the scene-transition curtain — rgb and, in alpha, how much of the
+    /// screen it covers. Applied LAST, after tonemap, because it is a curtain
+    /// hung over the finished image and not part of the image.
+    fade: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> params: PostParams;
@@ -172,6 +176,14 @@ fn fs_composite(in: VSOut) -> @location(0) vec4f {
 
     if (params.flags.x > 0.0) {
         c = tonemap(c);
+    }
+
+    // The fade, last. A transition is a CURTAIN over the finished frame, so
+    // compositing it after tonemap is what makes a fade-to-black actually black
+    // instead of "whatever the tone curve does to black". Alpha is the amount,
+    // so a zero amount is a multiply by one and costs nothing visible.
+    if (params.fade.a > 0.0) {
+        c = mix(c, params.fade.rgb, params.fade.a);
     }
 
     return vec4f(c, 1.0);

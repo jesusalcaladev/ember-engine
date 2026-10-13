@@ -478,7 +478,7 @@ const filter = components.CollisionLayers{
 | `Transform` | 40 | Auto-layout interleaves prev_* snapshot with live fields. |
 | `Parent` | 8 | Both u32 fields pack into one `Entity`. |
 | `Velocity` | 12 | Vec2 + f32. |
-| `Sprite` | 52 | Kept small on purpose: 50k sprites = 2.6 MB of column data. |
+| `Sprite` | 56 | Kept small on purpose: 50k sprites = 2.8 MB of column data. Includes M7's `coverage_index` (i32). |
 | `Script` | 4 | Single u32. |
 | `StateMachine` | 8 | u32 + bool. |
 | `RigidBody2D` | 52 | 2 handles + 13 plain-data fields. Grows with the world: 200k bodies = 10.4 MB. |

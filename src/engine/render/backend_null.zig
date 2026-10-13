@@ -58,6 +58,9 @@ pub const Backend = struct {
         .uploadGi = uploadGi,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
+        .createAtlasManager = createAtlasManager,
+        .addImageToAtlas = addImageToAtlas,
+        .uploadAtlas = uploadAtlas,
     };
 
     pub fn renderer(self: *Backend) render.Renderer {
@@ -219,6 +222,42 @@ fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count:
     fn destroyTexture(ptr: *anyopaque, texture: ?*anyopaque) void {
         _ = ptr;
         _ = texture;
+    }
+
+    // ── Atlas bridge (M3) ────────────────────────────────────────────────────
+    // The null backend draws nothing, so it packs nothing: every call answers
+    // "no". That is the point of having it — a headless run exercises the
+    // CALLING path, so a caller that forgets to handle null fails here rather
+    // than only on a machine with a GPU. Handles are 0 = "none".
+
+    fn createAtlasManager(ptr: *anyopaque, width: u32, height: u32) ?*anyopaque {
+        _ = ptr;
+        _ = width;
+        _ = height;
+        return null;
+    }
+
+    fn addImageToAtlas(
+        ptr: *anyopaque,
+        atlas: ?*anyopaque,
+        path: []const u8,
+        width: u32,
+        height: u32,
+        pixels: []const u8,
+    ) ?[4]f32 {
+        _ = ptr;
+        _ = atlas;
+        _ = path;
+        _ = width;
+        _ = height;
+        _ = pixels;
+        return null;
+    }
+
+    fn uploadAtlas(ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque {
+        _ = ptr;
+        _ = atlas;
+        return null;
     }
 };
 
