@@ -27,6 +27,7 @@
 - [x] **Blend Modes** - Add / Subtract / Mix (3 pipelines)
 - [x] **Layer Masking** - per-pixel en light shader
 - [x] **Auto-SDF Oclusores** - Cobertura α → máscara → EDT → Radiance Cascades (⚠️ la cobertura α estaba escrita pero **no cableada** — ya corregido, ver abajo)
+- [x] **GI ajustable por config** - `lighting.gi_resolution` + `lighting.shadow_resolution` en `project.config`; default 128 puesto por medición (392 ms → 14.2 ms en frame en movimiento)
 - [x] **Editor Bindings** - 167 bindings con metadata docs
 - [x] **Tests** - 86/86 passing (`zig build test-light`), 6 shaders validados
 
@@ -57,33 +58,60 @@ perfectas mientras el motor hacía lo contrario:
 | La pirámide GI se reconstruía cada frame | Bajo un comentario que decía "solo cuando el campo se mueve". | `updateSdf` devuelve si reconstruyó, y la pirámide sigue esa respuesta |
 | El coste de GI escalaba con el área de pantalla | 1,048,576 sondas × 16 rayos = 16.7M trazas a 2048². | Presupuesto de sondas por eje (128 medium, 256 high) |
 
-### ❌ GI A 1080p — 100× POR ENCIMA DEL PRESUPUESTO, MEDIDO
+### ✅ GI A 1080p — RESUELTO, Y AHORA ES UN DIAL DE CONFIGURACIÓN
 
-Presupuesto del ROADMAP: **GI ≤ 1.5 ms/frame amortizado**. Medido en
-`zig build bench-light`, medium, 21 luces + 40 oclusores, máscara 2048×2048:
+Presupuesto del ROADMAP: **GI ≤ 1.5 ms/frame amortizado**. Estaba **100× por
+encima**: el campo GI vivía a la resolución de la máscara (2048²), así que el
+transformado de distancia exacto corría sobre 4.2M celdas.
 
-| Etapa (frame en movimiento) | Coste |
-|---|---|
-| Relleno de máscara | 7.3 ms |
-| **Campo de distancia exacto** | **243–265 ms** |
-| **Pirámide GI** | **126–182 ms** |
-| Frame en reposo | **12.6 µs** |
+Ahora el campo GI tiene **resolución propia**, ajustable por el developer desde
+`project.config`:
 
-El presupuesto se incumple en **dos órdenes de magnitud**, y eso no se arregla
-reduciendo sondas: el EDT exacto corre a ~40–47 ns/celda sobre 4.2M celdas.
+```
+lighting {
+  gi_resolution 128        # lado mayor del campo GI, en celdas. 0 = una celda GI por celda de máscara
+  shadow_resolution 2048   # lado mayor de la máscara de sombras, en celdas
+}
+```
 
-**La causa es estructural**: el campo GI vive a la resolución de la máscara. El
-arreglo es **desacoplar la resolución del campo GI de la de la máscara** —
-calcular EDT y textura GI a la resolución de cascada 0 (~128×128), en vez de
-2048². Eso toca `sampleGi`, `encodeGi`, los tamaños de subida a GPU, el muestreo
-en `light.wgsl` y sus tests.
+El default (**128**) está puesto por medición, no por gusto. `zig build bench-light`
+imprime el barrido completo, con coste **y** diferencia contra el campo a
+resolución completa (MAE sobre 4096 muestras — medido, porque en un bench sin
+ventana no se puede "mirar"):
 
-**No está aterrizado, deliberadamente.** Romper la textura GI es peor que tenerla
-lenta, y esto no se puede verificar sin una ventana. Es el siguiente paso de M7 y
-necesita una decisión explícita.
+| `gi_resolution` | resample | transform | **total** | MAE | subida |
+|---|---|---|---|---|---|
+| 0 (antes) | 1.4 ms | 259.5 ms | **260.9 ms** | ref | 16 MiB |
+| 64 | 1.6 ms | 0.2 ms | 1.7 ms | 0.109 | 16 KiB |
+| **128** | 2.0 ms | 0.7 ms | **2.7 ms** | 0.040 | 64 KiB |
+| 256 | 3.1 ms | 3.0 ms | 6.1 ms | 0.025 | 256 KiB |
+| 512 | 9.1 ms | 13.2 ms | 22.3 ms | 0.008 | 1 MiB |
 
-Nota sobre las cifras: el bench tiene ~20% de dispersión entre corridas. Los
-números de EDT y pirámide son rangos, no medidas individuales.
+**Por qué 128 y no 256**: la rodilla está ahí. 64→128 cuesta 1 ms más y reduce el
+error a la mitad. 128→256 cuesta 3.4 ms más y mejora el error en 0.015 — sobre un
+término que se envía ponderado por `gi_contribution` (0.3 en la escena de
+aceptación) es menos del 1% de un término de iluminación que nadie nota.
+256→512 cuesta 16 ms por 0.017, y de ahí en adelante es una recta al coste
+anterior.
+
+**Efecto en el frame real** (`zig build bench-light`, medium, 21 luces,
+40 oclusores, máscara 2048²):
+
+| | Antes | Ahora |
+|---|---|---|
+| Frame en movimiento | 392 ms | **14.2 ms** |
+| Costo medio de frame | 125.9 ms | **4.7 ms** |
+| Subida de GI | 16 MiB | **64 KiB** |
+
+Un frame en movimiento a 1080p **cabe ahora en un frame de 60 Hz** (14.2 ms de
+16.67 ms), donde antes era 23× el presupuesto entero.
+
+**Lo que sigue sin cumplirse**: el presupuesto de 1.5 ms amortizados. El
+`resample` es lineal en la MÁSCULA y ninguna resolución lo reduce, así que 2.7 ms
+es el piso con este diseño. Está registrado como tal, no maquillado.
+
+Nota: el bench tiene ~20% de dispersión entre corridas; las cifras de EDT y
+pirámide son rangos.
 
 ### 🔒 LA SUITE NO PUEDE DESAPARECER EN SILENCIO
 

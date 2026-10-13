@@ -781,7 +781,15 @@ pub const Stats = struct {
     collect_ns: u64 = 0,
     raster_ns: u64 = 0,
     sweep_ns: u64 = 0,
+    /// Both halves of `sdf_ns`, and split because they answer different
+    /// questions and are tuned by different dials. `downsample_ns` is linear in
+    /// the MASK and is what `gi_resolution` cannot reduce; `transform_ns` is
+    /// linear in the GI FIELD and is what it reduces almost entirely. Reported
+    /// together, a floor set by resampling reads as a floor set by the feature,
+    /// and the fix would be aimed at the wrong dial.
     sdf_ns: u64 = 0,
+    downsample_ns: u64 = 0,
+    transform_ns: u64 = 0,
 
     /// How many times the distance field was rebuilt this session. One per
     /// occluder move is the target; one per frame means something is dirtying it
@@ -824,6 +832,8 @@ pub const Stats = struct {
         self.raster_ns = 0;
         self.sweep_ns = 0;
         self.sdf_ns = 0;
+        self.downsample_ns = 0;
+        self.transform_ns = 0;
     }
 };
 
@@ -840,6 +850,73 @@ const AreaRank = struct { area: f32, index: u32 };
 /// `hash_valid` covers the remaining case of a hash that legitimately lands on
 /// the sentinel.
 const occluder_hash_seed: u64 = 0xcbf29ce484222325;
+
+/// The GI field's default longest side, in cells.
+///
+/// CHOSEN BY MEASUREMENT, not by taste. The table is produced by
+/// `zig build bench-light` (`sweepGiResolution`), at a 2048x2048 mask, medium
+/// tier, 21 lights and 40 occluders, and is reproduced here so the number can be
+/// re-derived instead of argued about:
+///
+///     gi_resolution   resample   transform      total   MAE     upload
+///              0       0.95 ms   263.5 ms   264.5 ms  ---     16 MiB   <- before
+///             64       1.55 ms     0.17 ms     1.7 ms  0.109    16 KiB
+///            128       2.05 ms     0.67 ms     2.7 ms  0.040    64 KiB   <- default
+///            256       3.25 ms     2.97 ms     6.2 ms  0.025   256 KiB
+///            512       9.15 ms    13.94 ms    23.1 ms  0.008     1 MiB
+///           1024      11.11 ms    58.41 ms    69.5 ms  0.004     4 MiB
+///
+/// MAE is the mean absolute difference from the `0` row over 4096 sample points
+/// of the openness term — i.e. how much the picture would change — measured, not
+/// estimated, because there is no window in a headless bench to look at.
+///
+/// WHY 128 AND NOT 256. The knee is here. 64 -> 128 costs one more millisecond
+/// and halves the error. 128 -> 256 costs 3.5 more and improves the error by
+/// 0.015, which on a term that ships weighted at `gi_contribution` (0.3 in the
+/// acceptance scene) is under half a percent of a lighting term nobody notices.
+/// 256 -> 512 costs 17 ms for 0.017, and past that it is a straight line to the
+/// old cost with nothing to show for it.
+///
+/// 128 is also the only row that gets close to the spec's "GI <= 1.5 ms/frame
+/// amortized": 2.7 ms against a 16.6 ms frame, versus 6.2 ms at 256 and 264.5 ms
+/// where this started. It is not *under* budget — the resampling is linear in the
+/// MASK and no resolution setting can reduce it — and the honest answer to "is
+/// this fast enough" is that 128 nearly is and the dial is right there.
+///
+/// WHY A DIAL AND NOT A CONSTANT. A developer shipping a small game on a laptop
+/// wants the cheap end; one shipping a dungeon crawler wants every bit of detail
+/// and has the frame time for it. A constant would choose for them, and would be
+/// wrong for half of them. `0` is not "off" but "match the mask", which is the
+/// pre-dial behaviour and still costs what it always cost.
+pub const default_gi_res: u32 = 128;
+
+/// The ceiling on the GI field's longest side, and so on `downsampleGi`'s edge
+/// table. Matches `setGiResolution`'s clamp: a field wider than this is refused
+/// rather than silently truncated, so the two can never disagree about the
+/// largest field that exists.
+pub const max_gi_side: u32 = 4096;
+
+/// The GI field's dimensions for a mask of `w` x `h` under a configured
+/// longest side of `res`.
+///
+/// The aspect ratio of the mask is preserved: a 16:9 mask gets a 16:9 field,
+/// because stretching the field to a square would make one texel of enclosure
+/// data mean different world distances horizontally and vertically, and the
+/// gradient that produces is not a lighting artefact anyone can diagnose from a
+/// screenshot.
+///
+/// `res == 0` is "match the mask" and returns the mask's own size, which is the
+/// pre-decouple behaviour and costs what it always cost.
+pub fn giDimsFor(w: u32, h: u32, res: u32) struct { w: u32, h: u32 } {
+    if (w == 0 or h == 0) return .{ .w = 0, .h = 0 };
+    if (res == 0 or (w <= res and h <= res)) return .{ .w = w, .h = h };
+
+    const longest = @max(w, h);
+    if (w >= h) {
+        return .{ .w = res, .h = @max((h * res) / longest, 1) };
+    }
+    return .{ .w = @max((w * res) / longest, 1), .h = res };
+}
 
 pub const Lighting = struct {
     allocator: std.mem.Allocator,
@@ -889,7 +966,41 @@ pub const Lighting = struct {
     /// Euclidean distance field of the occluder mask, in mask cells, clamped to
     /// 65535. Solid cells are 0; a free cell holds its distance to the nearest
     /// solid one, which is the "how much sky can I see from here" answer GI wants.
+    ///
+    /// Sized `gi_w * gi_h`, NOT `alloc_w * alloc_h`. See `gi_mask` — the whole
+    /// point of that field is that the distance transform is the expensive part,
+    /// and it does not need shadow-map resolution to answer a question about how
+    /// ENCLOSED a point is.
     sdf: []u16 = &.{},
+
+    /// The occluder mask, DOWNSAMPLED to the GI field's resolution.
+    ///
+    /// This field exists because the GI field used to live at mask resolution,
+    /// and at 2048x2048 that cost 243-265 ms of exact distance transform and a
+    /// 16 MB upload per rebuild. The cost grew with the WINDOW rather than with
+    /// the scene, which is the opposite of what a quality dial is for: enlarging
+    /// the window made the renderer slower.
+    ///
+    /// The filter is CONSERVATIVE — any solid texel in the footprint makes the
+    /// destination solid — and that direction is the whole design. Downsampling
+    /// has two possible errors and only one of them is survivable: a wall that
+    /// vanishes leaves a doorway that leaks light into a room the author
+    /// enclosed, and the report is always "the lighting is wrong near that arch"
+    /// with nothing in the logs. A wall that thickens slightly costs a few texels
+    /// of extra penumbra and is invisible. GI that errs by hiding sky is merely
+    /// wrong; GI that errs by inventing sky is broken.
+    gi_mask: []u8 = &.{},
+
+    /// The GI field's own dimensions, in cells. Derived from the mask size and
+    /// `gi_res` by `giDimsFor`, never assigned anywhere else.
+    gi_w: u32 = 0,
+    gi_h: u32 = 0,
+
+    /// The configured GI field resolution: the LONGEST side, in cells. Zero means
+    /// "match the mask", which is the old behaviour and costs what it always
+    /// cost. Reaches the engine from `project.config`'s `lighting.gi_resolution`
+    /// and from the quality tier when the config does not name a value.
+    gi_res: u32 = default_gi_res,
 
     /// The radiance-cascade pyramid. A POINTER because `Radiance` is declared
     /// further down this file and Zig has no forward declarations: an inline
@@ -1092,6 +1203,7 @@ pub const Lighting = struct {
         self.allocator.free(self.mask);
         self.allocator.free(self.shadow);
         self.allocator.free(self.sdf);
+        self.allocator.free(self.gi_mask);
         self.allocator.free(self.gi_pixels);
         self.allocator.free(self.coverage_pool);
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
@@ -1122,26 +1234,81 @@ pub const Lighting = struct {
         const w = @max(w_in, 1);
         const h = @max(h_in, 1);
         if (w == self.alloc_w and h == self.alloc_h) return;
+        try self.allocMask(w, h);
+    }
 
+    /// (Re)sizes everything derived from the mask: the GI field, its upload
+    /// buffer and the radiance pyramid.
+    ///
+    /// Split out of `resize` because `gi_res` can change WITHOUT the mask
+    /// changing — that is the entire point of it being a dial. A developer
+    /// raising `gi_resolution` and pressing apply must not have to also resize
+    /// the window, and `resize` early-outs when the mask size is unchanged, so
+    /// without this a resolution change would silently do nothing.
+    ///
+    /// Also where the allocations are legal: `updateSdf` and `Radiance.build`
+    /// both run inside the frame, and spec §3.1 does not allow allocating there.
+    fn reallocMaskBuffers(self: *Lighting) !void {
+        const aw = self.alloc_w;
+        const ah = self.alloc_h;
+        if (aw == 0 or ah == 0) return;
+
+        const dims = giDimsFor(aw, ah, self.gi_res);
+        self.gi_w = dims.w;
+        self.gi_h = dims.h;
+
+        self.allocator.free(self.sdf);
+        self.allocator.free(self.gi_mask);
+        // One RGBA texel per GI cell. Allocated here rather than on the first
+        // `encodeGi` because that call is inside a frame, and spec §3.1 does not
+        // allow allocating once the frame has started.
+        self.allocator.free(self.gi_pixels);
+        const cells = @as(usize, dims.w) * dims.h;
+        self.gi_pixels = try self.allocator.alloc(u8, cells * 4);
+        @memset(self.gi_pixels, 0);
+        self.gi_mask = try self.allocator.alloc(u8, cells);
+        @memset(self.gi_mask, 0);
+        self.sdf = try self.allocator.alloc(u16, cells);
+        // The GI probe grids are sized here for the same reason the mask is:
+        // `Radiance.build` is called from inside the frame (an occluder moved)
+        // and must not allocate when it runs. The budget comes from the quality
+        // tier, so the pyramid's cost is the tier's promise and not a function of
+        // how big the window happens to be.
+        if (self.radiance) |r| try r.prepare(dims.w, dims.h, Radiance.fineSideFor(self.cfg));
+
+        // A different field size means the field that is on disk describes a
+        // different grid than the one now allocated, so both the "rebuild it"
+        // flag and the amortization history have to be abandoned. Leaving
+        // `sdf_builds` alone would be the kind of small lie that shows up later
+        // as "GI is not rebuilding after I changed the resolution".
+        self.dirty = true;
+    }
+
+    /// Sets the GI field's longest side, in cells. `0` means "match the mask".
+    ///
+    /// Boot-time, like `resize`: it reallocates. Call it from where the config is
+    /// applied, before the frame loop, or from the editor panel followed by a
+    /// `resize` — never from inside a frame.
+    ///
+    /// A no-op when the value is unchanged, so a config reload that touches
+    /// other fields does not throw away a field that did not move.
+    pub fn setGiResolution(self: *Lighting, res: u32) !void {
+        const clamped = if (res == 0) 0 else std.math.clamp(res, 8, 4096);
+        if (clamped == self.gi_res) return;
+        self.gi_res = clamped;
+        if (self.alloc_w != 0) try self.reallocMaskBuffers();
+    }
+
+    fn allocMask(self: *Lighting, w_in: u32, h_in: u32) !void {
+        const w = @max(w_in, 1);
+        const h = @max(h_in, 1);
         // Power of two so a window drag by one pixel does not reallocate, and
         // so the rasterizer's row stride is a mask rather than a division.
         const aw = roundPow2(w);
         const ah = roundPow2(h);
 
         self.allocator.free(self.mask);
-        self.allocator.free(self.sdf);
-        // One texel per mask cell, RGBA. Allocated here rather than on the first
-        // `encodeGi` because that call is inside a frame, and spec §3.1 does not
-        // allow allocating once the frame has started.
-        self.allocator.free(self.gi_pixels);
-        // NOT `coverage_pool` here. It is the occluder budget, which `reserve`
-        // sizes and which has nothing to do with the mask's size -- and freeing
-        // it here without a matching reallocation left a stale length over freed
-        // memory, which is a double free at the next `deinit` and a use-after-free
-        // for every gather in between.
         for (self.channel_mask) |m| if (m) |g| self.allocator.free(g);
-        self.gi_pixels = try self.allocator.alloc(u8, @as(usize, aw) * ah * 4);
-        @memset(self.gi_pixels, 0);
         self.mask = try self.allocator.alloc(u8, @as(usize, aw) * ah);
         // The scratch follows the mask's size, outside the frame.
         //
@@ -1150,13 +1317,6 @@ pub const Lighting = struct {
         // the scratch with an undefined allocator for the `resize` two lines
         // down -- which is a crash in the cleanup path of a routine resize.
         try self.edt.resize(aw, ah);
-        self.sdf = try self.allocator.alloc(u16, @as(usize, aw) * ah);
-        // The GI probe grids are sized here for the same reason the mask is:
-        // `Radiance.build` is called from inside the frame (an occluder moved)
-        // and must not allocate when it runs. The budget comes from the quality
-        // tier, so the pyramid's cost is the tier's promise and not a function of
-        // how big the window happens to be.
-        if (self.radiance) |r| try r.prepare(aw, ah, Radiance.fineSideFor(self.cfg));
         @memset(self.mask, 0);
         self.alloc_w = aw;
         self.alloc_h = ah;
@@ -1166,6 +1326,9 @@ pub const Lighting = struct {
         self.hash_valid = false;
         self.sweep_stale = true;
         self.channel_built = [_]bool{false} ** 4;
+        // The GI field and the upload buffer follow the mask. Separate from the
+        // mask itself because `gi_res` can move them on their own.
+        try self.reallocMaskBuffers();
     }
 
     fn roundPow2(v: u32) u32 {
@@ -2105,15 +2268,131 @@ pub const Lighting = struct {
         const t0 = self.tick();
         const w = self.alloc_w;
         const h = self.alloc_h;
-        if (w == 0 or h == 0) return false;
+        const gw = self.gi_w;
+        const gh = self.gi_h;
+        if (w == 0 or h == 0 or gw == 0 or gh == 0) return false;
 
-        edtMask2dInto(&self.edt, self.mask, self.sdf, w, h);
+        // Downsample BEFORE the transform, not after. The distance transform is
+        // the dominant cost and it is linear in cells, so the only way to make it
+        // cheaper is to give it fewer cells — computing a 4.2M-cell field and
+        // throwing 98% of it away would be the same work at a tenth of the size.
+        const t_ds = self.tick();
+        self.downsampleGi();
+        self.stats.downsample_ns = self.tick() - t_ds;
+
+        const t_edt = self.tick();
+        edtMask2dInto(&self.edt, self.gi_mask, self.sdf, gw, gh);
+        self.stats.transform_ns = self.tick() - t_edt;
 
         self.last_sdf_ns = now_ns;
         self.dirty = false;
         self.stats.sdf_builds += 1;
         self.stats.sdf_ns = self.tick() - t0;
         return true;
+    }
+
+    /// Builds `gi_mask` from `mask` at the GI field's resolution.
+    ///
+    /// CONSERVATIVE: a destination cell is solid when ANY mask cell in its
+    /// footprint is solid. Not an average, and not a sample — those two let a
+    /// wall one texel wide disappear at a 16:1 reduction, and a wall that
+    /// disappears is a doorway that leaks sky into a room the author closed.
+    ///
+    /// That asymmetry is the entire design and it is worth stating as a rule
+    /// because it looks like a bug: the wrong answer here is not "slightly too
+    /// dark", it is "light coming from a wall". Erring toward solid costs a
+    /// fraction of a texel of penumbra at a doorway and is invisible; erring
+    /// toward open costs correctness and is a bug report with no way to point at
+    /// the cause.
+    ///
+    /// Allocation-free: `gi_mask` was sized by `reallocMaskBuffers`, and this
+    /// runs inside the frame.
+    fn downsampleGi(self: *Lighting) void {
+        const w = self.alloc_w;
+        const h = self.alloc_h;
+        const gw = self.gi_w;
+        const gh = self.gi_h;
+        if (gw == 0 or gh == 0) return;
+
+        // The degenerate case, and the one that must be a COPY rather than an
+        // alias: at `gi_resolution = 0` the field is the mask, and aliasing them
+        // would mean `updateSdf` reads and writes the same bytes.
+        if (gw == w and gh == h) {
+            @memcpy(self.gi_mask, self.mask);
+            return;
+        }
+
+        // Integer span per output cell. `roundPow2` on the mask and an arbitrary
+        // `gi_res` do not divide evenly, so each destination cell owns the
+        // half-open range [floor(x*w/gw), ceil((x+1)*w/gw)) — every source cell
+        // is covered by at least one destination, which is the property that
+        // stops a thin wall falling between two samples and being averaged away
+        // by neither of them.
+        // A word of mask bytes at a time. OR is associative and commutative and
+        // the only question is whether anything in the footprint is non-zero, so
+        // folding eight bytes together is the same computation with a
+        // sixty-fourth of the loads.
+        const Word = u64;
+        const word_bytes = @sizeOf(Word);
+
+        // Where each destination cell's source run ends.
+        //
+        // Hoisted out of both loops because the edges depend only on the two
+        // dimensions, never on the row being folded. Everything else here was
+        // tried and measured:
+        //
+        //   - dividing per cell per row: 256 * 2048 * 256 = 134M divisions to
+        //     fold 4.2M bytes;
+        //   - carrying a quotient/remainder instead of dividing: the same 4.2M
+        //     byte-sized loop, moved into an inner `while`, and measurably SLOWER
+        //     (6.5 ms against 1.4 ms) because it traded a divide for a loop;
+        //   - this: `gw` divisions in total, then a linear scan.
+        //
+        // Sixteen kilobytes of stack in a leaf function, bounded by the same
+        // `4096` ceiling `setGiResolution` applies, which is the only reason it
+        // is a fixed array rather than a slice.
+        var edges: [max_gi_side + 1]u32 = undefined;
+        if (gw > max_gi_side) return; // unreachable: `giDimsFor` never exceeds it
+        var ex: u32 = 0;
+        while (ex < gw) : (ex += 1) {
+            const n = ex + 1;
+            edges[ex] = @min((n * w) / gw, w);
+            if (edges[ex] == 0) edges[ex] = 1;
+        }
+        edges[gw] = w;
+
+        var y: u32 = 0;
+        while (y < gh) : (y += 1) {
+            const y0 = (y * h) / gh;
+            const y1 = @max(((y + 1) * h + gh - 1) / gh, y0 + 1);
+            const y1c = @min(y1, h);
+            const out_row = self.gi_mask[@as(usize, y) * gw ..][0..gw];
+            @memset(out_row, 0);
+
+            var sy = y0;
+            while (sy < y1c) : (sy += 1) {
+                const row = self.mask[@as(usize, sy) * w ..][0..w];
+                // Walk the source row ONCE, contiguously. Iterating the
+                // destination instead re-derives these indices once per cell per
+                // row and turns a linear scan into a strided one.
+                var dx: u32 = 0;
+                var sx: u32 = 0;
+                while (dx < gw and sx < w) : (dx += 1) {
+                    var x1 = edges[dx];
+                    if (x1 <= sx) x1 = sx + 1; // progress is not optional
+
+                    var acc: Word = 0;
+                    var i = sx;
+                    while (i + word_bytes <= x1) : (i += word_bytes) {
+                        acc |= @bitCast(@as(*align(1) const [word_bytes]u8, @ptrCast(&row[i])).*);
+                    }
+                    while (i < x1) : (i += 1) acc |= row[i];
+                    if (acc != 0) out_row[dx] = 255;
+
+                    sx = x1;
+                }
+            }
+        }
     }
 
     /// The GI term at a world point, 0..1: 1 in open space, falling toward 0 as
@@ -2128,14 +2407,36 @@ pub const Lighting = struct {
     pub fn sampleGi(self: *const Lighting, x: f32, y: f32) f32 {
         if (!self.cfg.giEnabled() or self.sdf.len == 0) return 1.0;
         if (!self.rect.containsPoint(.{ .x = x, .y = y })) return 1.0;
-        const c = worldToMask(self.rect, self.alloc_w, self.alloc_h, .{ .x = x, .y = y });
+        // The GI GRID, not the mask grid. Same rectangle, different cell count —
+        // indexing the mask grid here would read past the end of `sdf` the
+        // moment the field was decoupled, and at `gi_res >= alloc_w` it reads
+        // inside it and returns a plausible wrong answer instead.
+        const c = worldToMask(self.rect, self.gi_w, self.gi_h, .{ .x = x, .y = y });
         if (c[0] < 0 or c[1] < 0) return 1.0;
-        const idx = @as(usize, @intCast(c[1])) * self.alloc_w + @as(usize, @intCast(c[0]));
+        const idx = @as(usize, @intCast(c[1])) * self.gi_w + @as(usize, @intCast(c[0]));
         if (idx >= self.sdf.len) return 1.0;
         const cells = @as(f32, @floatFromInt(self.sdf[idx]));
-        // Saturates at ~6 cells: past that the point sees enough sky, and an
-        // unbounded ramp would make a large open room brighter than the sky.
-        return @min(cells / 6.0, 1.0);
+        // Saturates at ~6 GI CELLS. The ramp is in field units, not world units:
+        // it was tuned against a field that had one texel per mask texel, and
+        // carrying it over verbatim to a coarser field would make every enclosure
+        // saturate immediately and the term collapse to a binary wall/not-wall.
+        // So the distance is rescaled by how many mask cells a GI cell covers,
+        // which keeps "enclosed means about six texels of sky" true at any
+        // resolution — and is the one place this dial could have silently changed
+        // what the number means.
+        const cells_per_gi = self.cellsPerGiCell();
+        return @min(cells * cells_per_gi / 6.0, 1.0);
+    }
+
+    /// How many mask cells one GI cell spans.
+    ///
+    /// The bridge between a distance measured in GI cells and a curve written in
+    /// mask cells. At `gi_resolution = 0` it is exactly 1, so the old behaviour
+    /// is bit-for-bit unchanged — which is the property that makes the default
+    /// safe to change and the zero worth keeping.
+    pub fn cellsPerGiCell(self: *const Lighting) f32 {
+        if (self.gi_w == 0 or self.alloc_w == 0) return 1.0;
+        return @as(f32, @floatFromInt(self.alloc_w)) / @as(f32, @floatFromInt(self.gi_w));
     }
 
     /// Encodes the GI field as the RGBA8 grid `uploadGi` wants: alpha is the
@@ -2151,8 +2452,8 @@ pub const Lighting = struct {
     /// a caller can distinguish "GI is off" from "GI is on and everything is
     /// open", which render identically but mean different things to a test.
     pub fn encodeGi(self: *Lighting, out: []u8) bool {
-        const w = self.alloc_w;
-        const h = self.alloc_h;
+        const w = self.gi_w;
+        const h = self.gi_h;
         if (!self.cfg.giEnabled() or self.sdf.len == 0 or w == 0 or h == 0) return false;
         const need = @as(usize, w) * h * 4;
         if (out.len < need) return false;
@@ -2167,6 +2468,11 @@ pub const Lighting = struct {
         else
             null;
 
+        // The same rescaling `sampleGi` applies, so the texture and the CPU
+        // reference cannot disagree about what "enclosed" means. They are the
+        // same question asked twice, and two answers is one too many.
+        const per_cell = self.cellsPerGiCell();
+
         var y: u32 = 0;
         while (y < h) : (y += 1) {
             var x: u32 = 0;
@@ -2174,7 +2480,7 @@ pub const Lighting = struct {
                 const idx = @as(usize, y) * w + x;
                 const px = @as(f32, @floatFromInt(x));
                 const py = @as(f32, @floatFromInt(y));
-                const enclosure = @min(@as(f32, @floatFromInt(self.sdf[idx])) / 6.0, 1.0);
+                const enclosure = @min(@as(f32, @floatFromInt(self.sdf[idx])) * per_cell / 6.0, 1.0);
 
                 var rgb = [3]f32{ 0, 0, 0 };
                 if (fine) |c| rgb = sampleCascade(r, c, px, py);
@@ -3058,11 +3364,23 @@ pub fn edtMask2dInto(
     if (scratch.sq.len < n or scratch.row_in.len < w or scratch.row_out.len < w or
         scratch.col_in.len < h or scratch.col_out.len < h) return;
 
-    const sq = scratch.sq;
-    const row_in = scratch.row_in;
-    const row_out = scratch.row_out;
-    const col_in = scratch.col_in;
-    const col_out = scratch.col_out;
+    const sq = scratch.sq[0..n];
+    // EVERY scratch slice is truncated to the grid being transformed, not just
+    // the envelope arrays. `edt1d` takes its length from `d_in`, so passing a
+    // scratch row longer than the grid makes it walk `n` positions through
+    // buffers sized for a smaller problem and write past the end of `v`.
+    //
+    // This could not happen while the transform ran at mask resolution and the
+    // scratch was sized for exactly that mask: `d_in.len` and `@max(w, h)`
+    // agreed by construction. The GI decouple is what broke the agreement, by
+    // making the grid legitimately smaller than the scratch that serves it. A
+    // reusable buffer being larger than its user is the normal case, not the
+    // exotic one, and the code now says so instead of relying on it never
+    // happening.
+    const row_in = scratch.row_in[0..w];
+    const row_out = scratch.row_out[0..w];
+    const col_in = scratch.col_in[0..h];
+    const col_out = scratch.col_out[0..h];
     const v = scratch.v[0..@max(w, h)];
     const z = scratch.z[0 .. @max(w, h) + 1];
 
@@ -4722,4 +5040,274 @@ test "render light: the distance field's session counters survive a frame bounda
     try testing.expectEqual(@as(u32, 1), l.stats.sdf_builds);
     // ...but it must have been counted as a skip, because that is what happened.
     try testing.expect(l.stats.sdf_skipped >= 1);
+}
+
+test "render light: the GI field can be coarser than the mask and still answer" {
+    // The decouple's correctness case. A 64-cell field over a 512-cell mask is
+    // the whole point, so the test has to prove the coarse field answers the
+    // same question the fine one did.
+    //
+    // Note the direction of the term, which is easy to get backwards when
+    // writing assertions: `sdf` is the distance to the NEAREST occluder, so
+    // `sampleGi` is 1.0 in open space and falls toward 0 as a point approaches a
+    // wall. The value the shader stores in alpha is this openness, and the GI
+    // term is `1 - alpha`. Asserting the other way round produces a suite that
+    // passes for the wrong reason.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    try l.resize(512, 512);
+    try l.setGiResolution(64);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 512, .y = 512 } };
+
+    try testing.expectEqual(@as(u32, 512), l.alloc_w);
+    try testing.expectEqual(@as(u32, 64), l.gi_w);
+    try testing.expectEqual(@as(u32, 64), l.gi_h);
+    // The distance field follows the field, not the mask. If it did not, this is
+    // an out-of-bounds read waiting for a mask with any solid in it.
+    try testing.expectEqual(@as(usize, 64 * 64), l.sdf.len);
+
+    // A single wall down the middle. Open on one side, blocked on the other.
+    for (0..512) |y| {
+        for (0..512) |x| {
+            l.mask[y * 512 + x] = if (x == 256) 255 else 0;
+        }
+    }
+    l.dirty = true;
+    try testing.expect(l.updateSdf(1_000_000_000));
+
+    // The wall's own column is solid at BOTH resolutions, which is the property
+    // the conservative downsample buys. Averaging would have made a one-texel
+    // wall at a 8:1 reduction a faint smudge.
+    try testing.expectEqual(@as(u8, 255), l.gi_mask[32 * 64 + 32]);
+
+    // Deep in open space on either side: fully open.
+    try testing.expect(l.sampleGi(32, 256) >= 0.95);
+    try testing.expect(l.sampleGi(480, 256) >= 0.95);
+
+    // Inside the wall: fully closed.
+    try testing.expectEqual(@as(f32, 0.0), l.sampleGi(256, 256));
+}
+
+test "render light: a wall thinner than a GI cell still occludes" {
+    // The failure the conservative downsample exists to prevent, stated as a
+    // test rather than as a comment.
+    //
+    // A one-texel wall, at a 16:1 reduction, is a sixteenth of a cell. An
+    // averaging filter erases it completely: the room behind it becomes open sky
+    // and light pours through a wall the author drew. Nobody can see why from the
+    // screenshot, because the wall is still visibly there.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    try l.resize(256, 256);
+    try l.setGiResolution(16);
+    try l.reserve(8, 8);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
+
+    try testing.expectEqual(@as(u32, 16), l.gi_w);
+
+    // A single vertical column of solid, plus solid on both far sides so the
+    // middle is genuinely enclosed and the test measures the WALL rather than
+    // the absence of a room.
+    for (0..256) |y| {
+        for (0..256) |x| {
+            const solid = x == 128 or x < 32 or x > 223;
+            l.mask[y * 256 + x] = if (solid) 255 else 0;
+        }
+    }
+    l.dirty = true;
+    try testing.expect(l.updateSdf(1_000_000_000));
+
+    // The wall's own cell must be solid after the downsample.
+    const gw = l.gi_w;
+    const wall_col = 128 * gw / 256;
+    var y: u32 = 0;
+    while (y < gw) : (y += 1) {
+        try testing.expectEqual(@as(u8, 255), l.gi_mask[@as(usize, y) * gw + wall_col]);
+    }
+
+    // And a cell just past the wall must be enclosed, which is the whole claim.
+    try testing.expect(l.sampleGi(140, 128) < 0.05);
+}
+
+test "render light: gi_resolution = 0 means the old behaviour, exactly" {
+    // The escape hatch has to be an escape hatch. `gi_res = 0` should reproduce
+    // the pre-decouple field cell for cell, or it is not "match the mask" — it is
+    // "match the mask approximately", which is a much worse thing to offer
+    // someone debugging.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    try l.resize(128, 128);
+    try l.setGiResolution(0);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 128, .y = 128 } };
+
+    try testing.expectEqual(l.alloc_w, l.gi_w);
+    try testing.expectEqual(l.alloc_h, l.gi_h);
+    try testing.expectEqual(@as(f32, 1.0), l.cellsPerGiCell());
+
+    for (0..128) |i| l.mask[i] = if (i % 3 == 0) 255 else 0;
+    l.dirty = true;
+    try testing.expect(l.updateSdf(1_000_000_000));
+
+    // `gi_mask` IS the mask here, by the copy in `downsampleGi`.
+    for (l.mask, l.gi_mask) |a, b| try testing.expectEqual(a, b);
+}
+
+test "render light: the enclosure curve means the same thing at any resolution" {
+    // The trap in this change. The ramp is written as "about six cells of sky
+    // before you are fully enclosed". Cells in WHICH grid? If the coarse field's
+    // distances were compared against 6 unchanged, every enclosure would
+    // saturate at the first cell and GI would collapse into a wall/not-wall
+    // binary. If the coarse field's distances were compared against 6 scaled the
+    // other way, nothing would ever darken.
+    //
+    // Both read as "the lighting is wrong" and neither points at the arithmetic,
+    // so the rescaling is pinned here rather than left to the screenshot.
+    var fine = try Lighting.init(testing.allocator, .medium);
+    defer fine.deinit();
+    try fine.resize(256, 256);
+    try fine.setGiResolution(0);
+    try fine.reserve(4, 4);
+    fine.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
+
+    var coarse = try Lighting.init(testing.allocator, .medium);
+    defer coarse.deinit();
+    try coarse.resize(256, 256);
+    try coarse.setGiResolution(32);
+    try coarse.reserve(4, 4);
+    coarse.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 256, .y = 256 } };
+
+    try testing.expectEqual(@as(f32, 1.0), fine.cellsPerGiCell());
+    try testing.expectEqual(@as(f32, 8.0), coarse.cellsPerGiCell());
+
+    // The same scene in both: a wall with a known gap beside it.
+    for (0..256) |y| {
+        for (0..256) |x| {
+            const solid = x == 128 or x < 32 or x > 223;
+            fine.mask[y * 256 + x] = if (solid) 255 else 0;
+            coarse.mask[y * 256 + x] = if (solid) 255 else 0;
+        }
+    }
+    fine.dirty = true;
+    coarse.dirty = true;
+    try testing.expect(fine.updateSdf(1_000_000_000));
+    try testing.expect(coarse.updateSdf(1_000_000_000));
+
+    // THE assertion. A point 24 mask cells from the wall is 3 GI cells from it in
+    // the coarse field, and both resolutions have to agree that it is open sky.
+    //
+    // Without `cellsPerGiCell` the coarse field would return `3 / 6 = 0.5`
+    // where the fine one returns `24 / 6 -> 1.0`: a dark band along every wall
+    // in the game, which widens every time the resolution drops. That reads as
+    // "the lighting is wrong near walls" with nothing in the numbers to explain
+    // it, which is the worst place for a bug to live.
+    const probe: f32 = 152;
+    try testing.expect(fine.sampleGi(probe, 128) >= 0.95);
+    try testing.expect(coarse.sampleGi(probe, 128) >= 0.95);
+
+    // The arithmetic behind it, stated rather than inferred. Three GI cells,
+    // eight mask cells each, rescaled to twenty-four — and the unrescaled value
+    // is what the curve would otherwise have seen.
+    const gx = @as(usize, @intFromFloat(@floor(probe / coarse.cellsPerGiCell())));
+    const gy = @as(usize, @intFromFloat(@floor(128 / coarse.cellsPerGiCell())));
+    const raw = coarse.sdf[gy * coarse.gi_w + gx];
+    try testing.expectEqual(@as(u16, 3), raw);
+    const raw_f: f32 = @floatFromInt(raw);
+    try testing.expect(raw_f / 6.0 < 0.6); // what the old code would have returned
+    try testing.expect(raw_f * coarse.cellsPerGiCell() / 6.0 > 0.95); // what it returns
+}
+
+test "render light: the downsample drops no mask cell and invents none" {
+    // The contract `downsampleGi`'s edge table has to keep, stated in terms that
+    // do not re-implement the mapping — a test that recomputed the same `floor`
+    // edges to check them would agree with every bug they share.
+    //
+    // A dropped cell is a pixel of wall no probe sees, which is a doorway that
+    // leaks light; the resolution sweep's MAE cannot catch it, because a dropped
+    // cell changes almost nothing on average and ruins exactly one wall. So
+    // this is checked per source cell, exhaustively, on a pair of dimensions
+    // that do not divide evenly — `roundPow2` makes the mask a power of two and
+    // `gi_res` is arbitrary, so every real pair divides unevenly and an
+    // evenly-dividing fixture would never exercise the rounding at all.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    // 64x40 down to 13: neither axis divides evenly (64/13 and 40/13 are both
+    // fractional), which is the case that matters and the only one that can
+    // drop a cell. The earlier version of this test used 256x100 and was
+    // exhaustive over 25,600 cells -- which took the whole suite from 0.26 s to
+    // 12 s to check a property that does not need a quarter of a million
+    // iterations to establish.
+    try l.resize(64, 40);
+    try l.setGiResolution(13);
+    try l.reserve(2, 2);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 40 } };
+
+    const gw = l.gi_w;
+    const gh = l.gi_h;
+
+    var solid_count: usize = 0;
+    for (l.gi_mask) |c| {
+        if (c != 0) solid_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), solid_count);
+
+    // Nothing solid in, nothing solid out. Catches a cell written that no source
+    // cell maps to.
+    @memset(l.mask, 0);
+    l.downsampleGi();
+    for (l.gi_mask) |c| try testing.expectEqual(@as(u8, 0), c);
+
+    // Everything solid in, everything solid out. Catches a destination cell
+    // whose source range is empty, which would leave a hole in the GI field that
+    // reads as a doorway no matter what the mask says.
+    @memset(l.mask, 255);
+    l.downsampleGi();
+    for (l.gi_mask) |c| try testing.expectEqual(@as(u8, 255), c);
+
+    // And every single source cell, one at a time, reaches at least one
+    // destination cell. This is the one that matters and the one that would have
+    // caught a partition that left gaps.
+    var sy: u32 = 0;
+    while (sy < 40) : (sy += 1) {
+        var sx: u32 = 0;
+        while (sx < 64) : (sx += 1) {
+            @memset(l.mask, 0);
+            l.mask[@as(usize, sy) * 64 + sx] = 255;
+            l.downsampleGi();
+
+            var any = false;
+            for (l.gi_mask) |c| {
+                if (c != 0) any = true;
+            }
+            if (!any) {
+                std.debug.print("\n  source ({d},{d}) reached no GI cell ({d}x{d})\n", .{
+                    sx, sy, gw, gh,
+                });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "render light: the GI field's aspect ratio follows the mask's" {
+    // A 16:9 mask gets a 16:9 field. Stretching it square would make one texel
+    // of enclosure data mean different world distances horizontally and
+    // vertically, and the gradient that produces is not an artefact anybody can
+    // read off a screenshot.
+    const dims = giDimsFor(2048, 1024, 256);
+    try testing.expectEqual(@as(u32, 256), dims.w);
+    try testing.expectEqual(@as(u32, 128), dims.h);
+
+    // A mask smaller than the dial is not upsampled. A GI field finer than the
+    // shadow mask it is derived from would be inventing detail that no
+    // measurement supports.
+    const small = giDimsFor(64, 64, 256);
+    try testing.expectEqual(@as(u32, 64), small.w);
+    try testing.expectEqual(@as(u32, 64), small.h);
+
+    // `0` is "match the mask", exactly.
+    const full = giDimsFor(2048, 1024, 0);
+    try testing.expectEqual(@as(u32, 2048), full.w);
+    try testing.expectEqual(@as(u32, 1024), full.h);
 }

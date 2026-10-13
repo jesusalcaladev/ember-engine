@@ -311,7 +311,11 @@ pub const Driver = struct {
                 // was never sized for this mask, and silently skipping the bounce
                 // light would look exactly like GI that is simply too dark to
                 // notice.
-                r.build(l.mask, l.sdf, l.alloc_w, l.alloc_h, self.sky) catch |err| switch (err) {
+                // The GI field, not the mask. The pyramid's probes trace the
+                // downsampled mask and the field's own distance data, and are
+                // sized to the field's grid -- which is what makes the bounce
+                // light cost follow `gi_resolution` instead of the window.
+                r.build(l.gi_mask, l.sdf, l.gi_w, l.gi_h, self.sky) catch |err| switch (err) {
                     error.NotPrepared => l.stats.gi_not_prepared += 1,
                     else => return,
                 };
@@ -320,6 +324,51 @@ pub const Driver = struct {
         } else {
             l.stats.gi_skipped += 1;
         }
+    }
+
+    /// Sets the shadow map's longest side, in cells, for a view of this size.
+    ///
+    /// The other half of `lighting`'s config surface, and unlike `gi_resolution`
+    /// it is expressed in CELLS rather than as a scale factor. A developer
+    /// reading a config wants to say "my shadows are 2048 across"; making them
+    /// divide a view by a float to arrive there would put a unit conversion
+    /// between the question and the answer.
+    ///
+    /// The result lands in `scale`, which is what `resize` already divides by, so
+    /// this needs no second path into the mask size — and it does NOT resize. The
+    /// caller does that, because resizing allocates and this does not; splitting
+    /// them means a caller that resizes anyway pays for it once.
+    pub fn setShadowResolution(self: *Driver, cells: u32, view: MaskRect) void {
+        if (cells == 0) return;
+        const longest = @max(view.max.x - view.min.x, view.max.y - view.min.y);
+        if (longest <= 0) return;
+        // `resize` computes `cells_wanted = extent / scale`, so the scale that
+        // yields `cells` is `extent / cells` — NOT its reciprocal, which is the
+        // mistake that made this read 8192 when asked for 512.
+        const want = longest / @as(f32, @floatFromInt(cells));
+        // Clamped rather than trusted: a scale of 0 is a division by zero and a
+        // scale of 0.01 is a 100x mask nobody asked for.
+        self.scale = std.math.clamp(want, 1.0 / 16.0, 4.0);
+    }
+
+    /// The GI field's longest side, in cells. `0` means "match the mask".
+    ///
+    /// This is `project.config`'s `lighting.gi_resolution`, and it is the dial
+    /// that decides what a moving frame's GI costs. Reaching the engine as a
+    /// number rather than as a quality preset is deliberate: the preset says
+    /// "medium", and medium cannot answer "how many milliseconds do I actually
+    /// want to spend on bounce light in this project", which is the question a
+    /// developer tuning a 2D game is asking.
+    ///
+    /// Allocates, so it belongs with `resize` and not inside a frame. Applying a
+    /// config that changed it is the normal caller.
+    pub fn setGiResolution(self: *Driver, res: u32) !void {
+        try self.lighting.setGiResolution(res);
+        // The field on disk describes the old grid, so it must be uploaded again
+        // rather than skipped as unchanged. Without this the new resolution takes
+        // effect in the CPU sampler and not on the GPU, which is the worst kind
+        // of half-applied setting: the numbers move and the picture does not.
+        self.gi_dirty = true;
     }
 
     /// Whether the GI grid changed since the last submission, and the `GiUpload`
@@ -337,8 +386,8 @@ pub const Driver = struct {
                 self.lighting.rect.max.x,
                 self.lighting.rect.max.y,
             },
-            .width = self.lighting.alloc_w,
-            .height = self.lighting.alloc_h,
+            .width = self.lighting.gi_w,
+            .height = self.lighting.gi_h,
             .pixels = self.lighting.gi_pixels,
         };
     }
@@ -933,4 +982,66 @@ test "render light driver: a coverage hook with no world is a no-op, not a crash
     try Driver.registerCoverageForPage(&d, &[_]u8{ 255, 255, 255, 255 }, 1, 1);
     try testing.expectEqual(@as(usize, 0), d.coverage().count());
     try testing.expectEqual(@as(u32, 0), d.lighting.stats.coverage_dropped);
+}
+
+test "render light driver: the config's gi_resolution reaches the field it sizes" {
+    // The last link in the chain, and the one most likely to be silently absent.
+    //
+    // A config key that parses, validates, shows up in the editor's inspector and
+    // then does nothing is the worst outcome available: the developer believes
+    // the dial works, tunes it, and sees no change and has no way to find out
+    // why. Every other link here has a test — the schema defaults, the
+    // round-trip, `setGiResolution` itself — and the one that matters is whether
+    // the two ends meet.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+
+    const view = Driver.viewFor(null, 1920, 1080);
+    try d.resize(view);
+
+    // Before: the default, from `light.default_gi_res`.
+    try testing.expectEqual(light_mod.default_gi_res, d.lighting.gi_res);
+    const default_w = d.lighting.gi_w;
+    try testing.expect(default_w == light_mod.default_gi_res);
+
+    // The number a developer types into `lighting.gi_resolution`.
+    try d.setGiResolution(64);
+    try d.resize(view);
+
+    try testing.expectEqual(@as(u32, 64), d.lighting.gi_res);
+    try testing.expectEqual(@as(u32, 64), d.lighting.gi_w);
+    try testing.expectEqual(@as(usize, 64 * 64), d.lighting.sdf.len);
+    // And it must be flagged for upload, or the CPU would change its mind while
+    // the picture stayed where it was.
+    try testing.expect(d.gi_dirty);
+
+    // `0` is a value with a meaning — "match the mask" — not "off", so it must be
+    // accepted and must enlarge the field back to the mask.
+    try d.setGiResolution(0);
+    try d.resize(view);
+    try testing.expectEqual(d.lighting.alloc_w, d.lighting.gi_w);
+}
+
+test "render light driver: shadow_resolution is a cell count, not a scale factor" {
+    // The unit conversion this is supposed to remove, tested where it would come
+    // back. A developer says "2048 across"; the driver must arrive at a mask
+    // whose longest side is 2048 cells, without them dividing anything.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+
+    const view = Driver.viewFor(null, 1920, 1080);
+    d.setShadowResolution(2048, view);
+    try d.resize(view);
+
+    const longest = @max(d.lighting.alloc_w, d.lighting.alloc_h);
+    // The mask is a power of two, so 2048 cells means 2048 — but only if the
+    // scale was computed from CELLS. Asserting the exact number is what makes
+    // this test about the unit rather than about "roughly right".
+    try testing.expectEqual(@as(u32, 2048), longest);
+
+    // And a smaller budget really does shrink the mask, which is the whole point
+    // of putting it in a config.
+    d.setShadowResolution(512, view);
+    try d.resize(view);
+    try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
 }

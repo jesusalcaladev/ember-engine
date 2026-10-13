@@ -300,6 +300,7 @@ pub fn main(init: std.process.Init) !void {
     // asking for a second mask.
     try run(20, 4, 40);
     try measureAutomatic(std.heap.c_allocator);
+    try sweepGiResolution(std.heap.c_allocator);
     try acceptance(std.heap.c_allocator);
 }
 
@@ -329,13 +330,19 @@ pub fn main(init: std.process.Init) !void {
 const acceptance_world_w: f32 = 1920;
 const acceptance_world_h: f32 = 1080;
 
-fn acceptance(allocator: std.mem.Allocator) !void {
-    const lights_n: u16 = 20;
-    const occluders_n: u16 = 40;
-
-    var world = World.init(allocator);
-    defer world.deinit();
-
+/// The M7 acceptance scene: a ring of walls, twenty lights of all four kinds,
+/// an Environment with GI on, and an ambient light.
+///
+/// EXTRACTED rather than written twice, because `sweepGiResolution` below has
+/// to measure the same scene the acceptance demo does. A sweep that quietly
+/// built an easier scene would report the cost of something nobody ships, and
+/// the default it picked would be tuned to the wrong thing.
+///
+/// Everything is placed around the ORIGIN on purpose. `viewFor(null, ...)`
+/// returns a view centred on the origin, so a scene laid out from (0, 0) upward
+/// is laid out off screen — which is what made the first version of this demo
+/// report "15 lights gathered" out of twenty and read as a gather bug.
+fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
     // The environment is a COMPONENT and the driver reads it every frame, which
     // is how a scene turns GI on. A demo that set the driver's private flag
     // would prove nothing about the path a project actually uses.
@@ -429,6 +436,146 @@ fn acceptance(allocator: std.mem.Allocator) !void {
     _ = try world.spawn(.{components.AmbientLight2D{
         .base = .{ .color = .{ 0.05, 0.06, 0.09, 1 } },
     }});
+
+}
+
+/// `lighting.gi_resolution` swept, with the cost AND the difference from the
+/// full-resolution field, so the default is chosen from a trade rather than
+/// from a preference.
+///
+/// The quality column matters as much as the cost column, and it is measured
+/// rather than asserted. There is no window here, so "does it look right" cannot
+/// be answered by looking; what CAN be answered is "how far does this field's
+/// answer differ from the one GI had before the dial existed", sampled over a
+/// grid of world points. The full-resolution field is the reference because it
+/// is the pre-decouple behaviour, and it is not assumed to be perfect — it is
+/// the thing every other resolution is being measured AGAINST.
+///
+/// Mean absolute error over `gi_samples` points, in units of the openness term
+/// (0..1). A resolution that costs 30x less and reads within a percent of the
+/// reference is a free win; one that costs 30x less and reads 40% different is
+/// a different lighting system, and the cost column alone would not say so.
+fn sweepGiResolution(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+
+    const resolutions = [_]u32{ 0, 32, 64, 128, 256, 512, 1024 };
+    const moving_frames: u32 = 6;
+
+    log("M7 GI RESOLUTION SWEEP — what `lighting.gi_resolution` buys", .{});
+    log("  medium tier, 1920x1080 view (2048x2048 mask), 21 lights, 40 occluders", .{});
+    log("  MAE is against gi_resolution = 0 (match the mask), the pre-dial field.", .{});
+
+    // The reference, built once and sampled once.
+    var reference: [gi_samples]f32 = undefined;
+
+    for (resolutions, 0..) |res, ri| {
+        var world = World.init(allocator);
+        defer world.deinit();
+        try buildAcceptanceScene(&world, lights_n, occluders_n);
+
+        var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+        defer driver.deinit();
+        try driver.setGiResolution(res);
+
+        const view = engine.lighting_driver.Driver.viewFor(
+            null,
+            @intFromFloat(acceptance_world_w),
+            @intFromFloat(acceptance_world_h),
+        );
+        try driver.resize(view);
+        driver.lighting.reserve(lights_n + 4, occluders_n) catch {};
+        driver.sky = .{ 0.06, 0.07, 0.10 };
+
+        // The frame loop: only MOVING frames, because a resting frame rebuilds
+        // nothing and would report a cost of zero for every resolution, making
+        // the whole table a lie.
+        var ds_ns: u64 = 0;
+        var edt_ns: u64 = 0;
+        var rebuilds: u32 = 0;
+        var f: u32 = 0;
+        while (f < moving_frames) : (f += 1) {
+            var it = world.query(.{components.LightOccluder2D, components.Transform});
+            var e = it.next();
+            var n: u32 = 0;
+            while (e) |en| : (e = it.next()) {
+                if (n % 2 == 0) en.get(components.Transform).position.x += 1.0;
+                n += 1;
+            }
+            const before = if (driver.lighting.radiance) |r| r.builds else 0;
+            driver.update(&world, @intCast(monotonicNs()));
+            const after = if (driver.lighting.radiance) |r| r.builds else 0;
+            if (after != before) {
+                ds_ns += driver.lighting.stats.downsample_ns;
+                edt_ns += driver.lighting.stats.transform_ns;
+                rebuilds += 1;
+            }
+        }
+
+        // Sample the field now and compare.
+        var samples: [gi_samples]f32 = undefined;
+        for (0..gi_samples) |i| {
+            samples[i] = driver.lighting.sampleGi(
+                sampleWorldX(i),
+                sampleWorldY(i),
+            );
+        }
+
+        var mae: f64 = 0;
+        if (ri == 0) {
+            reference = samples;
+        } else {
+            for (samples, reference) |a, b| {
+                mae += @abs(@as(f64, @floatCast(a)) - @as(f64, @floatCast(b)));
+            }
+            mae /= @floatFromInt(gi_samples);
+        }
+
+        const n_rebuild: f64 = @floatFromInt(@max(rebuilds, 1));
+        const ds_us = @as(f64, @floatFromInt(ds_ns)) / n_rebuild / 1000.0;
+        const edt_us = @as(f64, @floatFromInt(edt_ns)) / n_rebuild / 1000.0;
+        const cells = @as(f64, @floatFromInt(driver.lighting.gi_w)) *
+            @as(f64, @floatFromInt(driver.lighting.gi_h));
+        const upload_kb = cells * 4.0 / 1024.0;
+
+        log("  gi_resolution {d:>5} -> {d}x{d} field, {d:.1} KiB upload", .{
+            res,
+            driver.lighting.gi_w,
+            driver.lighting.gi_h,
+            upload_kb,
+        });
+        log("      resample {d:>7.1} us + transform {d:>8.1} us = {d:>8.1} us   MAE {d:.4}", .{
+            ds_us,
+            edt_us,
+            ds_us + edt_us,
+            mae,
+        });
+    }
+
+    log("  the default is `light.default_gi_res`; this table is how it was chosen.", .{});
+}
+
+/// Sample points spread over the acceptance view, in world units. `viewFor`
+/// centres on the origin, so the grid is symmetric about it.
+const gi_samples: usize = 4096;
+
+fn sampleWorldX(i: usize) f32 {
+    const gx: usize = i % 64;
+    return (@as(f32, @floatFromInt(gx)) - 31.5) / 31.5 * (acceptance_world_w * 0.5);
+}
+
+fn sampleWorldY(i: usize) f32 {
+    const gy: usize = i / 64;
+    return (@as(f32, @floatFromInt(gy)) - 31.5) / 31.5 * (acceptance_world_h * 0.5);
+}
+
+fn acceptance(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+
+    var world = World.init(allocator);
+    defer world.deinit();
+    try buildAcceptanceScene(&world, lights_n, occluders_n);
 
     var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
     defer driver.deinit();

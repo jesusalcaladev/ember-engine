@@ -323,7 +323,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     // no way to point at the cause.
     var gi: f32 = 1.0;
     if (in.si_gi > 0.0) {
-        let size = vec2f(textureDimensions(gi_tex));
+        // Normalized UV over `mask_rect`, NOT over the texture's own dimensions.
+        // That is what lets `lighting.gi_resolution` change the field's size
+        // without touching this shader: the texture covers the same world
+        // rectangle whatever its resolution, so the field's cell count is the
+        // CPU's business and the GPU's only business is where to sample it.
         let span = max(globals.mask_rect.zw - globals.mask_rect.xy, vec2f(1e-4));
         // Outside the cascade's rectangle there is no enclosure data, and the
         // honest answer for "how enclosed is somewhere we never measured" is
