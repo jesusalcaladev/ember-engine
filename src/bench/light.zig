@@ -301,6 +301,8 @@ pub fn main(init: std.process.Init) !void {
     try run(20, 4, 40);
     try measureAutomatic(std.heap.c_allocator);
     try sweepGiResolution(std.heap.c_allocator);
+    try sweepEarlyOut(std.heap.c_allocator);
+    try sweepBackends(std.heap.c_allocator);
     try acceptance(std.heap.c_allocator);
 }
 
@@ -437,6 +439,246 @@ fn buildAcceptanceScene(world: *World, lights_n: u16, occluders_n: u16) !void {
         .base = .{ .color = .{ 0.05, 0.06, 0.09, 1 } },
     }});
 
+}
+
+/// The two GI models, on the same scenes, so `gi_backend`'s default and the
+/// bounce numbers in `light.bounce_iterations` rest on measurement.
+///
+/// The claim being tested is not "the bounce is cheaper" — it is that the bounce
+/// is a DIFFERENT ANSWER, so a project can pick the model that matches its
+/// scene, and the cost column is what tells you what picking costs.
+fn sweepBackends(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+    const frames: u32 = 12;
+
+    log("GI BACKENDS — same scenes, both models", .{});
+
+    for ([_]EarlyOutScene{ .open, .room }) |which| {
+        try backendOne(allocator, which, .sky, lights_n, occluders_n, frames);
+        try backendOne(allocator, which, .bounce, lights_n, occluders_n, frames);
+        log("", .{});
+    }
+}
+
+fn backendOne(
+    allocator: std.mem.Allocator,
+    which: EarlyOutScene,
+    backend: engine.light.GiBackend,
+    lights_n: u16,
+    occluders_n: u16,
+    frames: u32,
+) !void {
+    var world = World.init(allocator);
+    defer world.deinit();
+    try buildAcceptanceScene(&world, lights_n, occluders_n);
+    if (which == .room) try sealTheRoom(&world);
+
+    var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+    defer driver.deinit();
+    driver.default_backend = backend;
+    driver.lighting.gi_backend = backend;
+    driver.bounce_iterations = light.bounce_iterations;
+
+    const view = engine.lighting_driver.Driver.viewFor(
+        null,
+        @intFromFloat(acceptance_world_w),
+        @intFromFloat(acceptance_world_h),
+    );
+    try driver.resize(view);
+    driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
+    driver.sky = .{ 0.06, 0.07, 0.10 };
+
+    // The world's Environment must not override what this bench is measuring.
+    var it = world.query(.{components.Environment});
+    if (it.next()) |row| row.get(components.Environment).gi_backend = null;
+
+    // GI's own cost, not the frame's. The frame is dominated by the shadow
+    // sweep, which scales with the SCENE's geometry -- so comparing whole frames
+    // between two backends on two different scenes measures the rooms, not the
+    // GI. That mistake is what made the first version of this table say the
+    // bounce backend was more expensive than the cascade on identical input.
+    var gi_ns: u64 = 0;
+    var gi_events: u32 = 0;
+    var last_builds: u32 = 0;
+    var frame_ns: u64 = 0;
+    var f: u32 = 0;
+    while (f < frames) : (f += 1) {
+        var oit = world.query(.{components.LightOccluder2D, components.Transform});
+        var oe = oit.next();
+        var n: u32 = 0;
+        while (oe) |en| : (oe = oit.next()) {
+            if (n % 2 == 0) en.get(components.Transform).position.x += 1.0;
+            n += 1;
+        }
+        const t0 = monotonicNs();
+        driver.update(&world, @intCast(monotonicNs()));
+        frame_ns += monotonicNs() - t0;
+        if (backend == .bounce) {
+            gi_ns += driver.lighting.stats.bounce_ns;
+            gi_events += 1;
+        } else {
+            // The cascade is AMORTIZED, so its cost lands on a minority of
+            // frames. Dividing by all of them reports an average that is true of
+            // the average and false of the thing being compared -- and would make
+            // the bounce look dearer than it is purely by being called more
+            // often. Divided by the rebuilds, both columns are "per GI event".
+            if (driver.lighting.stats.sdf_builds != last_builds) {
+                gi_ns += driver.lighting.stats.pyramid_ns + driver.lighting.stats.sdf_ns;
+                gi_events += 1;
+                last_builds = driver.lighting.stats.sdf_builds;
+            }
+        }
+    }
+
+    // What each model actually believes about the middle of the scene, which is
+    // the number that says whether they are different models or the same one
+    // twice.
+    const enc = driver.lighting.sampleGi(0, 0);
+    // The PEAK of the field rather than one sample point. A single point is not
+    // evidence of anything in a scene made of a grid of walls: the first one
+    // tried was (0, 0), which is inside a wall, and it reported "no bounce" for
+    // a field that was in fact the brightest thing in the scene.
+    var bmax: f32 = 0;
+    for (driver.lighting.bounce.rgb) |v| {
+        if (v > bmax) bmax = v;
+    }
+
+    const n: f64 = @floatFromInt(frames);
+    const gi_us = @as(f64, @floatFromInt(gi_ns)) / @as(f64, @floatFromInt(@max(gi_events, 1))) / 1000.0;
+    const frame_us = @as(f64, @floatFromInt(frame_ns)) / n / 1000.0;
+    log("  {s:<5} {s:<7} GI {d:>8.2} us/event  (whole frame {d:>8.2} us)   enclosure {d:.3}  propagated {d:.3}", .{
+        @tagName(which),
+        @tagName(backend),
+        gi_us,
+        frame_us,
+        enc,
+        if (backend == .bounce) bmax else 0,
+    });
+}
+
+/// The enclosed-probe early-out, measured both ways on the SAME scene.
+///
+/// This is the "measure it, then decide" case. The early-out is obviously good
+/// in a room and obviously useless in the open, and the acceptance scene -- a
+/// grid of walls in open space -- is the case where it should do least. If the
+/// win here is small, that is the measurement, and the flag stays on because the
+/// room case is where the engine will actually be used.
+///
+/// The interior case is measured too, and it is the one that matters: a sealed
+/// box with one doorway is a room, and every probe inside it is enclosed.
+fn sweepEarlyOut(allocator: std.mem.Allocator) !void {
+    const lights_n: u16 = 20;
+    const occluders_n: u16 = 40;
+    const frames: u32 = 6;
+
+    log("ENCLOSED-PROBE EARLY-OUT — same scene, both settings", .{});
+
+    try earlyOutOne(allocator, .open, lights_n, occluders_n, frames);
+    try earlyOutOne(allocator, .room, lights_n, occluders_n, frames);
+}
+
+/// A sealed box with one doorway, built around the origin.
+///
+/// A ROOM, not a maze: everything inside is enclosed, which is the case the
+/// bounce backend exists for and the case a grid of walls in the open is not.
+/// Shared by the early-out sweep and the backend sweep so both measure the same
+/// interior rather than two similar ones.
+fn sealTheRoom(world: *World) !void {
+    const w: f32 = acceptance_world_w * 0.42;
+    const h: f32 = acceptance_world_h * 0.42;
+    var x: usize = 0;
+    while (x < 4) : (x += 1) {
+        var poly = components.OccluderPolygon{};
+        poly.count = 4;
+        const x0: f32 = -w + @as(f32, @floatFromInt(x)) * (w * 0.5);
+        poly.points = .{
+            x0,           -h,
+            x0 + w * 0.5, -h,
+            x0 + w * 0.5, h,
+            x0,           h,
+        } ++ [_]f32{0} ** 8;
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = 0, .y = 0 } },
+            components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+        });
+    }
+    var y: usize = 0;
+    while (y < 2) : (y += 1) {
+        var poly = components.OccluderPolygon{};
+        poly.count = 4;
+        const y0: f32 = -h + @as(f32, @floatFromInt(y)) * h;
+        poly.points = .{
+            -w, y0,
+            w,  y0,
+            w,  y0 + h * 0.5,
+            -w, y0 + h * 0.5,
+        } ++ [_]f32{0} ** 8;
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = 0, .y = 0 } },
+            components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+        });
+    }
+}
+
+const EarlyOutScene = enum { open, room };
+
+fn earlyOutOne(
+    allocator: std.mem.Allocator,
+    which: EarlyOutScene,
+    lights_n: u16,
+    occluders_n: u16,
+    frames: u32,
+) !void {
+    var world = World.init(allocator);
+    defer world.deinit();
+    try buildAcceptanceScene(&world, lights_n, occluders_n);
+
+
+    if (which == .room) try sealTheRoom(&world);
+
+    for ([_]bool{ false, true }) |early| {
+        var driver = try engine.lighting_driver.Driver.init(allocator, .medium);
+        defer driver.deinit();
+        if (driver.lighting.radiance) |r| r.early_out_enclosed = early;
+
+        const view = engine.lighting_driver.Driver.viewFor(
+            null,
+            @intFromFloat(acceptance_world_w),
+            @intFromFloat(acceptance_world_h),
+        );
+        try driver.resize(view);
+        driver.lighting.reserve(lights_n + 8, occluders_n + 8) catch {};
+        driver.sky = .{ 0.06, 0.07, 0.10 };
+
+        var pyramid_ns: u64 = 0;
+        var rebuilds: u32 = 0;
+        var f: u32 = 0;
+        while (f < frames) : (f += 1) {
+            var it = world.query(.{components.LightOccluder2D, components.Transform});
+            var e = it.next();
+            var n: u32 = 0;
+            while (e) |en| : (e = it.next()) {
+                if (n % 2 == 0) en.get(components.Transform).position.x += 1.0;
+                n += 1;
+            }
+            const before = if (driver.lighting.radiance) |r| r.builds else 0;
+            driver.update(&world, @intCast(monotonicNs()));
+            const after = if (driver.lighting.radiance) |r| r.builds else 0;
+            if (after != before) {
+                pyramid_ns += driver.lighting.stats.pyramid_ns;
+                rebuilds += 1;
+            }
+        }
+
+        const per: f64 = if (rebuilds == 0) 0 else
+            @as(f64, @floatFromInt(pyramid_ns)) / @as(f64, @floatFromInt(rebuilds)) / 1000.0;
+        log("  {s:<5} early_out={s:<5}  radiance pyramid {d:>7.2} us per rebuild", .{
+            @tagName(which),
+            if (early) "on" else "off",
+            per,
+        });
+    }
 }
 
 /// `lighting.gi_resolution` swept, with the cost AND the difference from the

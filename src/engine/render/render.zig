@@ -8,8 +8,23 @@
 const std = @import("std");
 pub const light_mod = @import("light.zig");
 
+// Submodule exports. The engine boundary and the bench/test roots reach these
+// THROUGH the `render` module rather than by relative path, because a file may
+// only belong to one module: `script` imports `render` for the camera view, so
+// every file under `render/` already lives in this module and a second relative
+// import from `engine/root.zig` is the "file exists in two modules" error.
+pub const batcher = @import("batcher.zig");
+pub const atlas = @import("atlas.zig");
+pub const render2d = @import("2d.zig");
+pub const light = @import("light.zig");
+pub const lighting_driver = @import("lighting_driver.zig");
+
 pub const backend_null = @import("backend_null.zig");
 pub const backend_dawn = @import("backend_dawn.zig");
+/// The atlas bridge (M3): the CPU-side packer a backend fills and then uploads
+/// as one texture. Public because the backends' VTable signatures are typed on
+/// it — the manager is the bridge's own type, not the renderer's.
+pub const atlas_bridge = @import("atlas_bridge.zig");
 
 pub const QuadVertex = struct {
     pos: [2]f32,
@@ -164,6 +179,16 @@ pub const SceneEnvironment = struct {
     /// How much of what arrives at an occluder is reflected back. 0.85 is a
     /// mid-grey wall; 0.2 is velvet.
     albedo: f32 = 0.85,
+    /// Which GI model this environment asks for, or `null` for "whatever the
+    /// project configured".
+    ///
+    /// Per-environment rather than global, and that is the whole point of it: a
+    /// single 2D RPG is outdoors at noon and inside a dungeon in the same hour,
+    /// and those two places want DIFFERENT models — the sky carries an outdoor
+    /// courtyard and a sealed basement has no sky at all, so a global answer is
+    /// right for one of them and wrong for the other. `null` means "inherit the
+    /// project default", which is the outdoor one.
+    gi_backend: ?u8 = null,
 
     /// Fog's near and far distance from the centre of the screen, 0 disabling.
     ///
@@ -283,6 +308,14 @@ pub const Renderer = struct {
         createTexture: *const fn (ptr: *anyopaque, width: u32, height: u32, pixels: []const u8) ?*anyopaque,
         /// Destroys a texture created by createTexture.
         destroyTexture: *const fn (ptr: *anyopaque, texture: ?*anyopaque) void,
+
+        // ── Atlas bridge (M3) ──────────────────────────────────────────────────
+        /// Creates an AtlasManager for packing sprites into an atlas.
+        createAtlasManager: *const fn (ptr: *anyopaque, width: u32, height: u32) ?*anyopaque,
+        /// Adds an image to the atlas. Returns UV coordinates.
+        addImageToAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque, path: []const u8, width: u32, height: u32, pixels: []const u8) ?[4]f32,
+        /// Uploads the atlas page to GPU. Returns the atlas handle for drawSprites.
+        uploadAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque,
     };
 
     pub fn beginFrame(self: Renderer) void {
@@ -354,6 +387,20 @@ pub const Renderer = struct {
     }
     pub fn destroyTexture(self: Renderer, texture: ?*anyopaque) void {
         self.vtable.destroyTexture(self.ptr, texture);
+    }
+
+    // ── Atlas bridge (M3) ──────────────────────────────────────────────────
+    pub fn createAtlasManager(self: Renderer, width: u32, height: u32) ?*anyopaque {
+        return self.vtable.createAtlasManager(self.ptr, width, height);
+    }
+    // The parameter is `atlas_handle` and not `atlas`: `atlas` is the module's
+    // own submodule export (the packer), and a parameter that shadows it is a
+    // compile error now that the two share a namespace.
+    pub fn addImageToAtlas(self: Renderer, atlas_handle: ?*anyopaque, path: []const u8, width: u32, height: u32, pixels: []const u8) ?[4]f32 {
+        return self.vtable.addImageToAtlas(self.ptr, atlas_handle, path, width, height, pixels);
+    }
+    pub fn uploadAtlas(self: Renderer, atlas_handle: ?*anyopaque) ?*anyopaque {
+        return self.vtable.uploadAtlas(self.ptr, atlas_handle);
     }
 };
 

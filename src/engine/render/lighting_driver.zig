@@ -103,6 +103,21 @@ pub const Driver = struct {
     /// the backend's cache to notice on its own.
     shadow_angles: u32 = 0,
 
+    /// How many diffusion passes the `bounce` backend runs per frame, and the
+    /// fraction of light a wall keeps on each one.
+    ///
+    /// BOTH PARAMETRISED because they are the two numbers that decide what this
+    /// backend costs and how far light travels, and a developer with a lantern
+    /// puzzle and a developer with a stadium want different answers. The defaults
+    /// are in `light.bounce_iterations` and `light.default_bounce_albedo` and
+    /// were measured, not guessed.
+    /// The project-level model, from `lighting.gi_backend`. An Environment
+    /// overrides it per scene; this is what everything falls back to.
+    default_backend: light_mod.GiBackend = .sky,
+
+    bounce_iterations: u32 = light_mod.bounce_iterations,
+    gi_albedo: f32 = light_mod.default_bounce_albedo,
+
     /// The scene this driver last saw.
     ///
     /// Borrowed, and only between an `update` and the next one — the same
@@ -303,6 +318,41 @@ pub const Driver = struct {
         // here used to say "only when the field moved" over code that moved
         // every frame, which is the kind of claim that is worth more removed
         // than kept.
+        // The environment decides, per frame, and it is a read rather than a
+        // decision because both models are already allocated -- see
+        // `reallocMaskBuffers`, where the note explains why paying for both is
+        // cheaper than forbidding the switch inside a frame.
+        //
+        // `?u8` on the component is the escape from a layering problem rather
+        // than an optimisation: `ecs.components` cannot name `light.GiBackend`
+        // without importing the renderer, and the renderer already imports the
+        // components. So the tag travels as a number and is translated here,
+        // where both sides are in scope. An unknown tag falls back to the
+        // project's setting rather than guessing: a typo in a .zson should not
+        // silently change the lighting model.
+        // Falls back to the PROJECT's setting, not to whatever the field already
+        // holds. Reading its own previous value would make the override sticky:
+        // one frame with `bounce` in the environment would leave `bounce` running
+        // for a scene that never asked for it, and nothing in the picture would
+        // say so.
+        l.gi_backend = if (worldHasEnvironment(world)) |env|
+            backendFromTag(env.gi_backend) orelse self.default_backend
+        else
+            self.default_backend;
+
+        if (l.gi_backend == .bounce) {
+            // Every frame, by design. See `stepBounce`: the field is an
+            // integrator, so skipping frames does not save anything, it just makes
+            // the bounce arrive more slowly.
+            const t_b = l.tick();
+            l.downsampleGi();
+            l.stepBounce(self.bounce_iterations, self.gi_albedo);
+            l.stats.bounce_ns = l.tick() - t_b;
+            self.gi_dirty = true;
+            l.stats.sdf_skipped += 0;
+            return;
+        }
+
         const field_rebuilt = l.updateSdf(now_ns);
         if (field_rebuilt) {
             if (l.radiance) |r| {
@@ -357,6 +407,30 @@ pub const Driver = struct {
         // Clamped rather than trusted: a scale of 0 is a division by zero and a
         // scale of 0.01 is a 100x mask nobody asked for.
         self.scale = std.math.clamp(want, 1.0 / 16.0, 4.0);
+    }
+
+    /// Applies a project's whole `lighting` section in one call.
+    ///
+    /// ONE entry point rather than four setters, because the values are not
+    /// independent and applying them separately is how a config ends up
+    /// half-installed: a resolution that took effect with a backend that did
+    /// not, or a bounce albedo with no bounce running. The order below is the
+    /// order they must be applied in — resolution first, because the backend's
+    /// buffers are sized from it.
+    ///
+    /// Allocates when it changes, so it belongs with `resize` and not inside a
+    /// frame. The editor's settings panel applies configs between frames.
+    pub fn applyLightingConfig(self: *Driver, c: anytype) !void {
+        self.default_backend = switch (@as(u8, @intFromEnum(@field(c, "backend")))) {
+            0 => light_mod.GiBackend.off,
+            1 => light_mod.GiBackend.sky,
+            else => light_mod.GiBackend.bounce,
+        };
+        self.bounce_iterations = @intCast(@max(@field(c, "bounce_iterations"), 0));
+        self.gi_albedo = @floatCast(@max(@min(@field(c, "bounce_albedo"), 1.0), 0.0));
+        self.lighting.gi_backend = self.default_backend;
+        try self.setGiResolution(@intCast(@max(@field(c, "gi_resolution"), 0)));
+        try self.setShadowResolution(@intCast(@max(@field(c, "shadow_resolution"), 256)), self.lighting.rect);
     }
 
     /// The GI field's longest side, in cells. `0` means "match the mask".
@@ -447,9 +521,27 @@ pub const Driver = struct {
             .ambient = env.ambient(),
             .sky = env.sky(),
             .albedo = env.gi_albedo,
+            .gi_backend = env.gi_backend,
         };
     }
 };
+
+fn backendFromTag(tag: ?u8) ?light_mod.GiBackend {
+    return switch (tag orelse return null) {
+        0 => .sky,
+        1 => .bounce,
+        2 => .off,
+        else => null,
+    };
+}
+
+/// The world's Environment, or null when it has none. Null means "use the
+/// project's configured default", which is the one a scene gets for free.
+fn worldHasEnvironment(world: *ecs.World) ?*const ecs.components.Environment {
+    var it = world.query(.{ecs.components.Environment});
+    const row = it.next() orelse return null;
+    return row.get(ecs.components.Environment);
+}
 
 /// Degrees to radians, exported because the driver's public surface talks in
 /// angles everywhere else and a caller should not have to remember which.
@@ -1052,4 +1144,226 @@ test "render light driver: shadow_resolution is a cell count, not a scale factor
     d.setShadowResolution(512, view);
     try d.resize(view);
     try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
+}
+
+test "render light driver: bounce carries a torch into a room the sky cannot reach" {
+    // The reason the second backend exists, as a test.
+    //
+    // A sealed room has no sky. The cascade traces toward it, finds nothing,
+    // and returns darkness -- which is CORRECT for that model and useless for a
+    // dungeon, and there was no configuration that could fix it because the
+    // light that should be in the room comes from the torches in it, and
+    // torches are not in the field the cascade traces.
+    //
+    // So: a box with a doorway, a light inside it, and the claim that light
+    // reaches the far corner. If this passes, an interior is solvable by
+    // configuration instead of by hand-placing a light per room.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    d.default_backend = .bounce;
+    d.lighting.gi_backend = .bounce;
+    d.bounce_iterations = 32;
+    d.gi_albedo = 0.75;
+
+    try d.lighting.resize(64, 64);
+    try d.lighting.reserve(16, 16);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+
+    // A sealed box: four walls with a gap in the right-hand one, so the room is
+    // enclosed and the ONLY thing lighting it is the torch.
+    const wall = struct {
+        fn add(w: *ecs.World, pts: [16]f32) !void {
+            var poly = components.OccluderPolygon{};
+            poly.count = 4;
+            poly.points = pts;
+            _ = try w.spawn(.{
+                components.Transform{ .position = .{ .x = 0, .y = 0 } },
+                components.LightOccluder2D{ .mode = .manual, .polygon = poly },
+            });
+        }
+    };
+    try wall.add(&world, .{ 4, 4, 60, 4, 60, 7, 4, 7, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try wall.add(&world, .{ 4, 57, 60, 57, 60, 60, 4, 60, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try wall.add(&world, .{ 4, 4, 7, 4, 7, 60, 4, 60, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try wall.add(&world, .{ 57, 4, 60, 4, 60, 30, 57, 30, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try wall.add(&world, .{ 57, 34, 60, 34, 60, 60, 57, 60, 0, 0, 0, 0, 0, 0, 0, 0 });
+
+    // The torch, near the left wall.
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 32 } },
+        components.PointLight2D{
+            .radius = 48,
+            .base = .{ .gi_contribution = 1.0, .color = .{ 1, 0.85, 0.6, 1 } },
+        },
+    });
+
+    // Several frames: the field is an integrator, so one frame is not the claim.
+    var f: u32 = 0;
+    while (f < 20) : (f += 1) {
+        d.update(&world, @intCast(@as(i64, f) * 16_000_000));
+    }
+
+    const near = d.lighting.sampleBounce(16, 32);
+    const far = d.lighting.sampleBounce(48, 32);
+
+    // The far corner is the whole test. Directly under the torch it is bright;
+    // fifty cells away and around two corners, it is dimmer but NOT zero.
+    try testing.expect(near[0] > 0.01);
+    try testing.expect(far[0] > 0.0);
+
+    // And dimmer, because a bounce is a loss. A field that carried the torch's
+    // full energy to the far corner would be a bug that happens to look right in
+    // the one screenshot someone checks.
+    try testing.expect(far[0] <= near[0]);
+
+    // The walls must not glow from the inside. This is the invariant that makes
+    // the reflection work at all rather than turning every wall into a lamp.
+    try testing.expectEqual(@as(f32, 0.0), d.lighting.sampleBounce(5, 32)[0]);
+}
+
+test "render light driver: the bounce field converges instead of growing forever" {
+    // A diffusion pass with no loss term grows without bound, and a light that
+    // gets brighter the longer the game runs is a bug that takes ten minutes to
+    // notice and an hour to find. With albedo the field has a fixed point.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    d.default_backend = .bounce;
+    d.lighting.gi_backend = .bounce;
+    d.bounce_iterations = 4;
+    d.gi_albedo = 0.6;
+
+    try d.lighting.resize(32, 32);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.PointLight2D{
+            .radius = 64,
+            .base = .{ .gi_contribution = 1.0, .color = .{ 1, 1, 1, 1 } },
+        },
+    });
+
+    var peak: f32 = 0;
+    var f: u32 = 0;
+    while (f < 400) : (f += 1) {
+        d.update(&world, @intCast(@as(i64, f) * 16_000_000));
+        const v = d.lighting.sampleBounce(16, 16)[0];
+        if (v > peak) peak = v;
+    }
+
+    // Bounded, and in a range that says "converged" rather than "did not run".
+    // A field that decayed to nothing would pass a `<= 2.0` check on its own.
+    try testing.expect(peak < 4.0);
+    try testing.expect(peak > 0.05);
+}
+
+test "render light driver: gi_backend = off costs nothing and takes nothing away" {
+    // The "developer lights it by hand" path, and the one most likely to be a
+    // lie.
+    //
+    // Three separate claims, because turning a subsystem off has three separate
+    // ways to go wrong: it must not cost anything, it must not leave memory
+    // behind, and — the one that actually matters to a developer — it must not
+    // take anything else with it. Shadows, shadowed occluders and automatic
+    // occluders all have to keep working, because a hand-lit project still wants
+    // shadows and a sprite that casts its own silhouette.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    d.default_backend = .off;
+    d.lighting.gi_backend = .off;
+
+    try d.lighting.resize(64, 64);
+    try d.lighting.reserve(16, 16);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
+
+    // Nothing allocated for GI: no field, no distance data, no upload buffer,
+    // no propagation grid. `resize` frees them and leaves empty slices, so these
+    // are zero-length rather than merely unread.
+    try testing.expectEqual(@as(usize, 0), d.lighting.sdf.len);
+    try testing.expectEqual(@as(usize, 0), d.lighting.gi_pixels.len);
+    try testing.expectEqual(@as(usize, 0), d.lighting.gi_mask.len);
+    try testing.expectEqual(@as(usize, 0), d.lighting.bounce.rgb.len);
+    try testing.expectEqual(@as(u32, 0), d.lighting.gi_w);
+
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+
+    var poly = components.OccluderPolygon{};
+    poly.count = 4;
+    poly.points = .{ 20, 0, 22, 0, 22, 64, 20, 64, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 32 } },
+        components.LightOccluder2D{ .mode = .auto_sdf, .alpha_threshold = 0.5 },
+        components.PointLight2D{ .radius = 64, .base = .{ .cast_shadows = true } },
+    });
+
+    d.update(&world, 0);
+
+    // The light gathered, the occluder is in the scene, and the shadow map was
+    // built. THAT is what "off" is not allowed to take away.
+    try testing.expect(d.lighting.stats.lights >= 1);
+    try testing.expect(d.lighting.stats.occluders >= 1);
+    try testing.expect(d.lighting.stats.shadow_lights >= 1);
+
+    // And the GI terms read as absent rather than as zero, which is the
+    // difference between "no bounce" and "no sky". A zero enclosure would darken
+    // every room in the game; `sampleGi` returning 1.0 means the term is simply
+    // not there.
+    try testing.expectEqual(@as(f32, 1.0), d.lighting.sampleGi(32, 32));
+    const b = d.lighting.sampleBounce(32, 32);
+    try testing.expectEqual(@as(f32, 0.0), b[0]);
+
+    // `encodeGi` refuses rather than writing a zero-filled texture, because a
+    // valid-looking GI texture full of zeros is a scene that gets darker with no
+    // way to ask why.
+    try testing.expect(!d.lighting.encodeGi(d.lighting.gi_pixels));
+    // And nothing is queued for upload.
+    try testing.expect(!d.gi_dirty);
+}
+
+test "render light driver: an environment picks the backend, and only for its own scene" {
+    // The reason `gi_backend` is on `Environment` and not only in the project
+    // config: one 2D game is a courtyard and a dungeon, often in the same file.
+    var d = try Driver.init(testing.allocator, .high);
+    defer d.deinit();
+    d.default_backend = .sky;
+    d.bounce_iterations = 8;
+    try d.lighting.resize(32, 32);
+    try d.lighting.reserve(8, 8);
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+
+    var outdoors = ecs.World.init(testing.allocator);
+    defer outdoors.deinit();
+    _ = try outdoors.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.PointLight2D{ .radius = 32 },
+    });
+
+    var dungeon = ecs.World.init(testing.allocator);
+    defer dungeon.deinit();
+    _ = try dungeon.spawn(.{components.Environment{ .gi_backend = 1 }});
+    _ = try dungeon.spawn(.{
+        components.Transform{ .position = .{ .x = 16, .y = 16 } },
+        components.PointLight2D{ .radius = 32 },
+    });
+
+    // Outdoors: no Environment at all, so the project's setting stands.
+    d.update(&outdoors, 0);
+    try testing.expectEqual(light_mod.GiBackend.sky, d.lighting.gi_backend);
+
+    // The dungeon asks for bounce, and gets it.
+    d.update(&dungeon, 0);
+    try testing.expectEqual(light_mod.GiBackend.bounce, d.lighting.gi_backend);
+
+    // And going back outdoors releases it. A sticky override would leave the
+    // bounce running in a courtyard, and nothing in the picture would say so.
+    d.update(&outdoors, 1_000_000);
+    try testing.expectEqual(light_mod.GiBackend.sky, d.lighting.gi_backend);
 }

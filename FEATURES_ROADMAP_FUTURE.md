@@ -27,7 +27,8 @@
 - [x] **Blend Modes** - Add / Subtract / Mix (3 pipelines)
 - [x] **Layer Masking** - per-pixel en light shader
 - [x] **Auto-SDF Oclusores** - Cobertura α → máscara → EDT → Radiance Cascades (⚠️ la cobertura α estaba escrita pero **no cableada** — ya corregido, ver abajo)
-- [x] **GI ajustable por config** - `lighting.gi_resolution` + `lighting.shadow_resolution` en `project.config`; default 128 puesto por medición (392 ms → 14.2 ms en frame en movimiento)
+- [x] **GI ajustable por config** - `gi_resolution`, `shadow_resolution`, `gi_backend`, `bounce_iterations`, `bounce_albedo`; defaults puestos por medición
+- [x] **3 modelos de GI** - `sky` (exteriores), `bounce` (interiores, más barato y el único que ilumina una sala sellada), `off` (iluminación a mano, coste cero y sin alias). Elegible por proyecto y por `Environment`
 - [x] **Editor Bindings** - 167 bindings con metadata docs
 - [x] **Tests** - 86/86 passing (`zig build test-light`), 6 shaders validados
 
@@ -112,6 +113,71 @@ es el piso con este diseño. Está registrado como tal, no maquillado.
 
 Nota: el bench tiene ~20% de dispersión entre corridas; las cifras de EDT y
 pirámide son rangos.
+
+### ✅ GI: TRES MODELOS, UN ENUM, TODO PARAMETRIZADO
+
+```
+lighting {
+  gi_resolution 128          # lado mayor del campo GI (0 = 1 celda GI por celda de máscara)
+  shadow_resolution 2048     # lado mayor de la máscara de sombras
+  gi_backend "sky"           # off | sky | bounce
+  bounce_iterations 8        # pases de difusión por frame (modelo bounce)
+  bounce_albedo 0.6          # fracción de luz que conserva una pared por rebote
+}
+```
+
+**`gi_backend` es un enum y no un número a propósito**: los tres son afirmaciones
+distintas sobre de dónde viene la luz, así que un número sería mentira de
+construcción.
+
+| | qué modela | para qué |
+|---|---|---|
+| `sky` | traza hacia el cielo y propaga lo que encontró | exteriores: un patio a mediodía |
+| `bounce` | lleva las luces **de la propia escena** por el espacio libre y las rebota en las paredes | interiores: un pasillo con antorchas |
+| `off` | nada | proyecto que ilumina a mano — **libera** cada buffer, no salta el trabajo |
+
+Medido, mismas escenas, mismos ajustes (`zig build bench-light`, "GI BACKENDS"):
+
+| escena | GI con `sky` | GI con `bounce` | luz que llega a la sala |
+|---|---|---|---|
+| abierta | 17.8 ms | **10.8 ms** | — |
+| **sala sellada** | 7.3 ms | **6.4 ms** | `sky`: **0.000** / `bounce`: **2.739** |
+
+La última columna es la que decide. **El modelo de cascadas produce exactamente
+nada en una habitación sin cielo** — y eso no era un bug, era la pregunta
+equivocada: la luz que debería estar en una mazmorra viene de las antorchas que
+están en la mazmorra, y las antorchas no están en el campo que la cascada traza.
+Un RPG 2D de mundo abierto es las dos cosas en el mismo fichero, por eso
+`gi_backend` está **también en `Environment`**, no solo en el config.
+
+Y el rebote es **más barato**, no más caro: un número fijo de pasadas sobre la
+rejilla contra `sondas × rayos` que crece con cada cascada.
+
+### ✅ GI OFF — como el de Unreal, y no es un castigo
+
+Tres afirmaciones distintas porque apagar un subsistema tiene tres maneras
+distintas de salir mal, y todas verificadas por test:
+
+1. **No cuesta nada.** Sin campo, sin transformada de distancia, sin buffer de
+   subida, sin rejilla de propagación. Todo a longitud cero, no "no leído".
+2. **No se lleva nada más.** Las sombras siguen, los oclusores manuales siguen, y
+   los **oclusores automáticos siguen** — un proyecto iluminado a mano quiere
+   sombras, y un sprite que proyecta su propia silueta también.
+3. **El término se lee como ausente, no como cero.** `sampleGi` devuelve 1.0, que
+   significa "no hay término" y no "el cielo es negro". Un cero oscurecería cada
+   sala del juego y `encodeGi` se niega a escribir una textura válida llena de
+   ceros, porque eso es una escena que se oscurece sin forma de preguntar por qué.
+
+### ✅ EARLY-OUT PARA SONDAS ENCERRADAS — MEDIDO ANTES DE DECIDIR
+
+| escena | apagado | encendido |
+|---|---|---|
+| abierta | 15.56 ms | 14.68 ms (**5.7%**) |
+| **sala sellada** | 7.07 ms | **4.82 ms (31.8%)** |
+
+Gana justo donde el motor se va a usar. Se queda **encendido**, y la bandera
+existe porque la respuesta depende de la escena, no porque la idea sea obviamente
+buena.
 
 ### 🔒 LA SUITE NO PUEDE DESAPARECER EN SILENCIO
 

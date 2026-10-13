@@ -155,6 +155,16 @@ pub const Rendering = struct {
 /// Separate from `rendering` because these are the numbers that decide what a
 /// frame COSTS, and a developer tuning a game on a laptop wants them somewhere
 /// they can find them rather than inferred from a draw-call budget.
+/// Which global-illumination model a project uses.
+///
+/// DECLARED HERE AND NOT IMPORTED from the renderer, for the same reason
+/// `AudioBackend` is: `project` sits below `render` in the dependency order, so
+/// naming `light.GiBackend` here would invert it. The engine translates the two
+/// at the boundary, and the cost of that is one `switch` — which is cheaper than
+/// the coupling, and cheaper than the bug that a shared enum would invite when
+/// either side renames an option.
+pub const GiBackend = enum { off, sky, bounce };
+
 pub const Lighting = struct {
     /// The GI field's longest side, in cells. This is the dial that decides what
     /// bounce light costs: the distance field, the radiance pyramid and the
@@ -169,6 +179,37 @@ pub const Lighting = struct {
     /// The default is in `light.default_gi_res` and was chosen from the table
     /// `zig build bench-light` prints, not by taste.
     gi_resolution: i32 = 128,
+
+    /// Which global-illumination model the project uses: `sky`, `bounce` or
+    /// `off`.
+    ///
+    /// NOT a quality setting. These are three different claims about where light
+    /// comes from, so a number would be a lie by construction:
+    ///
+    ///   - `sky` traces toward the sky and propagates what it found. Right for a
+    ///     courtyard at noon; produces nothing for a sealed room, correctly,
+    ///     because there is no sky inside to trace.
+    ///   - `bounce` carries the scene's OWN lights through free space and off the
+    ///     walls. Right for a torch-lit corridor, and cheaper than `sky` as well
+    ///     — a fixed number of grid passes rather than probes-times-rays.
+    ///   - `off` is not a downgrade. It is the path for a project that lights by
+    ///     hand, and it frees every GI buffer rather than skipping the work.
+    ///
+    /// `sky` is the default because it is the one a project that says nothing
+    /// wants, and because an outdoor scene is where a 2D game spends most of its
+    /// time. A scene can override this per Environment, which is how one game is
+    /// a courtyard and a dungeon in the same file.
+    gi_backend: GiBackend = .sky,
+
+    /// Diffusion passes per frame for the `bounce` model. Cost is linear in it,
+    /// and so is how far light travels per frame: a pass moves information
+    /// exactly one cell.
+    bounce_iterations: i32 = 8,
+
+    /// How much of the light a wall keeps on each bounce pass, 0..1. 0.6 is a
+    /// mid-grey painted wall. What matters is how far light has to travel: two
+    /// bounces through a corridor keep 0.36 of it.
+    bounce_albedo: f64 = 0.6,
 
     /// Shadow-map resolution, in cells along the longest side of the view. Like
     /// `gi_resolution` this is a budget rather than a look: the angular sweep

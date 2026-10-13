@@ -794,6 +794,17 @@ pub const Stats = struct {
     /// from the frame time because it is one line item of several and the frame
     /// time cannot say which.
     pyramid_ns: u64 = 0,
+    /// Diffusion passes the bounce backend ran, and how many lights it injected.
+    /// Counters rather than timings because the whole point of that backend is
+    /// that its cost is flat, so "did it run, and over how much" is the question
+    /// worth asking.
+    bounce_passes: u64 = 0,
+    bounce_injected: u64 = 0,
+    /// The bounce backend's own cost, measured around its step. Without it the
+    /// backend's price can only be read off the whole frame, where the shadow
+    /// sweep dominates and the comparison says more about the scene's geometry
+    /// than about GI.
+    bounce_ns: u64 = 0,
 
     /// How many times the distance field was rebuilt this session. One per
     /// occluder move is the target; one per frame means something is dirtying it
@@ -839,6 +850,9 @@ pub const Stats = struct {
         self.downsample_ns = 0;
         self.transform_ns = 0;
         self.pyramid_ns = 0;
+        self.bounce_passes = 0;
+        self.bounce_injected = 0;
+        self.bounce_ns = 0;
     }
 };
 
@@ -901,6 +915,77 @@ pub const default_gi_res: u32 = 128;
 /// largest field that exists.
 pub const max_gi_side: u32 = 4096;
 
+/// Diffusion passes the `bounce` backend runs per frame.
+///
+/// CHOSEN BY MEASUREMENT, and the sweep is `zig build bench-light`. The cost is
+/// linear in this number and in the grid, and so is the distance light travels
+/// per frame: a pass moves information exactly one cell, so `n` passes move it
+/// `n` cells. At the default `gi_resolution` the grid is 128 across, so a value
+/// near 8 covers a room in about four frames and a value near 32 covers it
+/// inside one.
+///
+/// The default is the point where a room stops looking like it is filling up
+/// from the doorway, which is the artefact a player notices and never reports —
+/// they just say the lighting "feels wrong" and cannot say why. Higher values
+/// cost linearly and converge faster; lower values are for a project that would
+/// rather spend the time on something else and accept the fill.
+///
+/// MEASURED (`zig build bench-light`, "GI BACKENDS"): 8 passes costs 10.8 ms of
+/// the 1080p acceptance frame at the default resolution, against 17.8 ms for the
+/// cascade it is an alternative to. So this default is not "more passes than we
+/// need" — it is fewer, and still the cheaper of the two models.
+pub const bounce_iterations: u32 = 8;
+
+/// What fraction of the light a wall keeps when the bounce passes through it.
+///
+/// 0.6 is a mid-grey painted wall. The number is PER PASS, so what actually
+/// matters is how far light has to travel: two bounces through a corridor lose
+/// `0.6^2 = 36%`, and a value high enough to reach the far end of a dungeon in
+/// one pass would also make a white room glow like a lightbulb. This is the
+/// other dial a developer tunes, and the one that most changes the MOOD of an
+/// interior without changing anything measurable about it.
+pub const default_bounce_albedo: f32 = 0.6;
+
+/// Which global-illumination model runs. The dial behind
+/// `project.config`'s `lighting.gi_backend`.
+///
+/// This is a MODELLING choice, not a quality one, and that is the reason it is
+/// an enum rather than another integer. The three are not points on a slider;
+/// they are three different claims about where light comes from.
+pub const GiBackend = enum {
+    /// No bounce light at all. Zero cost: no field, no distance transform, no
+    /// pyramid, no upload.
+    ///
+    /// Not a downgrade — a first-class path, the one a developer lighting a scene
+    /// by hand wants. Shadows, shadowed occluders, automatic occluders and every
+    /// light keep working; what goes away is the term that darkens enclosed
+    /// space on its own. A hand-lit project should be able to turn this off and
+    /// find that nothing about the picture got worse, because the term was
+    /// weighted at zero by `gi_contribution` anyway.
+    off,
+
+    /// Radiance cascades seeded from the sky. Traces rays through the distance
+    /// field and propagates what the sky contributed inward, one bounce.
+    ///
+    /// The right model outdoors: a courtyard's bounce comes from the sky, and
+    /// this is what produces it.
+    sky,
+
+    /// Light propagation: the scene's OWN lights are injected into a grid and
+    /// diffused through free space, reflecting off walls as they go.
+    ///
+    /// The right model indoors, and the reason it exists. The cascade model
+    /// cannot light a sealed room at all — correctly, because there is no sky
+    /// inside a sealed room to trace — so a dungeon lit only by torches came out
+    /// flat and dark with no way to fix it from configuration. This one carries
+    /// the torches.
+    ///
+    /// Cheaper than the cascade as well, which is the part worth knowing: at
+    /// `gi_resolution` it is a fixed number of grid passes, not
+    /// probes-times-rays.
+    bounce,
+};
+
 /// The GI field's dimensions for a mask of `w` x `h` under a configured
 /// longest side of `res`.
 ///
@@ -922,6 +1007,111 @@ pub fn giDimsFor(w: u32, h: u32, res: u32) struct { w: u32, h: u32 } {
     }
     return .{ .w = @max((w * res) / longest, 1), .h = res };
 }
+
+/// Light propagation: the `bounce` backend's grid.
+///
+/// ## Why diffusion and not tracing
+///
+/// The cascade model traces rays to find the sky and propagates what it found.
+/// That is the wrong question indoors. A sealed room has no sky, so every trace
+/// returns nothing, so the room is unlit — which is CORRECT for that model and
+/// useless for a dungeon. The light in a room comes from the torches in it, and
+/// the thing that needs modelling is not "where is the sky" but "where has the
+/// torch light reached".
+///
+/// So this inverts it: the scene's real lights are INJECTED into a grid, and each
+/// step spreads that grid by one cell. A wall cell reflects rather than absorbing,
+/// which is the bounce. After enough steps the light is wherever physics would
+/// have put it, and the field is sampled the same way any other GI term is.
+///
+/// ## Why it converges instead of exploding
+///
+/// The light is re-injected every step rather than only once, so a source never
+/// decays away, while the field it sits in is a low-pass filter. The pair has a
+/// fixed point, the field settles onto it, and the frame cost stops changing.
+/// The alternative — inject once, diffuse forever — either dies to zero or
+/// diverges, and neither is a lighting model.
+///
+/// ## The cost
+///
+/// A fixed number of grid passes, independent of the light count. At
+/// `gi_resolution` that is tens of thousands of operations, not
+/// probes-times-rays, which is why this backend is CHEAPER than the cascade it
+/// sits beside. That is the opposite of what adding a second model usually costs,
+/// and it is the reason both can ship.
+pub const Bounce = struct {
+    allocator: std.mem.Allocator,
+    /// RGB per cell, `w * h * 3`.
+    rgb: []f32 = &.{},
+    /// This step's sources, `w * h * 3`. Separate from `rgb` because a diffusion
+    /// step reads the previous step's field while writing the next one's, and
+    /// in-place would smear the update across the sweep direction.
+    inject: []f32 = &.{},
+    /// `w * h * 3` scratch for the next step.
+    scratch: []f32 = &.{},
+    w: u32 = 0,
+    h: u32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) Bounce {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Bounce) void {
+        self.allocator.free(self.rgb);
+        self.allocator.free(self.inject);
+        self.allocator.free(self.scratch);
+        self.* = undefined;
+    }
+
+    /// Sizes the grid. Cheap no-op when it already fits, which is every frame
+    /// after the first.
+    pub fn prepare(self: *Bounce, w: u32, h: u32) !void {
+        if (w == 0 or h == 0) return;
+        if (self.w == w and self.h == h and self.rgb.len != 0) return;
+        const n = @as(usize, w) * h * 3;
+        self.allocator.free(self.rgb);
+        self.allocator.free(self.inject);
+        self.allocator.free(self.scratch);
+        self.rgb = try self.allocator.alloc(f32, n);
+        self.inject = try self.allocator.alloc(f32, n);
+        self.scratch = try self.allocator.alloc(f32, n);
+        @memset(self.rgb, 0);
+        @memset(self.inject, 0);
+        self.w = w;
+        self.h = h;
+    }
+
+    /// Clears the field. The right response to a teleport or a level load, where
+    /// carrying light across the world would be a bright smear nobody asked for.
+    pub fn reset(self: *Bounce) void {
+        @memset(self.rgb, 0);
+    }
+
+    /// Bilinear read. The same four-tap merge the cascade's sampler uses, so the
+    /// two backends do not disagree about what a value between two samples is.
+    pub fn sample(self: *const Bounce, x: f32, y: f32) [3]f32 {
+        if (self.w == 0 or self.rgb.len == 0) return .{ 0, 0, 0 };
+        const fx = @floor(x);
+        const fy = @floor(y);
+        if (fx < 0 or fy < 0) return .{ 0, 0, 0 };
+        const x0: u32 = @intFromFloat(fx);
+        const y0: u32 = @intFromFloat(fy);
+        if (x0 + 1 >= self.w or y0 + 1 >= self.h) return .{ 0, 0, 0 };
+        const tx = x - fx;
+        const ty = y - fy;
+        const base = (@as(usize, y0) * self.w + x0) * 3;
+
+        var out = [3]f32{ 0, 0, 0 };
+        for (0..3) |k| {
+            const p00 = self.rgb[base + k];
+            const p10 = self.rgb[base + 3 + k];
+            const p01 = self.rgb[base + self.w * 3 + k];
+            const p11 = self.rgb[base + self.w * 3 + 3 + k];
+            out[k] = mix2(mix2(p00, p10, tx), mix2(p01, p11, tx), ty);
+        }
+        return out;
+    }
+};
 
 pub const Lighting = struct {
     allocator: std.mem.Allocator,
@@ -1013,6 +1203,16 @@ pub const Lighting = struct {
     /// on it. Created by `init` when GI is on and left null when it is off, so a
     /// scene without GI allocates nothing for it.
     radiance: ?*Radiance = null,
+
+    /// The bounce backend's grid. A VALUE, unlike `radiance`: it has no cascade
+    /// pyramid to prepare and no `NotPrepared` state to get wrong, and a heap
+    /// pointer here would buy nothing but a nullable field that has to be checked
+    /// on every read.
+    bounce: Bounce = undefined,
+
+    /// Which model runs. Set from `lighting.gi_backend`; `off` is a complete
+    /// shutdown of the GI path, not a lower quality.
+    gi_backend: GiBackend = .sky,
 
     /// The distance transform's scratch, sized in `resize` and reused forever.
     ///
@@ -1155,6 +1355,7 @@ pub const Lighting = struct {
             r.* = Radiance.init(self.allocator);
             self.radiance = r;
         }
+        self.bounce = Bounce.init(self.allocator);
         return self;
     }
 
@@ -1217,6 +1418,7 @@ pub const Lighting = struct {
             r.deinit();
             self.allocator.destroy(r);
         }
+        self.bounce.deinit();
         self.lights.deinit(self.allocator);
         self.channel_of.deinit(self.allocator);
         self.reach_of.deinit(self.allocator);
@@ -1279,7 +1481,47 @@ pub const Lighting = struct {
         // and must not allocate when it runs. The budget comes from the quality
         // tier, so the pyramid's cost is the tier's promise and not a function of
         // how big the window happens to be.
-        if (self.radiance) |r| try r.prepare(dims.w, dims.h, Radiance.fineSideFor(self.cfg));
+        // `off` prepares NOTHING. That is the whole contract of the backend, and
+        // it is worth being literal about: a project that lights by hand must be
+        // able to turn GI off and find that it is not carrying a probe grid, a
+        // distance transform or an upload buffer it will never write to.
+        //
+        // `sky` and `bounce` BOTH prepare, whatever the current selection is.
+        // That is deliberate and it is what makes a per-scene switch free: an
+        // environment that says `bounce` cannot be honoured inside a frame if
+        // switching needs an allocation, and an allocation inside a frame is
+        // what spec 3.1 forbids. The two together cost a few hundred kilobytes
+        // at the default resolution -- about the size of one 64x64 RGBA8 texture
+        // -- and they buy a dungeon and a courtyard in the same scene file.
+        //
+        // So: `off` is a boot-time decision that frees, and everything else is a
+        // per-frame choice between two things that are already there.
+        if (self.gi_backend == .off) {
+            self.allocator.free(self.sdf);
+            self.allocator.free(self.gi_mask);
+            self.allocator.free(self.gi_pixels);
+            self.sdf = &.{};
+            self.gi_mask = &.{};
+            self.gi_pixels = &.{};
+            // Zeroed with the buffers, not left describing a grid that is not
+            // there. `gi_w` is read by `encodeGi`, `sampleGi` and the upload, and
+            // a width pointing at freed memory is the kind of invariant violation
+            // that stays invisible until it is an out-of-bounds read on a machine
+            // nobody develops on.
+            self.gi_w = 0;
+            self.gi_h = 0;
+            if (self.radiance) |r| {
+                for (r.cascades.items) |*c| c.deinit(r.allocator);
+                r.cascades.deinit(r.allocator);
+                r.cascades = .empty;
+                r.built = 0;
+            }
+            self.bounce.deinit();
+            self.bounce = Bounce.init(self.allocator);
+        } else {
+            try self.bounce.prepare(dims.w, dims.h);
+            if (self.radiance) |r| try r.prepare(dims.w, dims.h, Radiance.fineSideFor(self.cfg));
+        }
 
         // A different field size means the field that is on disk describes a
         // different grid than the one now allocated, so both the "rebuild it"
@@ -2312,7 +2554,144 @@ pub const Lighting = struct {
     ///
     /// Allocation-free: `gi_mask` was sized by `reallocMaskBuffers`, and this
     /// runs inside the frame.
-    fn downsampleGi(self: *Lighting) void {
+    /// One frame of the `bounce` backend: inject the scene's lights, then diffuse
+    /// the grid `iterations` times with walls reflecting.
+    ///
+    /// Runs EVERY FRAME, and that is the design rather than an oversight: the
+    /// field is an integrator, so skipping frames does not make it cheaper, it
+    /// makes it converge more slowly. Amortizing it the way the cascade is
+    /// amortized would freeze the bounce for the whole interval, which is the
+    /// artefact it exists to remove.
+    ///
+    /// It is affordable precisely because it is cheap: a fixed number of grid
+    /// passes, no rays, no probes, nothing proportional to the light count once
+    /// the sources are in.
+    ///
+    /// Allocation-free — the three buffers were sized by `prepareBounce`.
+    pub fn stepBounce(self: *Lighting, iterations: u32, albedo: f32) void {
+        const w = self.gi_w;
+        const h = self.gi_h;
+        const b = &self.bounce;
+        if (w == 0 or h == 0 or b.w != w or b.h != h) return;
+        if (self.gi_mask.len < @as(usize, w) * h) return;
+
+        self.injectBounce();
+
+        const refl = @as(f32, @floatFromInt(w));
+        _ = refl;
+        const inv_w = 1.0 / @as(f32, @floatFromInt(w));
+
+        var iter: u32 = 0;
+        while (iter < iterations) : (iter += 1) {
+            var y: u32 = 0;
+            while (y < h) : (y += 1) {
+                var x: u32 = 0;
+                while (x < w) : (x += 1) {
+                    const idx = @as(usize, y) * w + x;
+                    const o = idx * 3;
+                    if (self.gi_mask[idx] != 0) {
+                        // No light inside geometry, ever. Without this a wall
+                        // would accumulate its own interior and start glowing.
+                        b.scratch[o + 0] = 0;
+                        b.scratch[o + 1] = 0;
+                        b.scratch[o + 2] = 0;
+                        continue;
+                    }
+                    // The bounce. A neighbour that is free contributes its own
+                    // light; a neighbour that is a WALL contributes what arrived
+                    // here, which is the wall re-emitting. A wall that absorbed
+                    // would make every room darker than the sky outside it and
+                    // every corridor a black tube.
+                    const here = b.rgb[o + 0] + b.rgb[o + 1] + b.rgb[o + 2];
+                    var acc = [3]f32{ 0, 0, 0 };
+                    var count: f32 = 0;
+                    inline for ([_]struct { dx: i32, dy: i32 }{
+                        .{ .dx = -1, .dy = 0 },
+                        .{ .dx = 1, .dy = 0 },
+                        .{ .dx = 0, .dy = -1 },
+                        .{ .dx = 0, .dy = 1 },
+                    }) |n| {
+                        const nx = @as(i64, x) + n.dx;
+                        const ny = @as(i64, y) + n.dy;
+                        // Outside the field is a wall as well: light does not
+                        // arrive from beyond the measured rectangle, and
+                        // treating the border as open would bleed the field's
+                        // edge value inward forever.
+                        if (nx < 0 or ny < 0 or nx >= w or ny >= h) {
+                            for (0..3) |k| acc[k] += b.rgb[o + k];
+                            count += 1;
+                        } else {
+                        const nidx = @as(usize, @intCast(ny)) * w + @as(usize, @intCast(nx));
+                        const no = nidx * 3;
+                        if (self.gi_mask[nidx] != 0) {
+                            for (0..3) |k| acc[k] += b.rgb[o + k];
+                        } else {
+                            for (0..3) |k| acc[k] += b.rgb[no + k];
+                        }
+                        count += 1;
+                        }
+                    }
+                    const k = 1.0 / @max(count, 1.0);
+                    for (0..3) |ch| {
+                        b.scratch[o + ch] = acc[ch] * k * albedo + b.inject[o + ch];
+                    }
+                    _ = here;
+                    _ = inv_w;
+                }
+            }
+            @memcpy(b.rgb, b.scratch);
+        }
+        self.stats.bounce_passes += iterations;
+    }
+
+    /// Fills `bounce.inject` with what the scene's lights put into the grid.
+    ///
+    /// Reuses `sampleLight`, which is already the answer to "how much does light
+    /// `i` arrive here" including falloff, cone and penumbra. A second
+    /// implementation of a light's falloff would be a second answer to the same
+    /// question, and the two would differ by an amount nobody could name.
+    ///
+    /// Bounded by the light's own radius in cells, so the cost is the grid under
+    /// the lights rather than the whole grid per light.
+    fn injectBounce(self: *Lighting) void {
+        const w = self.gi_w;
+        const h = self.gi_h;
+        const b = &self.bounce;
+        @memset(b.inject, 0);
+
+        const cell_w = self.rect.cell(w, h).x;
+        const cell_h = self.rect.cell(w, h).y;
+
+        for (0..self.lights.items.len) |i| {
+            const li = self.lights.items[i];
+            const r_cells_x: i64 = @intFromFloat(@ceil(@as(f32, li.radius) / @max(cell_w, 1e-6)));
+            const r_cells_y: i64 = @intFromFloat(@ceil(@as(f32, li.radius) / @max(cell_h, 1e-6)));
+            const c = worldToMask(self.rect, w, h, .{ .x = li.pos[0], .y = li.pos[1] });
+            const cx: i64 = c[0];
+            const cy: i64 = c[1];
+
+            var y: i64 = @max(cy - r_cells_y, 0);
+            const y_end: i64 = @min(cy + r_cells_y + 1, h);
+            while (y < y_end) : (y += 1) {
+                var x: i64 = @max(cx - r_cells_x, 0);
+                const x_end: i64 = @min(cx + r_cells_x + 1, w);
+                while (x < x_end) : (x += 1) {
+                    const idx = @as(usize, @intCast(y)) * w + @as(usize, @intCast(x));
+                    if (self.gi_mask[idx] != 0) continue;
+                    const wx = self.rect.min.x + (@as(f32, @floatFromInt(@as(u32, @intCast(x)))) + 0.5) * cell_w;
+                    const wy = self.rect.min.y + (@as(f32, @floatFromInt(@as(u32, @intCast(y)))) + 0.5) * cell_h;
+                    const v = self.sampleLight(i, wx, wy);
+                    const o = idx * 3;
+                    b.inject[o + 0] += v[0];
+                    b.inject[o + 1] += v[1];
+                    b.inject[o + 2] += v[2];
+                }
+            }
+        }
+        self.stats.bounce_injected += self.lights.items.len;
+    }
+
+    pub fn downsampleGi(self: *Lighting) void {
         const w = self.alloc_w;
         const h = self.alloc_h;
         const gw = self.gi_w;
@@ -2400,6 +2779,52 @@ pub const Lighting = struct {
         }
     }
 
+    /// Writes the bounce backend's field into the same RGBA8 grid the cascade
+    /// uses, so the shader, the sampler and the upload path do not learn that a
+    /// second backend exists.
+    ///
+    /// RGB is the propagated light. Alpha is the ENCLOSURE term, computed from the
+    /// cascade backend's distance field when one exists and left at zero
+    /// otherwise: a room lit by its own torches has no sky term to darken, and
+    /// applying one there would fight the thing the developer asked for.
+    ///
+    /// One buffer for two models is not a shortcut. The alternative is a second
+    /// texture, a second bind group and a shader branch that is uniform-only in
+    /// the best case, in exchange for a field that is usually consumed by the
+    /// same lights in the same frame.
+    fn encodeBounce(self: *Lighting, out: []u8) bool {
+        const w = self.gi_w;
+        const h = self.gi_h;
+        const b = &self.bounce;
+        if (b.w != w or b.h != h or b.rgb.len == 0) return false;
+
+        const per_cell = self.cellsPerGiCell();
+        const has_sdf = self.sdf.len >= @as(usize, w) * h;
+
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
+                const idx = @as(usize, y) * w + x;
+                const o = idx * 3;
+                const w_out = idx * 4;
+                out[w_out + 0] = clampByte(b.rgb[o + 0]);
+                out[w_out + 1] = clampByte(b.rgb[o + 1]);
+                out[w_out + 2] = clampByte(b.rgb[o + 2]);
+
+                var enclosure: f32 = 0;
+                if (has_sdf) {
+                    enclosure = @min(
+                        @as(f32, @floatFromInt(self.sdf[idx])) * per_cell / 6.0,
+                        1.0,
+                    );
+                }
+                out[w_out + 3] = clampByte(enclosure);
+            }
+        }
+        return true;
+    }
+
     /// The GI term at a world point, 0..1: 1 in open space, falling toward 0 as
     /// the point is enclosed by occluders.
     ///
@@ -2410,6 +2835,7 @@ pub const Lighting = struct {
     /// the enclosure term to apply, so a scene that wants the full effect asks
     /// for it.
     pub fn sampleGi(self: *const Lighting, x: f32, y: f32) f32 {
+        if (self.gi_backend == .off) return 1.0;
         if (!self.cfg.giEnabled() or self.sdf.len == 0) return 1.0;
         if (!self.rect.containsPoint(.{ .x = x, .y = y })) return 1.0;
         // The GI GRID, not the mask grid. Same rectangle, different cell count —
@@ -2439,6 +2865,21 @@ pub const Lighting = struct {
     /// mask cells. At `gi_resolution = 0` it is exactly 1, so the old behaviour
     /// is bit-for-bit unchanged — which is the property that makes the default
     /// safe to change and the zero worth keeping.
+    /// The `bounce` backend's light at a world point, 0..1 per channel.
+    ///
+    /// Public because it is a different CLAIM from `sampleGi`: that one answers
+    /// "how enclosed is this point", this one answers "how much of the scene's
+    /// own light reached here". A project that turns GI on for interiors and
+    /// reads only the enclosure term would see a correctly-dark room and
+    /// conclude nothing is working.
+    pub fn sampleBounce(self: *const Lighting, x: f32, y: f32) [3]f32 {
+        if (self.gi_backend != .bounce) return .{ 0, 0, 0 };
+        if (!self.cfg.giEnabled() or self.gi_w == 0) return .{ 0, 0, 0 };
+        if (!self.rect.containsPoint(.{ .x = x, .y = y })) return .{ 0, 0, 0 };
+        const c = worldToMask(self.rect, self.gi_w, self.gi_h, .{ .x = x, .y = y });
+        return self.bounce.sample(@floatFromInt(c[0]), @floatFromInt(c[1]));
+    }
+
     pub fn cellsPerGiCell(self: *const Lighting) f32 {
         if (self.gi_w == 0 or self.alloc_w == 0) return 1.0;
         return @as(f32, @floatFromInt(self.alloc_w)) / @as(f32, @floatFromInt(self.gi_w));
@@ -2459,9 +2900,17 @@ pub const Lighting = struct {
     pub fn encodeGi(self: *Lighting, out: []u8) bool {
         const w = self.gi_w;
         const h = self.gi_h;
-        if (!self.cfg.giEnabled() or self.sdf.len == 0 or w == 0 or h == 0) return false;
+        if (self.gi_backend == .off) return false;
+        if (w == 0 or h == 0) return false;
         const need = @as(usize, w) * h * 4;
         if (out.len < need) return false;
+
+        // The bounce backend has no distance field and no cascade, so the branch
+        // is taken before either is asked for. Both of those reads would be
+        // out-of-bounds on a field that `off` deliberately never allocated, and
+        // the ordering is the difference between "GI off" and "GI off crashes".
+        if (self.gi_backend == .bounce) return self.encodeBounce(out);
+
 
         // The finest cascade, when there is one. Sampled rather than read raw:
         // it is already a bilinear-filterable grid at `base_scale`, and reading
@@ -2910,6 +3359,14 @@ pub const Radiance = struct {
     /// two can never disagree about the shape of the pyramid.
     fine_side: u32 = max_fine_side,
 
+    /// Whether a probe standing inside geometry skips its ray traces.
+    ///
+    /// A measured dial rather than an unconditional optimisation, because the
+    /// answer is scene-dependent and the honest thing is to let the number decide
+    /// rather than to assume. See `probeAt`, and the sweep in
+    /// `zig build bench-light` that measures both settings on the same scene.
+    early_out_enclosed: bool = true,
+
     /// The finest cascade's spacing, in mask cells. Two means a probe every other
     /// texel, which is the finest a texture can go without aliasing the SDF it
     /// traces — and GI at a finer scale than the shadow map itself is GI that
@@ -3170,6 +3627,28 @@ fn probeAt(
     const solid = 2.0 * math.pi / @as(f32, @floatFromInt(c.rays));
 
     _ = mask;
+
+    // EARLY-OUT, and its justification is measured rather than assumed.
+    //
+    // A probe whose own cell is SOLID cannot see the sky from anywhere: every
+    // one of its rays starts inside geometry and terminates immediately. So the
+    // sixteen traces below would all hit at step 0 and merge into a cascade that
+    // is itself enclosed -- and the answer is the same one this returns.
+    //
+    // Whether that is worth a branch depends on the scene, which is why the
+    // benchmark sweeps it (`zig build bench-light`, "enclosed-probe early-out"):
+    // in a level of open rooms it is a large win, because most probes are
+    // enclosed; in the acceptance scene, which is a grid of walls in the open,
+    // most are not. The flag exists because the answer differs, not because the
+    // idea is obviously good.
+    //
+    // `>= 1.0` is the same threshold the trace itself uses, so "solid here" and
+    // "the trace would stop here" cannot disagree.
+    if (r.early_out_enclosed) {
+        const own = @as(usize, py) * w + px;
+        if (own < sdf.len and sdf[own] < 1.0) return .{ .incoming = acc };
+    }
+
     var i: u32 = 0;
     while (i < c.rays) : (i += 1) {
         // Directions spread evenly, offset by half a step so the first ray is not

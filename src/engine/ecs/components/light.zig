@@ -463,6 +463,24 @@ pub const Environment = struct {
     /// one surface, which is what makes one number enough.
     gi_albedo: f32 = 0.85,
 
+    /// Which GI model this environment asks for, or `null` for the project's
+    /// configured default.
+    ///
+    /// PER ENVIRONMENT, and that is the reason it exists at all: one 2D RPG is
+    /// outdoors at noon and inside a dungeon in the same hour, and those want
+    /// different models. `sky` traces to the sky and propagates what it found,
+    /// which is right for a courtyard and produces nothing for a sealed room —
+    /// not because it is broken, but because there is no sky inside to trace.
+    /// `bounce` carries the scene's own lights through the walls instead, which
+    /// is what a torch-lit corridor needs.
+    ///
+    /// Tagged `null` rather than defaulting to a model, so that ADDING this
+    /// field cannot change any existing project's picture. `null` means exactly
+    /// what it meant before the field existed.
+    ///
+    /// 0 = sky, 1 = bounce, 2 = off.
+    gi_backend: ?u8 = null,
+
     /// Whether fog reaches the given distance.
     pub fn foggy(self: Environment) bool {
         return self.fog[1] > self.fog[0];
