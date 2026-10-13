@@ -25,7 +25,7 @@ const render = @import("render.zig");
 /// The atlas bridge packs `assets.Image` pixels; the image type is what an
 /// importer hands over, so the two modules meet here rather than duplicating it.
 const assets = @import("assets");
-const wgpu = @import("webgpu.zig");
+pub const wgpu = @import("webgpu.zig");
 const platform = @import("platform");
 const log = @import("core").log.scoped("render");
 
@@ -34,6 +34,14 @@ const light_wgsl = @embedFile("shaders/light.wgsl");
 const sprite_wgsl = @embedFile("shaders/sprite.wgsl");
 const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
 const post_wgsl = @embedFile("shaders/post.wgsl");
+/// M7's radiance-cascade compute pass. VALIDATED by tint (`zig build shaders`)
+/// and NOT WIRED into any pipeline yet -- there is no bind group layout, no
+/// dispatch, and no code path that reaches it.
+///
+/// Embedded anyway, and deliberately: the smoke test compiles it on a real
+/// device so "it validates" stops being the strongest claim anyone can make
+/// about it. See `checkShaders`.
+const radiance_wgsl = @embedFile("shaders/radiance.wgsl");
 
 // Dawn ships the C API as a dispatch table (libdawn_proc) whose default
 // procs are null stubs; the real implementation lives in libdawn_native.
@@ -89,7 +97,27 @@ fn deviceCallback(
     }
 }
 
-/// Uncaptured GPU errors are logged, never swallowed.
+/// How many uncaptured GPU errors this process has seen.
+///
+/// THE COUNTER, and it exists because logging an error is not the same as
+/// failing on one. Every one of the five defects in `12c9062` printed a red line
+/// and the build stayed green: a validation error is not a compile error, it is a
+/// message the driver chose to send, and a pipeline that comes back invalid takes
+/// the rest of the frame down with it while the process exits zero.
+///
+/// With this, a test can assert that a run produced no GPU errors, and the
+/// assertion is about the thing that was actually broken rather than about a
+/// string appearing in a log someone has to remember to read.
+pub var gpu_error_count: usize = 0;
+
+/// How many GPU shader modules this process has failed to compile.
+///
+/// Separate from `gpu_error_count` because a shader that will not compile is a
+/// different failure with a different owner, and lumping them together means a
+/// smoke test can only say "something went wrong".
+pub var gpu_shader_failures: usize = 0;
+
+/// Uncaptured GPU errors are counted AND logged. Never swallowed.
 fn deviceErrorCallback(
     device: ?wgpu.WGPUDevice,
     error_type: c_uint,
@@ -101,6 +129,7 @@ fn deviceErrorCallback(
     _ = userdata1;
     _ = userdata2;
     const msg: []const u8 = if (message.data) |p| p[0..message.length] else "no detail";
+    gpu_error_count += 1;
     log.err("WebGPU error (type {d}): {s}", .{ error_type, msg });
 }
 
@@ -441,6 +470,60 @@ pub const Backend = struct {
 
     pub fn renderer(self: *Backend) render.Renderer {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Every shader this engine ships, as (label, source).
+    ///
+    /// One list so that "all the shaders compile" is a question with one answer
+    /// rather than six, and so that adding a shader without adding it HERE is
+    /// visible: the list is the only place a `.wgsl` gets into the smoke test.
+    const shader_sources = [_]struct { label: [:0]const u8, src: []const u8 }{
+        .{ .label = "quad.wgsl", .src = quad_wgsl },
+        .{ .label = "light.wgsl", .src = light_wgsl },
+        .{ .label = "sprite.wgsl", .src = sprite_wgsl },
+        .{ .label = "smaa.wgsl", .src = smaa_wgsl },
+        .{ .label = "post.wgsl", .src = post_wgsl },
+        // NOT WIRED into a pipeline yet, and compiled here anyway. It is the one
+        // file in the tree whose only claim to being correct is that a validator
+        // liked it, which is not the same as the driver's compiler liking it --
+        // and the driver is the thing that has to run it.
+        .{ .label = "radiance.wgsl", .src = radiance_wgsl },
+    };
+
+    /// Compiles every shipped shader on a REAL device and reports what failed.
+    ///
+    /// The gate that the null backend cannot be. Every test in this repository
+    /// runs against `backend_null`, which takes the same structs and draws
+    /// nothing, so the entire time between writing `backend_dawn.zig` and
+    /// running it on a GPU it could not have been correct. It was not: five
+    /// defects, every one of them visible to the driver's validator on the first
+    /// frame.
+    ///
+    /// Returns the number of shaders the device refused. Zero is the only good
+    /// answer, and a caller that gets a non-zero should FAIL rather than warn --
+    /// a shader that does not compile is the most expensive kind of broken.
+    pub fn checkShaders(device: wgpu.WGPUDevice) usize {
+        var failed: usize = 0;
+        for (shader_sources) |sh| {
+            // Through the SAME `createShader` the pipelines use, so this gate
+            // cannot pass while the real path fails: a second descriptor spelled
+            // out here would be a second definition of "a shader", and the two
+            // would drift exactly the way the attribute counts did.
+            if (createShader(device, sh.src, sh.label)) |m| {
+                wgpu.wgpuShaderModuleRelease(m);
+            } else |_| {
+                failed += 1;
+                log.err("shader {s} was refused by the device", .{sh.label});
+            }
+        }
+        return failed;
+    }
+
+    /// The device this backend was built on, for the GPU gate. It compiles
+    /// shaders against the SAME device the frames are drawn on rather than a
+    /// second one that might disagree.
+    pub fn gpuDevice(self: *Backend) wgpu.WGPUDevice {
+        return self.device;
     }
 
     pub fn create(

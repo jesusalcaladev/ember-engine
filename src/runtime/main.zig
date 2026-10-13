@@ -33,6 +33,22 @@ const log = core.log.scoped("runtime");
 const fixed_dt: f32 = 1.0 / 60.0;
 const rotation_speed: f32 = 1.5; // rad/s
 
+/// Where a project's sound files live, relative to the project root.
+///
+/// The runtime is launched FROM the project root — that is where
+/// `project.config` is read from (`project.config.default_path`) — so the path
+/// a script plays (`audio.play_file("assets/audio/boom.wav")`) is spelled
+/// exactly the way the watcher reports it. That is what makes a reload find the
+/// bank slot: `Bank.find` is a string match, and a directory watched under a
+/// different spelling would report names no slot ever held.
+const audio_asset_dir = "assets/audio";
+
+/// How many changed entries one poll may report. A `git checkout` of the sound
+/// directory touches every file in it; the watcher truncates past this and the
+/// poll reports the rest on the next frame, which is harmless because a reload
+/// is idempotent.
+const audio_watch_capacity = 16;
+
 const Args = struct {
     frames: u64 = 0, // 0 = infinite
     headless: bool = false,
@@ -40,6 +56,9 @@ const Args = struct {
     warmup: u64 = 30,
     max_fps: u32 = 0,
     smaa: bool = true,
+    /// Boot the real backend, compile every shader, render a few frames, and
+    /// EXIT NON-ZERO if the GPU reported anything.
+    gpu_smoke: bool = false,
     sprites: u32 = 50_000,
     sort: batcher_mod.SortMode = .none,
 };
@@ -53,6 +72,8 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
             if (it.next()) |n| args.frames = std.fmt.parseInt(u64, n, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             args.headless = true;
+        } else if (std.mem.eql(u8, arg, "--gpu-smoke")) {
+            args.gpu_smoke = true;
         } else if (std.mem.eql(u8, arg, "--vsync")) {
             if (it.next()) |v| args.vsync = onOff(v, true);
         } else if (std.mem.eql(u8, arg, "--warmup")) {
@@ -161,6 +182,36 @@ fn sceneCamera(view: ?ecs.camera.View, width: u32, height: u32) render.Camera {
     );
 }
 
+/// Re-decodes every resident sound whose file just changed.
+///
+/// Three deliberate refusals, each of which is the honest answer rather than a
+/// best effort:
+///
+/// - **A non-audio entry is ignored.** The watcher reports every write in the
+///   directory (it knows nothing about audio), so the extension check is here.
+/// - **A file the bank does not hold is ignored.** Reloading would DECODE a
+///   sound nobody is playing and charge it to the PCM budget, evicting
+///   something that is. A sound that was evicted is decoded again the next time
+///   it is played, which is correct — just later.
+/// - **A streaming slot is refused by `Audio.reload`**, because its PCM is a
+///   window into a ring and re-decoding it would free an interior pointer. That
+///   is logged rather than swallowed: the operator needs to know why the edit
+///   did not take.
+fn reloadChangedAudio(sys: *engine.audio.Audio, watcher: *platform.DirectoryWatcher) void {
+    var names: [audio_watch_capacity][]const u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = watcher.pollNames(&names);
+    for (names[0..n]) |name| {
+        if (!platform.isAudioAsset(name)) continue;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ audio_asset_dir, name }) catch continue;
+        if (sys.bank.find(path) == null) continue;
+        sys.reload(path) catch |err| switch (err) {
+            error.StreamNotReloadable => log.info("{s} is streamed: stop and play it again to pick up the edit", .{path}),
+            else => log.warn("audio reload of {s} failed: {s}", .{ path, @errorName(err) }),
+        };
+    }
+}
+
 // ── Project config apply callbacks ──────────────────────────────────────
 // These are called by `project.runtime.apply` to push config values into
 // engine subsystems. Kept here so the runtime owns the engine objects.
@@ -228,6 +279,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Renderer: Dawn with a window, null in headless mode.
     var null_backend = backend_null.Backend{};
     var renderer: render.Renderer = undefined;
+    // Kept so the smoke gate can reach the device the backend made. Null in
+    // headless, where the smoke gate refuses to claim a verdict it cannot earn.
+    var dawn_device: ?backend_dawn.wgpu.WGPUDevice = null;
     if (args.headless) {
         renderer = null_backend.renderer();
     } else {
@@ -242,6 +296,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .max_sprites = args.sprites,
             },
         );
+        dawn_device = dawn.gpuDevice();
         renderer = dawn.renderer();
     }
     defer renderer.deinit();
@@ -436,6 +491,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // behavior's `start()` sees the real system rather than null.
     behaviors.ctx.audio = audio_system;
 
+    // ── M8: audio asset hot-reload (inotify on the sound directory) ─────────
+    // `project.config` has its own watcher above; this one is per-ASSET, which
+    // is the other half of the M8 hot-reload promise: saving `boom.wav` in the
+    // project's sound directory re-decodes it INTO ITS BANK SLOT, so a voice
+    // already playing that slot picks up the new bytes without a restart.
+    //
+    // One directory watch rather than one per file: a level's library is dozens
+    // of clips, and a watch per clip is N descriptors plus a list to rebuild
+    // every time an artist adds a file.
+    //
+    // A missing directory is not an error: a project with no sounds yet (or a
+    // game that plays its audio from a `.pak`) simply has nothing to watch.
+    var audio_watcher: ?platform.DirectoryWatcher = null;
+    if (audio_system != null and !args.headless) {
+        if (platform.watchDirectory(boot_alloc, audio_asset_dir)) |w| {
+            audio_watcher = w;
+            log.info("watching {s} for sound changes", .{audio_asset_dir});
+        } else |err| {
+            log.info("no audio asset watch ({s} at '{s}')", .{ @errorName(err), audio_asset_dir });
+        }
+    }
+    defer if (audio_watcher) |*w| w.deinit(boot_alloc);
+
     // ── M8: sound events → Signals (ROADMAP M8, spec §6) ─────────────────────
     // The device thread learns that a voice started or ended; only the MAIN
     // thread may touch the ECS or the signal bus, so the event ring is where the
@@ -567,6 +645,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
+        // ── M8: audio asset hot-reload: poll the sound directory.
+        // NEXT TO the config watch and OUTSIDE the frame guard, because reloading
+        // decodes (blocking I/O plus an allocation) and §3.4 forbids both inside
+        // a frame. Ordering it before `tracker.beginFrame` below is what keeps
+        // the reload honest: the engine never pays for an artist's save inside
+        // the loop it is measuring.
+        if (audio_watcher) |*w| {
+            if (audio_system) |sys| reloadChangedAudio(sys, w);
+        }
+
         // ── M7: the lighting mask is sized HERE, before the allocation guard is
         // armed, and not in the render section below where it used to live.
         //
@@ -612,12 +700,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // the frame it started in) and folds the listener in from the camera.
         // It allocates nothing — the audio path is command-ring pushes only, and
         // the frame's allocation guard is armed from `tracker.beginFrame` above.
+        //
+        // Its own zone is what makes the main-thread audio cost visible in the
+        // report: `play` pushes a command and returns, and a scene that fires
+        // fifty sounds in one frame pays fifty pushes. That number was
+        // invisible before M8 closed, and a regression in it is exactly the
+        // kind of thing PROFILING.md promises CI will catch.
+        var z_audio_main = prof.zone("audio");
         if (audio_system) |sys| {
             sys.beginFrame(@intCast(frame_index));
             // Rotation 0: the runtime ears face +x. A game that wants the ears
             // to turn with an actor calls `audio.set_listener(x, y, rot)`.
             if (camera_view) |v| sys.setListener(v.cx, v.cy, 0);
+
+            // The device thread's own numbers, published once a frame. These
+            // are the M8 criteria as counters: the peak proves the emitters
+            // overlapped, the xrun count is the one failure mode audio has that
+            // is not a crash, and the mix cost is whether the callback fits in
+            // its period.
+            const a = sys.stats();
+            const bs = sys.bankStats();
+            const c = &prof.counters;
+            c.audio_voices_peak = @max(c.audio_voices_peak, a.voices_peak);
+            c.audio_xruns = a.xruns;
+            c.audio_commands_dropped = a.commands_dropped;
+            c.audio_latency_us = @intFromFloat(@as(f64, @floatFromInt(a.period_frames)) /
+                @as(f64, @floatFromInt(@max(a.sample_rate, 1))) * 1_000_000.0);
+            c.audio_mix_ns = sys.mixNsPerBuffer();
+            c.audio_bank_bytes = bs.bytes_used;
+            c.audio_bank_budget = bs.budget_bytes;
         }
+        z_audio_main.end();
 
         // Fixed-timestep simulation
         const now_ns = core.time.monotonicNs();
@@ -745,8 +858,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // ── Acceptance report (M2)
     const st = renderer.stats();
     core.log.info("frames rendered: {d}", .{frame_count});
+    // The sprite count was a literal `0` with a TODO beside it, printed in a line
+    // that reads as a measurement. So the canonical scene reported "0 sprites ->
+    // N draw calls" and nobody could tell from the output whether the world had
+    // loaded, the collector had dropped everything, or the number was simply never
+    // wired up -- which is exactly what it was.
+    //
+    // `Stats.instances` has existed the whole time. Three of the four counters in
+    // this line were already real; this one was a constant wearing a label.
     core.log.info("batcher: {d} sprites -> {d} draw calls this frame (max {d} in the run), budget 32", .{
-        0, // TODO: expose from r2d
+        r2d.stats.instances,
         draw_calls_max,
         draw_calls_max,
     });
@@ -789,6 +910,34 @@ pub fn main(init: std.process.Init.Minimal) !void {
     core.log.info("gpu upload: {d} B/frame (budget 2097152, spec §4)", .{st.upload_bytes});
     if (st.upload_bytes > 2 * 1024 * 1024) {
         core.log.warn("staging upload {d} B/frame exceeds the spec §4 ceiling (2 MB)", .{st.upload_bytes});
+    }
+    // ── THE GPU GATE ────────────────────────────────────────────────────────────
+    //
+    // Everything else in this report is a measurement the CPU made about itself.
+    // This is the one question only the device can answer: did the GPU accept
+    // what we asked it to draw?
+    //
+    // It is a separate exit path on purpose. `--frames N` exits zero whether or
+    // not anything rendered, because a benchmark that fails for being slow gets
+    // muted -- but a VALIDATION ERROR is not slowness. It is the driver saying
+    // "I did not build that pipeline", and the frame that follows is drawn with
+    // an invalid pipeline, which means the picture on screen is not the picture
+    // the code describes.
+    //
+    // Five such defects shipped before this flag existed (see `12c9062`), each
+    // one printing a red line while the process exited 0.
+    if (args.gpu_smoke) {
+        const shader_failures = if (dawn_device) |d| backend_dawn.Backend.checkShaders(d) else 0;
+        const gpu_errors = backend_dawn.gpu_error_count;
+        core.log.info("== GPU SMOKE ==", .{});
+        core.log.info("  shaders refused by the device: {d} of 6", .{shader_failures});
+        core.log.info("  uncaptured GPU errors this run: {d}", .{gpu_errors});
+        core.log.info("  frames rendered: {d}", .{frame_count});
+        if (shader_failures != 0 or gpu_errors != 0) {
+            core.log.err("GPU SMOKE FAILED: the device did not accept everything we sent it", .{});
+            std.process.exit(1);
+        }
+        core.log.info("  OK: the device compiled every shader and raised nothing.", .{});
     }
     prof.report("== PERF (frames) ==");
     core.log.info("mem: frame arena high-water: {d} bytes", .{frame_arena.high_water});
