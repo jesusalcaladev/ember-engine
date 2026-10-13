@@ -22,8 +22,11 @@
 
 const std = @import("std");
 const render = @import("render.zig");
+/// The atlas bridge packs `assets.Image` pixels; the image type is what an
+/// importer hands over, so the two modules meet here rather than duplicating it.
+const assets = @import("assets");
 const wgpu = @import("webgpu.zig");
-const platform = @import("../platform/platform.zig");
+const platform = @import("platform");
 const log = @import("core").log.scoped("render");
 
 const quad_wgsl = @embedFile("shaders/quad.wgsl");
@@ -173,48 +176,48 @@ const Offscreen = struct {
     // Filled in createOffscreenTarget; `undefined` here is only a placeholder
     // for the allocator (nothing may read the struct before that function
     // finishes, or it reads garbage).
-    color: wgpu.WGPUTexture = undefined,
-    color_view: wgpu.WGPUTextureView = undefined,
+    color: ?wgpu.WGPUTexture = null,
+    color_view: ?wgpu.WGPUTextureView = null,
     /// Which sprite layer each pixel is on, written by the sprite pass as a
     /// second colour attachment and read by the light pass for `item_cull_mask`.
     ///
     /// R8Unorm, not an integer format: R8Unorm is renderable on every backend
     /// that can render to R8 at all, and the one `* 255` on the read side is
     /// cheaper than a format some drivers refuse.
-    layer: wgpu.WGPUTexture = undefined,
-    layer_view: wgpu.WGPUTextureView = undefined,
-    depth: wgpu.WGPUTexture = undefined,
-    depth_view: wgpu.WGPUTextureView = undefined,
+    layer: ?wgpu.WGPUTexture = null,
+    layer_view: ?wgpu.WGPUTextureView = null,
+    depth: ?wgpu.WGPUTexture = null,
+    depth_view: ?wgpu.WGPUTextureView = null,
     /// SMAA pass 1 output (edge directions), half resolution.
-    edge: wgpu.WGPUTexture = undefined,
-    edge_view: wgpu.WGPUTextureView = undefined,
+    edge: ?wgpu.WGPUTexture = null,
+    edge_view: ?wgpu.WGPUTextureView = null,
     /// SMAA pass 2 output (blend weights), half resolution.
-    weights: wgpu.WGPUTexture = undefined,
-    weights_view: wgpu.WGPUTextureView = undefined,
+    weights: ?wgpu.WGPUTexture = null,
+    weights_view: ?wgpu.WGPUTextureView = null,
     /// The post pass's output, full resolution.
     ///
     /// A separate texture rather than an in-place pass because a post pass reads
     /// the frame it is modifying, and reading and writing one texture in a
     /// single pass is undefined rather than merely slow. When the post pass is
     /// off this is never written, and SMAA reads `color` instead.
-    post: wgpu.WGPUTexture = undefined,
-    post_view: wgpu.WGPUTextureView = undefined,
+    post: ?wgpu.WGPUTexture = null,
+    post_view: ?wgpu.WGPUTextureView = null,
     /// Bloom's two half-resolution ping-pong buffers.
-    bloom_a: wgpu.WGPUTexture = undefined,
-    bloom_a_view: wgpu.WGPUTextureView = undefined,
-    bloom_b: wgpu.WGPUTexture = undefined,
-    bloom_b_view: wgpu.WGPUTextureView = undefined,
+    bloom_a: ?wgpu.WGPUTexture = null,
+    bloom_a_view: ?wgpu.WGPUTextureView = null,
+    bloom_b: ?wgpu.WGPUTexture = null,
+    bloom_b_view: ?wgpu.WGPUTextureView = null,
     /// Bind groups that reference the views (recreated with the target).
-    smaa_edge_bind: wgpu.WGPUBindGroup = undefined,
-    smaa_weights_bind: wgpu.WGPUBindGroup = undefined,
-    smaa_blend_bind: wgpu.WGPUBindGroup = undefined,
+    smaa_edge_bind: ?wgpu.WGPUBindGroup = null,
+    smaa_weights_bind: ?wgpu.WGPUBindGroup = null,
+    smaa_blend_bind: ?wgpu.WGPUBindGroup = null,
     /// M7: one per post pipeline. All five share a bind group LAYOUT but bind
     /// different textures, so a pass that does not read `bloom_tex` still has to
     /// name something for it.
-    post_bright_bind: wgpu.WGPUBindGroup = undefined,
-    post_blur_h_bind: wgpu.WGPUBindGroup = undefined,
-    post_blur_v_bind: wgpu.WGPUBindGroup = undefined,
-    post_composite_bind: wgpu.WGPUBindGroup = undefined,
+    post_bright_bind: ?wgpu.WGPUBindGroup = null,
+    post_blur_h_bind: ?wgpu.WGPUBindGroup = null,
+    post_blur_v_bind: ?wgpu.WGPUBindGroup = null,
+    post_composite_bind: ?wgpu.WGPUBindGroup = null,
     /// SMAA's groups rebuilt against the POST output, created on first use and
     /// released with the rest. Null until a frame actually needs them.
     smaa_post_edge_bind: ?wgpu.WGPUBindGroup = null,
@@ -326,6 +329,14 @@ pub const Backend = struct {
     atlases: std.ArrayList(?AtlasTexture) = .empty,
     atlas_allocator: std.mem.Allocator,
 
+    // ── Atlas bridge (M3) ────────────────────────────────────────────────────
+    // Packed atlas managers, one per `createAtlasManager` call, addressed from
+    // the outside by INDEX + 1 (0 = "no atlas"), the same convention
+    // `createTexture` uses. The packers and their page pixels are CPU-side; the
+    // GPU sees one texture per uploaded page.
+    atlas_managers: std.ArrayList(render.atlas_bridge.AtlasManager) = .empty,
+    atlas_managers_allocator: std.mem.Allocator,
+
     // ── M2 SMAA pipelines ──────────────────────────────────────────────────
     smaa_shader: wgpu.WGPUShaderModule,
     smaa_bgl: wgpu.WGPUBindGroupLayout,
@@ -423,6 +434,9 @@ pub const Backend = struct {
         .uploadGi = uploadGi,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
+        .createAtlasManager = createAtlasManager,
+        .addImageToAtlas = addImageToAtlas,
+        .uploadAtlas = uploadAtlas,
     };
 
     pub fn renderer(self: *Backend) render.Renderer {
@@ -650,15 +664,20 @@ pub const Backend = struct {
                 .buffer_type = 0, // BindingNotUsed: this entry is a sampler
                 .sampler_type = wgpu.SamplerBindingType_Filtering,
             },
-            // The layer target, for `item_cull_mask`. Written by the sprite pass
-            // as a second colour attachment, read by the light pass.
-            .{
-                .binding = 3,
-                .visibility = wgpu.ShaderStage_Fragment,
-                .buffer_type = 0, // BindingNotUsed: this entry is a texture
-                .texture_sampleType = wgpu.TextureSampleType_Float,
-                .texture_viewDimension = wgpu.TextureViewDimension_2D,
-            },
+            // NO BINDING 3 HERE, and there used to be one.
+            //
+            // The layer target belongs to the LIGHT pass, at `light.wgsl`'s
+            // `@group(0) @binding(4) var layer_tex` -- the sprite pass WRITES it as
+            // a second colour attachment and the light pass READS it back. This
+            // pass neither declares nor samples it, so an entry for it here was a
+            // layout that no shader agreed with.
+            //
+            // Dawn caught it by refusing the bind group: the layout demanded four
+            // entries and `sprite.white` supplied three, so EVERY sprite draw in
+            // EVERY windowed run failed validation and the pipeline came back
+            // invalid. Nothing in the test suite noticed, because every test runs
+            // against `backend_null` -- the one thing the null backend cannot tell
+            // you is whether the GPU agrees with the shader.
         }, "sprite.bgl");
         resources_created += 1;
 
@@ -739,7 +758,7 @@ pub const Backend = struct {
         const sprite_vlayout = wgpu.VertexBufferLayout{
             .stepMode = wgpu.VertexStepMode_Instance,
             .arrayStride = SpriteInstanceBytes,
-            .attributeCount = 6,
+            .attributeCount = 7,
             .attributes = &sprite_instance_attrs,
         };
 
@@ -760,7 +779,7 @@ pub const Backend = struct {
         const sprite_fragment_textured = wgpu.FragmentState{
             .module = sprite_shader,
             .entryPoint = wgpu.StringView.from("fs_main"),
-            .targetCount = 1,
+            .targetCount = 2,
             .targets = &alpha_target,
         };
         const sprite_pipeline_textured = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
@@ -783,7 +802,7 @@ pub const Backend = struct {
         const sprite_fragment_solid = wgpu.FragmentState{
             .module = sprite_shader,
             .entryPoint = wgpu.StringView.from("fs_main_solid"),
-            .targetCount = 1,
+            .targetCount = 2,
             .targets = &solid_target,
         };
         const sprite_pipeline_solid = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
@@ -1358,6 +1377,8 @@ pub const Backend = struct {
             .white_bind_group = white_bind_group,
             .atlases = .empty,
             .atlas_allocator = allocator,
+            .atlas_managers = .empty,
+            .atlas_managers_allocator = allocator,
             .smaa_shader = smaa_shader,
             .smaa_bgl = smaa_bgl,
             .post_bgl = post_bgl,
@@ -1720,32 +1741,71 @@ pub const Backend = struct {
 
     // ── M2: offscreen target ───────────────────────────────────────────────
 
-    fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
-        wgpu.wgpuBindGroupRelease(o.smaa_edge_bind);
-        wgpu.wgpuBindGroupRelease(o.smaa_weights_bind);
-        wgpu.wgpuBindGroupRelease(o.smaa_blend_bind);
-        wgpu.wgpuBindGroupRelease(o.post_bright_bind);
-        wgpu.wgpuBindGroupRelease(o.post_blur_h_bind);
-        wgpu.wgpuBindGroupRelease(o.post_blur_v_bind);
-        wgpu.wgpuBindGroupRelease(o.post_composite_bind);
+    /// Null-guarded releases. See `destroyOffscreen` for why they exist; these are
+/// helpers rather than eight `if (x != null)` lines so the guard cannot be
+/// forgotten on the resource that arrives next.
+fn releaseBind(h: *?wgpu.WGPUBindGroup) void {
+    if (h.*) |v| {
+        wgpu.wgpuBindGroupRelease(v);
+        h.* = null;
+    }
+}
+
+fn releaseView(v: *?wgpu.WGPUTextureView) void {
+    if (v.*) |value| {
+        wgpu.wgpuTextureViewRelease(value);
+        v.* = null;
+    }
+}
+
+fn releaseTexture(t: *?wgpu.WGPUTexture) void {
+    if (t.*) |value| {
+        wgpu.wgpuTextureRelease(value);
+        t.* = null;
+    }
+}
+
+fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
+        // EVERY release is null-guarded, and that is the fix for a crash that
+        // only a real GPU produces.
+        //
+        // `createOffscreenTarget` bails out of a dozen creation steps with an
+        // early `return`, and this function runs on whatever was built. Any step
+        // that had not been reached left its handle UNINITIALISED -- `undefined`
+        // is a promise about how the field is USED, not about what is in it -- and
+        // releasing that is a refcount decrement on garbage, which Dawn aborts on
+        // with "General protection exception" and no line number pointing at the
+        // real mistake.
+        //
+        // Null is a valid "never created" for every one of these, because every
+        // one of them is assigned from a `orelse return`, so null can only mean
+        // the step did not run. Guarding costs nothing on the path that built
+        // everything and turns a fatal abort into a clean partial teardown.
+        releaseBind(&o.smaa_edge_bind);
+        releaseBind(&o.smaa_weights_bind);
+        releaseBind(&o.smaa_blend_bind);
+        releaseBind(&o.post_bright_bind);
+        releaseBind(&o.post_blur_h_bind);
+        releaseBind(&o.post_blur_v_bind);
+        releaseBind(&o.post_composite_bind);
         if (o.smaa_post_edge_bind) |b| wgpu.wgpuBindGroupRelease(b);
         if (o.smaa_post_blend_bind) |b| wgpu.wgpuBindGroupRelease(b);
-        wgpu.wgpuTextureViewRelease(o.color_view);
-        wgpu.wgpuTextureRelease(o.color);
-        wgpu.wgpuTextureViewRelease(o.layer_view);
-        wgpu.wgpuTextureRelease(o.layer);
-        wgpu.wgpuTextureViewRelease(o.depth_view);
-        wgpu.wgpuTextureRelease(o.depth);
-        wgpu.wgpuTextureViewRelease(o.edge_view);
-        wgpu.wgpuTextureRelease(o.edge);
-        wgpu.wgpuTextureViewRelease(o.weights_view);
-        wgpu.wgpuTextureRelease(o.weights);
-        wgpu.wgpuTextureViewRelease(o.post_view);
-        wgpu.wgpuTextureRelease(o.post);
-        wgpu.wgpuTextureViewRelease(o.bloom_a_view);
-        wgpu.wgpuTextureRelease(o.bloom_a);
-        wgpu.wgpuTextureViewRelease(o.bloom_b_view);
-        wgpu.wgpuTextureRelease(o.bloom_b);
+        releaseView(&o.color_view);
+        releaseTexture(&o.color);
+        releaseView(&o.layer_view);
+        releaseTexture(&o.layer);
+        releaseView(&o.depth_view);
+        releaseTexture(&o.depth);
+        releaseView(&o.edge_view);
+        releaseTexture(&o.edge);
+        releaseView(&o.weights_view);
+        releaseTexture(&o.weights);
+        releaseView(&o.post_view);
+        releaseTexture(&o.post);
+        releaseView(&o.bloom_a_view);
+        releaseTexture(&o.bloom_a);
+        releaseView(&o.bloom_b_view);
+        releaseTexture(&o.bloom_b);
         self.allocator.destroy(o);
     }
 
@@ -1766,6 +1826,12 @@ pub const Backend = struct {
             log.err("offscreen target allocation failed ({}x{})", .{ w, h });
             return no_target;
         };
+        // Zeroed BEFORE anything is assigned, so every handle starts as a
+        // defined "never created" rather than as whatever the allocator handed
+        // back. `undefined` on the struct's fields is a statement about how they
+        // are used, not a guarantee about what they contain, and this struct has
+        // a dozen early returns between here and the last assignment.
+        o.* = std.mem.zeroes(Offscreen);
         o.width = w;
         o.height = h;
 
@@ -1781,7 +1847,7 @@ pub const Backend = struct {
             self.allocator.destroy(o);
             return no_target;
         };
-        o.color_view = wgpu.wgpuTextureCreateView(o.color, null).?;
+        o.color_view = wgpu.wgpuTextureCreateView(o.color.?, null).?;
         o.layer = wgpu.wgpuDeviceCreateTexture(self.device, &.{
             .label = wgpu.StringView.from("offscreen.layer"),
             .usage = wgpu.TextureUsage_RenderAttachment | wgpu.TextureUsage_TextureBinding,
@@ -1793,7 +1859,7 @@ pub const Backend = struct {
             self.destroyOffscreen(o);
             return no_target;
         };
-        o.layer_view = wgpu.wgpuTextureCreateView(o.layer, null).?;
+        o.layer_view = wgpu.wgpuTextureCreateView(o.layer.?, null).?;
         // The layer texture view is used in atlas bind groups for item_cull_mask.
         // Set it here so rebuildAtlasBindGroups can use it.
         self.layer_atlas_view = o.layer_view;
@@ -1807,12 +1873,12 @@ pub const Backend = struct {
             .size = .{ .width = w, .height = h },
             .format = wgpu.TextureFormat_Depth24PlusStencil8,
         }) orelse {
-            wgpu.wgpuTextureViewRelease(o.color_view);
-            wgpu.wgpuTextureRelease(o.color);
+            releaseView(&o.color_view);
+            releaseTexture(&o.color);
             self.allocator.destroy(o);
             return no_target;
         };
-        o.depth_view = wgpu.wgpuTextureCreateView(o.depth, null).?;
+        o.depth_view = wgpu.wgpuTextureCreateView(o.depth.?, null).?;
 
         // SMAA scratch at half resolution: the edge detector and the weight
         // pass do not need full res (SMAA's own reference runs them at half).
@@ -1825,7 +1891,7 @@ pub const Backend = struct {
             .size = .{ .width = hw, .height = hh },
             .format = self.format,
         }).?;
-        o.edge_view = wgpu.wgpuTextureCreateView(o.edge, null).?;
+        o.edge_view = wgpu.wgpuTextureCreateView(o.edge.?, null).?;
         o.weights = wgpu.wgpuDeviceCreateTexture(self.device, &.{
             .label = wgpu.StringView.from("smaa.weights"),
             .usage = wgpu.TextureUsage_RenderAttachment | wgpu.TextureUsage_TextureBinding,
@@ -1833,7 +1899,7 @@ pub const Backend = struct {
             .size = .{ .width = hw, .height = hh },
             .format = self.format,
         }).?;
-        o.weights_view = wgpu.wgpuTextureCreateView(o.weights, null).?;
+        o.weights_view = wgpu.wgpuTextureCreateView(o.weights.?, null).?;
 
         // ── M7: the post pass's targets ───────────────────────────────────
         //
@@ -1853,7 +1919,7 @@ pub const Backend = struct {
             self.destroyOffscreen(o);
             return no_target;
         };
-        o.post_view = wgpu.wgpuTextureCreateView(o.post, null).?;
+        o.post_view = wgpu.wgpuTextureCreateView(o.post.?, null).?;
 
         const bw = @max(1, w / 2);
         const bh = @max(1, h / 2);
@@ -2136,9 +2202,9 @@ pub const Backend = struct {
         // it is bloom and fog that render perfectly and are then thrown away
         // by a resolve that copied the pre-post image to the screen.
         const source_view = if (self.postActive())
-            (self.runPost(encoder, o) orelse o.color_view)
+            (self.runPost(encoder, o) orelse o.color_view.?)
         else
-            o.color_view;
+            o.color_view.?;
 
         if (enable_smaa and self.smaa_enabled) {
             self.runSmaa(encoder, o, surface_view, &texture, source_view);
@@ -2161,8 +2227,8 @@ pub const Backend = struct {
         // `smaa_edge_bind` and `smaa_blend_bind` name `o.color_view` at slot 0,
         // so a run against the post output needs its own groups -- see
         // `smaaBindFor`, which picks between them by view identity.
-        const edge_bind = self.smaaBindFor(o, o.smaa_edge_bind, o.color_view, src_view);
-        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind, o.color_view, src_view);
+        const edge_bind = self.smaaBindFor(o, o.smaa_edge_bind.?, o.color_view.?, src_view);
+        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind.?, o.color_view.?, src_view);
         const threshold: f32 = switch (self.smaa_quality) {
             .Low => 0.05,
             .Medium => 0.10,
@@ -2197,9 +2263,9 @@ pub const Backend = struct {
         wgpu.wgpuQueueWriteBuffer(self.queue, self.smaa_blend_uniform_buf, 0, &p, SmaaUniformBytes);
 
         // Pass 1: edge detection (full-res src → half-res edge).
-        self.smaaPass(encoder, self.smaa_pipeline_edge, edge_bind, o.edge_view, 0);
+        self.smaaPass(encoder, self.smaa_pipeline_edge, edge_bind, o.edge_view.?, 0);
         // Pass 2: blend weights (edge → weights).
-        self.smaaPass(encoder, self.smaa_pipeline_weights, o.smaa_weights_bind, o.weights_view, 1);
+        self.smaaPass(encoder, self.smaa_pipeline_weights, o.smaa_weights_bind.?, o.weights_view.?, 1);
         // Pass 3: neighborhood blend (color + weights → swapchain).
         self.smaaPass(encoder, self.smaa_pipeline_blend, blend_bind, dst_view, 2);
     }
@@ -2270,17 +2336,17 @@ pub const Backend = struct {
         };
         const runs: []const Run = if (bloom_on)
             &.{
-                .{ .pipeline = self.post_pipeline_bright, .bind = o.post_bright_bind, .view = o.bloom_a_view },
-                .{ .pipeline = self.post_pipeline_blur_h, .bind = o.post_blur_h_bind, .view = o.bloom_b_view },
-                .{ .pipeline = self.post_pipeline_blur_v, .bind = o.post_blur_v_bind, .view = o.bloom_a_view },
-                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
+                .{ .pipeline = self.post_pipeline_bright, .bind = o.post_bright_bind.?, .view = o.bloom_a_view.? },
+                .{ .pipeline = self.post_pipeline_blur_h, .bind = o.post_blur_h_bind.?, .view = o.bloom_b_view.? },
+                .{ .pipeline = self.post_pipeline_blur_v, .bind = o.post_blur_v_bind.?, .view = o.bloom_a_view.? },
+                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind.?, .view = o.post_view.? },
             }
         else
             &.{
                 // Fog and tonemap alone: one pass, no bloom, no half-res round
                 // trip. This is the common case and it costs one full-screen
                 // read and one write.
-                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind, .view = o.post_view },
+                .{ .pipeline = self.post_pipeline_composite, .bind = o.post_composite_bind.?, .view = o.post_view.? },
             };
 
         // The chain is a VARIABLE number of passes, and `timestampWrites()`
@@ -2383,7 +2449,7 @@ pub const Backend = struct {
         // The blit reads whichever view the post pass produced. Binding the raw
         // scene unconditionally is the bug that makes bloom and fog render
         // correctly into a texture nobody ever looks at.
-        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind, o.color_view, src_view);
+        const blend_bind = self.smaaBindFor(o, o.smaa_blend_bind.?, o.color_view.?, src_view);
         self.smaaPass(encoder, self.smaa_pipeline_copy, blend_bind, dst_view, 0);
     }
 
@@ -2428,7 +2494,7 @@ pub const Backend = struct {
 
         var timestamp_writes = self.timestampWrites();
         const color_attachment = wgpu.RenderPassColorAttachment{
-            .view = o.color_view,
+            .view = o.color_view.?,
             // Load, not Clear: the sprites are already in the target and the
             // light pass adds to them. Clearing here would erase the scene.
             .loadOp = wgpu.LoadOp_Load,
@@ -2568,14 +2634,19 @@ pub const Backend = struct {
     /// item_cull_mask in the sprite shader.
     fn rebuildAtlasBindGroups(self: *Backend) !void {
         const layer = self.layer_atlas_view orelse return error.NoLayerTarget;
-        for (self.atlases.items) |*atlas| {
-            wgpu.wgpuBindGroupRelease(atlas.bind_group);
-            atlas.bind_group = try createBindGroup(self.device, self.sprite_bgl, &[_]wgpu.BindGroupEntry{
-                .{ .binding = 0, .buffer = self.sprite_uniform_buf, .offset = 0, .size = SpriteUniformBytes },
-                .{ .binding = 1, .textureView = atlas.view },
-                .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
-                .{ .binding = 3, .textureView = layer },
-            }, "atlas.bg");
+        // The list is a slot array (`?AtlasTexture`): a destroyed slot is null,
+        // and the old bind group of a LIVE one is released before it is replaced,
+        // which is what keeps a resize from leaking one bind group per atlas.
+        for (self.atlases.items) |*slot| {
+            if (slot.*) |*atlas| {
+                wgpu.wgpuBindGroupRelease(atlas.bind_group);
+                atlas.bind_group = try createBindGroup(self.device, self.sprite_bgl, &[_]wgpu.BindGroupEntry{
+                    .{ .binding = 0, .buffer = self.sprite_uniform_buf, .offset = 0, .size = SpriteUniformBytes },
+                    .{ .binding = 1, .textureView = atlas.view },
+                    .{ .binding = 2, .sampler = @ptrCast(self.sampler) },
+                    .{ .binding = 3, .textureView = layer },
+                }, "atlas.bg");
+            }
         }
     }
 
@@ -2727,7 +2798,7 @@ pub const Backend = struct {
 
         var timestamp_writes = self.timestampWrites();
         const color_attachment = wgpu.RenderPassColorAttachment{
-            .view = o.color_view,
+            .view = o.color_view.?,
             .loadOp = wgpu.LoadOp_Clear,
             .storeOp = wgpu.StoreOp_Store,
             .clearValue = .{ .r = 0.06, .g = 0.07, .b = 0.10, .a = 1.0 },
@@ -2738,7 +2809,7 @@ pub const Backend = struct {
         // background belongs to everyone. Clearing to layer 0 instead would mean
         // a masked light left the whole background black.
         const layer_attachment = wgpu.RenderPassColorAttachment{
-            .view = o.layer_view,
+            .view = o.layer_view.?,
             .loadOp = wgpu.LoadOp_Clear,
             .storeOp = wgpu.StoreOp_Store,
             .clearValue = .{ .r = 1.0, .g = 0.0, .b = 0.0, .a = 1.0 },
@@ -2875,6 +2946,81 @@ pub const Backend = struct {
         self.atlases.items[idx] = null;
     }
 
+    // ── Atlas bridge (M3) ──────────────────────────────────────────────────
+    //
+    // Three calls, load time only, in the order a caller uses them: create a
+    // packer, pack images into it, upload the packed page as one texture. The
+    // packing is CPU-side work (`atlas.zig`'s shelf packer); only `uploadAtlas`
+    // touches the GPU, and it goes through `createTexture`, which already owns
+    // the "upload RGBA8, build the bind group, record it" path.
+
+    /// Returns an opaque handle: the manager's index + 1, so 0 stays "none".
+    fn createAtlasManager(ptr: *anyopaque, width: u32, height: u32) ?*anyopaque {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        // Padding 2: a one-pixel gutter on each side is what stops bilinear
+        // sampling from bleeding one sprite into its neighbour.
+        const manager = render.atlas_bridge.AtlasManager.init(self.atlas_managers_allocator, width, height, 2) catch return null;
+        const idx = self.atlas_managers.items.len;
+        self.atlas_managers.append(self.atlas_managers_allocator, manager) catch {
+            var m = manager;
+            m.deinit(self.atlas_managers_allocator);
+            return null;
+        };
+        return @ptrFromInt(idx + 1);
+    }
+
+    /// Packs one RGBA8 image and returns its UVs, or null when it does not fit
+    /// or the handle is stale. The manager copies the pixels into its page, so
+    /// the caller's buffer may die the moment this returns.
+    fn addImageToAtlas(
+        ptr: *anyopaque,
+        atlas: ?*anyopaque,
+        path: []const u8,
+        width: u32,
+        height: u32,
+        pixels: []const u8,
+    ) ?[4]f32 {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const manager = self.atlasManagerOf(atlas) orelse return null;
+
+        const image = assets.Image{
+            .width = width,
+            .height = height,
+            .channels = 4,
+            // The bridge only READS these bytes (it blits them into its page),
+            // but `Image` declares them mutable because that is what the decoder
+            // allocates. The cast is here, at the one boundary between the two,
+            // and it is load-time only.
+            .pixels = @constCast(pixels),
+        };
+        _ = manager.addImage(self.atlas_managers_allocator, path, image) catch return null;
+        // Null rather than `.?`: a path that is not in the atlas is a bug to
+        // report, not a panic inside whatever asked.
+        return manager.getUV(path) orelse null;
+    }
+
+    /// Uploads the packer's current page as a texture and returns the texture
+    /// handle (an index + 1 into `atlases`), which is what a drawing call wants.
+    fn uploadAtlas(ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const manager = self.atlasManagerOf(atlas) orelse return null;
+
+        const handle = createTexture(ptr, manager.width, manager.height, manager.getPagePixels()) orelse return null;
+        manager.setTextureHandle(manager.getCurrentPageIndex(), handle);
+        manager.markUploaded();
+        return handle;
+    }
+
+    /// The manager behind a handle, or null for 0, a stale index, or a handle
+    /// from any other backend.
+    fn atlasManagerOf(self: *Backend, atlas: ?*anyopaque) ?*render.atlas_bridge.AtlasManager {
+        const raw = @intFromPtr(atlas orelse return null);
+        if (raw == 0) return null;
+        const idx = raw - 1;
+        if (idx >= self.atlas_managers.items.len) return null;
+        return &self.atlas_managers.items[idx];
+    }
+
     fn deinit(ptr: *anyopaque) void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (self.timestamps) {
@@ -2902,6 +3048,11 @@ pub const Backend = struct {
             }
         }
         self.atlases.deinit(self.atlas_allocator);
+        // The packers own their page pixels, and the managers own the paths
+        // they interned: both are released with the backend, not with the
+        // process (a long editor session creates and drops these).
+        for (self.atlas_managers.items) |*manager| manager.deinit(self.atlas_managers_allocator);
+        self.atlas_managers.deinit(self.atlas_managers_allocator);
         if (self.offscreen) |o| self.destroyOffscreen(o);
 
         if (self.surface_texture) |t| wgpu.wgpuTextureRelease(t);

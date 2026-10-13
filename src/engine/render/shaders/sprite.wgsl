@@ -140,6 +140,19 @@ fn fs_main(in: VSOut) -> FragOut {
 
 /// Untextured variant (a material without atlas): solid tint per instance.
 @fragment
-fn fs_main_solid(in: VSOut) -> @location(0) vec4f {
-    return in.color;
+/// The untextured variant, and it returns the SAME two outputs as `fs_main`.
+///
+/// It used to return a bare `@location(0) vec4f`, which is wrong in a way only a
+/// real GPU notices: the sprite pass has TWO colour attachments, and a fragment
+/// stage that writes only the first leaves the second untouched while its write
+/// mask says otherwise. Dawn rejects that at pipeline creation, so every solid
+/// sprite in every windowed run failed to build its pipeline.
+///
+/// And the layer genuinely has to be written here. A solid sprite still occupies
+/// a light layer, and it still occludes the ones behind it -- leaving this
+/// variant out of the layer target would make every untextured sprite invisible
+/// to `item_cull_mask`, which reads as "lights do not reach solid geometry"
+/// rather than as the bug it is.
+fn fs_main_solid(in: VSOut) -> FragOut {
+    return FragOut(in.color, f32(in.layer));
 }
