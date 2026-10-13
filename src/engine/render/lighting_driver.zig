@@ -315,11 +315,19 @@ pub const Driver = struct {
                 // downsampled mask and the field's own distance data, and are
                 // sized to the field's grid -- which is what makes the bounce
                 // light cost follow `gi_resolution` instead of the window.
+                const t_pyr = l.tick();
                 r.build(l.gi_mask, l.sdf, l.gi_w, l.gi_h, self.sky) catch |err| switch (err) {
                     error.NotPrepared => l.stats.gi_not_prepared += 1,
                     else => return,
                 };
                 if (r.builds != before) self.gi_dirty = true;
+                // Measured here rather than inferred from the frame time in the
+                // benchmark. The bench's "GI pyramid" line was reporting the
+                // WHOLE frame on rebuild frames and calling it the pyramid, which
+                // made the pyramid look like the most expensive thing in the
+                // renderer when it is one line item among four. A number wearing
+                // a label it has not earned is the same defect as a missing one.
+                l.stats.pyramid_ns = l.tick() - t_pyr;
             }
         } else {
             l.stats.gi_skipped += 1;

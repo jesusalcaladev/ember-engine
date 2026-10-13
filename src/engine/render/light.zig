@@ -790,6 +790,10 @@ pub const Stats = struct {
     sdf_ns: u64 = 0,
     downsample_ns: u64 = 0,
     transform_ns: u64 = 0,
+    /// The radiance pyramid, measured around the build call itself. Separate
+    /// from the frame time because it is one line item of several and the frame
+    /// time cannot say which.
+    pyramid_ns: u64 = 0,
 
     /// How many times the distance field was rebuilt this session. One per
     /// occluder move is the target; one per frame means something is dirtying it
@@ -834,6 +838,7 @@ pub const Stats = struct {
         self.sdf_ns = 0;
         self.downsample_ns = 0;
         self.transform_ns = 0;
+        self.pyramid_ns = 0;
     }
 };
 
@@ -1376,7 +1381,7 @@ pub const Lighting = struct {
         self.stats.mask_h = self.mask_h;
     }
 
-    fn tick(self: *Lighting) u64 {
+    pub fn tick(self: *Lighting) u64 {
         const clock = self.now orelse return 0;
         return clock();
     }

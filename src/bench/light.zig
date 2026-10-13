@@ -608,6 +608,8 @@ fn acceptance(allocator: std.mem.Allocator) !void {
     // be true of the average and false of the thing being budgeted.
     var gi_rebuild_ns: u64 = 0;
     var gi_rebuilds: u32 = 0;
+    // The pyramid on its own, not the frame that happens to contain it.
+    var pyramid_ns: u64 = 0;
     // The sweep's counters are PER FRAME, so the last frame of the run is a
     // resting one and reports zero steps no matter how much the moving frames
     // marched. Kept from the last MOVING frame instead, for the same reason the
@@ -648,6 +650,7 @@ fn acceptance(allocator: std.mem.Allocator) !void {
         if (after_builds != before_builds) {
             gi_rebuild_ns += dt;
             gi_rebuilds += 1;
+            pyramid_ns += driver.lighting.stats.pyramid_ns;
         }
     }
 
@@ -723,11 +726,24 @@ fn acceptance(allocator: std.mem.Allocator) !void {
     // slow", which is the sentence every performance report degrades into.
     const raster_us = us(l.stats.raster_ns, 1);
     const sdf_us = us(l.stats.sdf_ns, 1);
+    // MEASURED, not derived. This line used to be
+    // `rebuild - raster - sdf`, which attributed whatever the subtraction left
+    // over to the pyramid -- so the most expensive-looking number in the report
+    // was a residual that included the shadow sweep, the gather and the
+    // bookkeeping, wearing the pyramid's name. Reading it as "the pyramid is the
+    // bottleneck" would have sent any optimisation at the wrong subsystem.
+    const pyramid_us = us(pyramid_ns, gi_rebuilds);
+    const sweep_us = us(sweep_ns_moving, 1);
     const rebuild_us = us(gi_rebuild_ns, gi_rebuilds);
-    const pyramid_us = @max(rebuild_us - raster_us - sdf_us, 0);
-    log("    per moving frame:   mask fill {d:.2} us, distance field {d:.2} us, GI pyramid {d:.2} us", .{
-        raster_us, sdf_us, pyramid_us,
-    });
+    const other_us = @max(rebuild_us - raster_us - sdf_us - pyramid_us, 0);
+
+    log("    per moving frame, each part measured rather than derived:", .{});
+    log("      mask fill         {d:>8.2} us", .{raster_us});
+    log("      shadow sweep      {d:>8.2} us   ({d} ray steps)", .{ sweep_us, sweep_steps_moving });
+    log("      GI distance field {d:>8.2} us   (resample + transform)", .{sdf_us});
+    log("      GI radiance pyramid {d:>6.2} us", .{pyramid_us});
+    log("      unattributed      {d:>8.2} us   (gather, bookkeeping, allocation checks)", .{other_us});
+    log("      whole rebuild frame {d:>6.2} us", .{rebuild_us});
 
     // The budget, as a comparison rather than a verdict on the machine.
     const cpu_budget_us: f64 = 1000.0 / 60.0; // one frame at 60 Hz, 16.67 ms
