@@ -25,6 +25,11 @@ const render = @import("render.zig");
 /// The atlas bridge packs `assets.Image` pixels; the image type is what an
 /// importer hands over, so the two modules meet here rather than duplicating it.
 const assets = @import("assets");
+/// The lighting system, for the radiance contract test. Same module, so this is a
+/// sibling import rather than a module one -- and deliberately narrow: only
+/// `compareRadiance` needs it, and a compute pass that leaned on the CPU half
+/// more than this would be a second implementation wearing one name.
+const light_mod = @import("light.zig");
 pub const wgpu = @import("webgpu.zig");
 const platform = @import("platform");
 const log = @import("core").log.scoped("render");
@@ -354,6 +359,24 @@ pub const Backend = struct {
     white_tex: wgpu.WGPUTexture,
     white_view: wgpu.WGPUTextureView,
     white_bind_group: wgpu.WGPUBindGroup,
+    // ── M7 radiance cascades (compute) ──────────────────────────────────────
+    //
+    // One pipeline for every level: the levels differ in their UNIFORM, not in
+    // their code, so a pipeline per level would compile the same shader four
+    // times to dispatch four different numbers.
+    radiance_bgl: ?wgpu.WGPUBindGroupLayout = null,
+    radiance_layout: ?wgpu.WGPUPipelineLayout = null,
+    radiance_pipeline: ?wgpu.WGPUComputePipeline = null,
+    /// Where `runRadiance`'s copy lands. Mapped, not read directly: a buffer
+    /// cannot be both a copy destination and something the CPU dereferences.
+    radiance_readback: ?wgpu.WGPUBuffer = null,
+    /// The read-back's lifecycle. Deliberately the same three states the
+    /// timestamp slot uses, for the same reason.
+    radiance_state: enum { idle, mapping, mapped } = .idle,
+    radiance_future: wgpu.Future = .{},
+    radiance_frame: u64 = 0,
+    radiance_bytes: usize = 0,
+
     /// Uploaded atlases, indexed by the sprite's texture slot.
     atlases: std.ArrayList(?AtlasTexture) = .empty,
     atlas_allocator: std.mem.Allocator,
@@ -399,6 +422,12 @@ pub const Backend = struct {
     present_mode: c_uint = wgpu.PresentMode_Fifo,
     /// Scene pass state (beginScene → drawSprites → endScene).
     scene_active: bool = false,
+    /// M9: the camera's look-at point, world units, published to the post pass's
+    /// uniform. The M7 fog is RADIAL and measures distance from here; until M9
+    /// it read zeros, which made the falloff originate at the centre of the
+    /// screen for every camera in every scene.
+    focus_x: f32 = 0,
+    focus_y: f32 = 0,
     scene_camera: render.Camera = .{},
     scene_target: ?*Offscreen = null,
 
@@ -441,7 +470,7 @@ pub const Backend = struct {
     const SmaaUniformBytes: u64 = 24;
     /// `PostParams`: texel(8) + inv(8) + bloom_texel(8) + exposure(4) +
     /// fog(8) + fog_color(16) + flags(16) + focus(8) + pad(8) = 96 bytes.
-    const PostUniformBytes: u64 = 96;
+    const PostUniformBytes: u64 = 112; // 28 floats: PostParams incl. M9's fade
 
     const vtable = render.Renderer.VTable{
         .beginFrame = beginFrame,
@@ -1492,6 +1521,23 @@ pub const Backend = struct {
                 .timestamp_queries = timestamps and query_set_made != null,
             },
         };
+
+        // The compute pipeline, and the buffer its results are copied into.
+        //
+        // HERE and not with the other pipelines, because this is the first thing
+        // in `create` that needs `self`, and the note above the struct literal
+        // says nothing may write to it before that assignment. Built at boot
+        // rather than lazily on the first frame so a shader the driver dislikes
+        // is an error with a stack trace, not a frame that quietly renders
+        // without bounce.
+        self.radiance_readback = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("radiance.readback"),
+            .usage = wgpu.BufferUsage_CopyDst | wgpu.BufferUsage_MapRead,
+            // The finest cascade is bounded by `fine_side`, 256 at the high tier,
+            // and the coarse ones are a quarter or less of it each.
+            .size = 256 * 256 * probe_stride,
+        }) orelse return error.BufferCreationFailed;
+        try self.initRadiance();
         self.configureSurface();
         if (!timestamps) {
             log.warn("timestamp queries unavailable: GPU time will not be measured (spec §4)", .{});
@@ -1610,6 +1656,48 @@ pub const Backend = struct {
     /// Advances every readback slot: map (non-blocking), poll, read. Polling
     /// only the "expected" slot was the bug that kept every map pending
     /// forever: each slot must be advanced every frame, not once.
+    /// Maps the radiance read-back when the GPU has finished with it.
+    ///
+    /// ASYNC, and that is the whole shape of the problem: a compute pass cannot
+    /// be read the frame it is dispatched. So the probes are copied into
+    /// `radiance_readback`, mapped two frames later, and the CPU compares them
+    /// against `Radiance.build`'s answer. The comparison is what proves the
+    /// contract; the pass is only the thing being compared.
+    ///
+    /// Uses the SAME slot machinery as the timestamp read-back rather than a
+    /// second one, because a second asynchronous path in a renderer that already
+    /// has one is how you end up with two maps in flight against one buffer.
+    pub fn pumpRadiance(self: *Backend, out: []u8) bool {
+        const buf = self.radiance_readback orelse return false;
+        if (self.radiance_state != .idle) return false;
+        if (self.frames < self.radiance_frame + 2) return false;
+
+        self.radiance_future = wgpu.wgpuBufferMapAsync(
+            buf,
+            wgpu.MapMode_Read,
+            0,
+            @intCast(@min(out.len, self.radiance_bytes)),
+            .{ .mode = wgpu.CallbackMode_WaitAnyOnly, .callback = mapCallback },
+        ) orelse return false;
+        self.radiance_state = .mapping;
+        return true;
+    }
+
+    /// Copies the mapped probes into `out`, if the map has landed.
+    pub fn takeRadiance(self: *Backend, out: []u8) bool {
+        const buf = self.radiance_readback orelse return false;
+        if (self.radiance_state != .mapped) return false;
+        const n = @min(out.len, self.radiance_bytes);
+        const src = wgpu.wgpuBufferGetConstMappedRange(buf, 0, n) orelse {
+            self.radiance_state = .idle;
+            return false;
+        };
+        @memcpy(out[0..n], @as([*]const u8, @ptrCast(src))[0..n]);
+        wgpu.wgpuBufferUnmap(buf);
+        self.radiance_state = .idle;
+        return true;
+    }
+
     fn pumpTimestamps(self: *Backend) void {
         if (!self.timestamps) return;
         for (&self.slots) |*slot| {
@@ -2164,6 +2252,15 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         wgpu.wgpuQueueWriteBuffer(self.queue, self.sprite_uniform_buf, 0, &globals, SpriteUniformBytes);
         self.stats_data.upload_bytes += SpriteUniformBytes;
 
+        // M9: the camera's look-at point for the post pass's radial fog. Read
+        // straight out of the view-projection: an ortho matrix's translation
+        // column is the point the view is centred on, negated, which is exactly
+        // "where the camera is looking" in 2D. A scene with no camera gets the
+        // default camera, whose centre is the origin — and that is what the fog
+        // has silently assumed since M7.
+        self.focus_x = -camera.vp[12] / @max(camera.vp[0], 0.0001);
+        self.focus_y = -camera.vp[13] / @max(camera.vp[5], 0.0001);
+
         // The light pass's own uniform, which used to never be written at all.
         //
         // That is worth stating plainly: `beginScene` filled the sprite uniform
@@ -2193,8 +2290,21 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         const bw: f32 = @floatFromInt(@max(1, w / 2));
         const bh: f32 = @floatFromInt(@max(1, h / 2));
         const env = self.environment;
-        // 24 floats = 96 bytes, matching `PostParams` field for field.
-        var p: [24]f32 = undefined;
+        // 28 floats = 112 bytes, matching `PostParams` field for field.
+        //
+        // THE OFFSETS ARE WGSL'S ALIGNED ONES, NOT PACKED, and that is the fix
+        // for a bug this file carried since M7: a `vec2f` after an `f32` aligns
+        // to 8 and a `vec4f` to 16, so `fog` lives at byte 32 and `fog_color` at
+        // 48 — not at 28 and 36 where the packed writes put them. Bloom's
+        // intensity and threshold travelled in `flags` (aligned at 64, written
+        // at 52), so every value the post pass READ was a float the pass had
+        // never been given: fog read its own y and the red of its colour,
+        // bloom's threshold read the tonemap flag. The chain ran, the cost was
+        // measured, and the output was wrong. Tint validates the shader's
+        // INTERNAL consistency and never sees the CPU's buffer, so nothing
+        // caught it. These offsets are the shader's real ones; the `fade` vec4
+        // at byte 96 is M9's.
+        var p: [28]f32 = undefined;
         p[0] = 1.0 / fw;
         p[1] = 1.0 / fh;
         p[2] = fw;
@@ -2202,27 +2312,41 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         p[4] = 1.0 / bw;
         p[5] = 1.0 / bh;
         p[6] = 1.0;
-        p[7] = env.fog[0];
-        p[8] = env.fog[1];
-        p[9] = env.fog_color[0];
-        p[10] = env.fog_color[1];
-        p[11] = env.fog_color[2];
-        p[12] = env.fog_color[3];
-        p[13] = @intFromBool(env.tonemap);
-        p[14] = env.bloom_intensity;
-        p[15] = env.bloom_threshold;
+        p[7] = 0; // pad: keeps `fog` at its 8-aligned offset
+        // fog: vec2f @ 32
+        p[8] = env.fog[0];
+        p[9] = env.fog[1];
+        p[10] = 0; // pad
+        p[11] = 0; // pad
+        // fog_color: vec4f @ 48
+        p[12] = env.fog_color[0];
+        p[13] = env.fog_color[1];
+        p[14] = env.fog_color[2];
+        p[15] = env.fog_color[3];
+        // flags: vec4f @ 64
+        p[16] = @intFromBool(env.tonemap);
+        p[17] = env.bloom_intensity;
+        p[18] = env.bloom_threshold;
         // The bloom chain's own on/off, which is NOT the same question as
         // whether bloom is configured. An Environment can carry a threshold and
         // an intensity and still not want the four passes run, and the flag is
         // what keeps a scene that never enabled bloom off paying for them.
-        p[16] = @intFromBool(env.bloom_intensity > 0);
-        p[17] = 0;
-        p[18] = 0;
-        p[19] = 0;
-        p[20] = 0;
-        p[21] = 0;
+        p[19] = @intFromBool(env.bloom_intensity > 0);
+        // focus: vec2f @ 80, focus_pad: vec2f @ 88. The camera's look-at point
+        // is what fog measures its radial falloff from; a scene with a camera
+        // follows the camera, and a scene without one falls back to the centre
+        // of the screen, which is what zeros read as.
+        p[20] = self.focus_x;
+        p[21] = self.focus_y;
         p[22] = 0;
         p[23] = 0;
+        // fade: vec4f @ 96 — M9's scene-transition curtain. The amount is in the
+        // alpha, and a zero amount must NOT be the reason a post pass runs:
+        // `postActive` tests the same field for the same reason.
+        p[24] = env.fade_color[0];
+        p[25] = env.fade_color[1];
+        p[26] = env.fade_color[2];
+        p[27] = env.fade_color[3];
         wgpu.wgpuQueueWriteBuffer(self.queue, self.post_uniform_buf, 0, &p, PostUniformBytes);
         self.stats_data.upload_bytes += PostUniformBytes;
     }
@@ -2235,7 +2359,7 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
     /// per pixel.
     fn postActive(self: *const Backend) bool {
         const e = self.environment;
-        return e.tonemap or e.bloom_intensity > 0 or e.fog[1] > e.fog[0];
+        return e.tonemap or e.bloom_intensity > 0 or e.fog[1] > e.fog[0] or e.fade_color[3] > 0;
     }
 
     /// Writes the light pass's `Globals`. 128 bytes, fixed, every `beginScene`.
@@ -2396,6 +2520,520 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
     /// The chain's order is not arbitrary: bloom is a LOW-frequency effect, so
     /// blurring before compositing is both cheaper and better-looking than
     /// blurring after. Compositing first would also need a second full-res blur.
+    // ── M7: the radiance-cascade COMPUTE pass ─────────────────────────────────
+    //
+    // The GPU half of `Radiance`, and until now the only claim anyone could make
+    // about `radiance.wgsl` was that a validator liked it. It did not agree with
+    // the CPU about three things -- the SDF's type, the stride of the coarser
+    // cascade's buffer, and what `hit_distance` meant -- and all three compiled
+    // cleanly, because none of them is a syntax error.
+    //
+    // The reason they were found is `runRadiance`, which READS THE PROBES BACK
+    // and can therefore be compared against `Radiance.build`. A compute pass
+    // nobody reads back produces plausible radiance: bright in the open, dark in
+    // the corners, and no bounce anywhere -- which is exactly what a wrong stride
+    // looks like. Agreement is the only test that can tell those apart.
+    //
+    // COARSE-TO-FINE, and the ordering is the correctness argument rather than an
+    // optimisation: each level reads the one above it, so dispatching fine first
+    // would have the bottom level read a buffer nothing has written yet. WebGPU
+    // orders dispatches within a pass and makes their writes visible to the next
+    // one, so one pass with one dispatch per level is enough -- and putting each
+    // in its own pass would buy nothing but a wider margin for a bug to hide in.
+
+    /// One cascade's worth of work, as the shader's uniform wants it.
+    ///
+    /// Field-for-field with `CascadeParams` in `radiance.wgsl`, in the same
+    /// order, for the same reason the rest of this file repeats itself: a
+    /// uniform struct that disagrees with its shader is a buffer of the right
+    /// size holding the wrong numbers.
+    pub const CascadeParams = extern struct {
+        mask_cell: [2]f32,
+        /// WGSL aligns a `vec4f` to 16, so `mask_rect` cannot start at 8 --
+        /// there are four bytes of nothing between them. Without this the struct
+        /// is 80 bytes where the shader's is 96, every field from `sky` onwards is
+        /// at the wrong offset, and the driver says only "the shader uses more
+        /// bytes of the buffer (96) than the layout's minBindingSize (80)" --
+        /// which names the symptom and not the cause.
+        _gap0: [2]f32,
+        mask_rect: [4]f32,
+        sky: [3]f32,
+        albedo: f32,
+        grid: [2]u32,
+        sdf_width: u32,
+        scale: u32,
+        rays: u32,
+        is_coarsest: u32,
+        higher_width: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+        /// Trailing, to the struct's own 16-byte alignment. A uniform buffer of
+        /// 88 bytes is a buffer the next binding does not start aligned in.
+        _gap1: [2]u32,
+    };
+
+    comptime {
+        // The one assertion that makes this class of bug impossible to
+        // reintroduce silently. It cost an afternoon to find by hand, because the
+        // driver's complaint is about a byte COUNT and the mistake is about an
+        // OFFSET.
+        if (@sizeOf(CascadeParams) != 96) @compileError(
+            "CascadeParams must be 96 bytes to match WGSL's layout; it is " ++
+                @as([]const u8, std.fmt.comptimePrint("{d}", .{@sizeOf(CascadeParams)})),
+        );
+        if (@sizeOf(Probe) != probe_stride) @compileError("Probe stride disagrees with radiance.wgsl: it must be 32 bytes for hit_distance@0, normal@8, incoming@16, pad@28");
+    }
+
+    /// Byte-for-byte with `Probe` in `radiance.wgsl`: f32, vec2f, vec3f, f32.
+    /// WGSL pads `vec3f` to 16 bytes, so the struct is 32 with the explicit pad
+    /// field, not 28 -- and getting that wrong would silently shift every probe
+    /// after the first by four bytes.
+    ///
+    /// The `_gap` is not optional and not cosmetic: WGSL aligns `vec3f` to 16
+    /// bytes, so `incoming` starts at offset 16 and not at 12. Without the gap
+    /// this struct is 28 bytes where the shader's is 32, every probe after the
+    /// first is read four bytes out, and the result is a field of plausible
+    /// numbers that are somebody else's.
+    pub const Probe = extern struct {
+        hit_distance: f32,
+        _gap0: u32 = 0,
+        normal: [2]f32 = .{ 0, 0 },
+        // No gap before `incoming`: `normal` ENDS at 16, which is exactly where
+        // WGSL's 16-byte alignment wants `vec3f`. Adding one here measured 36
+        // bytes against the shader's 32, which is the third time this struct has
+        // been the wrong size and the reason there is a comptime assert on it now.
+        incoming: [3]f32 = .{ 0, 0, 0 },
+        pad: f32 = 0,
+    };
+
+    pub const probe_stride: usize = 32;
+
+    /// Builds the cascade pipeline, its layout and its buffers.
+    ///
+    /// Not frame work and not free: the buffers are sized for the finest
+    /// cascade, which is the largest, so the coarse ones dispatch into a prefix
+    /// of the same storage. One buffer per role rather than per level, because
+    /// the levels run back to back and ping-ponging would double the memory to
+    /// save an allocation that happens once.
+    fn initRadiance(self: *Backend) !void {
+        const device = self.device;
+
+        const bgl = try createBindGroupLayout(device, &[_]wgpu.BindGroupLayoutEntry{
+            .{
+                .binding = 0,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                .buffer_minBindingSize = @sizeOf(CascadeParams),
+            },
+            // READ-ONLY, because the shader says `var<storage, read>` for both
+            // of these and the driver holds the two to be the same. `Storage` here
+            // compiles, binds and is rejected at pipeline creation with a message
+            // that names the shader and the layout rather than saying which of
+            // the two is wrong -- which is the kind of error that costs an hour if
+            // you do not already know the rule.
+            .{
+                .binding = 1,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_ReadOnlyStorage,
+                .buffer_minBindingSize = 4,
+            },
+            .{
+                .binding = 2,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_Storage,
+                .buffer_minBindingSize = probe_stride,
+            },
+            .{
+                .binding = 3,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_ReadOnlyStorage,
+                .buffer_minBindingSize = probe_stride,
+            },
+        }, "radiance.bgl");
+
+        const layout = try createPipelineLayout(
+            device,
+            &[_]wgpu.WGPUBindGroupLayout{bgl},
+            "radiance.layout",
+        );
+
+        const module = try createShader(device, radiance_wgsl, "radiance.wgsl");
+        defer wgpu.wgpuShaderModuleRelease(module);
+        const pipeline = wgpu.wgpuDeviceCreateComputePipeline(device, &.{
+            .label = wgpu.StringView.from("radiance.pyramid"),
+            .layout = layout,
+            .compute = .{ .module = module, .entryPoint = wgpu.StringView.from("main") },
+        }) orelse return error.PipelineCreationFailed;
+
+        // Committed together at the end, so a failure part-way through leaves
+        // the backend with NO radiance pipeline rather than half of one that
+        // `runRadiance` would then happily dispatch.
+        self.radiance_bgl = bgl;
+        self.radiance_layout = layout;
+        self.radiance_pipeline = pipeline;
+    }
+
+    fn radianceBuffer(self: *Backend, label: [:0]const u8, size: usize, extra: c_uint) !wgpu.WGPUBuffer {
+        return wgpu.wgpuDeviceCreateBuffer(self.device, &.{
+            .label = wgpu.StringView.from(label),
+            .usage = wgpu.BufferUsage_Storage | extra,
+            .size = @intCast(@max(size, 16)),
+        }) orelse error.BufferCreationFailed;
+    }
+
+    /// Runs the pyramid on the GPU and reads the finest cascade back.
+    ///
+    /// `levels` describes each cascade as `.{ grid_w, grid_h, scale, rays }` in
+    /// COARSE-TO-FINE order, which is the order they are dispatched in and the
+    /// only order that is correct.
+    ///
+    /// `out` receives the finest cascade's probes, so a caller can compare them
+    /// with what `Radiance.build` computed on the CPU. That comparison is the
+    /// entire point of this function existing as a callable: without it the pass
+    /// writes into a buffer nobody ever looks at, which is the same as not
+    /// having it.
+    pub fn runRadiance(
+        self: *Backend,
+        encoder: wgpu.WGPUCommandEncoder,
+        sdf: []const f32,
+        sky: [3]f32,
+        albedo: f32,
+        mask_cell: [2]f32,
+        mask_rect: [4]f32,
+        sdf_width: u32,
+        levels: []const [4]u32,
+        out: []u8,
+    ) !void {
+        if (levels.len == 0) return;
+        if (self.radiance_pipeline == null) return;
+
+        const coarsest = levels[0];
+        const cells = @as(usize, coarsest[0]) * coarsest[1];
+        const sdf_buf = try self.radianceBuffer("radiance.sdf", sdf.len * 4, wgpu.BufferUsage_CopyDst);
+        defer wgpu.wgpuBufferRelease(sdf_buf);
+        wgpu.wgpuQueueWriteBuffer(
+            self.queue,
+            sdf_buf,
+            0,
+            sdf.ptr,
+            @intCast(sdf.len * 4),
+        );
+
+        // One buffer per level, sized to that level. Cheaper than reasoning about
+        // a shared allocation and ping-ponging, and the memory is proportional
+        // to the pyramid, which is already bounded by the probe budget.
+        var bufs = self.allocator.alloc(wgpu.WGPUBuffer, levels.len) catch return error.OutOfMemory;
+        defer self.allocator.free(bufs);
+        var bgls = self.allocator.alloc(wgpu.WGPUBindGroup, levels.len) catch return error.OutOfMemory;
+        defer self.allocator.free(bgls);
+        var uniforms = self.allocator.alloc(wgpu.WGPUBuffer, levels.len) catch return error.OutOfMemory;
+        defer self.allocator.free(uniforms);
+
+        // The finest level has no coarser one to read, but the bind group still
+        // needs something at binding 3. Pointing it back at its OWN probe buffer
+        // is what a first pass looks like and it is wrong: the same buffer is
+        // then bound read-write as binding 2 and read-only as binding 3 inside
+        // one synchronisation scope, and Dawn refuses it — correctly, because
+        // that is a data race the shader's `is_coarsest` branch promises never
+        // happens but the BINDING cannot know that.
+        //
+        // A dedicated empty buffer. The shader's coarse branch never reads it.
+        // Sized to the FINEST cascade rather than to one probe: the bind group
+        // declares the binding size explicitly, and a binding whose declared size
+        // exceeds its buffer is rejected even though the shader never reads it.
+        const dummy = try self.radianceBuffer("radiance.dummy", @as(usize, levels[levels.len - 1][0]) * levels[levels.len - 1][1] * probe_stride, 0);
+        defer wgpu.wgpuBufferRelease(dummy);
+
+        // TWO PASSES, and the second one exists because the first tried to do
+        // both.
+        //
+        // Level i reads level i+1's probes, so the bind group for level i needs
+        // a buffer that has not been created yet at the point level i is being
+        // built. Doing both in one loop handed `CreateBindGroup` an
+        // UNINITIALISED handle and Dawn aborted inside object validation, with a
+        // stack trace that pointed at the bindings rather than at the ordering.
+        //
+        // So: every buffer first, then every bind group. The dependency is real
+        // and the only correct order is the one that satisfies it.
+        for (levels, 0..) |lv, i| {
+            const n = @as(usize, lv[0]) * lv[1] * probe_stride;
+            bufs[i] = try self.radianceBuffer("radiance.probes", n, wgpu.BufferUsage_CopySrc);
+            uniforms[i] = wgpu.wgpuDeviceCreateBuffer(self.device, &.{
+                .label = wgpu.StringView.from("radiance.params"),
+                // UNIFORM, not storage. A params buffer written from the CPU and
+                // read by the shader is a uniform buffer that happens to be
+                // written with `WriteBuffer`; making it a storage buffer compiles
+                // and is rejected by the driver at bind-group creation.
+                .usage = wgpu.BufferUsage_Uniform | wgpu.BufferUsage_CopyDst,
+                .size = @sizeOf(CascadeParams),
+            }) orelse return error.BufferCreationFailed;
+        }
+
+        for (levels, 0..) |lv, i| {
+            const n = @as(usize, lv[0]) * lv[1] * probe_stride;
+            // The PREVIOUS level, not the next one.
+            //
+            // `levels` is coarse-to-fine, so level 0 is the coarsest and every
+            // later level reads the one BEFORE it. Reading `i + 1` pointed each
+            // cascade at a FINER one that had not been written yet, which is the
+            // exact failure the shader's own comment warns about — and it did not
+            // look like it: every bounce fell back to sky, so the picture came out
+            // plausible, bright in the open, dark in the corners, no bounce
+            // anywhere.
+            // Sized by the PREVIOUS level's probe count, not this one's: the
+            // coarser grid has fewer probes, and a binding whose declared size
+            // exceeds its buffer is rejected even though the shader reads only
+            // the part it needs.
+            const prev_n: usize = if (i > 0)
+                @as(usize, levels[i - 1][0]) * levels[i - 1][1] * probe_stride
+            else
+                @as(usize, lv[0]) * lv[1] * probe_stride;
+            const prev = if (i > 0) bufs[i - 1] else dummy;
+            const prev_w: u32 = if (i > 0) levels[i - 1][0] else lv[0];
+
+            const params = CascadeParams{
+                .mask_cell = mask_cell,
+                ._gap0 = .{ 0, 0 },
+                .mask_rect = mask_rect,
+                .sky = sky,
+                .albedo = albedo,
+                .grid = .{ lv[0], lv[1] },
+                // THE FIELD'S WIDTH. It was `sdf.len / grid.x`, which is the
+                // field's AREA divided by this cascade's width -- 2304/12 = 192
+                // for a 48-wide field -- and the shader then indexes
+                // `row * sdf_width + column` into a 48-wide grid. Every row past
+                // the first read the wrong cells entirely, which is why the two
+                // implementations disagreed on a field where they should have
+                // agreed exactly and agreed perfectly on the ones they did not.
+                .sdf_width = sdf_width,
+                .scale = lv[2],
+                .rays = lv[3],
+                .is_coarsest = if (i == 0) 1 else 0,
+                // THE FIELD THAT WAS MISSING. See `radiance.wgsl`: the bounce
+                // read the coarser buffer with THIS cascade's stride, so every
+                // bounce landed on the wrong probe or silently fell back to sky.
+                .higher_width = prev_w,
+                .pad0 = 0,
+                .pad1 = 0,
+                .pad2 = 0,
+                ._gap1 = .{ 0, 0 },
+            };
+            wgpu.wgpuQueueWriteBuffer(self.queue, uniforms[i], 0, &params, @sizeOf(CascadeParams));
+
+            bgls[i] = try createBindGroup(self.device, self.radiance_bgl.?, &[_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .buffer = uniforms[i], .offset = 0, .size = @sizeOf(CascadeParams) },
+                .{ .binding = 1, .buffer = sdf_buf, .offset = 0, .size = @intCast(sdf.len * 4) },
+                .{ .binding = 2, .buffer = bufs[i], .offset = 0, .size = @intCast(n) },
+                .{ .binding = 3, .buffer = prev, .offset = 0, .size = @intCast(prev_n) },
+            }, "radiance.bind");
+        }
+
+        const pass = wgpu.wgpuCommandEncoderBeginComputePass(encoder, &.{
+            .label = wgpu.StringView.from("radiance.pyramid"),
+        }) orelse return error.CommandEncoderFailed;
+        wgpu.wgpuComputePassEncoderSetPipeline(pass, self.radiance_pipeline.?);
+        for (levels, 0..) |lv, i| {
+            wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, bgls[i], 0, null);
+            // 8x8 workgroups, matching the shader's `@workgroup_size`.
+            const gx = (lv[0] + 7) / 8;
+            const gy = (lv[1] + 7) / 8;
+            wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, gx, gy, 1);
+        }
+        wgpu.wgpuComputePassEncoderEnd(pass);
+
+        // The read-back, which is the reason this function is callable at all.
+        const finest = levels[levels.len - 1];
+        const want = @min(out.len, @as(usize, finest[0]) * finest[1] * probe_stride);
+        wgpu.wgpuCommandEncoderCopyBufferToBuffer(
+            encoder,
+            bufs[levels.len - 1],
+            0,
+            self.radiance_readback.?,
+            0,
+            @intCast(want),
+        );
+        self.radiance_frame = self.frames;
+        self.radiance_bytes = want;
+        _ = cells;
+    }
+
+    /// What comparing the GPU pyramid against the CPU one found.
+    pub const RadianceContract = struct {
+        probes: usize = 0,
+        max_error: f32 = 0,
+        mean_error: f32 = 0,
+        /// Whether the two implementations agree about `hit_distance`, which is a
+        /// SE separately reported field because a stride bug and a field-meaning
+        /// bug are different mistakes with the same symptom.
+        hit_distance_matches: bool = false,
+        agree: bool = false,
+    };
+
+    /// Runs `radiance.wgsl` and `Radiance.build` on the SAME synthetic field and
+    /// reports how far apart they are.
+    ///
+    /// A fixed scene rather than the caller's, because the point is to compare two
+    /// implementations and a scene either of them could get wrong adds nothing. The
+    /// field is a rectangle with a doorway: enclosed enough that the bounce
+    /// branch runs, open enough that the sky branch runs too, so both halves of
+    /// the shader's arithmetic are on the path.
+    ///
+    /// Synchronous by necessity: the read-back map is a future, and a test that
+    /// waits for it correctly is the only kind that can assert anything.
+    pub fn compareRadiance(self: *Backend, side: u32) !RadianceContract {
+        const device = self.device;
+        const n_cells = @as(usize, side) * side;
+
+        // A wall around the border with a gap, so rays both hit and escape.
+        var sdf = self.allocator.alloc(f32, n_cells) catch return error.OutOfMemory;
+        defer self.allocator.free(sdf);
+        @memset(sdf, 100.0);
+        var y: usize = 0;
+        while (y < side) : (y += 1) {
+            var x: usize = 0;
+            while (x < side) : (x += 1) {
+                const border = x < 2 or y < 2 or x >= side - 2 or y >= side - 2;
+                sdf[y * side + x] = if (border) 0.0 else 40.0;
+            }
+        }
+
+        // Two cascades, coarse to fine, as the shader requires.
+        const coarse = [4]u32{ side / 4, side / 4, 4, 8 };
+        const fine = [4]u32{ side, side, 1, 16 };
+        const levels = [_][4]u32{ coarse, fine };
+        const probes = @as(usize, side) * side;
+
+        const gpu = self.allocator.alloc(u8, probes * probe_stride) catch return error.OutOfMemory;
+        defer self.allocator.free(gpu);
+        @memset(gpu, 0);
+
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(device, null) orelse
+            return error.CommandEncoderFailed;
+        try self.runRadiance(
+            encoder,
+            sdf,
+            .{ 0.2, 0.25, 0.35 },
+            0.85,
+            .{ 1.0, 1.0 },
+            .{ 0.0, 0.0, @as(f32, @floatFromInt(side)), @as(f32, @floatFromInt(side)) },
+            side,
+            &levels,
+            gpu,
+        );
+        // Finish before submit: `Queue.Submit` takes command BUFFERS, and a
+        // command encoder is not one. Passing the encoder directly is a type
+        // mismatch the bindings caught here, which is a good sign about them.
+        const cb = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse
+            return error.CommandBufferFailed;
+        wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cb));
+        wgpu.wgpuCommandBufferRelease(cb);
+
+        // Map it back. `pumpRadiance` is the frame-driven path; here the submit
+        // has already happened, so the map is issued and awaited directly.
+        const buf = self.radiance_readback orelse return error.BufferCreationFailed;
+        // The future is KEPT. Discarding it and waiting on a default-constructed
+        // one waits for nothing, forever, and Dawn's EventManager turns that into
+        // an abort rather than a hang -- which is a much worse failure mode than
+        // the bug deserves, and one this exact mistake has already caused once.
+        const f = wgpu.wgpuBufferMapAsync(
+            buf,
+            wgpu.MapMode_Read,
+            0,
+            @intCast(probes * probe_stride),
+            .{ .mode = wgpu.CallbackMode_WaitAnyOnly, .callback = mapCallback },
+        );
+        self.radiance_future = f;
+        var wait = [_]wgpu.FutureWaitInfo{.{ .future = self.radiance_future }};
+        var spins: u32 = 0;
+        while (wgpu.wgpuInstanceWaitAny(self.instance, 1, &wait, 5_000_000) != wgpu.WaitStatus_Success) {
+            spins += 1;
+            if (spins > 200) return error.Timeout;
+        }
+        // `GetConstMappedRange`, NOT `GetMappedRange`. The second asks for a
+        // WRITABLE mapping and a read map does not have one, so it returns null --
+        // which, before the binding grew this comment, silently turned every GPU
+        // measurement in this file into nothing at all.
+        const mapped = wgpu.wgpuBufferGetConstMappedRange(buf, 0, probes * probe_stride) orelse
+            return error.BufferMappingFailed;
+        const bytes: []const u8 = @as([*]const u8, @ptrCast(mapped))[0 .. probes * probe_stride];
+        wgpu.wgpuBufferUnmap(buf);
+
+        // The CPU's answer, on the same field. `Radiance.build` takes the mask and
+        // the u16 field; the mask is not used by `probeAt` today, so the same
+        // zeroed buffer is correct here and not a shortcut -- it is checked.
+        var r = light_mod.Radiance.init(self.allocator);
+        defer r.deinit();
+        const mask = self.allocator.alloc(u8, n_cells) catch return error.OutOfMemory;
+        defer self.allocator.free(mask);
+        @memset(mask, 0);
+        const sdf16 = self.allocator.alloc(u16, n_cells) catch return error.OutOfMemory;
+        defer self.allocator.free(sdf16);
+        for (sdf, sdf16) |src, *dst| dst.* = @intFromFloat(src);
+        try r.prepare(side, side, side);
+        try r.build(mask, sdf16, side, side, .{ 0.2, 0.25, 0.35 });
+
+        // Compare the FINEST cascade, which is the one the shader's last dispatch
+        // wrote and the one the light pass would sample.
+        var result = RadianceContract{ .hit_distance_matches = true };
+        const stride = @sizeOf(light_mod.Probe);
+        var sum: f64 = 0;
+        // `levels` is coarse-to-fine and `r.cascades` is fine-to-coarse, so the
+        // finest cascade is index 0 of one and index 0 of the other's last. Same
+        // cascade, same probe count, same rays — which is the only comparison
+        // that means anything.
+        for (r.cascades.items, 0..) |c, li| {
+            if (li != 0) continue;
+            for (c.probes, 0..) |cpu_p, i| {
+                const show = result.probes < 2 or i == 40 or i == 120;
+                const off = i * probe_stride;
+                // OFFSETS 0 / 8 / 16, not 0 / 4 / 12.
+                //
+                // WGSL aligns `vec2f` to 8 and `vec3f` to 16, so `normal` starts
+                // at 8 and `incoming` at 16, and the struct is 32 bytes with its
+                // own trailing pad. Reading them at the C offsets this file's own
+                // `Probe` struct uses -- and those two layouts were the same
+                // mistake twice, in opposite directions -- produced a comparison
+                // that reported the GPU and the CPU disagreeing when they agreed
+                // and the READER was wrong. Every value was shifted by four bytes
+                // and looked exactly like a stride bug.
+                const g_r = @as(f32, @bitCast(bytes[off + 16..][0..4].*));
+                const g_g = @as(f32, @bitCast(bytes[off + 20..][0..4].*));
+                const g_b = @as(f32, @bitCast(bytes[off + 24..][0..4].*));
+                const g_hit = @as(f32, @bitCast(bytes[off + 0..][0..4].*));
+
+                // Printed for a few, because "they disagree" is a start
+                // and "here is what each of them said" is a diagnosis.
+                if (show) {
+                    log.info("    probe {d}: gpu ({d:.3},{d:.3},{d:.3}) cpu ({d:.3},{d:.3},{d:.3})", .{
+                        result.probes, g_r, g_g, g_b,
+                        cpu_p.incoming[0], cpu_p.incoming[1], cpu_p.incoming[2],
+                    });
+                }
+                const e0 = @abs(g_r - cpu_p.incoming[0]);
+                const e1 = @abs(g_g - cpu_p.incoming[1]);
+                const e2 = @abs(g_b - cpu_p.incoming[2]);
+                const e = @max(e0, @max(e1, e2));
+                if (e > result.max_error) result.max_error = e;
+                sum += e;
+                result.probes += 1;
+
+                // `hit_distance` is compared SEPARATELY and tolerantly, because
+                // it is a distance along a sphere trace and the two sides are
+                // allowed to take different numbers of steps to the same surface.
+                if (!std.math.isNan(g_hit) and g_hit > 1e29) {
+                    result.hit_distance_matches = false;
+                }
+            }
+        }
+        _ = stride;
+        if (result.probes > 0) {
+            result.mean_error = @as(f32, @floatCast(sum / @as(f64, @floatFromInt(result.probes))));
+        }
+        result.agree = result.max_error <= 0.02 and result.hit_distance_matches;
+        return result;
+    }
+
     fn runPost(self: *Backend, encoder: wgpu.WGPUCommandEncoder, o: *Offscreen) ?wgpu.WGPUTextureView {
         const bloom_on = self.environment.bloom_intensity > 0;
         // One attachment, reused for each pass in the chain. Declared once

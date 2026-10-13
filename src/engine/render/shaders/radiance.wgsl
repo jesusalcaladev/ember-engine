@@ -68,9 +68,39 @@ struct CascadeParams {
     rays: u32,
     /// Whether this is the coarsest level, which sees only sky.
     is_coarsest: u32,
+    /// THE WIDTH OF `higher_probes`, in probes.
+    ///
+    /// It was missing, and the bounce read used `grid.x` instead -- this
+    /// cascade's width -- to index the COARSER cascade's buffer, whose width is
+    /// half or a quarter of this one. Every bounce therefore landed on the wrong
+    /// probe, or past the end and silently fell back to sky, which is the
+    /// failure that looks most like a renderer bug: the picture is plausible,
+    /// the corners are dark, and nothing anywhere says a stride was wrong.
+    ///
+    /// A bounds check did not save it: it only stops the out-of-range read, not
+    /// the in-range wrong one.
+    higher_width: u32,
+    /// Padding to a 16-byte multiple, which every uniform buffer wants so the
+    /// next thing after it in a bind group starts aligned.
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: CascadeParams;
+/// The occluder distance field, as FLOAT.
+///
+/// It was `array<f32>` before and the CPU's field is `[]u16` -- a true
+/// distance clamped to 65535, four bytes to the GPU's two. The types both
+/// compiled and the shader read packed bytes as if they were floats, which
+/// produced distances that were wrong by an amount nobody could name.
+///
+/// The fix is a deliberate f32 mirror of the field rather than unpacking on the
+/// GPU: the field is the one thing in the GI path that must be BIT-IDENTICAL
+/// between the two implementations, because a merge that reads a different field
+/// is not a fast merge, it is a different answer. The mirror costs 4 bytes per
+/// cell of a grid that is 128x128 by default -- 64 KB -- and buys agreement that
+/// a test can actually check.
 @group(0) @binding(1) var<storage, read> sdf_in: array<f32>;
 @group(0) @binding(2) var<storage, read_write> probes_out: array<Probe>;
 @group(0) @binding(3) var<storage, read> higher_probes: array<Probe>;
@@ -108,6 +138,34 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let world = params.mask_rect.xy + cell * params.mask_cell;
 
     var acc = vec3f(0.0);
+    // Closest hit across the probe's rays, for `hit_distance`. See the write at
+    // the bottom for why this is tracked at all.
+    var closest: f32 = 1e30;
+
+    // THE SAME EARLY-OUT THE CPU HAS, and it was the last thing the two halves
+    // disagreed about.
+    //
+    // `probeAt` returns black for a probe standing inside geometry: every ray
+    // would start in a wall and terminate at step 0, and the merge would be
+    // reading an enclosed cascade and returning its answer. The shader traced
+    // them anyway and followed the bounce chain into the coarser cascades, which
+    // are solid at the same point, all the way up to the sky base case -- so a
+    // probe inside a wall reported SKY on the GPU and BLACK on the CPU.
+    //
+    // It looks fine. Walls are bright, rooms are dark, and a mismatch confined to
+    // solid cells is invisible until it lands on a prop that happens to be inside
+    // one.
+    {
+        let own = world_to_cell(world);
+        if (own.y * params.sdf_width + own.x < arrayLength(&sdf_in)) {
+            if (sdf_in[own.y * params.sdf_width + own.x] < 1.0) {
+                probes_out[probe_index].hit_distance = 0.0;
+                probes_out[probe_index].normal = vec2f(0.0);
+                probes_out[probe_index].incoming = vec3f(0.0);
+                return;
+            }
+        }
+    }
     // Solid angle per ray, and the 2*pi divisor that turns a sum over
     // directions into an integral over the hemisphere. Weighting by SOLID ANGLE
     // and summing rather than averaging is what makes a probe with four wide
@@ -143,6 +201,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             let d = sdf_in[idx];
             if (d < 1.0) {
                 hit = true;
+                closest = t;
                 break;
             }
             t = t + max(d * 0.9, 0.5);
@@ -163,7 +222,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         if (params.is_coarsest == 0u) {
             let hit_world = world + dir * t;
             let hc = world_to_cell(hit_world);
-            let hidx = hc.y * params.grid.x + hc.x;
+            // `params.higher_width`, NOT `params.grid.x`. See the struct.
+            let hidx = hc.y * params.higher_width + hc.x;
             if (hidx < arrayLength(&higher_probes)) {
                 from_here = higher_probes[hidx].incoming;
             }
@@ -173,7 +233,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         acc = acc + from_here * (params.albedo * solid / two_pi);
     }
 
-    probes_out[probe_index].hit_distance = f32(params.rays);
+    // The CLOSEST hit of any ray, not `f32(params.rays)`.
+    //
+    // It was the ray count, in a field documented as "distance to the nearest
+    // occluder along this ray" -- so every probe reported a distance equal to
+    // how many directions it looked in, and any consumer that believed the field
+    // got a plausible number that meant nothing. Nothing read it yet, which is
+    // the only reason it survived: an unused field written with the wrong value
+    // is invisible until the first thing reads it.
+    probes_out[probe_index].hit_distance = closest;
     probes_out[probe_index].normal = vec2f(0.0);
     probes_out[probe_index].incoming = acc;
 }

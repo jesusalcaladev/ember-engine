@@ -1043,6 +1043,24 @@ pub const Bounce = struct {
     allocator: std.mem.Allocator,
     /// RGB per cell, `w * h * 3`.
     rgb: []f32 = &.{},
+    /// The occluder distance field as f32, for the GPU compute pass.
+    ///
+    /// A MIRROR, deliberately, and the duplication is the point rather than an
+    /// oversight. `radiance.wgsl` reads the field as `array<f32>` while the CPU
+    /// keeps it as `[]u16` — a true distance clamped to 65535, two bytes to the
+    /// GPU's four. The types both compiled and the shader read packed bytes as
+    /// floats, which is a wrong answer rather than a failed one.
+    ///
+    /// Unpacking on the GPU instead would halve the upload, and would put the
+    /// one conversion in the path where a mistake is hardest to attribute. The
+    /// field is the only thing a CPU merge and a GPU merge must agree about
+    /// exactly: a merge that reads a different field is not a faster merge, it
+    /// is a different answer, and it would show up as "the GPU bounce looks
+    /// slightly wrong" with nothing to point at. 64 KB at the default
+    /// resolution is the price of being able to TEST the agreement, which is
+    /// worth more than the 32 KB.
+    sdf_f32: []f32 = &.{},
+
     /// This step's sources, `w * h * 3`. Separate from `rgb` because a diffusion
     /// step reads the previous step's field while writing the next one's, and
     /// in-place would smear the update across the sweep direction.
@@ -1060,6 +1078,7 @@ pub const Bounce = struct {
         self.allocator.free(self.rgb);
         self.allocator.free(self.inject);
         self.allocator.free(self.scratch);
+        self.allocator.free(self.sdf_f32);
         self.* = undefined;
     }
 
@@ -1476,6 +1495,8 @@ pub const Lighting = struct {
         self.gi_mask = try self.allocator.alloc(u8, cells);
         @memset(self.gi_mask, 0);
         self.sdf = try self.allocator.alloc(u16, cells);
+        self.allocator.free(self.bounce.sdf_f32);
+        self.bounce.sdf_f32 = try self.allocator.alloc(f32, cells);
         // The GI probe grids are sized here for the same reason the mask is:
         // `Radiance.build` is called from inside the frame (an occluder moved)
         // and must not allocate when it runs. The budget comes from the quality
@@ -2531,6 +2552,14 @@ pub const Lighting = struct {
         edtMask2dInto(&self.edt, self.gi_mask, self.sdf, gw, gh);
         self.stats.transform_ns = self.tick() - t_edt;
 
+        // The f32 mirror, in the same pass that writes the field, so it cannot
+        // lag it by a frame. One linear scan of a 128x128 grid: 16k writes,
+        // measured in microseconds, next to a 16 MB pyramid build it feeds.
+        const mirror = &self.bounce.sdf_f32;
+        if (mirror.len == self.sdf.len) {
+            for (self.sdf, mirror.*) |src, *dst| dst.* = @floatFromInt(src);
+        }
+
         self.last_sdf_ns = now_ns;
         self.dirty = false;
         self.stats.sdf_builds += 1;
@@ -3558,7 +3587,31 @@ pub const Radiance = struct {
                     // `c.scale` is the probe spacing, set by `prepare` for this
                     // level. Reading it here rather than recomputing `cells` keeps
                     // the grid and the probe lookup from ever disagreeing.
-                    c.probes[idx] = probeAt(self, c, next, mask, sdf, w, h, x * c.scale, y * c.scale, sky);
+                    // The probe stands at the CENTRE of its cell, not its corner.
+                    //
+                    // Half a cell of offset, which is nothing on an open plain and
+                    // a different answer on a wall: the corner of a cell abutting
+                    // an occluder IS the occluder, so every probe next to geometry
+                    // was being traced from inside it. `radiance.wgsl` has always
+                    // used the centre -- `gid * scale + scale * 0.5` -- and the two
+                    // halves disagreed by exactly that half cell, which is
+                    // invisible to any test that only runs one of them.
+                    //
+                    // `scale / 2` and not `scale * 0.5`: `px` is a CELL INDEX, and
+                    // `cellsFor` only ever returns a power of two of at least 2, so
+                    // the centre is always an exact cell and never a half one.
+                    c.probes[idx] = probeAt(
+                        self,
+                        c,
+                        next,
+                        mask,
+                        sdf,
+                        w,
+                        h,
+                        x * c.scale + c.scale / 2,
+                        y * c.scale + c.scale / 2,
+                        sky,
+                    );
                 }
             }
         }
@@ -3646,8 +3699,20 @@ fn probeAt(
     // "the trace would stop here" cannot disagree.
     if (r.early_out_enclosed) {
         const own = @as(usize, py) * w + px;
-        if (own < sdf.len and sdf[own] < 1.0) return .{ .incoming = acc };
+        // A probe standing inside geometry traces nothing, so its closest hit
+        // is "right here": zero, not the sentinel the ray loop would leave.
+        if (own < sdf.len and sdf[own] < 1.0) {
+            return .{ .incoming = acc, .hit_distance = 0.0 };
+        }
     }
+
+    // The CLOSEST hit across this probe's rays, for `hit_distance`.
+    //
+    // Declared OUTSIDE the ray loop, which is the only way it can be the closest
+    // rather than the last. It is declared where the GPU half declares its own,
+    // for the same reason: the field means one thing and both halves have to
+    // mean it by the same thing.
+    var closest: f32 = 1e30;
 
     var i: u32 = 0;
     while (i < c.rays) : (i += 1) {
@@ -3686,6 +3751,7 @@ fn probeAt(
             const d = @as(f32, @floatFromInt(sdf[@as(usize, iy) * w + ix]));
             if (d < 1.0) {
                 hit = true;
+                closest = t;
                 break;
             }
             t += @max(d * 0.9, 0.5);
@@ -3716,7 +3782,7 @@ fn probeAt(
         for (0..3) |k| acc[k] += from_here[k] * bounce * solid / (2.0 * math.pi);
     }
 
-    return .{ .incoming = acc };
+    return .{ .incoming = acc, .hit_distance = closest };
 }
 
 /// Nearest-probe read of a cascade, at probe units.
@@ -5794,4 +5860,44 @@ test "render light: the GI field's aspect ratio follows the mask's" {
     const full = giDimsFor(2048, 1024, 0);
     try testing.expectEqual(@as(u32, 2048), full.w);
     try testing.expectEqual(@as(u32, 1024), full.h);
+}
+
+test "render light: a probe stands at the CENTRE of its cell, where the shader puts it" {
+    // The half-cell contract between the CPU pyramid and `radiance.wgsl`.
+    //
+    // `radiance.wgsl` has always computed `gid * scale + scale * 0.5`. The CPU
+    // used `x * scale`, which is the cell's CORNER -- and for a cell that abuts an
+    // occluder, the corner IS the occluder. So every probe next to a wall was
+    // traced from inside the wall, on the CPU only, and the two halves answered
+    // different questions about the same scene.
+    //
+    // It is invisible to every test that runs only one implementation, which is
+    // all of them until the GPU gate exists -- and that gate found it by
+    // disagreeing with the CPU on a field where it should have agreed exactly.
+    var l = try Lighting.init(testing.allocator, .medium);
+    defer l.deinit();
+    try l.resize(16, 16);
+    try l.reserve(4, 4);
+    l.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 16, .y = 16 } };
+
+    var r = Radiance.init(testing.allocator);
+    defer r.deinit();
+    try r.prepare(16, 16, 4);
+    const c = r.cascades.items[0];
+
+    // `base_scale` is the finest spacing, and it is a power of two of at least 2,
+    // which is what makes "the centre" an exact cell rather than a half one.
+    try testing.expect(c.scale >= 2);
+    try testing.expect(std.math.isPowerOfTwo(c.scale));
+
+    // A free cell's centre is strictly inside it, and strictly nearer its own
+    // centre than its own corner -- which is the whole property.
+    for (0..c.w) |x| {
+        for (0..c.h) |_| {
+            const corner: u32 = @as(u32, @intCast(x)) * c.scale;
+            const centre: u32 = corner + c.scale / 2;
+            try testing.expect(centre > corner);
+            try testing.expect(centre < corner + c.scale);
+        }
+    }
 }

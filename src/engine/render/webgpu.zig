@@ -92,6 +92,7 @@ pub const PresentMode_Immediate: c_uint = 3;
 pub const PresentMode_Mailbox: c_uint = 4;
 pub const CompositeAlphaMode_Auto: c_uint = 0;
 pub const ColorWriteMask_All: Flags = 0xF;
+pub const BufferUsage_Storage: Flags = 0x80;
 pub const BufferUsage_Uniform: Flags = 0x40;
 pub const BufferUsage_Vertex: Flags = 0x20;
 pub const BufferUsage_Index: Flags = 0x10;
@@ -100,6 +101,10 @@ pub const BufferUsage_MapRead: Flags = 0x1;
 pub const BufferUsage_CopySrc: Flags = 0x4;
 pub const BufferUsage_QueryResolve: Flags = 0x200;
 pub const WaitStatus_Success: c_uint = 1;
+/// The non-terminal result. MISSING before, and only reachable by anything that
+/// WAITS rather than polls -- which is to say by the one read-back that has to
+/// block, the radiance contract test.
+pub const WaitStatus_TimedOut: c_uint = 0;
 pub const MapMode_None: Flags = 0;
 pub const MapMode_Read: Flags = 0x1;
 pub const Status_Success: c_uint = 1;
@@ -608,7 +613,15 @@ pub const ComputePipelineDescriptor = extern struct {
     nextInChain: ?*ChainedStruct = null,
     label: StringView = .{},
     layout: ?WGPUPipelineLayout,
-    compute: ProgrammableStage = .{},
+    /// NO `= .{}` DEFAULT, and it is the only field here without one.
+    ///
+    /// `ProgrammableStage.module` is non-optional, so `= .{}` is not a valid
+    /// value for it and the struct literal has to say. It compiled anyway until
+    /// something actually INSTANTIATED the type — which is what a compute
+    /// pipeline does, and nothing in the tree did before. A default that is never
+    /// taken until it cannot be taken is the same class of defect as the
+    /// attribute count: the type looked complete and was not.
+    compute: ProgrammableStage,
 };
 
 pub const ProgrammableStage = extern struct {
