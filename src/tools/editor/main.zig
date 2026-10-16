@@ -35,6 +35,7 @@ const ui = @import("ui");
 const physics = @import("physics");
 const session = @import("session");
 const code_pane = @import("code_pane.zig");
+const tilemap_panel = @import("tilemap_panel.zig");
 
 const Model = session.model.Model;
 const log = core.log.scoped("editor");
@@ -183,6 +184,20 @@ fn runHeadless(allocator: std.mem.Allocator, args: Args) !void {
 
 // ─── The built-in scene ──────────────────────────────────────────────────────
 
+/// A 6×4 checker of tiles, so the panel and the 2D batcher have something to
+/// show the moment the editor opens. Painted through the same `Store` the
+/// brushes use, which is what makes it a smoke test rather than a fixture.
+fn seedTilePattern(store: *tilemap_panel.Store) void {
+    var y: i32 = 0;
+    while (y < 4) : (y += 1) {
+        var x: i32 = 0;
+        while (x < 6) : (x += 1) {
+            const tile: ecs.components.Tile = .{ .atlas_index = @intCast(1 + @mod(x + y * 6, 8)) };
+            _ = store.setTile(x - 3, y - 12, tile) catch {};
+        }
+    }
+}
+
 /// A scene small enough to read at a glance and large enough to prove every
 /// body class the overlay knows how to colour: a floor, a dynamic box that
 /// falls onto it, a kinematic platform, and a sensor.
@@ -319,6 +334,24 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer pane.deinit();
+
+    // ── TileMap panel ───────────────────────────────────────────────────────
+    //
+    // The store owns the chunks, the panel owns the brush. Both live OUTSIDE
+    // the frame guard because painting allocates (a new chunk is an append);
+    // the panel's `draw` and `pushTiles` only read.
+    var tile_store = tilemap_panel.Store.init(boot_alloc) catch |err| {
+        log.err("tilemap store init failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer tile_store.deinit();
+    var tilemap = tilemap_panel.Panel{ .store = &tile_store };
+    tilemap_panel.Panel.host_ctx = &ui_ctx;
+
+    // Seed a small checker of tiles. An editor that opens onto an empty canvas
+    // reads as broken even when it is not, and this is also what proves the
+    // palette-to-batcher path end to end on the first frame.
+    seedTilePattern(&tile_store);
 
     // ── ECS World ───────────────────────────────────────────────────────────
     //
@@ -466,6 +499,8 @@ pub fn main(init: std.process.Init) !void {
     // because `drawCommands` needs a live ImGui frame — calling it in the
     // summary below asserts inside ImGui, since the frame is long over.
     var last_ui_cmds: usize = 0;
+    // Tiles the TileMap panel pushed on the last frame.
+    var tiles_pushed: usize = 0;
     while (true) {
         // Frame limiter
         const pacing = limiter.wait(core.time.monotonicNs());
@@ -559,6 +594,40 @@ pub fn main(init: std.process.Init) !void {
         pane.applyRequests();
         _ = pane.tokens() catch {};
 
+        // ── TileMap brush, OUTSIDE the frame ───────────────────────────────
+        //
+        // Painting can create a chunk, and a chunk is an append — an
+        // allocation, which the guard below forbids. So the brush runs here and
+        // only the resulting quads are pushed inside the frame.
+        if (has_window and camera_view != null and !ui_ctx.wantsMouse()) {
+            const m = window.input.mouse;
+            const inside = m.x >= 0 and m.y >= 0 and m.x < @as(f32, @floatFromInt(fb_w)) and m.y < @as(f32, @floatFromInt(fb_h));
+            const world_pos = camera_view.?.screenToWorld(.{ .x = m.x, .y = m.y });
+            const tx: i32 = @intFromFloat(@floor(world_pos.x / tilemap.tile_size));
+            const ty: i32 = @intFromFloat(@floor(world_pos.y / tilemap.tile_size));
+            tilemap.hover = .{ tx, ty };
+
+            if (m.buttons[0] and inside) {
+                if (tilemap.drag_anchor == null) {
+                    tilemap.drag_anchor = .{ tx, ty };
+                    switch (tilemap.brush) {
+                        .pencil, .eraser, .flood_fill, .picker => tilemap.paintAt(tx, ty, true) catch {},
+                        else => {},
+                    }
+                } else switch (tilemap.brush) {
+                    .pencil, .eraser => tilemap.paintAt(tx, ty, true) catch {},
+                    else => {},
+                }
+            } else if (tilemap.drag_anchor != null) {
+                // Released: a rectangle commits once, on the release edge.
+                switch (tilemap.brush) {
+                    .rect_fill, .rect_outline => tilemap.paintAt(tx, ty, true) catch {},
+                    else => {},
+                }
+                tilemap.drag_anchor = null;
+            }
+        }
+
         // ── The allocation-guarded frame ───────────────────────────────────
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
@@ -576,6 +645,7 @@ pub fn main(init: std.process.Init) !void {
         // ── Editor overlay: input, then widgets, then the code pane ───────
         ui_ctx.newFrame(real_dt);
         drawEditorUi(&ui_ctx, &pane, camera_view.?);
+        tilemap.draw();
         pane.draw(&ui_ctx, real_dt);
         last_ui_cmds = ui_ctx.drawCommands();
 
@@ -638,6 +708,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        const tiles = tilemap.pushTiles(&r2d);
+        tiles_pushed = tiles;
         r2d.submit(renderer);
 
         // ── Lighting ───────────────────────────────────────────────────────
@@ -683,13 +755,15 @@ pub fn main(init: std.process.Init) !void {
     // cannot distinguish "worked" from "never started".
     if (args.frames != 0) {
         const st = renderer.stats();
-        log.info("{d} frames, {d} draw calls, physics overlay: {d} bodies ({d} sensors), ui: {d} cmds", .{
+        log.info("{d} frames, {d} draw calls, physics overlay: {d} bodies ({d} sensors), tiles: {d}, ui: {d} cmds", .{
             frame_count,
             st.draw_calls,
             physics_debug.stats.bodies_drawn,
             physics_debug.stats.sensors_drawn,
+            tiles_pushed,
             last_ui_cmds,
         });
+        log.info("tilemap panel drew {d} frames", .{tilemap_panel.Panel.draws});
     }
 }
 

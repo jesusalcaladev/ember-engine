@@ -108,6 +108,8 @@ pub const TileSet = tilemap_mod.TileSet;
 pub const TileMapLayer = tilemap_mod.TileMapLayer;
 pub const TileChunk = tilemap_mod.TileChunk;
 pub const ChunkHandle = tilemap_mod.ChunkHandle;
+pub const ChunkMap = tilemap_mod.ChunkMap;
+pub const TilePhysics = tilemap_mod.TilePhysics;
 pub const chunk_size = tilemap_mod.chunk_size;
 pub const chunk_area = tilemap_mod.chunk_area;
 // Pull the per-file tests into the suite: `zig build test` runs the tests of

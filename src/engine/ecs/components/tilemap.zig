@@ -50,8 +50,8 @@ pub const ChunkCoord = struct {
 pub const ChunkKey = struct {
     cx: i32 = 0, cy: i32 = 0,
     pub fn fromWorld(world_x: f32, world_y: f32, tile_size: f32) ChunkKey {
-        const tile_x = @as(i32, @intCast(@floor(world_x / tile_size)));
-        const tile_y = @as(i32, @intCast(@floor(world_y / tile_size)));
+        const tile_x = @as(i32, @intFromFloat(@floor(world_x / tile_size)));
+        const tile_y = @as(i32, @intFromFloat(@floor(world_y / tile_size)));
         return .{ .cx = @divFloor(tile_x, @as(i32, chunk_size)),
                   .cy = @divFloor(tile_y, @as(i32, chunk_size)) };
     }

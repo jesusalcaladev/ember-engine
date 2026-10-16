@@ -276,9 +276,9 @@ fn beginHost(ctx: *Context, id: []const u8, opts: FloatingOptions) bool {
     if (opts.w <= 0 or opts.h <= 0) flags |= cimgui.WindowFlags.AlwaysAutoResize;
     if (!opts.resizable) flags |= cimgui.WindowFlags.NoResize;
     if (opts.menu_bar) flags |= cimgui.WindowFlags.MenuBar;
-    cimgui.ember_ui_set_next_window_pos(opts.x, opts.y, @intFromEnum(if (opts.first_use) .FirstUseEver else .None));
-    cimgui.ember_ui_set_next_window_size(opts.w, opts.h, @intFromEnum(if (opts.first_use) .FirstUseEver else .None));
-    return cimgui.ember_ui_begin(cimgui.text(id), flags) != 0;
+    cimgui.ember_ui_set_next_window_pos(opts.x, opts.y, @intFromEnum(if (opts.first_use) cimgui.Cond.FirstUseEver else cimgui.Cond.None));
+    cimgui.ember_ui_set_next_window_size(opts.w, opts.h, @intFromEnum(if (opts.first_use) cimgui.Cond.FirstUseEver else cimgui.Cond.None));
+    return cimgui.ember_ui_begin(cimgui.text(id), @bitCast(flags)) != 0;
 }
 
 test "ui layout: a row's items are separated by exactly the gap" {
