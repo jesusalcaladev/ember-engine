@@ -33,6 +33,9 @@ const light_mod = @import("light.zig");
 const sound_emitter_mod = @import("sound_emitter.zig");
 const particle_mod = @import("particle.zig");
 const animation_mod = @import("animation.zig");
+// M15 PARKED: the tilemap subsystem is unfinished; re-enable this import with
+// the component_list entry and the exports in components.zig.
+// const tilemap_mod = @import("tilemap.zig");
 
 pub const Name = name_mod.Name;
 pub const Transform = transform_mod.Transform;
@@ -162,6 +165,8 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "ParticleEmitter2D", .type = ParticleEmitter2D },
     // -- M13 -- appended, never inserted
     .{ .name = "AnimationPlayer", .type = AnimationPlayer },
+    // -- M15 PARKED: appended at id 23 once the tilemap subsystem is finished.
+    // .{ .name = "TileMapLayer", .type = tilemap_mod.TileMapLayer },
 };
 
 comptime {
@@ -329,6 +334,10 @@ test "the components were APPENDED, not inserted" {
     try testing.expectEqual(@as(ComponentId, 20), componentId(SoundEmitter2D));
     // M9's emitter follows it: id 21. Same rule — append, never insert.
     try testing.expectEqual(@as(ComponentId, 21), componentId(ParticleEmitter2D));
+    // M13's animation player: id 22.
+    try testing.expectEqual(@as(ComponentId, 22), componentId(AnimationPlayer));
+    // M15 PARKED: the tilemap layer would be id 23; disabled for now.
+    // try testing.expectEqual(@as(ComponentId, 23), componentId(tilemap_mod.TileMapLayer));
     try testing.expectEqual(@as(usize, 23), entries.len);
 }
 

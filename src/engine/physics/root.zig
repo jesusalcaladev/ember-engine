@@ -57,6 +57,23 @@ pub const System = system.System;
 pub const contact_signal = system.contact_signal;
 pub const ContactEvent = system.ContactEvent;
 
+/// Physics debug visualization (the editor's collision overlay). Collects
+/// colour-coded quads from the ECS + the physics world; the editor draws them.
+/// It does not import `render` — render imports physics, and that edge stays
+/// one-way — so this is pure collection with no drawing dependency.
+pub const debug = @import("debug.zig");
+pub const PhysicsDebugRenderer = debug.PhysicsDebugRenderer;
+pub const DebugFlags = debug.DebugFlags;
+pub const DebugColors = debug.DebugColors;
+pub const DebugColorSet = debug.DebugColorSet;
+pub const DebugQuad = debug.DebugQuad;
+
+/// M15: TileMap physics system — per-tile collision from TileSet physics data.
+/// M15: TileMap physics system — per-tile collision from TileSet physics data.
+// M15 PARKED: unfinished tilemap physics; re-enable with the rest of M15.
+// pub const tilemap = @import("tilemap.zig");
+// pub const TileMapPhysicsSystem = tilemap.TileMapPhysicsSystem;
+
 /// Creates a world on the chosen backend.
 ///
 /// `backend` is a comptime tag rather than a string so a typo is a compile
@@ -87,4 +104,8 @@ test {
     // it is tested as such: hysteresis bugs are invisible in a benchmark,
     // because a thrashing body costs only slightly more than a still one.
     _ = @import("activity.zig");
+    // M15: TileMap physics system tests.
+    // _ = @import("tilemap.zig");
+    // Debug renderer tests.
+    _ = @import("debug.zig");
 }

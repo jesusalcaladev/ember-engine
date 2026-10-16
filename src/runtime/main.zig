@@ -31,6 +31,7 @@ const script = engine.script;
 const project = engine.project;
 /// M-project → M8: the one file that can see `project.config` AND `audio`.
 const project_hook = @import("project_hook.zig");
+const assets = engine.assets;
 const components = ecs.components;
 const log = core.log.scoped("runtime");
 
@@ -46,11 +47,34 @@ const rotation_speed: f32 = 1.5; // rad/s
 /// different spelling would report names no slot ever held.
 const audio_asset_dir = "assets/audio";
 
+/// Where a project's `.anim` clips live, relative to the project root. The same
+/// convention `audio_asset_dir` follows, for the same reason: the runtime is
+/// launched FROM the project root, so a path a script spells
+/// (`anim.load("assets/animations/run.anim")`) is exactly the path the boot
+/// preload walked — which is what makes the GUID handle agree.
+const animation_asset_dir = "assets/animations";
+
+/// Where a project's sprite images live, relative to the project root. The same
+/// convention again, and for a sharper reason than the others: `HotReload` keys
+/// its watch list on the exact path string, and the atlas keys its rects on the
+/// exact path string. A script that spells the path one way and a watcher that
+/// derives it another would pack a second copy AND reload nothing.
+const image_asset_dir = "assets/sprites";
+
 /// How many changed entries one poll may report. A `git checkout` of the sound
 /// directory touches every file in it; the watcher truncates past this and the
 /// poll reports the rest on the next frame, which is harmless because a reload
 /// is idempotent.
 const audio_watch_capacity = 16;
+
+/// The image watcher's capacity. Separate constant, same contract: a checked-out
+/// sprite folder is a burst, and a reload is idempotent so truncation is fine.
+const image_watch_capacity = 16;
+
+/// Side of the sprite atlas, in texels. 2048² RGBA8 is 16 MB — the M6 per-page
+/// budget — and it is the SAME 2048 the Lua binding uses, on purpose: the binding
+/// and the reload sink must hand images to one atlas, not two.
+const atlas_side: u32 = 2048;
 
 const Args = struct {
     frames: u64 = 0, // 0 = infinite
@@ -210,6 +234,35 @@ fn reloadChangedAudio(sys: *engine.audio.Audio, watcher: *platform.DirectoryWatc
         sys.reload(path) catch |err| switch (err) {
             error.StreamNotReloadable => log.info("{s} is streamed: stop and play it again to pick up the edit", .{path}),
             else => log.warn("audio reload of {s} failed: {s}", .{ path, @errorName(err) }),
+        };
+    }
+}
+
+/// Polls the sprite directory and hands each changed name to the reload manager,
+/// which decodes it and drives the atlas through the `render.asset_reload` sink.
+///
+/// The filter is a prediction, not a promise: `isImageAsset` names the extensions
+/// `import.detect` will accept, so a name that passes is one the reload can
+/// actually classify. Names it rejects (a `.swp`, a `.pak`) are dropped here
+/// instead of taking a `stat` and a `readFileAlloc` to be discarded one layer
+/// down.
+///
+/// A watched path that is NOT in the manager's list reloads nothing — that is the
+/// intended outcome, not a gap: only images a script has packed into the atlas
+/// are registered (`sprite.set_image` does it), and an image nothing has drawn has
+/// no rect to update. Editing one is a no-op until it is first set.
+fn reloadChangedImages(hot: *assets.HotReload, watcher: *platform.DirectoryWatcher) void {
+    var names: [image_watch_capacity][]const u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = watcher.pollNames(&names);
+    for (names[0..n]) |name| {
+        if (!platform.isImageAsset(name)) continue;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ image_asset_dir, name }) catch continue;
+        // `reloadPath` runs the callback SYNCHRONOUSLY, and that callback does the
+        // GPU upload — so this returns only once the new pixels are in the
+        // texture. There is no second step to forget.
+        _ = hot.reloadPath(path) catch |err| {
+            log.warn("image reload of {s} failed: {s}", .{ path, @errorName(err) });
         };
     }
 }
@@ -571,6 +624,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var anim_system = ecs.animation.System.init(boot_alloc);
     defer anim_system.deinit();
+    // M13: `anim.length` needs the clip registry, and nothing else hands the
+    // script context a pointer to it — without this line the binding silently
+    // returned nothing for every actor.
+    behaviors.ctx.animations = &anim_system;
+
+    // ── M13: clips are ASSETS ───────────────────────────────────────────────
+    // Two halves of the same promise, both wired at boot:
+    //
+    // 1. **Preload.** Every `.anim` in the project's animation directory is
+    //    decoded before the first scene runs, so a clip is resident and a script
+    //    only names it (`anim.play(self, anim.load(path))` is then a lookup, not
+    //    a decode). Each clip's id is the GUID-derived handle of its path
+    //    (`clipIdForPath`), so the handle a scene or a script computes from the
+    //    path is the one the loader produced.
+    //
+    // 2. **Method track → Lua.** A clip's `call_lua <t> <script_id> <fn>`
+    //    keyframe reaches the named behavior through this hook. Crossed as a
+    //    function pointer because `ecs` cannot import `script` (the module graph
+    //    runs script -> ecs), exactly like the signal bridge.
+    //
+    // A missing directory is not an error: a project with no animations yet
+    // simply has nothing to preload, and the engine still runs.
+    anim_system.method_hook = behaviors.animationMethodHook();
+    if (anim_system.preloadDir(animation_asset_dir)) |report| {
+        if (report.loaded > 0 or report.failed > 0) {
+            log.info("preloaded {d} clip(s) from {s} ({d} failed)", .{
+                report.loaded, animation_asset_dir, report.failed,
+            });
+        }
+    } else |err| {
+        log.info("no animation asset preload ({s} at '{s}')", .{ @errorName(err), animation_asset_dir });
+    }
 
     // ── M9: the scene-transition fader hooks ────────────────────────────────
     var scene_hooks = script.context.SceneHooks{
@@ -669,6 +754,64 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
     defer if (audio_watcher) |*w| w.deinit(boot_alloc);
+
+    // ── M6: image asset hot-reload (the render half of the promise) ─────────
+    //
+    // `assets.HotReload` notices an on-disk edit and decodes it; it cannot put
+    // the pixels anywhere, because `assets` may not import `render`. The adapter
+    // that crosses that boundary lives in `render.asset_reload`, and this is the
+    // piece of the runtime that owns one of them.
+    //
+    // Everything here is OUTSIDE the frame loop by construction: the sink is
+    // built once, and `reloadChangedImages` below runs next to the audio poll,
+    // before `tracker.beginFrame`. An image reload decodes a file and writes a
+    // texture — I/O plus a GPU upload — and neither belongs inside a measured
+    // frame (spec §3.4).
+    var asset_registry = assets.AssetRegistry.init(boot_alloc);
+    defer asset_registry.deinit();
+
+    // The manager `sprite.set_image` loads through. 4096 slots and a 256 MB
+    // decoded budget are the M6 numbers, and the same ones the asset suite
+    // exercises, so a scene that fits the tests fits here.
+    var asset_manager = assets.AssetManager.init(boot_alloc, 4096, 256 << 20) catch |err| blk: {
+        log.warn("asset manager init failed ({s}); sprite.set_image is disabled", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (asset_manager) |*am| am.deinit();
+    if (asset_manager) |*am| behaviors.ctx.assets = am;
+    // The renderer is a by-value handle (a vtable plus a pointer), so the context
+    // holds its address — and `renderer` outlives every frame, including the
+    // `defer renderer.deinit()` above, which runs after this whole block.
+    behaviors.ctx.renderer = &renderer;
+
+    // The reload manager and its sink. The sink reads `ctx.atlas_manager` at call
+    // time (see `ImageSink.forRenderer`), so the atlas stays lazily created by
+    // the first `sprite.set_image` rather than being forced into existence here
+    // for a scene that may never load an image.
+    const image_io = std.Io.Threaded.global_single_threaded.io();
+    var asset_hot = assets.HotReload.init(boot_alloc, image_io, &asset_registry);
+    defer asset_hot.deinit();
+    // `sprite.set_image` registers each packed path here, which is the only way
+    // the watcher below learns what to re-check.
+    behaviors.ctx.hot_reload = &asset_hot;
+
+    var image_sink = render.asset_reload.ImageSink.forRenderer(renderer, &behaviors.ctx.atlas_manager);
+    var image_reloader = render.asset_reload.Reloader{ .sink = image_sink.sink() };
+    image_reloader.attach(&asset_hot);
+
+    // A missing directory is not an error, exactly as for audio: a project with
+    // no sprites yet, or one that ships its images inside a `.pak`, has nothing
+    // on disk to watch.
+    var image_watcher: ?platform.DirectoryWatcher = null;
+    if (!args.headless) {
+        if (platform.watchDirectory(boot_alloc, image_asset_dir)) |w| {
+            image_watcher = w;
+            log.info("watching {s} for image changes", .{image_asset_dir});
+        } else |err| {
+            log.info("no image asset watch ({s} at '{s}')", .{ @errorName(err), image_asset_dir });
+        }
+    }
+    defer if (image_watcher) |*w| w.deinit(boot_alloc);
 
     // ── M8: sound events → Signals (ROADMAP M8, spec §6) ─────────────────────
     // The device thread learns that a voice started or ended; only the MAIN
@@ -818,6 +961,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (audio_system) |sys| reloadChangedAudio(sys, w);
         }
 
+        // ── M6: image asset hot-reload: poll the sprite directory.
+        // The same placement and the same reason as the audio poll above: the
+        // reload decodes a file and writes a texture, and blocking I/O plus a GPU
+        // upload both belong outside the frame the profiler is measuring.
+        if (image_watcher) |*w| reloadChangedImages(&asset_hot, w);
+
         // ── M7: the lighting mask is sized HERE, before the allocation guard is
         // armed, and not in the render section below where it used to live.
         //
@@ -920,6 +1069,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // integration rather than the next one. Same fixed dt, same order
             // every frame, which is what makes a particle scene deterministic.
             particles.fixedUpdate(&world, fixed_dt);
+            // M13: root motion runs LAST — after the physics step and gameplay —
+            // so a solver (or a behavior) that wrote `Transform` this tick does
+            // not overwrite the clip's baked displacement.
+            anim_system.applyRootMotion(&world, fixed_dt);
         }
         // ── M4.5: the Camera2D system, once per fixed window (not per step).
         // The camera is what the player LOOKS at, so it belongs to the rendered

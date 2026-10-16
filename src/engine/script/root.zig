@@ -34,7 +34,11 @@ pub const luajit = @import("luajit.zig");
 pub const vm = @import("vm.zig");
 pub const scripts = @import("scripts.zig");
 pub const bindings = @import("bindings.zig");
-pub const metadata = @import("metadata.zig");
+// The registry is reached as its own MODULE, not by relative path: see the
+// comment on `script_mod.addImport("api_meta", ...)` in build.zig. A relative
+// import here would make `metadata.zig` belong to this module as well as to
+// `api_meta`, and Zig allows a file exactly one module.
+pub const metadata = @import("api_meta");
 pub const stubs = @import("stubs.zig");
 pub const input = @import("input.zig");
 pub const behavior = @import("behavior.zig");

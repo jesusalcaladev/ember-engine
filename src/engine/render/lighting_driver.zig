@@ -88,11 +88,6 @@ pub const Driver = struct {
     /// Bumped by `resize` so the caller's `reserve` can happen before a frame.
     needs_resize: bool = false,
 
-    /// Whether the GI grid changed since the last submission. Read (never
-    /// cleared) by `frame`, so a caller driving the steps by hand still gets an
-    /// accurate answer.
-    gi_dirty: bool = false,
-
     /// The sprite coverage the automatic occluders rasterize from.
     ///
     /// OWNED by the driver and not borrowed, for the same reason the engine owns
@@ -173,7 +168,14 @@ pub const Driver = struct {
         // moved the mask by exactly the ratio the window moved — which is how a
         // project's `shadow_resolution` turned into a suggestion the moment
         // anything was resized.
-        // fix removed for this run only
+        //
+        // The re-derivation only runs when a cell count is actually configured:
+        // a driver nobody called `setShadowResolution` on keeps whatever scale
+        // its constructor guessed, which is the quality tier's default and the
+        // behaviour every existing caller relies on.
+        if (self.shadow_resolution > 0) {
+            self.setShadowResolution(self.shadow_resolution, view);
+        }
         const w: u32 = @intFromFloat(@max(1, (view.max.x - view.min.x) / self.scale));
         const h: u32 = @intFromFloat(@max(1, (view.max.y - view.min.y) / self.scale));
         const changed = w != self.lighting.alloc_w or h != self.lighting.alloc_h;
@@ -318,62 +320,21 @@ pub const Driver = struct {
         if (l.mask_changed) l.rasterize();
         l.buildShadowMaps();
 
-        // The pyramid is a function of the distance field, so it is rebuilt on
-        // the frames the FIELD was rebuilt and on no others. `updateSdf` answers
-        // that question; before it returned the answer the driver called `build`
-        // unconditionally, which meant a resting scene rebuilt a 262,144-ray
-        // pyramid 60 times a second to arrive at the same numbers. The comment
-        // here used to say "only when the field moved" over code that moved
-        // every frame, which is the kind of claim that is worth more removed
-        // than kept.
-        // The environment decides, per frame, and it is a read rather than a
-        // decision because both models are already allocated -- see
-        // `reallocMaskBuffers`, where the note explains why paying for both is
-        // cheaper than forbidding the switch inside a frame.
+        // GI was removed in commit 08fa448 ("Remove GI (Global Illumination)
+        // from 2D lighting system"): the SDF, the radiance pyramid and the
+        // environment's `sky` term went with it, but this block — which was
+        // where the pyramid was rebuilt on the frames the distance field moved —
+        // stayed behind and kept calling `Lighting.updateSdf`, an API that no
+        // longer exists. It is deleted here rather than stubbed: `updateSdf` was
+        // removed for a reason (the field it rebuilt was the field the pyramid
+        // sampled, and neither exists now), so a stub returning `false` would be
+        // a lie that compiles and costs a branch every frame.
         //
-        // `?u8` on the component is the escape from a layering problem rather
-        // than an optimisation: `ecs.components` cannot name `light.GiBackend`
-        // without importing the renderer, and the renderer already imports the
-        // components. So the tag travels as a number and is translated here,
-        // where both sides are in scope. An unknown tag falls back to the
-        // project's setting rather than guessing: a typo in a .zson should not
-        // silently change the lighting model.
-        // Falls back to the PROJECT's setting, not to whatever the field already
-        // holds. Reading its own previous value would make the override sticky:
-        // one frame with `bounce` in the environment would leave `bounce` running
-        // for a scene that never asked for it, and nothing in the picture would
-        // say so.
-
-
-        const field_rebuilt = l.updateSdf(now_ns);
-        if (field_rebuilt) {
-            if (l.radiance) |r| {
-                const before = r.builds;
-                // `NotPrepared` is counted, not swallowed: it means the pyramid
-                // was never sized for this mask, and silently skipping the bounce
-                // light would look exactly like GI that is simply too dark to
-                // notice.
-                // The GI field, not the mask. The pyramid's probes trace the
-                // downsampled mask and the field's own distance data, and are
-                // sized to the field's grid -- which is what makes the bounce
-                // light cost follow `gi_resolution` instead of the window.
-                const t_pyr = l.tick();
-                r.build(l.gi_mask, l.sdf, l.gi_w, l.gi_h, self.sky) catch |err| switch (err) {
-                    error.NotPrepared => l.stats.gi_not_prepared += 1,
-                    else => return,
-                };
-                if (r.builds != before) self.gi_dirty = true;
-                // Measured here rather than inferred from the frame time in the
-                // benchmark. The bench's "GI pyramid" line was reporting the
-                // WHOLE frame on rebuild frames and calling it the pyramid, which
-                // made the pyramid look like the most expensive thing in the
-                // renderer when it is one line item among four. A number wearing
-                // a label it has not earned is the same defect as a missing one.
-                l.stats.pyramid_ns = l.tick() - t_pyr;
-            }
-        } else {
-            // No GI backend
-        }
+        // The whole of the removed GI half is therefore: the distance field, the
+        // radiance pyramid, `GiUpload`, `SceneEnvironment.sky`, and the two
+        // backends' upload hooks. If a future milestone wants GI back, it starts
+        // from a driver that has one model instead of two.
+        _ = now_ns;
     }
 
     /// Sets the shadow map's longest side, in cells, for a view of this size.
@@ -565,91 +526,6 @@ test "render light driver: a scene with four lights reaches the backend, lit" {
     backend.endScene(false, render_mod.SMAAQuality.Medium);
 }
 
-test "render light driver: GI is uploaded once per rebuild, not once per frame" {
-    // The amortization claim, measured. A static scene's GI must cost one upload
-    // and then nothing, and the number that proves it is the backend's upload
-    // counter -- not a comment about amortization.
-    var d = try Driver.init(testing.allocator, .high);
-    defer d.deinit();
-    var world = ecs.World.init(testing.allocator);
-    defer world.deinit();
-    try litWorld(&world, &d.lighting);
-    d.sky = .{ 0.4, 0.45, 0.6 };
-
-    var r2d = two_d.Renderer2D.init(testing.allocator);
-    defer r2d.deinit();
-    var nb = render_mod.backend_null.Backend{};
-    const backend = nb.renderer();
-    const target = backend.createOffscreenTarget(128, 128);
-    defer backend.destroyOffscreenTarget(target);
-    backend.beginScene(target, render_mod.makeCamera(128.0, 128.0));
-    const env = Driver.environmentOf(&world, .{});
-
-    // Ten frames of a scene where nothing moves.
-    var f: i128 = 0;
-    while (f < 10) : (f += 1 * std.time.ns_per_ms) {
-        _ = d.render(&world, &r2d, backend, env, f);
-    }
-    try testing.expectEqual(@as(u64, 1), nb.gi_uploads);
-
-    // Now move an occluder. That changes the mask, so the field and the pyramid
-    // are genuinely different and exactly one more upload is owed.
-    // Both components are in the query, so both are reachable from the row: a
-    // `Row.get` for a type the query did not name is a compile error, which is
-    // the trait that makes moving an occluder a two-line change instead of a
-    // second lookup.
-    var it = world.query(.{ components.LightOccluder2D, components.Transform });
-    const row = it.next().?;
-    row.get(components.LightOccluder2D).polygon.points[0] += 8;
-    row.get(components.Transform).position.x += 8;
-    d.lighting.dirty = true;
-    d.lighting.mask_changed = true;
-    _ = d.render(&world, &r2d, backend, env, 20 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(u64, 2), nb.gi_uploads);
-    try testing.expect(nb.gi_upload_bytes > 0);
-
-    backend.endScene(false, render_mod.SMAAQuality.Medium);
-}
-
-test "render light driver: encodeGi writes the enclosure term into alpha" {
-    // The upload's contract, checked on the bytes. Alpha is the enclosure term
-    // and RGB is radiance; a buffer with the right length and the wrong channel
-    // is a scene that renders and is subtly wrong.
-    var d = try Driver.init(testing.allocator, .high);
-    defer d.deinit();
-    try d.lighting.resize(64, 64);
-    // `reserve` is a precondition, not a hint: the gather buffers append without
-    // a capacity check because allocating mid-frame is forbidden. Getting this
-    // wrong is a panic in the middle of the first occluder rather than an error
-    // at a call site, which is why it is spelled out here.
-    try d.lighting.reserve(4, 4);
-    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 64, .y = 64 } };
-
-    var poly = components.OccluderPolygon{};
-    poly.count = 4;
-    // A solid block in the middle: the cells inside it are enclosed and their
-    // alpha must be near zero, while the open corners must be near 255.
-    poly.points = .{ 24, 24, 40, 24, 40, 40, 24, 40, 0, 0, 0, 0, 0, 0, 0, 0 };
-    d.lighting.occluders.appendAssumeCapacity(.{ .polygon = poly, .pos = .{ .x = 0, .y = 0 }, .extent = 8 });
-    d.lighting.rasterize();
-    try light_mod.edtMask2d(testing.allocator, d.lighting.mask, d.lighting.sdf, 64, 64);
-
-    try testing.expect(d.lighting.encodeGi(d.lighting.gi_pixels));
-
-    // (2, 2) is open corner; (32, 32) is inside the block.
-    const open = d.lighting.gi_pixels[(2 * 64 + 2) * 4 + 3];
-    const boxed = d.lighting.gi_pixels[(32 * 64 + 32) * 4 + 3];
-    try testing.expect(open > 200);
-    try testing.expect(boxed < open);
-
-    // The size the driver hands the backend is the mask's, not the cascade's:
-    // the shader indexes this grid by world position, and a pyramid-sized grid
-    // would put every lookup in the wrong place.
-    const up = d.giUpload();
-    try testing.expectEqual(d.lighting.alloc_w, up.width);
-    try testing.expectEqual(@as(usize, @as(usize, d.lighting.alloc_w) * d.lighting.alloc_h * 4), up.pixels.len);
-}
-
 test "render light driver: the mask covers the viewport AND the margin around it" {
     // The margin is the assertion. A mask that stops at the viewport edge drops
     // the shadow of any light just outside it, and a light just outside the
@@ -699,8 +575,8 @@ test "render light driver: the mask covers the viewport AND the margin around it
 }
 
 test "render light driver: setQuality reconfigures what it claims to, not just a field" {
-    // Three of the four tiers change something ALREADY ALLOCATED — the angle
-    // count, the GI interval, the channel invalidation — and writing `cfg` alone
+    // The tiers change something ALREADY ALLOCATED — the angle count, the
+    // channel invalidation — and writing `cfg` alone
     // would leave the buffers sized for the old tier while every read went to the
     // new one. So this asserts the things that actually moved.
     var d = try Driver.init(testing.allocator, .high);
@@ -709,7 +585,6 @@ test "render light driver: setQuality reconfigures what it claims to, not just a
     try testing.expectEqual(light_mod.Quality.high, d.quality());
     const high_angles = d.lighting.angles;
     try testing.expectEqual(@as(u8, 4), d.lighting.cfg.shadowLights());
-    try testing.expect(d.lighting.gi_interval_ns == 0);
 
     try testing.expect(d.setQuality(.low));
     try testing.expectEqual(light_mod.Quality.low, d.quality());
@@ -724,23 +599,27 @@ test "render light driver: setQuality reconfigures what it claims to, not just a
     try testing.expectEqual(high_angles, d.lighting.angles);
 }
 
-test "render light driver: a GI tier is declined by a driver that has no pyramid" {
-    // The one honest "no". The pyramid is a STARTUP budget decision: a driver
-    // created with `.off` has none, and building one here would allocate inside
-    // what the caller believes is a settings change. Answering no is better than
-    // allocating something the frame was never sized for.
+test "render light driver: the cheapest tier is `.off` and stays `.off`" {
+    // GI took the pyramid with it, and with it the one honest "no" a quality
+    // change used to have to give: `.off` has nothing to allocate, so asking
+    // for more could never answer yes here. What is left to assert is that the
+    // tier round-trips, because a `setQuality` that silently kept the old tier
+    // is the same defect in a smaller costume.
     var d = try Driver.init(testing.allocator, .off);
     defer d.deinit();
 
-    try testing.expect(d.lighting.radiance == null);
     try testing.expectEqual(light_mod.Quality.off, d.quality());
 
     // Down is always available — there is nothing to allocate.
     try testing.expect(d.setQuality(.off));
-    // Up to a GI tier is not.
-    try testing.expect(!d.setQuality(.medium));
     try testing.expectEqual(light_mod.Quality.off, d.quality());
+    // And up is: the shadow angle budget is a number, not a pyramid.
+    try testing.expect(d.setQuality(.medium));
+    try testing.expectEqual(light_mod.Quality.medium, d.quality());
+    try testing.expect(d.setQuality(.low));
+    try testing.expectEqual(light_mod.Quality.low, d.quality());
 }
+
 
 test "render light driver: a quality change invalidates every shadow channel" {
     // The maps were swept for the OLD angle count. Leaving them marked built
@@ -819,13 +698,13 @@ test "render light driver: the driver's own store makes an occluder's silhouette
     try testing.expectEqual(@as(u8, 255), d.lighting.mask[1 * 32 + 1]);
     try testing.expectEqual(@as(u8, 255), d.lighting.mask[30 * 32 + 30]);
 
-    // The field was rebuilt once, from the corrected mask. That is the SDF the
-    // ROADMAP asks for, and it needed no new representation: the exact EDT over a
-    // correct mask IS the distance field of the silhouette, and it is already
-    // amortized behind the mask's own dirty flag. `dirty` is false here, not
-    // true: `update` rasterizes and then immediately transforms.
-    try testing.expectEqual(@as(u32, 1), d.lighting.stats.sdf_builds);
-    try testing.expect(!d.lighting.dirty);
+    // The mask's own dirty flag is NOT asserted here any more. It used to be,
+    // and the assertion passed for a reason that no longer exists: the step
+    // after the rasterize (building the distance field from the mask) cleared
+    // `dirty`, and that step went with GI. `dirty` now means "the mask changed
+    // and nothing has re-derived anything from it yet", and its only remaining
+    // consumer is the shadow sweep. Asserting either value would encode a claim
+    // about a pipeline this no longer has.
 }
 
 test "render light driver: a whole-page sprite is the no-atlas default and registers nothing" {
@@ -1008,75 +887,52 @@ test "render light driver: a coverage hook with no world is a no-op, not a crash
 }
 
 test "render light driver: shadow_resolution is a cell count, not a scale factor" {
-    // The reason `gi_backend` is on `Environment` and not only in the project
-    // config: one 2D game is a courtyard and a dungeon, often in the same file.
+    // The distinction is the whole test: 512 CELLS is a budget a developer can
+    // reason about ("the shadow map is 512 across"), and expressing the same
+    // intent as a float scale would put a unit conversion between the question
+    // and the answer.
+    //
+    // It checks the two halves separately and on purpose. The end-to-end
+    // assertion — "configure 512, then resize a view, and the mask is 512 cells
+    // across" — lives in the two tests below, and it is passing: `Driver.resize`
+    // re-derives the scale from the new view whenever a cell count is
+    // configured, so the mask is sized by the view it is about to draw.
     var d = try Driver.init(testing.allocator, .high);
     defer d.deinit();
-    d.default_backend = .sky;
-    d.bounce_iterations = 8;
     try d.lighting.resize(32, 32);
     try d.lighting.reserve(8, 8);
-    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 32, .y = 32 } };
+    d.lighting.rect = .{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 1920, .y = 1080 } };
 
-    var outdoors = ecs.World.init(testing.allocator);
-    defer outdoors.deinit();
-    _ = try outdoors.spawn(.{
-        components.Transform{ .position = .{ .x = 16, .y = 16 } },
-        components.PointLight2D{ .radius = 32 },
-    });
+    d.setShadowResolution(512, d.lighting.rect);
+    try testing.expectEqual(@as(u32, 512), d.shadow_resolution);
 
-    var dungeon = ecs.World.init(testing.allocator);
-    defer dungeon.deinit();
-    _ = try dungeon.spawn(.{components.Environment{ .gi_backend = 1 }});
-    _ = try dungeon.spawn(.{
-        components.Transform{ .position = .{ .x = 16, .y = 16 } },
-        components.PointLight2D{ .radius = 32 },
-    });
-
-    // Outdoors: no Environment at all, so the project's setting stands.
-    d.update(&outdoors, 0);
-    try testing.expectEqual(light_mod.GiBackend.sky, d.lighting.gi_backend);
-
-    // The dungeon asks for bounce, and gets it.
-    d.update(&dungeon, 0);
-    try testing.expectEqual(light_mod.GiBackend.bounce, d.lighting.gi_backend);
-
-    // And going back outdoors releases it. A sticky override would leave the
-    // bounce running in a courtyard, and nothing in the picture would say so.
-    d.update(&outdoors, 1_000_000);
-    try testing.expectEqual(light_mod.GiBackend.sky, d.lighting.gi_backend);
+    // The cell count is what the mask is asked for, and 512 is a power of two,
+    // so a 512-cell request allocates exactly 512 and not 1024.
+    try d.lighting.resize(512, 288);
+    try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));
 }
 
 test "render light driver: a project's `lighting` section actually reaches the driver" {
     // The defect this exists for.
     //
     // `applyLightingConfig` had NO CALLER and read a field called `backend`,
-    // which `project.config.Lighting` has never had — it is `gi_backend`, and it
-    // is an enum rather than the `u8` the function expected. A generic function
-    // over `@field` is checked against whatever is passed in, and nothing ever
-    // was, so the mismatch cost nothing to compile.
+    // which `project.config.Lighting` has never had. A generic function over
+    // `@field` is checked against whatever is passed in, and nothing ever was,
+    // so the mismatch cost nothing to compile.
     //
     // The consequence was that the entire `lighting` section of `project.config`
-    // was inert: `gi_backend`, `gi_resolution`, `shadow_resolution`,
-    // `bounce_iterations` and `bounce_albedo` were parsed, documented in the
-    // schema with tooltips, shown in an editor dropdown, and never used. A
-    // project could set `shadow_resolution` to 512 and the renderer would have
-    // carried on at its constructor's guess.
+    // was inert: every field in it was parsed, documented in the schema with
+    // tooltips, shown in an editor dropdown, and never used. A project could
+    // set `shadow_resolution` to 512 and the renderer would have carried on at
+    // its constructor's guess. GI took most of those fields with it, but the
+    // defect was never a GI defect: the function is called with a real
+    // `config.Lighting` for the one field that survived, which is the only
+    // reason this compiles at all.
     var d = try Driver.init(testing.allocator, .medium);
     defer d.deinit();
 
-    try d.applyLightingConfig(.{
-        .gi_backend = .bounce,
-        .gi_resolution = 64,
-        .shadow_resolution = 512,
-        .bounce_iterations = 3,
-        .bounce_albedo = 0.42,
-    });
+    try d.applyLightingConfig(.{ .shadow_resolution = 512 });
 
-    try testing.expectEqual(light_mod.GiBackend.bounce, d.default_backend);
-    try testing.expectEqual(light_mod.GiBackend.bounce, d.lighting.gi_backend);
-    try testing.expectEqual(@as(u32, 3), d.bounce_iterations);
-    try testing.expectApproxEqAbs(@as(f32, 0.42), d.gi_albedo, 1e-6);
     try testing.expectEqual(@as(u32, 512), d.shadow_resolution);
 
     // The field itself, not just the knob that sizes it: a GI resolution the
@@ -1101,13 +957,7 @@ test "render light driver: the configured resolution survives a resize" {
     // second number is the one the driver has to recompute, and it did not.
     var d = try Driver.init(testing.allocator, .medium);
     defer d.deinit();
-    try d.applyLightingConfig(.{
-        .gi_backend = .off,
-        .gi_resolution = 0,
-        .shadow_resolution = 512,
-        .bounce_iterations = 8,
-        .bounce_albedo = 0.6,
-    });
+    try d.applyLightingConfig(.{ .shadow_resolution = 512 });
 
     try d.resize(.{ .min = .{ .x = 0, .y = 0 }, .max = .{ .x = 1920, .y = 1080 } });
     try testing.expectEqual(@as(u32, 512), @max(d.lighting.alloc_w, d.lighting.alloc_h));

@@ -11,6 +11,14 @@ libs/glfw/
 # Box2D is built from source by libs/bootstrap.sh; the pin lives in
 # libs/box2d.commit, which IS tracked, and the 6.5 MB of build output is not.
 libs/box2d/
+# Dear ImGui (Docking) and the editor's typefaces: the pins live in
+# libs/imgui.commit and libs/fonts.commit, which ARE tracked.
+libs/imgui/
+libs/fonts/
+# Dawn's generated C headers are not installed by the bootstrap, but the
+# repository checkout carries them: imgui's WebGPU backend includes
+# <webgpu/webgpu.h> and links the SAME Dawn we already build.
+
 
 # Logs and development artifacts
 *.log

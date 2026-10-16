@@ -197,6 +197,13 @@ pub const Context = struct {
     /// across calls instead of creating a new one per image. Null until the
     /// first image is set; the binding creates it lazily.
     atlas_manager: ?*anyopaque = null,
+    /// The asset hot-reload manager (M6). `sprite.set_image` registers each image
+    /// here as it packs it, which is what gives the runtime's directory watcher a
+    /// path to re-check: `HotReload.reloadPath` only re-checks paths it was told
+    /// to watch, and the manager has no way to discover them on its own. Null in
+    /// a headless tool or a test, where the binding simply does not register —
+    /// there is no watcher, so there is nothing to register FOR.
+    hot_reload: ?*assets.HotReload = null,
     /// The audio system (M8). Null means the `audio.*` bindings report failure
     /// rather than dereferencing null — a headless tool with no device, or an
     /// editor with sound disabled, both reach every call and get `false`/nil.
@@ -211,6 +218,9 @@ pub const Context = struct {
     /// Null for the same reason; the CONFIGURE half of the API is component
     /// writes and works without it.
     particles: ?*const ParticleHooks = null,
+    /// M13: animation system, for clip length queries. Null means `anim.length`
+    /// returns nil; component writes still work.
+    animations: ?*ecs.animation.System = null,
 
     /// The camera's view for RENDER culling, which is a different rectangle from
     /// the physics one on purpose: the renderer asks "can I see it", physics asks

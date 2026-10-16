@@ -29,6 +29,17 @@ extern fn stbi_load(
     channels_in_file: *c_int,
     desired_channels: c_int,
 ) ?[*]u8;
+/// The in-memory twin of `stbi_load`, used by the import pipeline: the importer
+/// already has the file's bytes (it read them once to sniff the format), so
+/// re-reading from the path would be a second trip past the format check.
+extern fn stbi_load_from_memory(
+    buffer: [*]const u8,
+    len: c_int,
+    x: *c_int,
+    y: *c_int,
+    channels_in_file: *c_int,
+    desired_channels: c_int,
+) ?[*]u8;
 extern fn stbi_image_free(data: ?*anyopaque) void;
 
 /// Decodes `path` into RGBA8. The returned `pixels` are allocated with
@@ -54,6 +65,42 @@ pub fn decode(allocator: std.mem.Allocator, path: []const u8) !Image {
     const pixels = try allocator.alloc(u8, total);
     // Forwards: `src` is the source, `pixels` the destination. The draft had
     // the two arguments swapped.
+    @memcpy(pixels, src.?[0..total]);
+
+    return .{
+        .width = @intCast(w),
+        .height = @intCast(h),
+        .channels = @intCast(channels_requested),
+        .pixels = pixels,
+    };
+}
+
+/// Decodes `bytes` (an encoded PNG/JPEG/etc.) into RGBA8. Same contract as
+/// `decode`, minus the filesystem: the caller owns `pixels`.
+pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+    if (bytes.len == 0) return error.InvalidImage;
+    if (bytes.len > std.math.maxInt(c_int)) return error.InvalidImage;
+
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp_in_file: c_int = 0;
+    const channels_requested: c_int = 4;
+
+    const src = stbi_load_from_memory(
+        bytes.ptr,
+        @intCast(bytes.len),
+        &w,
+        &h,
+        &comp_in_file,
+        channels_requested,
+    );
+    if (src == null) return error.InvalidImage;
+    defer stbi_image_free(@ptrCast(src));
+
+    if (w <= 0 or h <= 0) return error.InvalidImage;
+    const total: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * @as(usize, @intCast(channels_requested));
+
+    const pixels = try allocator.alloc(u8, total);
     @memcpy(pixels, src.?[0..total]);
 
     return .{

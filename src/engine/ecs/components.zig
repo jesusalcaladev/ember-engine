@@ -94,7 +94,22 @@ pub const AnimationPlayer = registry.AnimationPlayer;
 pub const anim_clip_loop = registry.anim_clip_loop;
 pub const anim_clip_ping_pong = registry.anim_clip_ping_pong;
 pub const anim_clip_root_motion = registry.anim_clip_root_motion;
-
+// M15: TileMap export surface. The types live in components/tilemap.zig (they
+// predate the registry entry, and the registry entry stays parked with the rest
+// of M15). The editor's tilemap workspace reaches them through this facade the
+// same way it reaches Transform, so they are re-exported here rather than
+// imported by path from the UI.
+const tilemap_mod = @import("components/tilemap.zig");
+pub const AssetGUID = tilemap_mod.AssetGUID;
+pub const ChunkCoord = tilemap_mod.ChunkCoord;
+pub const ChunkKey = tilemap_mod.ChunkKey;
+pub const Tile = tilemap_mod.Tile;
+pub const TileSet = tilemap_mod.TileSet;
+pub const TileMapLayer = tilemap_mod.TileMapLayer;
+pub const TileChunk = tilemap_mod.TileChunk;
+pub const ChunkHandle = tilemap_mod.ChunkHandle;
+pub const chunk_size = tilemap_mod.chunk_size;
+pub const chunk_area = tilemap_mod.chunk_area;
 // Pull the per-file tests into the suite: `zig build test` runs the tests of
 // every file reachable from the root under test, and these are only reachable
 // through this facade.

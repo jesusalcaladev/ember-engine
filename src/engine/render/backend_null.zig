@@ -29,13 +29,10 @@ pub const Backend = struct {
     /// Kept so a headless test can assert the scene asked for bounce rather than
     /// only that it drew some lights.
     environment: render.SceneEnvironment = .{},
-    gi_rect: [4]f32 = .{ 0, 0, 1, 1 },
-    gi_width: u32 = 0,
-    gi_height: u32 = 0,
-    gi_uploads: u64 = 0,
-    gi_upload_bytes: u64 = 0,
     /// M7: post passes the last `endScene` modelled. See `endScene`.
     post_passes: u32 = 0,
+    /// M5: one pass when an editor overlay drew, 0 otherwise.
+    overlay_passes: u32 = 0,
     stats_data: render.FrameStats = .{},
 
     const vtable = render.Renderer.VTable{
@@ -55,12 +52,14 @@ pub const Backend = struct {
         .createShadowMap = createShadowMap,
         .uploadShadowMap = uploadShadowMap,
         .setEnvironment = setEnvironment,
-        .uploadGi = uploadGi,
         .createTexture = createTexture,
         .destroyTexture = destroyTexture,
         .createAtlasManager = createAtlasManager,
         .addImageToAtlas = addImageToAtlas,
         .uploadAtlas = uploadAtlas,
+        .updateImageInAtlas = updateImageInAtlas,
+        .refreshAtlas = refreshAtlas,
+        .overlay = drawOverlay,
     };
 
     pub fn renderer(self: *Backend) render.Renderer {
@@ -77,6 +76,7 @@ pub const Backend = struct {
         self.stats_data.upload_bytes = 0;
         self.stats_data.gpu_ns = 0;
         self.stats_data.gpu_passes = 0;
+        self.stats_data.overlay_passes = 0;
         self.stats_data.resources_created_frame = 0;
     }
 
@@ -184,20 +184,19 @@ fn setEnvironment(ptr: *anyopaque, env: render.SceneEnvironment) void {
     self.environment = env;
 }
 
-fn uploadGi(ptr: *anyopaque, gi: render.GiUpload) void {
+/// M5: there is no swapchain here, so the overlay is counted and dropped.
+///
+/// Counting it anyway is the point: a headless test that asserts "the editor
+/// UI costs one pass" has to be able to ask that question of a backend that
+/// draws nothing, or the answer only exists on the machine with a GPU.
+fn drawOverlay(ptr: *anyopaque, ctx: ?*anyopaque, draw: render.OverlayFn) void {
     const self: *Backend = @ptrCast(@alignCast(ptr));
-    // Mirrors `backend_dawn.zig`'s validation, and that is the point of the null
-    // backend: it is the executable statement of the contract. A check that
-    // exists only in the Dawn backend is a check that only runs on a machine
-    // with a GPU, which is not the machine that has CI.
-    if (gi.width == 0 or gi.height == 0) return;
-    if (gi.pixels.len < @as(usize, gi.width) * gi.height * 4) return;
-    self.gi_upload_bytes += gi.pixels.len;
-    self.gi_rect = gi.rect;
-    self.gi_width = gi.width;
-    self.gi_height = gi.height;
-    self.gi_uploads += 1;
+    _ = ctx;
+    _ = draw;
+    self.overlay_passes += 1;
+    self.stats_data.overlay_passes += 1;
 }
+
 
 fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
         _ = instances;
@@ -255,6 +254,36 @@ fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count:
     }
 
     fn uploadAtlas(ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque {
+        _ = ptr;
+        _ = atlas;
+        return null;
+    }
+
+    // ── M6: asset hot reload ────────────────────────────────────────────────
+    // The null backend draws nothing, so it holds nothing to update. Answering
+    // "no" is the documented contract of this backend (see the M3 note above),
+    // and it is the answer a caller must already be prepared to take: the
+    // caller is a runtime with no renderer wired, and the alternative would be
+    // an atlas reload pretending to succeed and changing nothing.
+
+    fn updateImageInAtlas(
+        ptr: *anyopaque,
+        atlas: ?*anyopaque,
+        path: []const u8,
+        width: u32,
+        height: u32,
+        pixels: []const u8,
+    ) ?render.AtlasUpdate {
+        _ = ptr;
+        _ = atlas;
+        _ = path;
+        _ = width;
+        _ = height;
+        _ = pixels;
+        return null;
+    }
+
+    fn refreshAtlas(ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque {
         _ = ptr;
         _ = atlas;
         return null;
@@ -379,42 +408,6 @@ test "render light backend null: the light pass is counted and the shadow map up
 
     r.endScene(false, render.SMAAQuality.Medium);
     r.destroyOffscreenTarget(target);
-}
-
-test "render light backend null: the environment and the GI cascade reach the backend" {
-    // Without a GPU the only thing a GI upload CAN be checked for is that the
-    // scene decided to send it. That is worth asserting, because the whole
-    // amortization argument is "the pyramid is rebuilt sometimes, not every
-    // frame", and a driver that never uploads has nothing to amortize.
-    var b = Backend{};
-    const r = b.renderer();
-
-    const env = render.SceneEnvironment{
-        .ambient = .{ 0.2, 0.2, 0.3, 1 },
-        .sky = .{ 0.5, 0.6, 0.8 },
-        .albedo = 0.7,
-    };
-    r.setEnvironment(env);
-    try std.testing.expectEqual(@as(f32, 0.7), b.environment.albedo);
-    try std.testing.expectEqual(@as(f32, 0.6), b.environment.sky[1]);
-
-    const w: u32 = 4;
-    const h: u32 = 2;
-    const pixels = [_]u8{200, 200, 200, 128} ** (w * h);
-    r.uploadGi(.{ .rect = .{ -10, -20, 90, 60 }, .width = w, .height = h, .pixels = &pixels });
-    try std.testing.expectEqual(@as(u64, 1), b.gi_uploads);
-    try std.testing.expectEqual(@as(u64, pixels.len), b.gi_upload_bytes);
-    try std.testing.expectEqual(w, b.gi_width);
-    try std.testing.expectEqual(@as(f32, -10), b.gi_rect[0]);
-
-    // A short buffer is refused rather than read past its end: the pyramid is
-    // resized asynchronously, so a stale slice length is a normal race and not
-    // an error worth reporting.
-    const before = b.gi_uploads;
-    r.uploadGi(.{ .width = 64, .height = 64, .pixels = &pixels });
-    try std.testing.expectEqual(before, b.gi_uploads);
-    r.uploadGi(.{ .width = 0, .height = 0, .pixels = &pixels });
-    try std.testing.expectEqual(before, b.gi_uploads);
 }
 
 test "render post: the frame cost is four passes for bloom, one for fog, none for neither" {

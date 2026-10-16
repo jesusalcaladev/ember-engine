@@ -49,7 +49,10 @@ const entity_key = bindings.entity_key;
 // Local aliases over the raw C ABI, so the hot loops read as Lua operations
 // rather than C calls. All are `inline` and erased by the optimizer.
 inline fn lua_pop(L: ?*lua.lua_State, n: i32) void {
-    lua.setTop(L, -(n) - 1);
+    // `lua.pop` is the wrapper over `lua_settop`; there is no `lua.setTop`
+    // extern (this alias called one that never existed, which went unnoticed
+    // while nothing used it).
+    lua.pop(L, n);
 }
 inline fn lua_getfield_top(L: ?*lua.lua_State, name: [*:0]const u8) void {
     lua.getField(L, -1, name);
@@ -597,6 +600,54 @@ pub const Behaviors = struct {
         }
     }
 
+    /// Invokes a NAMED method on every live instance of `script_id`: the target
+    /// of an animation clip's M13 method track (`call_lua <t> <script_id> <fn>`).
+    ///
+    /// The clip carries only a script id and a function name, so an animator can
+    /// hang a footstep sound off a keyframe without the engine knowing any
+    /// script's name. Resolution is by name off the prototype, so a hot reload
+    /// replaces the body with no re-attach, and an instance that does not define
+    /// the method is SKIPPED rather than an error — one shared `run` clip may be
+    /// used by characters only some of which handle a footstep. An id with no
+    /// live instances is a no-op, which is the right answer for a clip that
+    /// outlives the actor it was authored for.
+    pub fn callMethodNamed(self: *Behaviors, script_id: u32, name: []const u8) void {
+        if (name.len == 0) return;
+        const L = self.vm.state() orelse return;
+        for (self.instances.items) |*inst| {
+            if (!inst.alive) continue;
+            if (inst.script_id != script_id) continue;
+            if (!self.ctx.world.isAlive(inst.entity)) continue;
+            // [self] -> push the key -> gettable -> [fn_or_nil]. A dynamic key
+            // needs gettable; getfield takes a NUL-terminated literal.
+            self.vm.pushRef(inst.self_ref);
+            lua.pushSlice(L, name);
+            lua.lua_gettable(L, -2);
+            if (!lua.isFunction(L, -1)) {
+                lua_pop(L, 2); // drop the key and `self`
+                continue;
+            }
+            self.vm.pushRef(inst.self_ref); // [fn, self]
+            self.callMethod(inst, 1); // fn(self) -> []
+        }
+    }
+
+    /// The animation system's `call_lua` hook, aimed at this behavior set.
+    ///
+    /// Built HERE and not in the runtime because the `script -> ecs` direction
+    /// is the one that knows both types, so the erased-callback cast lives with
+    /// the code it targets and a unit test can exercise the wiring without a
+    /// window. The runtime's job is one line: `anim.method_hook =
+    /// behaviors.animationMethodHook()`.
+    pub fn animationMethodHook(self: *Behaviors) ecs.animation.MethodHook {
+        return .{ .ctx = self, .call = struct {
+            fn call_fn(ctx: ?*anyopaque, script_id: u32, name: []const u8) void {
+                const b: *Behaviors = @ptrCast(@alignCast(ctx.?));
+                b.callMethodNamed(script_id, name);
+            }
+        }.call_fn };
+    }
+
     /// Protected call helper: the function and its `nargs` arguments are already
     /// on the stack as `[fn, arg1, ... argN]`. `nargs` counts EVERY argument,
     /// including `self` (a colon call `self:update(dt)` is `fn(self, dt)` = 2).
@@ -922,3 +973,63 @@ const Harness = struct {
 };
 
 const script_Input = @import("input.zig").Input;
+
+// ── M13 method track: `call_lua(script_id, fn)` ─────────────────────────────
+
+const footstep_src =
+    \\local M = {}
+    \\function M:on_footstep()
+    \\  self.steps = (self.steps or 0) + 1
+    \\end
+    \\return M
+;
+
+// A second script that does NOT define `on_footstep`: a shared clip may be used
+// by characters only some of which handle a footstep, and that must be skipped,
+// not an error.
+const quiet_src =
+    \\local M = {}
+    \\function M:update(dt)
+    \\end
+    \\return M
+;
+
+test "a call_lua method reaches only the named script's instances" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const speaker = try h.b.load("step.lua", footstep_src);
+    const quiet = try h.b.load("quiet.lua", quiet_src);
+    const e1 = try h.world.spawn(.{components.Transform{}});
+    const e2 = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e1, speaker);
+    try h.b.attach(e2, quiet);
+    h.b.startAll();
+
+    // The runtime's wiring, not a stand-in: the hook the animation system holds
+    // is built by the helper `main.zig` calls.
+    const hook = h.b.animationMethodHook();
+    const call = hook.call.?;
+
+    // Targeting the speaker's id calls it once on the speaker...
+    call(hook.ctx, speaker, "on_footstep");
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, h.b.instances.items[0].self_ref, "steps").?);
+    // ...and not on the quiet instance (no method of that name).
+    try std.testing.expect(readSelfNumber(&h.b, h.b.instances.items[1].self_ref, "steps") == null);
+
+    // Targeting an id with no live instances is a no-op, not a crash: a clip can
+    // outlive the actor it was authored for.
+    call(hook.ctx, 999_999, "on_footstep");
+    // A method the instance does not define is skipped silently, which is what
+    // makes one shared `run` clip usable by characters that handle different
+    // events.
+    call(hook.ctx, quiet, "on_footstep");
+    call(hook.ctx, speaker, "on_no_such_method");
+    try std.testing.expectEqual(@as(usize, 0), h.b.errors);
+
+    // A second step on the speaker is the second call, so events accumulate the
+    // way a looping walk cycle needs.
+    call(hook.ctx, speaker, "on_footstep");
+    try std.testing.expectEqual(@as(f64, 2), readSelfNumber(&h.b, h.b.instances.items[0].self_ref, "steps").?);
+}

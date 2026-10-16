@@ -54,6 +54,7 @@ const std = @import("std");
 
 pub const buffer = @import("doc/buffer.zig");
 pub const highlight = @import("lang/lua/lexer.zig");
+pub const highlight_cache = @import("lang/lua/highlight_cache.zig");
 pub const cursor = @import("doc/cursor.zig");
 pub const find = @import("doc/find.zig");
 pub const lexer = highlight;
@@ -66,6 +67,8 @@ pub const outline = @import("lang/lua/outline.zig");
 pub const goto = @import("lang/lua/goto.zig");
 pub const rename = @import("lang/lua/rename.zig");
 pub const help_index = @import("lang/lua/help_index.zig");
+pub const format = @import("lang/lua/format.zig");
+pub const tilemap = @import("tilemap.zig");
 
 // Short names for what the UI layer imports constantly. `Token` is a highlighted
 // run; `Span` is a plain byte range, and the two names are kept distinct because

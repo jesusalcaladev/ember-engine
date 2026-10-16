@@ -310,6 +310,32 @@ Docks shared by both tabs: actor hierarchy, component inspector, console, asset 
 
 **Criteria**: editing an external PNG → visible in-game < 250 ms; the export loads only from the pack, no real filesystem.
 
+**Status: closed.** `zig build test-assets` (36 tests, no window/GPU/Lua/Box2D)
+covers content-sniffing importers for PNG/JPEG/WebP, WAV and Lua (OGG is probed;
+its samples are decoded by miniaudio at load), the `.pak` writer+reader with
+per-entry deflate, the VFS over `.pak` and filesystem, and event-driven hot
+reload (mtime + content hash, decode, typed event). The render-side wiring that
+makes a reload VISIBLE is `render/asset_reload.zig`, exercised end-to-end — a
+real PNG edit on disk → decode → atlas page → texture write — by
+`zig build test-light`.
+
+- **Importers detect by bytes, not extension**, and hash with a wrapping FNV, so
+  a Debug build no longer aborts on a path longer than a few bytes.
+- **`.pak` has one encoder and one decoder** — variable-length paths, per-entry
+  deflate through `std.compress.flate` (Zig ships no zstd compressor), and total
+  validation at open. The draft's three mutually inconsistent encodings are gone.
+- **Hot reload is driven by the directory watcher** (`reloadPath`); `scanAll` is
+  the O(watched) fallback, never a per-frame call.
+- **The reload reaches the GPU in place**: `render/asset_reload` re-blits a
+  same-size edit over the sprite's own rect and re-uploads the page into the
+  EXISTING texture, so a sprite's slot and UVs survive the edit; a resize repacks
+  and reports `repositioned`. The runtime polls `assets/sprites` next to the audio
+  watcher (outside the frame), and `sprite.set_image` registers each path as it
+  packs it — which also fixes that binding's per-call atlas leak and its
+  asset-slot-for-texture-slot mix-up.
+
+Docs: [asset-pipeline](docs/reference/asset-pipeline.md).
+
 ### M7 — 2D Lighting (the flagship feature)
 - **Automatic occluder SDFs**: importing a sprite generates the distance field (alpha threshold) with zero dev action; manual overrides (`occluder = "none"` | custom polygon) for maximum optimization.
 - `Light2D`: point, **spot** (cone + penumbra), directional; additive light pass.

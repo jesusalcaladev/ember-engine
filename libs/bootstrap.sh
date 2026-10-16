@@ -88,6 +88,98 @@ elif [ "$(git -C "$LIBS/box2d" describe --tags --exact-match 2>/dev/null || true
 fi
 echo "box2d tag: $(git -C "$LIBS/box2d" describe --tags 2>/dev/null || echo "$B2PIN")"
 
+# --- Dear ImGui, Docking branch (M5: the editor shell) ---------------------
+# Pinned by COMMIT, not by tag, exactly like Dawn. The Docking branch is a
+# moving branch that ships tagged snapshots (v1.92.9b-docking and friends), so
+# the tag moves too — the commit is the thing that does not.
+#
+# Why the docking branch and not master: ROADMAP M5 asks for a "docking ImGui
+# shell", and migrating a layout saved to imgui.ini from master to docking
+# later is a user-visible migration nobody wants to ship twice.
+#
+# Why a commit and not a release tarball: the tag `v1.92.9b-docking` is an
+# ANNOTATED tag, and `git clone --branch` on one fetches the tag OBJECT; the
+# bootstrap below asks for the commit directly, so the checkout is the same
+# whether or not the tag is signed.
+# `grep -v '^#'` because these pin files carry a comment header explaining WHY
+# the pin is what it is, and `tr -d '[:space:]'` on a commented file would glue
+# the prose onto the SHA.
+IMGUIPIN="$(grep -v '^#' "$LIBS/imgui.commit" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+IMGUITAG="$(grep -v '^#' "$LIBS/imgui.tag" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+# Fetching a bare SHA is not portable: GitHub serves it, a local mirror or a
+# corporate proxy does not necessarily, and the failure mode is a bootstrap
+# that used to work. So the TAG is what gets fetched and the COMMIT in
+# libs/imgui.commit is what gets verified: the pin stays authoritative (a
+# re-tagged upstream release fails loudly instead of silently changing what the
+# editor is built against) without depending on SHA-in-want.
+if [ ! -d "$LIBS/imgui/.git" ]; then
+  echo "==> Cloning Dear ImGui $IMGUITAG"
+  git init -q "$LIBS/imgui"
+  git -C "$LIBS/imgui" remote add origin https://github.com/ocornut/imgui
+fi
+# The guard is `rev-parse --verify HEAD`, not `test -d .git`: an interrupted
+# bootstrap leaves a .git with no commit in it, and skipping the fetch then
+# fails three lines later with an error that says nothing about the cause.
+IMGUIHEAD="$(git -C "$LIBS/imgui" rev-parse --verify HEAD 2>/dev/null || true)"
+if [ "$IMGUIHEAD" != "$IMGUIPIN" ]; then
+  echo "==> Checking out Dear ImGui $IMGUITAG"
+  git -C "$LIBS/imgui" fetch -q --depth 1 origin "refs/tags/$IMGUITAG"
+  git -C "$LIBS/imgui" checkout -q --detach FETCH_HEAD
+  IMGUIHEAD="$(git -C "$LIBS/imgui" rev-parse HEAD)"
+fi
+if [ "$IMGUIHEAD" != "$IMGUIPIN" ]; then
+  echo "==> Dear ImGui $IMGUITAG is $IMGUIHEAD but libs/imgui.commit pins $IMGUIPIN" >&2
+  echo "    (update libs/imgui.commit deliberately, not automatically)" >&2
+  exit 1
+fi
+echo "imgui commit: $(git -C "$LIBS/imgui" rev-parse HEAD)"
+IMGUIVER="$(awk '/^#define IMGUI_VERSION/ { gsub(/"/, "", $3); print $3; exit }' "$LIBS/imgui/imgui.h")"
+echo "imgui version: $IMGUIVER (docking)"
+
+# --- Editor typefaces (Inter + JetBrains Mono) ------------------------------
+# ImGui's built-in font is ProggyClean: 13px bitmap, drawn at any DPI it looks
+# like a DOS screenshot. Every screenshot of an editor built with it looks
+# amateur, which is the one impression a tool must not make. So the two faces
+# below are downloaded and the editor builds its atlas from them.
+#
+# Pinned in libs/fonts.commit, parsed here: one `release <ver> <url>` per block
+# followed by the `files <in-archive> <out-name>` pairs to keep. Idempotent —
+# a face already present is not re-downloaded.
+echo "==> Typefaces (Inter + JetBrains Mono)"
+mkdir -p "$LIBS/fonts"
+FONTS_TMP="$TOOLS/fonts-tmp"
+mkdir -p "$FONTS_TMP"
+# One awk-driven pass would be shorter; this is a shell loop over a 20-line
+# file, and the failure mode of the clever version (a silently skipped block)
+# is a missing glyph that nobody notices until a screenshot.
+release_url=""
+while read -r kind a b rest; do
+  case "$kind" in
+    ''|\#*) continue ;;
+    release)
+      release_url="$b"
+      archive="$FONTS_TMP/$(basename "$b")"
+      if [ ! -f "$archive" ]; then
+        echo "    downloading $(basename "$b")"
+        curl -fsSL -o "$archive" "$b"
+      fi
+      ;;
+    files)
+      dest="$LIBS/fonts/$b"
+      if [ ! -f "$dest" ]; then
+        python3 - "$archive" "$a" "$dest" <<'PY'
+import sys, zipfile
+archive, member, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(archive) as z, z.open(member) as src, open(dest, "wb") as out:
+    out.write(src.read())
+PY
+        echo "    $(basename "$b")"
+      fi
+      ;;
+  esac
+done < <(sed -e 's/#.*//' "$LIBS/fonts.commit" | sed -e '/^$/d')
+echo "fonts: $(ls "$LIBS/fonts" 2>/dev/null | tr '\n' ' ')"
+
 # Box2D compiles with `-Werror` on its own target (src/CMakeLists.txt), which
 # lands AFTER CMAKE_C_FLAGS and so cannot be overridden from the command line.
 # GCC's strict-aliasing and maybe-uninitialized analyses fire false positives on

@@ -18,6 +18,8 @@ const AssetHandle = @import("asset.zig").AssetHandle;
 const types = @import("asset_types.zig");
 const Image = types.Image;
 const AssetSlot = types.AssetSlot;
+// M15 PARKED: TileSet decode is disabled until the tilemap subsystem is finished.
+// const TileSet = types.TileSet;
 const ImageDecode = @import("image.zig");
 
 pub const AssetError = error{
@@ -28,6 +30,8 @@ pub const AssetError = error{
     /// or absurdly dimensioned image). Distinct from FileNotFound because the
     /// file IS there; the format is the problem.
     InvalidImage,
+    /// Tileset decoding failed (missing atlas, invalid format).
+    InvalidTileset,
 };
 
 pub const AssetManager = struct {
@@ -78,8 +82,7 @@ pub const AssetManager = struct {
 
     /// Look up or load an asset by path. Returns the slot index.
     ///
-    /// Images only. A path with an audio extension is rejected rather than
-    /// decoded here — see the file comment.
+    /// Supports images and tilesets. Audio is handled by the audio bank.
     pub fn getOrLoad(self: *Self, path: []const u8) AssetError!usize {
         // 1. Cache hit.
         for (self.slots, 0..) |*s, i| {
@@ -92,19 +95,28 @@ pub const AssetManager = struct {
         // 2. Dispatch by extension, before choosing a victim: an unsupported
         //    path must not evict a live asset on its way to failing.
         const ext = fileExtension(path) orelse return error.UnsupportedFormat;
-        if (!isImageExtension(ext)) return error.UnsupportedFormat;
+        const is_image = isImageExtension(ext);
+        const is_tileset = isTilesetExtension(ext);
+        if (!is_image and !is_tileset) return error.UnsupportedFormat;
 
         // 3. Decode first, then make room. Decoding before eviction means a
         //    file that turns out to be corrupt never costs us a resident asset.
-        const img = try ImageDecode.decode(self.allocator, path);
-        errdefer self.allocator.free(img.pixels);
-        if (img.isEmpty()) return error.FileNotFound;
+        var payload: ?*anyopaque = null;
+        var bytes: usize = 0;
+        var kind: types.AssetKind = .image;
 
-        const bytes = img.pixels.len;
-        if (bytes > self.budgetBytes) {
-            // A single asset larger than the whole budget can never fit, and
-            // evicting everything for it would be strictly worse than failing.
-            return error.OutOfMemory;
+        if (is_image) {
+            const img = try ImageDecode.decode(self.allocator, path);
+            errdefer self.allocator.free(img.pixels);
+            if (img.isEmpty()) return error.FileNotFound;
+            bytes = img.pixels.len;
+            if (bytes > self.budgetBytes) return error.OutOfMemory;
+            const p = try self.allocator.create(Image);
+            p.* = img;
+            payload = p;
+            kind = .image;
+        } else if (is_tileset) {
+            return error.InvalidTileset;
         }
 
         // 4. Make room: free slots first, then LRU.
@@ -117,9 +129,7 @@ pub const AssetManager = struct {
         }
 
         // 5. Publish.
-        const payload = try self.allocator.create(Image);
-        payload.* = img;
-        self.slots[idx].kind = .image;
+        self.slots[idx].kind = kind;
         self.slots[idx].setPath(path);
         self.slots[idx].payload = payload;
         self.slots[idx].bytes = bytes;
@@ -225,6 +235,14 @@ fn isImageExtension(ext: []const u8) bool {
         "png", "PNG", "jpg", "JPG", "jpeg", "JPEG", "webp", "WEBP",
     };
     for (image_exts) |e| {
+        if (std.mem.eql(u8, e, ext)) return true;
+    }
+    return false;
+}
+
+fn isTilesetExtension(ext: []const u8) bool {
+    const tileset_exts = [_][]const u8{ "tileset", "ts" };
+    for (tileset_exts) |e| {
         if (std.mem.eql(u8, e, ext)) return true;
     }
     return false;

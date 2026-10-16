@@ -1,0 +1,27 @@
+# libs/fonts.commit — UI typefaces (M5: the editor shell)
+#
+# One line per pinned source, `<kind> <version> <url>`:
+#
+#   kind    `release`  a GitHub release asset (.zip, unpacked with python3's
+#                     zipfile, which is already a bootstrap dependency for ninja)
+#   kind    `files`    a list of `path-in-archive destination-name` pairs
+#
+# Both fonts are SIL Open Font License 1.1, which permits redistribution inside
+# a proprietary product — see DEPENDENCIES.md. Nothing here is committed: the
+# archives are downloaded into libs/fonts/ and the .ttf files are unpacked from
+# them, exactly like Dawn into libs/dawn/install.
+#
+# Only the weights the editor actually renders are kept. Inter ships 18 static
+# weights and JetBrains Mono another 15; keeping all of them would triple the
+# editor's font atlas for glyphs nothing draws.
+
+release 4.1 https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+files extras/ttf/Inter-Regular.ttf        Inter-Regular.ttf
+files extras/ttf/Inter-Medium.ttf         Inter-Medium.ttf
+files extras/ttf/Inter-SemiBold.ttf       Inter-SemiBold.ttf
+files extras/ttf/Inter-Bold.ttf           Inter-Bold.ttf
+
+release 2.304 https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip
+files fonts/ttf/JetBrainsMono-Regular.ttf   JetBrainsMono-Regular.ttf
+files fonts/ttf/JetBrainsMono-Medium.ttf    JetBrainsMono-Medium.ttf
+files fonts/ttf/JetBrainsMono-Bold.ttf      JetBrainsMono-Bold.ttf

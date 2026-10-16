@@ -40,6 +40,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 ### Level 2.5 — I want to know how a subsystem is built
 
 - [Code Editor core](internals/code-editor.md) — Buffer, cursor, highlighter, find
+- [Asset pipeline](reference/asset-pipeline.md) — Import, `.pak`, VFS, hot reload
 - [Benchmarks](internals/benchmarks.md) — What is measured and what it costs
 - [Build system](internals/build-system.md) — Modules, steps, tests
 
@@ -50,6 +51,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 - [Random](reference/core-random.md) — Deterministic PRNG
 - [Noise](reference/core-noise.md) — Procedural noise
 - [ECS](reference/ecs-entities.md) — Entities, components, actors, queries
+- [Animation clips](reference/ecs-animation.md) — The `.anim` format, GUID identity, root motion, the method track
 - [Rendering](reference/render-pipeline.md) — Pipeline, batching, atlas
 - [Scripting](reference/script-behaviors.md) — Behaviors, state machines, hot-reload
 - [Physics](reference/physics-overview.md) — Port, bodies, shapes, the sync contract
@@ -79,8 +81,10 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | Collision layers & tuning | [ecs-collision-layers](reference/ecs-collision-layers.md) |
 | Components (all 10) | [ecs-components](reference/ecs-components.md) |
 | Entities, actors, queries, signals, hierarchy, serialization | [ecs-entities](reference/ecs-entities.md) and siblings |
+| Animation clips, tracks, root motion | [ecs-animation](reference/ecs-animation.md) |
 | Math, random, noise, time | `core-*` |
 | Rendering | `render-*` |
+| Asset pipeline: import, `.pak`, VFS, hot reload | [asset-pipeline](reference/asset-pipeline.md) |
 | Audio: mixer, threads, voices, bank | [audio-system](reference/audio-system.md) |
 | Audio: buses, solo, sends | [audio-buses](reference/audio-buses.md) |
 | Audio: emitters, `sound.*`, hot-reload | [audio-emitters](reference/audio-emitters.md) |

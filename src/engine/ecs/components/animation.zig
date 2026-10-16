@@ -8,6 +8,7 @@ pub const AnimationPlayer = struct {
     clip_id: u32 = 0,
     next_clip_id: u32 = 0,
     time: f32 = 0.0,
+    next_time: f32 = 0.0,
     speed: f32 = 1.0,
     flags: u8 = 0,
     blend_factor: f32 = 0.0,

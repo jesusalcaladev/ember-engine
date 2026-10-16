@@ -264,6 +264,30 @@ pub fn isAudioAsset(name: []const u8) bool {
         std.mem.eql(u8, e, "flac");
 }
 
+/// True when a changed entry is an image the asset importer would classify as
+/// one. The list is deliberately the same three `import.detect` recognizes by
+/// MAGIC (png, jpeg, webp) — and not the wider set stb_image can decode.
+///
+/// That is the point of the filter: it predicts `detect`, not the decoder. A
+/// `.bmp` here would pass this gate, decode fine on reload, and then be dropped
+/// by `detect` one layer down, so the reload would look like it ran and changed
+/// nothing. A name that reaches this list but whose bytes `detect` refuses is a
+/// real (loud) failure rather than a silently skipped one.
+///
+/// Case-insensitive for the same reason `isAudioAsset` is: `.PNG` exports exist.
+pub fn isImageAsset(name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const ext = name[dot + 1 ..];
+    if (ext.len == 0 or ext.len > 8) return false;
+    var buf: [8]u8 = undefined;
+    for (ext, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const e = buf[0..ext.len];
+    return std.mem.eql(u8, e, "png") or
+        std.mem.eql(u8, e, "jpg") or
+        std.mem.eql(u8, e, "jpeg") or
+        std.mem.eql(u8, e, "webp");
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -356,4 +380,20 @@ test "isAudioAsset accepts the decoders' extensions, case-insensitively" {
     try testing.expect(!isAudioAsset("noextension"));
     try testing.expect(!isAudioAsset("trailing."));
     try testing.expect(!isAudioAsset("a.really.long.extension"));
+}
+
+test "isImageAsset matches what the importer can detect, case-insensitively" {
+    try testing.expect(isImageAsset("hero.png"));
+    try testing.expect(isImageAsset("HERO.PNG"));
+    try testing.expect(isImageAsset("shot.jpg"));
+    try testing.expect(isImageAsset("shot.jpeg"));
+    try testing.expect(isImageAsset("bg.webp"));
+    try testing.expect(isImageAsset("a/b/c/deep/path.png"));
+    try testing.expect(!isImageAsset("boom.wav"));
+    try testing.expect(!isImageAsset("noextension"));
+    try testing.expect(!isImageAsset("trailing."));
+    try testing.expect(!isImageAsset("a.really.long.extension"));
+    // `.bmp` is decodable by stb but NOT classified by `import.detect`, so the
+    // watcher must not promise it: letting it through would reload nothing.
+    try testing.expect(!isImageAsset("old.bmp"));
 }

@@ -24,9 +24,12 @@
 
 const std = @import("std");
 const lua = @import("luajit.zig");
-const metadata = @import("metadata.zig");
+// Module import, not a relative path — see build.zig's
+// `script_mod.addImport("api_meta", ...)`.
+const metadata = @import("api_meta");
 const context_mod = @import("context.zig");
 const assets_mod = @import("assets");
+const ecs = @import("ecs");
 
 const lua_State = lua.lua_State;
 const luaL_Reg = lua.luaL_Reg;
@@ -1382,6 +1385,76 @@ fn lua_physics_contains_point(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+// ── Physics Debug ─────────────────────────────────────────────────────────────
+//
+//PHYSDBG-PARKED // Debug visualization of collision shapes, contacts, and other physics internals.
+//PHYSDBG-PARKED // Intended for editor use only.
+//PHYSDBG-PARKED 
+//PHYSDBG-PARKED /// `physics.debug_draw(enabled?) -> boolean`
+//PHYSDBG-PARKED fn lua_physics_debug_draw(L: ?*lua_State) callconv(.c) c_int {
+//PHYSDBG-PARKED     const ctx = ctxOf(L);
+//PHYSDBG-PARKED     const debug = ctx.physics_debug orelse return 0;
+//PHYSDBG-PARKED     if (lua.getTop(L) >= 1) {
+//PHYSDBG-PARKED         debug.enabled = lua.toBool(L, 1);
+//PHYSDBG-PARKED     } else {
+//PHYSDBG-PARKED         debug.enabled = !debug.enabled;
+//PHYSDBG-PARKED     }
+//PHYSDBG-PARKED     lua.lua_pushboolean(L, @intFromBool(debug.enabled));
+//PHYSDBG-PARKED     return 1;
+//PHYSDBG-PARKED }
+//PHYSDBG-PARKED 
+//PHYSDBG-PARKED /// `physics.debug_flags(flags?) -> integer`
+//PHYSDBG-PARKED fn lua_physics_debug_flags(L: ?*lua_State) callconv(.c) c_int {
+//PHYSDBG-PARKED     const ctx = ctxOf(L);
+//PHYSDBG-PARKED     const debug = ctx.physics_debug orelse return 0;
+//PHYSDBG-PARKED     if (lua.getTop(L) >= 1) {
+//PHYSDBG-PARKED         const raw = lua.toInteger(L, 1);
+//PHYSDBG-PARKED         debug.flags = @bitCast(@as(u32, raw));
+//PHYSDBG-PARKED     } else {
+//PHYSDBG-PARKED         lua.pushInteger(L, @intCast(debug.flags));
+//PHYSDBG-PARKED         return 1;
+//PHYSDBG-PARKED     }
+//PHYSDBG-PARKED     return 0;
+//PHYSDBG-PARKED }
+//PHYSDBG-PARKED 
+//PHYSDBG-PARKED /// `physics.debug_colors(table?) -> table`
+//PHYSDBG-PARKED fn lua_physics_debug_colors(L: ?*lua_State) callconv(.c) c_int {
+//PHYSDBG-PARKED     const ctx = ctxOf(L);
+//PHYSDBG-PARKED     const debug = ctx.physics_debug orelse return 0;
+//PHYSDBG-PARKED     if (lua.getTop(L) >= 1 and lua.isTable(L, 1)) {
+//PHYSDBG-PARKED         lua.getField(L, 1, "solid_static"); if (!lua.isNil(L, -1)) { debug.colors.solid_static = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "solid_kinematic"); if (!lua.isNil(L, -1)) { debug.colors.solid_kinematic = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "solid_dynamic"); if (!lua.isNil(L, -1)) { debug.colors.solid_dynamic = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "sensor"); if (!lua.isNil(L, -1)) { debug.colors.sensor = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "one_way"); if (!lua.isNil(L, -1)) { debug.colors.one_way = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "tilemap_solid"); if (!lua.isNil(L, -1)) { debug.colors.tilemap_solid = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "tilemap_sensor"); if (!lua.isNil(L, -1)) { debug.colors.tilemap_sensor = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "tilemap_oneway"); if (!lua.isNil(L, -1)) { debug.colors.tilemap_oneway = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "broadphase_aabb"); if (!lua.isNil(L, -1)) { debug.colors.broadphase_aabb = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "shape_aabb"); if (!lua.isNil(L, -1)) { debug.colors.shape_aabb = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "contact_point"); if (!lua.isNil(L, -1)) { debug.colors.contact_point = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "contact_normal"); if (!lua.isNil(L, -1)) { debug.colors.contact_normal = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED         lua.getField(L, 1, "center_of_mass"); if (!lua.isNil(L, -1)) { debug.colors.center_of_mass = parseColor(L, -1); } lua.pop(L, 1);
+//PHYSDBG-PARKED     } else {
+//PHYSDBG-PARKED         lua.lua_createtable(L, 0, 13);
+//PHYSDBG-PARKED         pushColor(L, "solid_static", debug.colors.solid_static); lua.setField(L, -2, "solid_static");
+//PHYSDBG-PARKED         pushColor(L, "solid_kinematic", debug.colors.solid_kinematic); lua.setField(L, -2, "solid_kinematic");
+//PHYSDBG-PARKED         pushColor(L, "solid_dynamic", debug.colors.solid_dynamic); lua.setField(L, -2, "solid_dynamic");
+//PHYSDBG-PARKED         pushColor(L, "sensor", debug.colors.sensor); lua.setField(L, -2, "sensor");
+//PHYSDBG-PARKED         pushColor(L, "one_way", debug.colors.one_way); lua.setField(L, -2, "one_way");
+//PHYSDBG-PARKED         pushColor(L, "tilemap_solid", debug.colors.tilemap_solid); lua.setField(L, -2, "tilemap_solid");
+//PHYSDBG-PARKED         pushColor(L, "tilemap_sensor", debug.colors.tilemap_sensor); lua.setField(L, -2, "tilemap_sensor");
+//PHYSDBG-PARKED         pushColor(L, "tilemap_oneway", debug.colors.tilemap_oneway); lua.setField(L, -2, "tilemap_oneway");
+//PHYSDBG-PARKED         pushColor(L, "broadphase_aabb", debug.colors.broadphase_aabb); lua.setField(L, -2, "broadphase_aabb");
+//PHYSDBG-PARKED         pushColor(L, "shape_aabb", debug.colors.shape_aabb); lua.setField(L, -2, "shape_aabb");
+//PHYSDBG-PARKED         pushColor(L, "contact_point", debug.colors.contact_point); lua.setField(L, -2, "contact_point");
+//PHYSDBG-PARKED         pushColor(L, "contact_normal", debug.colors.contact_normal); lua.setField(L, -2, "contact_normal");
+//PHYSDBG-PARKED         pushColor(L, "center_of_mass", debug.colors.center_of_mass); lua.setField(L, -2, "center_of_mass");
+//PHYSDBG-PARKED         return 1;
+//PHYSDBG-PARKED     }
+//PHYSDBG-PARKED     return 0;
+//PHYSDBG-PARKED }
+
 // ── Sprite primitives: making a prototype without an art pipeline ────────────
 //
 // Godot can draw a rectangle, a circle, a line and a polygon with no texture at
@@ -1631,7 +1704,36 @@ fn lua_sprite_set_atlas(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `sprite.set_image(self, path)` — loads image, adds to atlas, sets atlas slot + UV in one call.
+/// Side of the sprite atlas, in texels. 2048² RGBA8 is 16 MB, the M6 budget for
+/// one page. A constant so the Lua path and the atlas cannot drift apart.
+const atlas_side: u32 = 2048;
+
+/// `sprite.set_image(self, path)` — loads image, packs it, sets texture slot + UV.
+///
+/// Three things this call gets right and one it deliberately does not:
+///
+/// - **One atlas for the whole context.** The manager lives on the `Context`
+///   (`ctx.atlas_manager`) and is created on first use. The previous version
+///   built a fresh 2048×2048 packer — and, through the upload, a fresh GPU
+///   texture — on EVERY call, so a scene that set a hundred sprites leaked a
+///   hundred atlases and every sprite but the last drew from a texture nothing
+///   had ever uploaded.
+/// - **The texture SLOT, not the asset slot.** A sprite's `atlas` field indexes
+///   the renderer's texture table, which is what `emitInstancedDraw` looks up.
+///   The old code stored the ASSET manager's slot — the right number for a
+///   different table, which agreed with the right one only by accident on the
+///   first call.
+/// - **A reload-safe update.** `updateImageInAtlas` re-blits in place when the
+///   image is already packed, so setting the same path twice is free and does not
+///   leak the interning of the path; `refreshAtlas` writes into the page's
+///   EXISTING texture instead of allocating a second one, which is what keeps the
+///   slot a sprite already stored valid across a hot reload.
+///
+/// It does NOT re-pack on a size change behind the sprite's back: `updateImageInAtlas`
+/// returns the new UVs when the image was resized, and this call applies them to
+/// the sprite it was given. Every OTHER sprite that shared the image keeps the old
+/// UVs — they are re-pointed by the runtime's `asset_reload` hook, which sees the
+/// same event.
 fn lua_sprite_set_image(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const renderer = ctx.renderer orelse {
@@ -1660,24 +1762,61 @@ fn lua_sprite_set_image(L: ?*lua_State) callconv(.c) c_int {
         return 2;
     };
     const image = @as(*const assets_mod.Image, @ptrCast(@alignCast(payload)));
-    const atlas_mgr = renderer.createAtlasManager(2048, 2048) orelse {
+
+    // 2048×2048 RGBA8 is 16 MB, which is the budget the atlas was sized for.
+    // Created lazily so a script that never sets an image never pays for it.
+    const atlas_mgr = ctx.atlas_manager orelse created: {
+        const created = renderer.createAtlasManager(atlas_side, atlas_side) orelse {
+            lua.lua_pushnil(L);
+            lua.lua_pushstring(L, "failed to create atlas manager");
+            return 2;
+        };
+        ctx.atlas_manager = created;
+        break :created created;
+    };
+
+    const update = renderer.updateImageInAtlas(atlas_mgr, path, image.width, image.height, image.pixels) orelse {
         lua.lua_pushnil(L);
-        lua.lua_pushstring(L, "failed to create atlas manager");
+        lua.lua_pushstring(L, "failed to pack image into the atlas");
         return 2;
     };
-    const uv = renderer.addImageToAtlas(atlas_mgr, path, image.width, image.height, image.pixels) orelse {
+    const texture = renderer.refreshAtlas(atlas_mgr) orelse {
         lua.lua_pushnil(L);
-        lua.lua_pushstring(L, "failed to add image to atlas");
+        lua.lua_pushstring(L, "failed to upload the atlas");
         return 2;
     };
-    _ = renderer.uploadAtlas(atlas_mgr) orelse {
-        lua.lua_pushnil(L);
-        lua.lua_pushstring(L, "failed to upload atlas");
-        return 2;
+
+    // Register the path for hot reload NOW, while we know the image is live.
+    // This is the only moment anything learns that the atlas holds `path`:
+    // `HotReload.reloadPath` re-checks paths it was TOLD to watch and cannot
+    // discover them, so a sprite set here would otherwise never reload.
+    //
+    // `watch` seeds a content hash, which is one read of a file this call has
+    // just decoded — a real cost, paid once per image, and the alternative (a
+    // first edit counted as a change) is worse. It allocates the path copy, so a
+    // runtime that calls this from inside a guarded frame will trip that guard on
+    // the load itself long before it reaches here; the honest place to set images
+    // is a preload, and the guard then stays armed for the frames that matter.
+    if (ctx.hot_reload) |hot| hot.watch(path) catch |err| {
+        // Not fatal: the sprite is packed and will draw. It just will not reload
+        // until it is set again, so it is worth a line in the log rather than a
+        // silent miss.
+        core_log.warn("could not watch '{s}' for reload: {s}", .{ path, @errorName(err) });
     };
+
     const sprite = spriteOf(L) orelse return 0;
-    sprite.atlas = @truncate(@as(u32, @intCast(slot)));
-    sprite.uv = uv;
+    // The handle is an index + 1 (0 means "none"), so the slot is the raw value
+    // minus one. The cast is checked rather than truncating: a 256th texture is a
+    // real limit of the `u8` field, and silently wrapping it would draw a
+    // different texture rather than reporting the overflow.
+    const texture_index = @intFromPtr(texture) - 1;
+    if (texture_index > std.math.maxInt(u8)) {
+        lua.lua_pushnil(L);
+        lua.lua_pushstring(L, "atlas texture table is full");
+        return 2;
+    }
+    sprite.atlas = @intCast(texture_index);
+    sprite.uv = update.uv;
     return 0;
 }
 
@@ -2882,6 +3021,188 @@ fn lua_camera_get_centre(L: ?*lua_State) callconv(.c) c_int {
     return 2;
 }
 
+// ── Animation (M13) ─────────────────────────────────────────────────────────
+
+fn lua_anim_new(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer) == null) {
+        _ = ctx.world.add(e, components.AnimationPlayer{}) catch return 0;
+    }
+    return 0;
+}
+
+fn lua_anim_play(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer) == null) {
+        _ = ctx.world.add(e, components.AnimationPlayer{}) catch return 0;
+    }
+    const p = ctx.world.get(e, components.AnimationPlayer).?;
+    const clip_id: u32 = if (lua.getTop(L) >= 2) @intFromFloat(@max(lua.toF32(L, 2), 0)) else p.clip_id;
+    // A third argument blends over that many seconds instead of cutting. A
+    // blend with nothing playing (or a replay of the same clip) has nothing to
+    // fade FROM, so it falls through to a hard start.
+    const blend: f32 = if (lua.getTop(L) >= 3) @max(lua.toF32(L, 3), 0) else 0;
+    if (blend > 0 and p.clip_id != 0 and p.clip_id != clip_id) {
+        p.next_clip_id = clip_id;
+        p.blend_duration = blend;
+        p.blend_remaining = 0; // the system arms it on the next tick
+        return 0;
+    }
+    p.clip_id = clip_id;
+    p.time = 0;
+    p.next_clip_id = 0;
+    p.blend_remaining = 0;
+    p.blend_duration = 0;
+    p.state = 1;
+    return 0;
+}
+
+fn lua_anim_stop(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer)) |p| {
+        p.clip_id = 0;
+        p.time = 0;
+        p.state = 0;
+    }
+    return 0;
+}
+
+fn lua_anim_pause(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer)) |p| p.speed = 0;
+    return 0;
+}
+
+fn lua_anim_resume(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer)) |p| {
+        if (p.speed == 0) p.speed = 1;
+    }
+    return 0;
+}
+
+fn lua_anim_seek(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer)) |p| p.time = @max(lua.toF32(L, 2), 0);
+    return 0;
+}
+
+fn lua_anim_set_speed(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, components.AnimationPlayer)) |p| p.speed = lua.toF32(L, 2);
+    return 0;
+}
+
+fn lua_anim_queue(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const clip_id: u32 = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    ecs.animation.System.queueClip(ctx.world, e, clip_id);
+    return 0;
+}
+
+fn lua_anim_state(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.AnimationPlayer) orelse return 0;
+    lua.lua_pushinteger(L, @intCast(p.state));
+    return 1;
+}
+
+fn lua_anim_time(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.AnimationPlayer) orelse return 0;
+    lua.pushF32(L, p.time);
+    return 1;
+}
+
+fn lua_anim_length(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.AnimationPlayer) orelse return 0;
+    if (ctx.animations) |sys| {
+        if (sys.clips.get(p.clip_id)) |clip| {
+            lua.pushF32(L, clip.duration);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn lua_anim_is_playing(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.AnimationPlayer) orelse return 0;
+    lua.lua_pushboolean(L, if (p.state == 1) 1 else 0);
+    return 1;
+}
+
+/// `anim.load(path) -> clip_id` — decodes a `.anim` clip file and registers it,
+/// returning the handle to pass to `anim.play`. Calling it again for the same
+/// path hot-reloads the clip under the SAME id, so a player mid-clip keeps its
+/// playback position. Returns nil when the animation system is not wired or the
+/// file cannot be decoded.
+fn lua_anim_load(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const path = lua.toSlice(L, 1) orelse return 0;
+    const sys = ctx.animations orelse return 0;
+    const id = sys.loadFile(path) catch return 0;
+    lua.lua_pushinteger(L, @intCast(id));
+    return 1;
+}
+
+/// `anim.set_param(self, name, value)` — sets one playback parameter by name.
+/// Recognised names: `"speed"`, `"time"`, `"clip"`, `"blend"`, `"state"`.
+/// Unknown names are ignored: a typo must not abort the frame.
+fn lua_anim_set_param(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.AnimationPlayer) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    const value = lua.toF32(L, 3);
+    if (std.mem.eql(u8, name, "speed")) {
+        p.speed = value;
+    } else if (std.mem.eql(u8, name, "time")) {
+        p.time = @max(value, 0);
+    } else if (std.mem.eql(u8, name, "clip")) {
+        p.clip_id = @intFromFloat(@max(value, 0));
+        p.time = 0;
+        p.state = 1;
+    } else if (std.mem.eql(u8, name, "blend")) {
+        p.blend_duration = @max(value, 0);
+        p.blend_remaining = 0; // the system arms it on the next tick
+    } else if (std.mem.eql(u8, name, "state")) {
+        p.state = @intFromFloat(@max(value, 0));
+    }
+    return 0;
+}
+
+const anim_regs = [_]luaL_Reg{
+    .{ .name = "new", .func = lua_anim_new },
+    .{ .name = "load", .func = lua_anim_load },
+    .{ .name = "play", .func = lua_anim_play },
+    .{ .name = "set_param", .func = lua_anim_set_param },
+    .{ .name = "stop", .func = lua_anim_stop },
+    .{ .name = "pause", .func = lua_anim_pause },
+    .{ .name = "resume", .func = lua_anim_resume },
+    .{ .name = "seek", .func = lua_anim_seek },
+    .{ .name = "set_speed", .func = lua_anim_set_speed },
+    .{ .name = "queue", .func = lua_anim_queue },
+    .{ .name = "state", .func = lua_anim_state },
+    .{ .name = "time", .func = lua_anim_time },
+    .{ .name = "length", .func = lua_anim_length },
+    .{ .name = "is_playing", .func = lua_anim_is_playing },
+    .{ .name = null, .func = null },
+};
+
 const camera_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_camera_new },
     .{ .name = "follow", .func = lua_camera_follow },
@@ -3033,6 +3354,10 @@ const physics_regs = [_]luaL_Reg{
     .{ .name = "set_body_enabled", .func = lua_physics_set_body_enabled },
     .{ .name = "overlap_rect", .func = lua_physics_overlap_rect },
     .{ .name = "contains_point", .func = lua_physics_contains_point },
+    // PARKED: physics debug bindings are unfinished (no functions yet).
+    // .{ .name = "debug_draw", .func = lua_physics_debug_draw },
+    // .{ .name = "debug_flags", .func = lua_physics_debug_flags },
+    // .{ .name = "debug_colors", .func = lua_physics_debug_colors },
     .{ .name = null, .func = null },
 };
 
@@ -3227,6 +3552,30 @@ fn toSeed(L: ?*lua_State, idx: c_int) u64 {
     if (whole < 0.0) return @bitCast(@as(i64, @intFromFloat(whole)));
     return @intFromFloat(whole);
 }
+
+    /// Parses a color table {r, g, b, a} or {r, g, b} (a defaults to 255).
+    /// Returns [4]u8 with RGBA values 0-255.
+    fn parseColor(L: ?*lua_State, idx: c_int) [4]u8 {
+        if (lua.isTable(L, idx)) {
+            lua.getField(L, idx, "r"); const r = @as(i32, @intFromFloat(lua.toNumber(L, -1))); lua.pop(L, 1);
+            lua.getField(L, idx, "g"); const g = @as(i32, @intFromFloat(lua.toNumber(L, -1))); lua.pop(L, 1);
+            lua.getField(L, idx, "b"); const b = @as(i32, @intFromFloat(lua.toNumber(L, -1))); lua.pop(L, 1);
+            lua.getField(L, idx, "a");
+            const a = if (lua.isNumber(L, -1)) @as(i32, @intFromFloat(lua.toNumber(L, -1))) else 255;
+            lua.pop(L, 1);
+            return .{ @intCast(r), @intCast(g), @intCast(b), @intCast(a) };
+        }
+        return .{ 255, 255, 255, 255 };
+    }
+
+    /// Pushes a [4]u8 color as a table {r, g, b, a} onto the Lua stack.
+    fn pushColor(L: ?*lua_State, color: [4]u8) void {
+        _ = lua.lua_createtable(L, 0, 4);
+        lua.pushInteger(L, @intCast(color[0])); lua.setField(L, -2, "r");
+        lua.pushInteger(L, @intCast(color[1])); lua.setField(L, -2, "g");
+        lua.pushInteger(L, @intCast(color[2])); lua.setField(L, -2, "b");
+        lua.pushInteger(L, @intCast(color[3])); lua.setField(L, -2, "a");
+    }
 
 /// Reads the basis name argument, defaulting to perlin when absent or unknown.
 /// Defaulting rather than erroring keeps a typo'd basis from breaking a level:
@@ -4051,6 +4400,263 @@ const sound_regs = [_]luaL_Reg{
     .{ .name = "describe", .func = lua_sound_describe },
     .{ .name = null, .func = null },
 };
+// ── M15: TileMap (chunked tile layers) ──────────────────────────────────────
+//
+// The tilemap bindings act on an actor that carries a `TileMapLayer` component.
+// They are per-actor methods like `sprite`/`timer`/`camera`, because a tile layer
+// is a component on an actor. The actual tile grid lives in the asset system.
+
+const TileMapLayer = components.TileMapLayer;
+const Tile = components.Tile;
+const ChunkKey = components.ChunkKey;
+const ChunkHandle = components.ChunkHandle;
+const AssetGUID = components.AssetGUID;
+
+/// `tilemap.set_tileset(self, tileset_guid)` — which TileSet this layer draws from.
+fn lua_tilemap_set_tileset(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, TileMapLayer)) |layer| {
+        const guid_hex = lua.toSlice(L, 2) orelse return 0;
+        layer.tileset_guid = parseAssetGUID(guid_hex);
+    }
+    return 0;
+}
+
+/// `tilemap.set_tile(self, tile_x, tile_y, atlas_index, flip_x?, flip_y?)` — sets a single tile.
+fn lua_tilemap_set_tile(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    const assets = ctx.assets orelse return 0;
+
+    const tile_x = lua.toInteger(L, 2);
+    const tile_y = lua.toInt(L, 3);
+    const atlas_index = @as(u32, @intFromFloat(@max(lua.toF32(L, 4), 0)));
+    const flip_x = lua.getTop(L) >= 5 and lua.toBool(L, 5);
+    const flip_y = lua.getTop(L) >= 6 and lua.toBool(L, 6);
+
+    // Find or create chunk
+    const tileset_entry_opt = assets.registry.get(layer.tileset_guid);
+    if (tileset_entry_opt == null) return 0;
+    const tileset_entry = tileset_entry_opt.?;
+    const tileset_ptr = tileset_entry.handle;
+    if (tileset_ptr == 0) return 0;
+    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
+    const tile_size = tileset.tile_size;
+
+    const chunk_key = ChunkKey.fromWorld(
+        @as(f32, @floatFromInt(tile_x)) * tile_size,
+        @as(f32, @floatFromInt(tile_y)) * tile_size,
+        tile_size,
+    );
+
+    var handle = layer.chunk_map.get(chunk_key) orelse {
+        // Would need to allocate a new chunk - for now just return
+        return 0;
+    };
+
+    if (handle.isNone() or handle.index >= layer.chunks.len) return 0;
+    const chunk = &layer.chunks[handle.index];
+    if (handle.generation != chunk.generation) return 0;
+
+    const local = components.ChunkCoord.fromTile(tile_x, tile_y);
+    const idx = local.index();
+    var tile = chunk.tiles[idx];
+    tile.atlas_index = @intCast(atlas_index);
+    tile.flags = 0;
+    if (flip_x) tile.flags |= Tile.FlagFlipX;
+    if (flip_y) tile.flags |= Tile.FlagFlipY;
+    chunk.tiles[idx] = tile;
+    chunk.has_tiles = true;
+    chunk.markDirty(idx);
+    layer.physics_dirty = true;
+    return 0;
+}
+
+/// `tilemap.get_tile(self, tile_x, tile_y) -> atlas_index, flip_x, flip_y`
+fn lua_tilemap_get_tile(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+
+    const tile_x = lua.toInteger(L, 2);
+    const tile_y = lua.toInt(L, 3);
+
+    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
+    if (tileset_entry_opt == null) return 0;
+    const tileset_entry = tileset_entry_opt.?;
+    const tileset_ptr = tileset_entry.handle;
+    if (tileset_ptr == 0) return 0;
+    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
+    const tile_size = tileset.tile_size;
+
+    const chunk_key = ChunkKey.fromWorld(
+        @as(f32, @floatFromInt(tile_x)) * tile_size,
+        @as(f32, @floatFromInt(tile_y)) * tile_size,
+        tile_size,
+    );
+
+    const handle = layer.chunk_map.get(chunk_key) orelse {
+        lua.pushF32(L, 0);
+        lua.lua_pushboolean(L, 0);
+        lua.lua_pushboolean(L, 0);
+        return 3;
+    };
+
+    if (handle.isNone() or handle.index >= layer.chunks.len) {
+        lua.pushF32(L, 0);
+        lua.lua_pushboolean(L, 0);
+        lua.lua_pushboolean(L, 0);
+        return 3;
+    }
+    const chunk = &layer.chunks[handle.index];
+    if (handle.generation != chunk.generation) {
+        lua.pushF32(L, 0);
+        lua.lua_pushboolean(L, 0);
+        lua.lua_pushboolean(L, 0);
+        return 3;
+    }
+
+    const local = components.ChunkCoord.fromTile(tile_x, tile_y);
+    const idx = local.index();
+    const tile = chunk.tiles[idx];
+    lua.pushF32(L, @floatFromInt(tile.atlas_index));
+    lua.lua_pushboolean(L, @intFromBool(tile.flipX()));
+    lua.lua_pushboolean(L, @intFromBool(tile.flipY()));
+    return 3;
+}
+
+/// `tilemap.fill_rect(self, x1, y1, x2, y2, atlas_index)` — fills a rectangle with a tile.
+fn lua_tilemap_fill_rect(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+
+    const x1 = lua.toInt(L, 2);
+    const y1 = lua.toInt(L, 3);
+    const x2 = lua.toInt(L, 4);
+    const y2 = lua.toInt(L, 5);
+    const atlas_index = @as(u32, @intFromFloat(@max(lua.toF32(L, 6), 0)));
+
+    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
+    if (tileset_entry_opt == null) return 0;
+    const tileset_entry = tileset_entry_opt.?;
+    const tileset_ptr = tileset_entry.handle;
+    if (tileset_ptr == 0) return 0;
+    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
+    const tile_size = tileset.tile_size;
+
+    const min_x = @min(x1, x2);
+    const max_x = @max(x1, x2);
+    const min_y = @min(y1, y2);
+    const max_y = @max(y1, y2);
+
+    var y = min_y;
+    while (y <= max_y) : (y += 1) {
+        var x = min_x;
+        while (x <= max_x) : (x += 1) {
+            const chunk_key = ChunkKey.fromWorld(
+                @as(f32, @floatFromInt(x)) * tile_size,
+                @as(f32, @floatFromInt(y)) * tile_size,
+                tile_size,
+            );
+            const handle = layer.chunk_map.get(chunk_key) orelse continue;
+            if (handle.isNone() or handle.index >= layer.chunks.len) continue;
+            const chunk = &layer.chunks[handle.index];
+            if (handle.generation != chunk.generation) continue;
+            const local = components.ChunkCoord.fromTile(x, y);
+            const idx = local.index();
+            var tile = chunk.tiles[idx];
+            tile.atlas_index = @intCast(atlas_index);
+            tile.flags = 0;
+            chunk.tiles[idx] = tile;
+            chunk.has_tiles = true;
+            chunk.markDirty(idx);
+        }
+    }
+    layer.physics_dirty = true;
+    return 0;
+}
+
+/// `tilemap.set_layer(self, layer)` — render layer (draw order).
+fn lua_tilemap_set_layer(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, TileMapLayer)) |layer| {
+        layer.layer = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    }
+    return 0;
+}
+
+/// `tilemap.set_physics_enabled(self, enabled)` — whether this layer collides.
+fn lua_tilemap_set_physics_enabled(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    if (ctx.world.get(e, TileMapLayer)) |layer| {
+        layer.physics_enabled = lua.toBool(L, 2);
+        layer.physics_dirty = true;
+    }
+    return 0;
+}
+
+/// `tilemap.get_chunk_bounds(self, cx, cy) -> min_x, min_y, max_x, max_y` — world bounds of a chunk.
+fn lua_tilemap_get_chunk_bounds(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+
+    const cx = lua.toInt(L, 2);
+    const cy = lua.toInt(L, 3);
+
+    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
+    if (tileset_entry_opt == null) return 0;
+    const tileset_entry = tileset_entry_opt.?;
+    const tileset_ptr = tileset_entry.handle;
+    if (tileset_ptr == 0) return 0;
+    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
+    const tile_size = tileset.tile_size;
+    const chunk_world_size = tile_size * 16.0;
+
+    const min_x = @as(f32, @floatFromInt(cx)) * chunk_world_size;
+    const min_y = @as(f32, @floatFromInt(cy)) * chunk_world_size;
+    const max_x = min_x + chunk_world_size;
+    const max_y = min_y + chunk_world_size;
+
+    lua.pushF32(L, min_x);
+    lua.pushF32(L, min_y);
+    lua.pushF32(L, max_x);
+    lua.pushF32(L, max_y);
+    return 4;
+}
+
+fn parseAssetGUID(hex: []const u8) AssetGUID {
+    if (!std.mem.startsWith(u8, hex, "asset_")) return AssetGUID{ .value = 0 };
+    const hex_part = hex[6..];
+    if (hex_part.len != 16) return AssetGUID{ .value = 0 };
+    var value: u64 = 0;
+    for (hex_part) |c| {
+        value <<= 4;
+        // Convert hex character to integer value
+        const digit = if (c >= '0' and c <= '9') c - '0'
+            else if (c >= 'a' and c <= 'f') c - 'a' + 10
+            else if (c >= 'A' and c <= 'F') c - 'A' + 10
+            else 0;
+        value |= @as(u64, digit) & 0xF;
+    }
+    return AssetGUID{ .value = value };
+}
+
+const tilemap_regs = [_]luaL_Reg{
+    .{ .name = "set_tileset", .func = lua_tilemap_set_tileset },
+    .{ .name = "set_tile", .func = lua_tilemap_set_tile },
+    .{ .name = "get_tile", .func = lua_tilemap_get_tile },
+    .{ .name = "fill_rect", .func = lua_tilemap_fill_rect },
+    .{ .name = "set_layer", .func = lua_tilemap_set_layer },
+    .{ .name = "set_physics_enabled", .func = lua_tilemap_set_physics_enabled },
+    .{ .name = "get_chunk_bounds", .func = lua_tilemap_get_chunk_bounds },
+    .{ .name = null, .func = null },
+};
 
 /// Installs every binding into `L`, closing each C function over `ctx` (a stable
 /// pointer the caller owns). Builds the `actor`, `input` and `log` global tables
@@ -4155,6 +4761,18 @@ pub const registered_names = [_][]const u8{
     "sound.set_spread",
     "sound.is_playing",
     "sound.describe",
+    // M15 PARKED: TileMap names are disabled with the rest of the subsystem.
+    // "tilemap.set_tileset",
+    // "tilemap.set_tile",
+    // "tilemap.get_tile",
+    // "tilemap.fill_rect",
+    // "tilemap.erase_rect",
+    // "tilemap.set_layer",
+    // "tilemap.set_physics_enabled",
+    // "tilemap.set_tile_size",
+    // "tilemap.get_chunk_bounds",
+    // "tilemap.set_default_flip",
+    // "tilemap.describe",
     "render.set_view",
     "render.stats",
     "render.set_resident",
@@ -4244,9 +4862,25 @@ pub const registered_names = [_][]const u8{
     "physics.set_body_type",
     "physics.set_body_enabled",
     "physics.overlap_rect",
-    "physics.contains_point",     "actor.set_linear_velocity",
+    "physics.contains_point",
+    // Debug
+    // PARKED: physics debug bindings are unfinished.
+    // "physics.debug_draw",
+    // "physics.debug_flags",
+    // "physics.debug_colors",
+    "actor.set_linear_velocity",
     "actor.get_linear_velocity", "actor.apply_impulse",
     "actor.is_awake",
+    // M15 PARKED: TileMap bindings are disabled until the subsystem is finished
+    // (see the `//M15-PARKED` block above). Re-enable these names together with
+    // the block and the `installModule` call.
+    // "tilemap.set_tileset",
+    // "tilemap.set_tile",
+    // "tilemap.get_tile",
+    // "tilemap.fill_rect",
+    // "tilemap.set_layer",
+    // "tilemap.set_physics_enabled",
+    // "tilemap.get_chunk_bounds",
     // M4.5 — every one of these needs a `metadata.bindings` entry or
     // `assertAllDocumented` above fails to compile, which is the gate that keeps
     // the stubs, the help panel and the API from drifting apart.
@@ -4263,6 +4897,22 @@ pub const registered_names = [_][]const u8{
     "timer.stop",
     "timer.kill",
     "timer.progress",
+    // M13: the per-actor AnimationPlayer surface. Same rule as above: every
+    // name here must have a metadata entry, or `assertAllDocumented` fails.
+    "anim.new",
+    "anim.load",
+    "anim.play",
+    "anim.stop",
+    "anim.pause",
+    "anim.resume",
+    "anim.seek",
+    "anim.set_speed",
+    "anim.queue",
+    "anim.set_param",
+    "anim.state",
+    "anim.time",
+    "anim.length",
+    "anim.is_playing",
 };
 
 pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
@@ -4304,9 +4954,12 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     // call per frame — the fixed step advances them.
     installModule(L, ctx, "camera", &camera_regs);
     installModule(L, ctx, "timer", &timer_regs);
+    installModule(L, ctx, "anim", &anim_regs);
     // M8: the per-actor emitter. Beside `sprite` and `timer` because it is the
     // same kind of surface — methods on `self` over a plain-data component.
     installModule(L, ctx, "sound", &sound_regs);
+    // M15 PARKED: tilemap module disabled until the subsystem is finished.
+    // installModule(L, ctx, "tilemap", &tilemap_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

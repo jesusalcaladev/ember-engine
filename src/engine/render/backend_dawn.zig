@@ -260,6 +260,13 @@ pub const Backend = struct {
         /// and re-uploaded, never per frame (spec §3.6).
         light_shadow_texture: ?wgpu.WGPUTexture = null,
         light_shadow_view: ?wgpu.WGPUTextureView = null,
+        /// The light pass's bind group LAYOUT, kept because the bind GROUP has
+        /// to be rebuilt whenever either of its views changes (a resize replaces
+        /// the sprite-layer view) and a bind group cannot be rebuilt without the
+        /// layout it was created from. The GI removal deleted this field while
+        /// leaving `rebuildLightBindGroup` calling it, which is the shape of
+        /// bug a compiler catches and nothing else does.
+        light_bgl: wgpu.WGPUBindGroupLayout = undefined,
         light_bind_group: wgpu.WGPUBindGroup = undefined,
         /// The shadow map's width in angle buckets; zero until it is created.
         light_shadow_angles: u32 = 0,
@@ -451,6 +458,9 @@ pub const Backend = struct {
         .createAtlasManager = createAtlasManager,
         .addImageToAtlas = addImageToAtlas,
         .uploadAtlas = uploadAtlas,
+        .updateImageInAtlas = updateImageInAtlas,
+        .refreshAtlas = refreshAtlas,
+        .overlay = drawOverlay,
     };
 
     pub fn renderer(self: *Backend) render.Renderer {
@@ -504,6 +514,18 @@ pub const Backend = struct {
     /// second one that might disagree.
     pub fn gpuDevice(self: *Backend) wgpu.WGPUDevice {
         return self.device;
+    }
+
+    /// The swapchain's texture format, as the raw `WGPUTextureFormat` value.
+    ///
+    /// M5 needs it because the editor's UI draws into the swapchain through
+    /// `Renderer.drawOverlay`, and ImGui's WebGPU backend builds its pipeline
+    /// for ONE format. A UI compiled for `BGRA8Unorm` and a surface that is
+    /// `RGBA8Unorm` is a validation error on the first frame, and the fix is to
+    /// read the number from here rather than to hardcode it in the UI — which is
+    /// the same rule as handing ImGui the device instead of letting it make one.
+    pub fn swapchainFormat(self: *Backend) u32 {
+        return @intCast(self.format);
     }
 
     pub fn create(
@@ -1348,6 +1370,7 @@ pub const Backend = struct {
             .light_pipeline_mix = light_pipeline_mix,
             .light_instance_buf = light_instance_buf,
             .light_uniform_buf = light_uniform_buf,
+            .light_bgl = light_bgl,
             .light_shadow_texture = light_shadow_texture,
             .light_shadow_view = light_shadow_view,
             .light_bind_group = light_bind_group,
@@ -1616,6 +1639,7 @@ pub const Backend = struct {
         self.pumpTimestamps();
         self.stats_data.draw_calls = 0;
         self.stats_data.render_passes = 0;
+        self.stats_data.overlay_passes = 0;
         self.stats_data.pipeline_changes = 0;
         self.stats_data.bind_group_changes = 0;
         self.stats_data.vertex_count = 0;
@@ -2191,7 +2215,10 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         const fw: f32 = @floatFromInt(@max(1, w));
         const fh: f32 = @floatFromInt(@max(1, h));
         // 16 mat4 + 4 screen + 4 ambient + 4 mask_rect + 4 sky = 32 floats.
-        var g: [32]f32 = undefined;
+        // Sized to the uniform, not to the largest thing that was ever written
+        // here: 96 bytes / 4 = 24 floats, and `g` is written through
+        // `LightUniformBytes` below.
+        var g: [24]f32 = undefined;
         @memcpy(g[0..16], &vp);
         g[16] = fw;
         g[17] = fh;
@@ -2202,11 +2229,13 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         g[21] = env.ambient[1];
         g[22] = env.ambient[2];
         g[23] = env.ambient[3];
-        @memcpy(g[24..28], &self.gi_rect);
-        g[28] = env.sky[0];
-        g[29] = env.sky[1];
-        g[30] = env.sky[2];
-        g[31] = env.albedo;
+        // Exactly 24 floats, and no more: `Globals` in light.wgsl is
+        // mat4 + vec2 + vec2 + vec4 = 96 bytes, and `LightUniformBytes` is 96.
+        // This used to also write a GI rect, a sky colour and a bounce albedo
+        // into g[24..32] — 32 floats into a 96-byte buffer, i.e. 32 bytes past
+        // the end of a uniform the GPU reads 96 bytes of. A write past the end
+        // is a Dawn validation error, so this was never a subtle corruption: it
+        // was a crash waiting for the first light.
         wgpu.wgpuQueueWriteBuffer(self.queue, self.light_uniform_buf, 0, &g, LightUniformBytes);
         self.stats_data.upload_bytes += LightUniformBytes;
     }
@@ -2248,6 +2277,61 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
         self.acquired = true;
         self.submitTimestampResolve();
+    }
+
+    /// M5: draws the editor's UI over the swapchain, after SMAA has resolved
+    /// into it.
+    ///
+    /// One pass, `LoadOp_Load`, its own encoder and submit. The obvious
+    /// alternative — encoding into the command buffer `endScene` already has —
+    /// would save one encoder and one submit per frame and would ALSO mean the
+    /// UI is not drawn at all whenever endScene bails early (no offscreen
+    /// target yet, no surface texture, SMAA disabled paths), which is exactly
+    /// the boot frame and every frame of a resized window. A UI that vanishes
+    /// for one frame at 60 Hz is a visible flicker; one extra submit is not
+    /// measurable.
+    fn drawOverlay(ptr: *anyopaque, ctx: ?*anyopaque, draw: render.OverlayFn) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        // Nothing to draw onto without an acquired texture. Swallowing it is
+        // correct: `acquireSurface` returning nothing is a backend that has
+        // lost the surface (minimised, device lost), and the right behaviour
+        // for a frame of UI is to skip it, not to assert.
+        const texture = self.surface_texture orelse return;
+        const view = wgpu.wgpuTextureCreateView(texture, null) orelse return;
+        defer wgpu.wgpuTextureViewRelease(view);
+
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse return;
+        defer wgpu.wgpuCommandEncoderRelease(encoder);
+
+        // Load, never Clear: this pass shares the swapchain with the frame that
+        // was just resolved into it.
+        const attachment = wgpu.RenderPassColorAttachment{
+            .view = view,
+            .loadOp = wgpu.LoadOp_Load,
+            .storeOp = wgpu.StoreOp_Store,
+            .clearValue = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        };
+        var pass_desc = wgpu.RenderPassDescriptor{
+            .colorAttachmentCount = 1,
+            .colorAttachments = @ptrCast(&attachment),
+        };
+        const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc) orelse return;
+        // `draw` borrows the encoder for the length of the call and must not
+        // keep it: the very next line ends the pass, and an End on a released
+        // encoder is a Dawn error that poisons the rest of the frame.
+        draw(ctx, pass);
+        wgpu.wgpuRenderPassEncoderEnd(pass);
+        wgpu.wgpuRenderPassEncoderRelease(pass);
+
+        // Counted as its own pass and NOT as a draw call: the frame budget in
+        // spec §4 is four calls for the GAME, and a UI that silently consumed
+        // two of them would make the scene look like it broke the budget the
+        // moment the editor opened.
+        self.stats_data.overlay_passes += 1;
+
+        const cmd = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse return;
+        defer wgpu.wgpuCommandBufferRelease(cmd);
+        wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
     }
 
     /// Runs the 3 SMAA passes. Edge and weights go to the half-res scratch
@@ -2726,103 +2810,9 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         self.environment = env;
         // The uniform is written in `beginScene`, which is once per frame and
         // not once per environment. Writing it here too would be a second
-        // 128-byte upload for a value that usually did not change.
+        // 96-byte upload for a value that usually did not change.
     }
 
-    /// M7: the GI cascade upload.
-    ///
-    /// Reallocates the texture only when the pyramid's dimensions change, which
-    /// is on a resize and not per frame -- so the steady state is one
-    /// `writeTexture` of a grid the CPU already rebuilt. Reallocating every
-    /// time would also invalidate the bind group, which is why the two are done
-    /// together here instead of at two call sites.
-    fn uploadGi(ptr: *anyopaque, gi: render.GiUpload) void {
-        const self: *Backend = @ptrCast(@alignCast(ptr));
-        if (gi.width == 0 or gi.height == 0) return;
-        const need = @as(usize, gi.width) * gi.height * 4;
-        if (gi.pixels.len < need) return;
-
-        self.gi_rect = gi.rect;
-
-        if (gi.width != self.light_gi_w or gi.height != self.light_gi_h) {
-            wgpu.wgpuTextureViewRelease(self.light_gi_view);
-            wgpu.wgpuTextureRelease(self.light_gi_texture);
-            self.light_gi_w = gi.width;
-            self.light_gi_h = gi.height;
-
-            self.light_gi_texture = wgpu.wgpuDeviceCreateTexture(self.device, &.{
-                .label = wgpu.StringView.from("light.gi"),
-                .usage = wgpu.TextureUsage_TextureBinding | wgpu.TextureUsage_CopyDst,
-                .dimension = wgpu.TextureDimension_2D,
-                .size = .{
-                    .width = gi.width,
-                    .height = gi.height,
-                    .depthOrArrayLayers = 1,
-                },
-                .format = wgpu.TextureFormat_RGBA8Unorm,
-                .mipLevelCount = 1,
-                .sampleCount = 1,
-            }) orelse return;
-            self.light_gi_view =
-                wgpu.wgpuTextureCreateView(self.light_gi_texture, null) orelse return;
-
-            // The bind group holds a texture view, so a new view means a new
-            // bind group — and the shadow map may not exist yet on the very
-            // first frame, which is why this is a helper that can decline rather
-            // than a call site that reads as unconditional.
-            //
-            // Forgetting this is not a crash: the old group keeps the 1x1
-            // placeholder and the scene renders with GI silently disabled, which
-            // is the hardest version of this bug to report.
-            self.rebuildLightBindGroup() catch {};
-        }
-
-        const dst = wgpu.TexelCopyTextureInfo{ .texture = self.light_gi_texture };
-        // 256 is `bytesPerRow`'s alignment floor, so the row is padded and the
-        // padding has to be SKIPPED -- `writeTexture` takes the stride, not a
-        // tightly packed buffer. Getting this wrong shifts every row by a few
-        // bytes and the cascade becomes diagonal noise.
-        const stride = gi.width * 4;
-        var padded = (stride + 255) & ~@as(usize, 255);
-        var scratch: ?[]u8 = null;
-        defer if (scratch) |s| self.allocator.free(s);
-        var src = gi.pixels;
-        if (padded != stride) {
-            // A padded copy for the 256-byte row alignment. On failure the
-            // upload is DROPPED, not retried and not fatal: a frame with no GI
-            // upload is a frame that keeps the previous cascade, and a scene
-            // that cannot allocate is a scene that should still render.
-            scratch = self.allocator.alloc(u8, padded * gi.height) catch null;
-            if (scratch) |buf| {
-                var y: usize = 0;
-                while (y < gi.height) : (y += 1) {
-                    const row = buf[y * padded ..][0..stride];
-                    @memcpy(row, gi.pixels[y * stride ..][0..stride]);
-                    @memset(buf[y * padded + stride ..][0 .. padded - stride], 0);
-                }
-                src = buf;
-            } else {
-                // Out of memory: upload the tightly packed rows anyway and let
-                // the driver reject the stride. A wrong GI frame is better than
-                // no frame, and this only happens when the allocation failed.
-                padded = stride;
-            }
-        }
-        const layout = wgpu.TexelCopyBufferLayout{
-            .bytesPerRow = @intCast(padded),
-            .rowsPerImage = gi.height,
-        };
-        const size = wgpu.Extent3D{ .width = gi.width, .height = gi.height };
-        wgpu.wgpuQueueWriteTexture(
-            self.queue,
-            &dst,
-            src.ptr,
-            padded * gi.height,
-            &layout,
-            &size,
-        );
-        self.stats_data.upload_bytes += need;
-    }
 
     fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count: usize) void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
@@ -3061,6 +3051,70 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         return handle;
     }
 
+    /// Writes page-sized RGBA8 pixels over a texture that already exists.
+    ///
+    /// This is the reload path. `createTexture` allocates, and an allocation here
+    /// would give the page a SECOND texture while the sprites that draw from it
+    /// still hold the first one's slot — the edit would reach the GPU and never
+    /// reach the screen. Handling is the same layout `createTexture` writes:
+    /// tightly packed rows, one mip, RGBA8.
+    fn writeTexture(ptr: *anyopaque, texture: ?*anyopaque, width: u32, height: u32, pixels: []const u8) bool {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const target = texture orelse return false;
+        const idx = @intFromPtr(target);
+        if (idx == 0 or idx > self.atlases.items.len) return false;
+        const existing = self.atlases.items[idx - 1] orelse return false;
+
+        const w = @max(1, width);
+        const h = @max(1, height);
+        const dst = wgpu.TexelCopyTextureInfo{ .texture = existing.texture };
+        const layout = wgpu.TexelCopyBufferLayout{ .bytesPerRow = w * 4, .rowsPerImage = h };
+        const size = wgpu.Extent3D{ .width = w, .height = h };
+        const data_len = @min(pixels.len, @as(usize, w) * @as(usize, h) * 4);
+        if (data_len == 0) return false;
+        wgpu.wgpuQueueWriteTexture(self.queue, &dst, pixels.ptr, data_len, &layout, &size);
+        return true;
+    }
+
+    /// M6: swaps an already-packed image's pixels. See `render.AtlasUpdate`.
+    fn updateImageInAtlas(
+        ptr: *anyopaque,
+        atlas: ?*anyopaque,
+        path: []const u8,
+        width: u32,
+        height: u32,
+        pixels: []const u8,
+    ) ?render.AtlasUpdate {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const manager = self.atlasManagerOf(atlas) orelse return null;
+
+        const image = assets.Image{
+            .width = width,
+            .height = height,
+            .channels = 4,
+            // Read-only here, same cast and for the same reason as
+            // `addImageToAtlas`: the bytes are copied into the page, and a
+            // reload's source is a decoded image the asset pipeline owns.
+            .pixels = @constCast(pixels),
+        };
+        const replaced = manager.replaceImage(self.atlas_managers_allocator, path, image) catch return null;
+        return .{ .uv = replaced.uv, .repositioned = replaced.repositioned };
+    }
+
+    /// M6: re-uploads the atlas's dirty pages, writing over a page's existing
+    /// texture so the texture slot a sprite stores never changes.
+    fn refreshAtlas(ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        const manager = self.atlasManagerOf(atlas) orelse return null;
+
+        _ = render.atlas_bridge.refreshAtlas(self, manager, createTexture, writeTexture) catch return null;
+
+        // The handle the caller wants is the one for the page it is drawing from,
+        // which is not necessarily the page that just changed — a multi-page
+        // atlas reloads whichever page the edited image lives on.
+        return manager.getTextureHandle(manager.getCurrentPageIndex());
+    }
+
     /// The manager behind a handle, or null for 0, a stale index, or a handle
     /// from any other backend.
     fn atlasManagerOf(self: *Backend, atlas: ?*anyopaque) ?*render.atlas_bridge.AtlasManager {
@@ -3071,7 +3125,7 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         return &self.atlas_managers.items[idx];
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *Backend = @ptrCast(@alignCast(ptr));
         if (self.timestamps) {
             // Drain the maps still in flight BEFORE releasing the instance.

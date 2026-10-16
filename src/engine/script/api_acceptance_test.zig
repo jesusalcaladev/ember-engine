@@ -22,6 +22,7 @@ const spatial = @import("spatial.zig");
 const steer = @import("steer.zig");
 const physics = @import("physics");
 const audio = @import("audio");
+const behavior_mod = @import("behavior.zig");
 const build_options = @import("options");
 
 /// One named check. `text` is Lua source that must evaluate to `true`; the
@@ -1272,6 +1273,169 @@ fn checkAudio(allocator: std.mem.Allocator) bool {
     return true;
 }
 
+// ── Animation (M13) ─────────────────────────────────────────────────────────
+// A clip is an asset: `anim.load(path)` decodes a `.anim` file, registers it
+// and hands back the clip id `anim.play` takes. These checks drive that through
+// Lua against a real `animation.System`, because a binding that returned a
+// constant id would satisfy a pure-Zig test and break every game.
+fn checkAnimation(allocator: std.mem.Allocator) bool {
+    var vm = vm_mod.Vm.init(allocator) catch return false;
+    defer vm.deinit();
+    const L = vm.state() orelse return false;
+
+    var world = ecs.World.init(allocator);
+    defer world.deinit();
+    const input = context_mod.Input{};
+    var ctx = bindings.Context.init(&world, &input);
+    var anim_sys = ecs.animation.System.init(allocator);
+    defer anim_sys.deinit();
+    ctx.animations = &anim_sys;
+    bindings.registerAll(L, &ctx);
+
+    // A real file under `.zig-cache` (which exists during a build): the point
+    // of the check is that `anim.load` reads and decodes an asset, so a stub
+    // path would test nothing.
+    const path = ".zig-cache/anim_acceptance.anim";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data =
+        \\clip 1
+        \\duration 1.0
+        \\flags loop
+        \\value transform_x 2 0.0 0.0 1.0 10.0
+    }) catch return false;
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var ok = true;
+
+    var s1_buf: [1024]u8 = undefined;
+    const s1 = std.fmt.bufPrintZ(&s1_buf,
+        "local id = anim.load([[{s}]])\nreturn type(id) == 'number' and id > 0\n", .{path}) catch return false;
+    if (!runSrcBool(&vm, s1, "anim.load")) ok = false;
+
+    // Loading the same path again must return the SAME id (the hot-reload
+    // contract the players rely on to keep their time).
+    var s2_buf: [1024]u8 = undefined;
+    const s2 = std.fmt.bufPrintZ(&s2_buf,
+        "local a = anim.load([[{s}]])\nlocal b = anim.load([[{s}]])\nreturn a == b\n", .{ path, path }) catch return false;
+    if (!runSrcBool(&vm, s2, "anim.reload")) ok = false;
+
+    // `anim.set_param` writes the player component; `anim.state` reads it back,
+    // so the check is a real round-trip through the binding and not a stub.
+    const e = world.spawn(.{ecs.components.AnimationPlayer{}}) catch return false;
+    _ = lua.lua_createtable(L, 0, 0);
+    bindings.stampSelfEntity(L, e);
+    lua.setGlobal(L, "_self");
+    const s3 = "anim.set_param(_self, \"state\", 5)\nreturn anim.state(_self) == 5\n";
+    if (!runSrcBool(&vm, s3, "anim.set_param")) ok = false;
+
+    // ── M13 as an ASSET: preload a project's animation directory ───────────
+    // Every `.anim` in the directory is decoded, so a clip is resident before
+    // the first scene runs, and each lands under the GUID-derived handle of its
+    // path (`clipIdForPath`) — the identity an M6 scene would reference.
+    const dir = ".zig-cache/anim_acceptance_dir";
+    // Deleted first, not only at the end: a run that crashed half-way through
+    // would otherwise leave a `.anim` behind and the next run would preload one
+    // file too many.
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return false;
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    for ([_][]const u8{ "idle", "run" }) |name| {
+        var pbuf: [128]u8 = undefined;
+        const p = std.fmt.bufPrint(&pbuf, "{s}/{s}.anim", .{ dir, name }) catch return false;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = "clip 1\nduration 1.0\nflags loop\n" }) catch return false;
+    }
+    const preloaded = anim_sys.preloadDir(dir) catch {
+        std.debug.print("  preloadDir could not open {s}\n", .{dir});
+        ok = false;
+        return false;
+    };
+
+    if (preloaded.loaded != 2 or preloaded.failed != 0) {
+        std.debug.print("  preloadDir loaded {d}, failed {d} (wanted 2, 0)\n", .{ preloaded.loaded, preloaded.failed });
+        ok = false;
+    }
+    {
+        var pbuf: [128]u8 = undefined;
+        const p = std.fmt.bufPrint(&pbuf, "{s}/run.anim", .{dir}) catch return false;
+        const via_guid = ecs.animation.clipIdForPath(p);
+        if (anim_sys.lookupPath(p) != via_guid) {
+            std.debug.print("  path -> handle differs from the GUID of '{s}'\n", .{p});
+            ok = false;
+        }
+        if (anim_sys.clips.get(via_guid) == null) {
+            std.debug.print("  clip {d} is not resident after preload\n", .{via_guid});
+            ok = false;
+        }
+    }
+
+    // ── M13 method track: `call_lua <t> <script_id> <fn>` ─────────────────
+    // A keyframe names a script and a function; the runtime's hook (the one
+    // `main.zig` installs, built by `Behaviors.animationMethodHook`) calls it.
+    // Driven through the REAL Behaviors VM, so the Lua -> C -> Lua round trip
+    // is what is being checked, not a Zig stub.
+    var anim_input = context_mod.Input{};
+    var behaviors: behavior_mod.Behaviors = undefined;
+    behaviors.init(allocator, &world, &anim_input) catch {
+        std.debug.print("  Behaviors.init failed\n", .{});
+        ok = false;
+        return false;
+    };
+    defer behaviors.deinit();
+
+    const foot_src =
+        \\local M = {}
+        \\function M:on_footstep()
+        \\  footsteps = (footsteps or 0) + 1
+        \\end
+        \\return M
+    ;
+    const foot_id_script = behaviors.load("foot.lua", foot_src) catch {
+        std.debug.print("  behaviors.load failed\n", .{});
+        ok = false;
+        return false;
+    };
+    const foot_actor = world.spawn(.{ ecs.components.AnimationPlayer{}, ecs.components.Transform{} }) catch return false;
+    behaviors.attach(foot_actor, foot_id_script) catch {
+        std.debug.print("  method track: attach failed\n", .{});
+        ok = false;
+        return false;
+    };
+    behaviors.startAll();
+    anim_sys.method_hook = behaviors.animationMethodHook();
+
+    // The clip names the script id, so the file is written once the id is
+    // known — exactly how an exporter that knows the script table would.
+    var foot_path_buf: [128]u8 = undefined;
+    const foot_path = std.fmt.bufPrint(&foot_path_buf, "{s}/foot.anim", .{dir}) catch return false;
+    var foot_text_buf: [256]u8 = undefined;
+    const foot_text = std.fmt.bufPrint(&foot_text_buf,
+        "clip 1\nduration 1.0\ncall_lua 0.25 {d} on_footstep\n", .{foot_id_script}) catch return false;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = foot_path, .data = foot_text }) catch return false;
+    const foot_clip = anim_sys.loadFile(foot_path) catch |err| {
+        std.debug.print("  method track: loadFile failed: {s}\n", .{@errorName(err)});
+        ok = false;
+        return false;
+    };
+    {
+        const p = world.get(foot_actor, ecs.components.AnimationPlayer) orelse return false;
+        p.clip_id = foot_clip;
+        p.speed = 1.0;
+    }
+
+    const no_signals = ecs.timer.SignalBridge{};
+    var tick: usize = 0;
+    while (tick < 60) : (tick += 1) anim_sys.update(&world, 1.0 / 60.0, no_signals);
+    // The keyframe at 0.25 s fired the Lua method ONCE in the first second.
+    var s4_buf: [128]u8 = undefined;
+    const s4 = std.fmt.bufPrintZ(&s4_buf, "return (footsteps or 0) == 1", .{}) catch return false;
+    if (!runSrcBool(&behaviors.vm, s4, "method track")) {
+        std.debug.print("  method track: script {d}, clip {d}, behavior errors {d}\n", .{ foot_id_script, foot_clip, behaviors.errors });
+        ok = false;
+    }
+
+    return ok;
+}
+
 pub fn main() !void {
     // A page allocator: each check builds and tears down its own VM and world,
     // and the process is short-lived, so there is nothing to interleave and no
@@ -1304,6 +1468,14 @@ pub fn main() !void {
     std.debug.print("\naudio (M8):\n", .{});
     if (checkAudio(allocator)) {
         std.debug.print("  ok    play/stop/bus/stats through a real system\n", .{});
+    } else {
+        failed += 1;
+    }
+
+    std.debug.print("\nanimation (M13):\n", .{});
+    if (checkAnimation(allocator)) {
+        std.debug.print("  ok    anim.load registers + hot-reloads a clip; anim.set_param round-trips;\n" ++
+            "        preloadDir keys clips by GUID; a call_lua keyframe runs the named script's method\n", .{});
     } else {
         failed += 1;
     }

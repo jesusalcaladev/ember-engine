@@ -128,6 +128,44 @@ all M3 budgets met
 - **GC step**: Must be under 0.4 ms/frame. The Lua heap size is printed for
   context — a growing heap means the GC step will get slower.
 
+## M13 Animation Benchmark (`ember-bench-animation`)
+
+**Source**: `src/bench/animation.zig` · **Step**: `zig build bench-animation`
+
+The ROADMAP M13 criterion is *"the system costs ≤ 0.05 ms/frame for 100 clips
+simultaneously"*, and this is that number as a gate: the run **fails** if p50
+goes over budget or if the frame path allocates at all.
+
+- **100 clips playing at once**, each on its own actor, through the real
+  `System.update` — not a synthetic inner loop. Every clip is decoded by the real
+  parser from real `.anim` text (4 value tracks, an 8-frame sprite track and a
+  method event), which is what a character clip actually looks like.
+- **Each clip is registered under the GUID-derived handle of a path**, so the
+  bench measures the shipping identity scheme rather than a counter.
+- **p50 is the gate** (spec §2), after 16 warm-up frames; p99 and the worst frame
+  are reported because a spike is what drops a frame.
+- **The allocation check is a counting allocator** around the frame path, with
+  every harness buffer allocated BEFORE the baseline is read — otherwise the
+  bench blames its own `samples` array on the engine.
+
+```
+== M13 animation (100 clips, 240 frames, 16 warm-up) ==
+  update + root motion   p50 0.0233 ms   p99 0.0303 ms   worst 0.0332 ms
+  budget (ROADMAP M13)   p50 <= 0.050 ms                        OK
+  clips resident         100
+  method events fired    560 over 240 frames
+  allocations in frame    0
+```
+
+`--clips <n>` changes the actor count, so you can see where the curve turns:
+
+```bash
+zig build bench-animation -- --clips 400
+```
+
+It is headless (`core` + `ecs` only) and is part of `zig build bench`, so the
+number cannot rot while the renderer is mid-edit.
+
 ## Profiling and CI Gate
 
 ### Runtime Profiling

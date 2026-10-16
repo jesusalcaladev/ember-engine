@@ -22,6 +22,9 @@ pub const particles = @import("particles.zig");
 pub const fade = @import("fade.zig");
 pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
+/// M15 PARKED: TileMap chunked rendering is unfinished; re-enable with the rest
+/// of the M15 wiring. Keeping the file in the tree, out of the build.
+// pub const tilemap = @import("tilemap.zig");
 
 pub const backend_null = @import("backend_null.zig");
 pub const backend_dawn = @import("backend_dawn.zig");
@@ -29,6 +32,11 @@ pub const backend_dawn = @import("backend_dawn.zig");
 /// as one texture. Public because the backends' VTable signatures are typed on
 /// it — the manager is the bridge's own type, not the renderer's.
 pub const atlas_bridge = @import("atlas_bridge.zig");
+
+/// The render half of asset hot reload (M6): the callback that ties
+/// `assets.HotReload` to an atlas. Public because the runtime and the editor own
+/// one of these and `assets` cannot — it must not import `render`.
+pub const asset_reload = @import("asset_reload.zig");
 
 pub const QuadVertex = struct {
     pos: [2]f32,
@@ -142,6 +150,15 @@ pub const FrameStats = struct {
     /// one full-screen composite, and a scene that turned it on without knowing
     /// should be able to find out what it cost.
     post_passes: u32 = 0,
+    /// M5: render passes the editor overlay cost this frame — 0 when no editor
+    /// is attached, 1 when the UI drew (one load pass on the swapchain).
+    ///
+    /// Separate from `render_passes` and from `draw_calls` on purpose, and for
+    /// the same reason `post_passes` is: the scene budget is "four draw calls"
+    /// (spec §4) and the editor's UI is not part of the scene. Counting ImGui's
+    /// triangles in `draw_calls` would make an idle scene look like it blew the
+    /// budget the first time a panel opened.
+    overlay_passes: u32 = 0,
     /// GPU objects created since boot.
     resources_created_total: u64 = 0,
     /// GPU objects created in the CURRENT frame (must be 0: spec §3.6).
@@ -166,6 +183,14 @@ pub const OffscreenTarget = struct {
 
 /// SMAA quality presets.
 pub const SMAAQuality = enum { Low, Medium, High };
+
+/// The draw half of `Renderer.VTable.overlay`: draws UI into an open pass.
+///
+/// The handle is the backend's own (a `WGPURenderPassEncoder` on Dawn, null
+/// on the null backend) and is only valid inside the call. A draw that needs a
+/// real API (ImGui, say) takes the handle, casts it, and never stores it —
+/// storing one is the classic "works until the next resize" WebGPU bug.
+pub const OverlayFn = *const fn (ctx: ?*anyopaque, pass: ?*anyopaque) void;
 
 /// M7: the pieces of an `Environment` a backend needs, as plain data.
 ///
@@ -287,6 +312,47 @@ pub const Renderer = struct {
         addImageToAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque, path: []const u8, width: u32, height: u32, pixels: []const u8) ?[4]f32,
         /// Uploads the atlas page to GPU. Returns the atlas handle for drawSprites.
         uploadAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque,
+
+        // ── M6: asset hot reload ──────────────────────────────────────────────
+        /// Swaps an already-packed image's pixels (the hot-reload path).
+        ///
+        /// Returned because the UVs are not always the same: an image whose size
+        /// changed has been repacked to a new rect, and the caller has to re-point
+        /// whatever drew the old one. Null only means "the backend could not do
+        /// it" — no atlas, a stale handle, or an image bigger than a page.
+        updateImageInAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque, path: []const u8, width: u32, height: u32, pixels: []const u8) ?AtlasUpdate,
+        /// Re-uploads the atlas's dirty pages IN PLACE.
+        ///
+        /// A page that already has a texture has its new pixels written over that
+        /// texture rather than being given a second one, which is what makes an
+        /// edit visible: a sprite stores a texture SLOT, and a slot that stops
+        /// resolving is a sprite drawing the white fallback forever. A page that
+        /// has never been uploaded is uploaded here too, so a refresh after an
+        /// edit to something the boot never packed still works.
+        ///
+        /// Returns the current page's texture handle, or null.
+        refreshAtlas: *const fn (ptr: *anyopaque, atlas: ?*anyopaque) ?*anyopaque,
+
+        // ── M5: editor overlay ────────────────────────────────────────────────
+        /// Draws UI on top of the resolved frame, INSIDE the same submit.
+        ///
+        /// `draw` receives an opaque pass handle the backend opened on the
+        /// swapchain with a load, and must draw into it with whatever API it
+        /// uses (ImGui, a 2D canvas, a debug HUD). The handle is valid only for
+        /// the duration of the call: the backend ends the pass and submits it
+        /// immediately afterwards.
+        ///
+        /// Why a callback and not a texture: the editor's UI is immediate-mode,
+        /// so there is no texture to hand anybody — the pixels exist only while
+        /// the pass is open. The alternative (render the UI into its own
+        /// target, hand the editor a texture, composite) buys nothing here and
+        /// costs a full-screen resolve every frame.
+        ///
+        /// Why it is a vtable entry rather than something only Dawn has: the
+        /// editor must be able to ask for this without knowing which backend it
+        /// got, or the null backend (CI, tests, the frame budget harness) would
+        /// need a second code path for a UI that cannot be drawn anyway.
+        overlay: *const fn (ptr: *anyopaque, ctx: ?*anyopaque, draw: OverlayFn) void,
     };
 
     pub fn beginFrame(self: Renderer) void {
@@ -326,6 +392,16 @@ pub const Renderer = struct {
     }
     pub fn drawSprites(self: Renderer, instances: []const SpriteInstance, count: usize) void {
         self.vtable.drawSprites(self.ptr, instances, count);
+    }
+    /// M5: draws the editor overlay on top of the resolved frame.
+    ///
+    /// A no-op on the null backend (there is no swapchain to draw on, and a
+    /// headless test run must not have to special-case it). On Dawn it costs
+    /// exactly one extra render pass with `LoadOp_Load`, in the submit that
+    /// `endScene` already makes — so the game's draw calls stay at four and the
+    /// UI is not antialiased.
+    pub fn drawOverlay(self: Renderer, ctx: ?*anyopaque, draw: OverlayFn) void {
+        self.vtable.overlay(self.ptr, ctx, draw);
     }
     /// M7: draws `count` lights from `instances`.
     ///
@@ -369,6 +445,34 @@ pub const Renderer = struct {
     pub fn uploadAtlas(self: Renderer, atlas_handle: ?*anyopaque) ?*anyopaque {
         return self.vtable.uploadAtlas(self.ptr, atlas_handle);
     }
+
+    // ── M6: asset hot reload ──────────────────────────────────────────────────
+    //
+    // The pair is what turns "a file changed" into "the sprite is different".
+    //
+    // `updateImageInAtlas` puts the new pixels on the rect the sprite's UVs
+    // already point at, and `refreshAtlas` writes that page into the texture the
+    // sprite's slot already resolves to. Both halves are needed: the first
+    // without the second leaves the CPU right and the GPU stale, and the second
+    // without the first uploads an unchanged page. A caller that does only one
+    // of the two has a reload that appears to work and changes nothing.
+    pub fn updateImageInAtlas(self: Renderer, atlas_handle: ?*anyopaque, path: []const u8, width: u32, height: u32, pixels: []const u8) ?AtlasUpdate {
+        return self.vtable.updateImageInAtlas(self.ptr, atlas_handle, path, width, height, pixels);
+    }
+    pub fn refreshAtlas(self: Renderer, atlas_handle: ?*anyopaque) ?*anyopaque {
+        return self.vtable.refreshAtlas(self.ptr, atlas_handle);
+    }
+};
+
+/// What an atlas reload changed, as the renderer reports it.
+///
+/// The `uv` is what to draw with AFTER the reload — the same rect for a
+/// same-size edit, a new one when the image was resized. `repositioned` records
+/// which of the two happened, so the caller only goes looking for sprites to
+/// re-point when it actually has to.
+pub const AtlasUpdate = struct {
+    uv: [4]f32,
+    repositioned: bool,
 };
 
 /// Creates an orthographic camera covering `width` x `height` pixels.

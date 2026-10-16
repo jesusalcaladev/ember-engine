@@ -1,83 +1,97 @@
-//! Script Asset Handling — Lua source validation and script_id registration.
-//! Integrates VFS/Registry with the script system.
+//! Script asset validation (M6): what the importer checks about a `.lua` file
+//! before the script layer ever sees it.
+//!
+//! ## The scope line
+//!
+//! This module answers "is this a text Lua source file?", not "does this Lua
+//! compile?". Compilation is LuaJIT's job and is already wired: the runtime's
+//! `script.Behaviors`/`Scripts` compiles and hot-reloads chunks. Re-implementing
+//! a Lua parser here would be a second, weaker source of truth, and it would
+//! reject a valid file the day it disagreed with the real one. So the checks are
+//! exactly the ones a *parser cannot* make for you:
+//!
+//! - **non-empty** — an empty script is a mistake, not a program;
+//! - **no NUL bytes** — the tell-tale of a file that is not source at all;
+//! - **valid UTF-8** — the editor lexes, colours and completes by UTF-8
+//!   codepoint; a script it cannot decode is a script it renders as noise;
+//! - **within the size cap** — a bound that keeps the frame arena honest later.
+//!
+//! It also strips a leading UTF-8 BOM, because a BOM before `function` is the
+//! one byte sequence that silently breaks `loadstring` on some editors' output.
 
 const std = @import("std");
-const Scripts = @import("script").Scripts;
-const VFS = @import("vfs.zig").VFS;
-const AssetRegistry = @import("registry.zig").AssetRegistry;
 
 pub const ScriptError = error{
-    FileNotFound,
-    SyntaxError,
-    OutOfMemory,
+    Empty,
+    ContainsNul,
+    NotUtf8,
+    TooLarge,
 };
 
-/// Load and validate a Lua script, register with script system.
-pub fn loadScript(
-    vfs: *VFS,
-    registry: *AssetRegistry,
-    scripts: *Scripts,
-    path: []const u8,
-) ScriptError!u32 {
-    const ext = fileExtension(path) orelse return ScriptError.SyntaxError;
-    if (!isScriptExtension(ext)) return ScriptError.SyntaxError;
+/// The largest script the importer will accept. Generous for hand-written code,
+/// small enough that a mis-typed `.lua` pointing at a binary is refused fast.
+pub const default_max_bytes: usize = 8 * 1024 * 1024;
 
-    const source = try vfs.readFile(path);
-    defer vfs.allocator.free(source);
+pub const Validated = struct {
+    /// The source to compile: BOM already removed, everything else untouched.
+    source: []const u8,
+    /// True when a UTF-8 BOM was present and stripped.
+    had_bom: bool,
+    /// Byte length of `source` after stripping.
+    size: usize,
+};
 
-    // Syntax check: compile in LuaJIT (validates without executing)
-    const script_id = try scripts.add(source);
-    errdefer scripts.remove(script_id);
+/// Validates a script's bytes. On success the returned `source` is a sub-slice
+/// of the input (no allocation); the caller owns the original buffer.
+pub fn validate(bytes: []const u8, max_bytes: usize) ScriptError!Validated {
+    if (bytes.len > max_bytes) return error.TooLarge;
 
-    // Register in asset registry
-    const content_hash = hashContent(source);
-    try registry.register(.script, path, @intCast(script_id), content_hash);
-
-    return script_id;
-}
-
-/// Reload a script (hot reload).
-pub fn reloadScript(
-    vfs: *VFS,
-    registry: *AssetRegistry,
-    scripts: *Scripts,
-    path: []const u8,
-) ScriptError!u32 {
-    const guid = registry.getByPath(path) orelse return ScriptError.FileNotFound;
-    const entry = registry.get(guid) orelse return ScriptError.FileNotFound;
-    const script_id = entry.handle;
-
-    const source = try vfs.readFile(path);
-    defer vfs.allocator.free(source);
-
-    const new_hash = hashContent(source);
-    if (entry.content_hash == new_hash) return script_id; // No change
-
-    // Hot reload: replace script content, keep same script_id
-    try scripts.replace(script_id, source);
-    registry.updateAfterReload(guid, script_id, new_hash);
-    return script_id;
-}
-
-fn isScriptExtension(ext: []const u8) bool {
-    return std.mem.eql(u8, ext, "lua");
-}
-
-fn fileExtension(path: []const u8) ?[]const u8 {
-    var i: isize = @as(isize, @intCast(path.len)) - 1;
-    while (i >= 0) : (i -= 1) {
-        const c = path[@intCast(i)];
-        if (c == '.') return path[@as(usize, @intCast(i)) + 1 ..];
-        if (c == '/' or c == '\\') break;
+    var source = bytes;
+    var had_bom = false;
+    if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) {
+        source = source[3..];
+        had_bom = true;
     }
-    return null;
+
+    if (source.len == 0) return error.Empty;
+    if (std.mem.indexOfScalar(u8, source, 0) != null) return error.ContainsNul;
+    if (!std.unicode.utf8ValidateSlice(source)) return error.NotUtf8;
+
+    return .{ .source = source, .had_bom = had_bom, .size = source.len };
 }
 
-fn hashContent(content: []const u8) u64 {
-    var h: u64 = 0xcbf29ce484222325;
-    for (content) |c| {
-        h ^= @as(u64, c);
-        h *= 0x100000001b3;
-    }
-    return h;
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "a plain Lua script passes and is returned unchanged" {
+    const src = "local function update(self, dt)\n  self.x = self.x + dt\nend\n";
+    const v = try validate(src, default_max_bytes);
+    try testing.expectEqualStrings(src, v.source);
+    try testing.expect(!v.had_bom);
+}
+
+test "a UTF-8 BOM is stripped so the first token is really the first token" {
+    const v = try validate("\xEF\xBB\xBFfunction f() end", default_max_bytes);
+    try testing.expect(v.had_bom);
+    try testing.expectEqualStrings("function f() end", v.source);
+}
+
+test "empties, NULs, binary and oversize files are each refused" {
+    try testing.expectError(error.Empty, validate("", default_max_bytes));
+    try testing.expectError(error.Empty, validate("\xEF\xBB\xBF", default_max_bytes));
+
+    try testing.expectError(error.ContainsNul, validate("function f()\x00 end", default_max_bytes));
+
+    // A byte that is the start of a multi-byte sequence with no continuation is
+    // invalid UTF-8 (and a good stand-in for a renamed binary: no NUL to trip
+    // the earlier check first).
+    try testing.expectError(error.NotUtf8, validate("local x = \xFF\xFEy", default_max_bytes));
+
+    try testing.expectError(error.TooLarge, validate("aaaa", 3));
+}
+
+test "valid multi-byte UTF-8 in a string literal is accepted" {
+    const src = "local greeting = \"hola, mañana — señor\"\n";
+    _ = try validate(src, default_max_bytes);
 }

@@ -1,0 +1,16 @@
+# Dear ImGui (M5: the editor shell) — TWO pins, on purpose.
+#
+# libs/imgui.tag    the upstream snapshot that gets FETCHED. A tag is the only
+#                   thing that survives a mirror, a tarball proxy or a
+#                   corporate git cache without server-side SHA-in-want.
+# libs/imgui.commit the commit that tag must resolve to, and the bootstrap
+#                   VERIFIES it. The tag is therefore never authoritative: if
+#                   upstream re-points or re-tags it, the bootstrap fails
+#                   loudly instead of silently rebuilding the editor against
+#                   different ImGui code.
+#
+# The Docking branch, not master: ROADMAP M5 asks for a docking shell, and
+# migrating an imgui.ini layout between the two branches is a user-visible
+# migration nobody wants to ship twice.
+
+b48d1afbe8ee8b238e2961dc363a949dd7304e23

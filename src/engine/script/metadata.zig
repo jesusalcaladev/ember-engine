@@ -3508,6 +3508,366 @@ pub const bindings = [_]Binding{
         \\log.warn("out of ammo")
         ,
     },
+    // ── M15: TileMap (chunked tile layers) ─────────────────────────────────────
+    .{
+        .name = "tilemap.set_tileset",
+        .module = "tilemap",
+        .signature = "tilemap.set_tileset(self, tileset_guid)",
+        .summary = "Sets the TileSet (tile palette) this layer draws from. The GUID is in 'asset_XXXXXXXXXXXXXXXX' format.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "tileset_guid", .kind = .string, .doc = "TileSet asset GUID from the asset registry" },
+        },
+        .returns = &.{},
+        .example =
+        \\tilemap.set_tileset(self, "asset_0123456789abcdef")
+        ,
+    },
+    .{
+        .name = "tilemap.set_tile",
+        .module = "tilemap",
+        .signature = "tilemap.set_tile(self, tile_x, tile_y, atlas_index, flip_x?, flip_y?)",
+        .summary = "Sets a single tile at the given tile coordinates. Flip flags are optional.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "tile_x", .kind = .integer, .doc = "tile coordinate X (not pixels)" },
+            .{ .name = "tile_y", .kind = .integer, .doc = "tile coordinate Y (not pixels)" },
+            .{ .name = "atlas_index", .kind = .integer, .doc = "index into the TileSet atlas (0 = empty)" },
+            .{ .name = "flip_x", .kind = .boolean, .default = "false", .doc = "mirror horizontally" },
+            .{ .name = "flip_y", .kind = .boolean, .default = "false", .doc = "mirror vertically" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- place a grass tile at (5, 3) with atlas index 1
+        \\tilemap.set_tile(self, 5, 3, 1)
+        \\-- place a flipped tile
+        \\tilemap.set_tile(self, 6, 3, 2, true, false)
+        ,
+    },
+    .{
+        .name = "tilemap.get_tile",
+        .module = "tilemap",
+        .signature = "tilemap.get_tile(self, tile_x, tile_y) -> atlas_index, flip_x, flip_y",
+        .summary = "Returns the tile at the given coordinates, or 0/false/false if empty.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "tile_x", .kind = .integer, .doc = "tile coordinate X" },
+            .{ .name = "tile_y", .kind = .integer, .doc = "tile coordinate Y" },
+        },
+        .returns = &.{
+            .{ .kind = .integer, .doc = "atlas index (0 = empty)" },
+            .{ .kind = .boolean, .doc = "flip_x flag" },
+            .{ .kind = .boolean, .doc = "flip_y flag" },
+        },
+        .example =
+        \\local idx, fx, fy = tilemap.get_tile(self, 5, 3)
+        \\if idx > 0 then log.info("tile at 5,3 is " .. idx) end
+        ,
+    },
+    .{
+        .name = "tilemap.fill_rect",
+        .module = "tilemap",
+        .signature = "tilemap.fill_rect(self, x1, y1, x2, y2, atlas_index)",
+        .summary = "Fills a rectangle (inclusive) with the same tile. Order of corners does not matter.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x1", .kind = .integer, .doc = "first corner tile X" },
+            .{ .name = "y1", .kind = .integer, .doc = "first corner tile Y" },
+            .{ .name = "x2", .kind = .integer, .doc = "opposite corner tile X" },
+            .{ .name = "y2", .kind = .integer, .doc = "opposite corner tile Y" },
+            .{ .name = "atlas_index", .kind = .integer, .doc = "tile atlas index to fill with" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- fill a 10x10 floor area with grass (atlas index 1)
+        \\tilemap.fill_rect(self, 0, 0, 9, 9, 1)
+        ,
+    },
+    .{
+        .name = "tilemap.set_layer",
+        .module = "tilemap",
+        .signature = "tilemap.set_layer(self, layer)",
+        .summary = "Sets the render layer (draw order). Lower layers draw first.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "layer", .kind = .integer, .doc = "render layer (0 = default, negative = behind, positive = front)" },
+        },
+        .returns = &.{},
+        .example =
+        \\tilemap.set_layer(self, -1) -- draw behind the player
+        ,
+    },
+    .{
+        .name = "tilemap.set_physics_enabled",
+        .module = "tilemap",
+        .signature = "tilemap.set_physics_enabled(self, enabled)",
+        .summary = "Enables or disables physics collision for this tile layer.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "enabled", .kind = .boolean, .doc = "true = collidable, false = no collision" },
+        },
+        .returns = &.{},
+        .example =
+        \\tilemap.set_physics_enabled(self, true) -- this layer blocks movement
+        ,
+    },
+    .{
+        .name = "tilemap.get_chunk_bounds",
+        .module = "tilemap",
+        .signature = "tilemap.get_chunk_bounds(self, cx, cy) -> min_x, min_y, max_x, max_y",
+        .summary = "Returns the world-space bounds of a chunk. Useful for spawning or querying.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "cx", .kind = .integer, .doc = "chunk X coordinate" },
+            .{ .name = "cy", .kind = .integer, .doc = "chunk Y coordinate" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "minimum world X" },
+            .{ .kind = .number, .doc = "minimum world Y" },
+            .{ .kind = .number, .doc = "maximum world X" },
+            .{ .kind = .number, .doc = "maximum world Y" },
+        },
+        .example =
+        \\local min_x, min_y, max_x, max_y = tilemap.get_chunk_bounds(self, 0, 0)
+        \\log.info("chunk 0,0 spans " .. min_x .. " to " .. max_x)
+        ,
+    },
+    .{
+        .name = "tilemap.erase_rect",
+        .module = "tilemap",
+        .signature = "tilemap.erase_rect(self, x1, y1, x2, y2)",
+        .summary = "Erases a rectangle (sets tiles to empty). Order of corners does not matter.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x1", .kind = .integer, .doc = "first corner tile X" },
+            .{ .name = "y1", .kind = .integer, .doc = "first corner tile Y" },
+            .{ .name = "x2", .kind = .integer, .doc = "opposite corner tile X" },
+            .{ .name = "y2", .kind = .integer, .doc = "opposite corner tile Y" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- clear a 10x10 area
+        \\tilemap.erase_rect(self, 0, 0, 9, 9)
+        ,
+    },
+    .{
+        .name = "tilemap.set_tile_size",
+        .module = "tilemap",
+        .signature = "tilemap.set_tile_size(self, size)",
+        .summary = "Overrides the tile size for this layer. 0 = use TileSet default.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "size", .kind = .number, .doc = "tile size in world units (0 = default)" },
+        },
+        .returns = &.{},
+        .example =
+        \\tilemap.set_tile_size(self, 64) -- use 64px tiles instead of TileSet default
+        ,
+    },
+    .{
+        .name = "tilemap.set_default_flip",
+        .module = "tilemap",
+        .signature = "tilemap.set_default_flip(self, flip_x, flip_y)",
+        .summary = "Sets default flip flags for newly placed tiles via set_tile/fill_rect.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "flip_x", .kind = .boolean, .doc = "mirror horizontally by default" },
+            .{ .name = "flip_y", .kind = .boolean, .doc = "mirror vertically by default" },
+        },
+        .returns = &.{},
+        .example =
+        \\tilemap.set_default_flip(self, true, false) -- flip horizontally by default
+        ,
+    },
+    .{
+        .name = "tilemap.describe",
+        .module = "tilemap",
+        .signature = "tilemap.describe(self) -> table",
+        .summary = "Returns a table with debug info about this tilemap layer.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .table, .doc = "fields: tileset_guid, layer, z_offset, physics_enabled, tile_size_override, default_flip_x, default_flip_y" },
+        },
+        .example =
+        \\local info = tilemap.describe(self)
+        \\log.info("tileset: " .. info.tileset_guid)
+        ,
+    },
+    // ── M13: Animation (per-actor AnimationPlayer surface) ─────────────────
+    .{
+        .name = "anim.new",
+        .module = "anim",
+        .signature = "anim.new(self)",
+        .summary = "Adds an AnimationPlayer to this actor when it does not already have one.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\anim.new(self)
+        ,
+    },
+    .{
+        .name = "anim.load",
+        .module = "anim",
+        .signature = "anim.load(path) -> integer",
+        .summary = "Decodes a .anim clip file and registers it, returning the clip id for anim.play. Calling it again for the same path hot-reloads the clip under the same id, so playback position is kept.",
+        .params = &.{
+            .{ .name = "path", .kind = .string, .doc = "path to a .anim clip file" },
+        },
+        .returns = &.{.{ .kind = .integer, .doc = "clip id, or nil on failure" }},
+        .example =
+        \\local run = anim.load("assets/player_run.anim")
+        \\anim.play(self, run, 0.2)
+        ,
+    },
+    .{
+        .name = "anim.play",
+        .module = "anim",
+        .signature = "anim.play(self, clip_id?, blend?)",
+        .summary = "Plays a clip. A positive blend crossfades over that many seconds instead of cutting.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "clip_id", .kind = .integer, .default = "current", .doc = "clip handle to play (0 = nothing)" },
+            .{ .name = "blend", .kind = .number, .default = "0", .doc = "crossfade seconds; 0 cuts" },
+        },
+        .returns = &.{},
+        .example =
+        \\anim.play(self, 3, 0.2) -- walk -> run over 0.2 s
+        ,
+    },
+    .{
+        .name = "anim.stop",
+        .module = "anim",
+        .signature = "anim.stop(self)",
+        .summary = "Stops playback and clears the current clip.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\anim.stop(self)
+        ,
+    },
+    .{
+        .name = "anim.pause",
+        .module = "anim",
+        .signature = "anim.pause(self)",
+        .summary = "Pauses playback by setting speed to 0; the clip and time are kept.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\anim.pause(self)
+        ,
+    },
+    .{
+        .name = "anim.resume",
+        .module = "anim",
+        .signature = "anim.resume(self)",
+        .summary = "Resumes a paused player by restoring speed 1; a no-op otherwise.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\anim.resume(self)
+        ,
+    },
+    .{
+        .name = "anim.seek",
+        .module = "anim",
+        .signature = "anim.seek(self, time)",
+        .summary = "Jumps to a time in seconds inside the current clip.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "time", .kind = .number, .doc = "seconds from the clip start" },
+        },
+        .returns = &.{},
+        .example =
+        \\anim.seek(self, 0.5)
+        ,
+    },
+    .{
+        .name = "anim.set_speed",
+        .module = "anim",
+        .signature = "anim.set_speed(self, speed)",
+        .summary = "Sets the playback rate: 1 is normal, negative plays in reverse.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "speed", .kind = .number, .doc = "time multiplier" },
+        },
+        .returns = &.{},
+        .example =
+        \\anim.set_speed(self, 2.0) -- double speed
+        ,
+    },
+    .{
+        .name = "anim.queue",
+        .module = "anim",
+        .signature = "anim.queue(self, clip_id)",
+        .summary = "Queues a clip to start when the current one finishes (up to four).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "clip_id", .kind = .integer, .doc = "clip handle to queue" },
+        },
+        .returns = &.{},
+        .example =
+        \\anim.queue(self, 4) -- attack, then go back to idle
+        ,
+    },
+    .{
+        .name = "anim.set_param",
+        .module = "anim",
+        .signature = "anim.set_param(self, name, value)",
+        .summary = "Sets one playback parameter by name: speed, time, clip, blend or state. Unknown names are ignored.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "name", .kind = .string, .doc = "'speed' | 'time' | 'clip' | 'blend' | 'state'" },
+            .{ .name = "value", .kind = .number, .doc = "new value for the parameter" },
+        },
+        .returns = &.{},
+        .example =
+        \\anim.set_param(self, "speed", 1.5)
+        ,
+    },
+    .{
+        .name = "anim.state",
+        .module = "anim",
+        .signature = "anim.state(self) -> integer",
+        .summary = "Current playback state (0 idle, 1 playing, 2 paused, 3 finished).",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .integer, .doc = "playback state" }},
+        .example =
+        \\if anim.state(self) == 3 then log.info("clip finished") end
+        ,
+    },
+    .{
+        .name = "anim.time",
+        .module = "anim",
+        .signature = "anim.time(self) -> number",
+        .summary = "Current time in seconds inside the playing clip.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .number, .doc = "seconds from the clip start" }},
+        .example =
+        \\local t = anim.time(self)
+        ,
+    },
+    .{
+        .name = "anim.length",
+        .module = "anim",
+        .signature = "anim.length(self) -> number",
+        .summary = "Duration in seconds of the current clip; 0 when the clip is unknown.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .number, .doc = "clip duration in seconds" }},
+        .example =
+        \\local total = anim.length(self)
+        ,
+    },
+    .{
+        .name = "anim.is_playing",
+        .module = "anim",
+        .signature = "anim.is_playing(self) -> boolean",
+        .summary = "True while the player is in the playing state.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true when playing" }},
+        .example =
+        \\if anim.is_playing(self) then anim.play(self, 2) end
+        ,
+    },
 };
 
 // ── Lookup and the registration gate ────────────────────────────────────────

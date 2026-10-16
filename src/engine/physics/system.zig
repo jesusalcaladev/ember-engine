@@ -174,6 +174,11 @@ pub const System = struct {
         return initWithActivity(allocator, backend, gravity, null);
     }
 
+    /// Returns the underlying physics world for external systems (e.g. TileMap).
+    pub fn getWorld(self: *const System) physics.World {
+        return self.world;
+    }
+
     /// The constructor an open world uses: it supplies activity radii, so bodies
     /// far from the focus are progressively taken out of the solver.
     pub fn initWithActivity(

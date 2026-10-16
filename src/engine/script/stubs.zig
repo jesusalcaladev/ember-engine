@@ -13,7 +13,9 @@
 //! the rest of `core`/`ecs` writes text (see `json.Writer`).
 
 const std = @import("std");
-const metadata = @import("metadata.zig");
+// Module import, not a relative path — see build.zig's
+// `script_mod.addImport("api_meta", ...)`.
+const metadata = @import("api_meta");
 
 const Binding = metadata.Binding;
 const Kind = metadata.Kind;

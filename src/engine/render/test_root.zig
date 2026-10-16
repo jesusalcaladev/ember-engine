@@ -57,6 +57,7 @@ pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
 pub const backend_null = @import("backend_null.zig");
 pub const atlas_bridge = @import("atlas_bridge.zig");
+pub const asset_reload = @import("asset_reload.zig");
 
 test {
     _ = batcher;
@@ -68,6 +69,7 @@ test {
     _ = lighting_driver;
     _ = backend_null;
     _ = atlas_bridge;
+    _ = asset_reload;
 
     // `refAllDecls` on the root as well, deliberately. The explicit references
     // above are what pull each file's own top-level tests in; this is cheap
@@ -160,6 +162,10 @@ test "the renderer's tests are in this binary, not just its code" {
             @compileError("batcher.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(atlas.AtlasPacker))
             @compileError("atlas.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(atlas_bridge.AtlasManager))
+            @compileError("atlas_bridge.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(asset_reload.Reloader))
+            @compileError("asset_reload.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(two_d.Renderer2D))
             @compileError("2d.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(particles.System))
