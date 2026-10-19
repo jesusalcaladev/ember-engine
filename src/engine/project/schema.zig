@@ -199,6 +199,7 @@ pub const sections: []const Section = &.{
         .tooltip = "The project's Lua global scripts: behavior chunks mounted with no actor (game manager, score, spawner).",
         .fields = &.{
             .{ .name = "global", .type = .string_list, .list_style = .bare, .max_items = config.max_global_scripts, .tooltip = "Script paths relative to the project root, in LOAD order: the first listed runs first each frame. Each mounts under its basename — \"scripts/globals/game.lua\" is `globals.get(\"game\")` from any script." },
+            .{ .name = "behavior", .type = .string_list, .list_style = .bare, .max_items = config.max_behavior_scripts, .tooltip = "The behavior scripts an actor can run, in LOAD order. The ORDER IS THE ID: the first entry is script 0, and that is what a scene file's `Script {script: 0}` refers to." },
         },
     },
     .{
@@ -377,7 +378,10 @@ fn isNameList(comptime section: []const u8, comptime field: []const u8) bool {
         // `scripts.global` is a load ORDER, so a duplicate mounts one global and
         // hides the other — an error at attach time (`GlobalsAlreadyMounted`)
         // that validation can catch before anything is mounted.
-        (std.mem.eql(u8, section, "scripts") and std.mem.eql(u8, field, "global"));
+        (std.mem.eql(u8, section, "scripts") and std.mem.eql(u8, field, "global")) or
+        // `scripts.behavior` is an id TABLE: a duplicate path would make two
+        // ids the same script, and the scene file would be ambiguous.
+        (std.mem.eql(u8, section, "scripts") and std.mem.eql(u8, field, "behavior"));
 }
 
 fn isLayersList(comptime section: []const u8, comptime field: []const u8) bool {

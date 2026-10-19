@@ -161,6 +161,111 @@ const driver_src =
     \\return M
 ;
 
+/// The coroutine layer: `self:async(fn)` and the global `wait(seconds)`.
+///
+/// WHY IT IS ALL LUA: a coroutine that yields has to be resumed by someone, and
+/// the natural someone is the script layer itself. A yield cannot cross the C
+/// boundary of a `pcall` in plain Lua 5.1 — but this engine runs LuaJIT, whose
+/// VM is fully resumable, and the whole scheme is easier to get right with the
+/// resume loop in the same language as the code that yields.
+///
+/// The resume loop runs on the FIXED step, so a `wait(1.0)` is a second of
+/// GAME time: it slows down with the global time scale and it replays
+/// identically, which a frame-rate-dependent wait would not.
+const coroutine_src =
+    \\local M = {}
+    \\local report = __behavior_error
+    \\-- The coroutine list lives on the instance's own table, under a private
+    \\-- key. It is per instance, so two actors never share a coroutine.
+    \\local LIST = "__coroutines"
+    \\-- The errors a coroutine raised since the last drive. The driver hands
+    \\-- them to the engine so they land in the same counter the behaviors'
+    \\-- errors do: a broken coroutine has to show up in the report.
+    \\local pending_errors = 0
+    \\-- Starts `fn` as a coroutine on this instance.
+    \\--
+    \\-- `fn` is called with the instance's `self` as its argument and may call
+    \\-- the global `wait(seconds)` to pause. The coroutine is resumed by the
+    \\-- engine's fixed step.
+    \\function M.async(self, fn)
+    \\  if type(fn) ~= "function" then
+    \\    error("async expects a function", 2)
+    \\  end
+    \\  local list = self[LIST]
+    \\  if list == nil then
+    \\    list = {}
+    \\    self[LIST] = list
+    \\  end
+    \\  local entry = { co = coroutine.create(fn), wait = 0, dead = false }
+    \\  list[#list + 1] = entry
+    \\  M.resume(self, entry)
+    \\  return true
+    \\end
+    \\-- Resumes a coroutine once. A YIELD means "sleep this long"; a coroutine
+    \\-- that ERRORED is reported and dropped, exactly like a broken behavior.
+    \\function M.resume(self, entry)
+    \\  local ok, value = coroutine.resume(entry.co, self)
+    \\  if not ok then
+    \\    if report ~= nil then report(self, value) end
+    \\    entry.dead = true
+    \\    pending_errors = pending_errors + 1
+    \\    return
+    \\  end
+    \\  if coroutine.status(entry.co) == "dead" then
+    \\    entry.dead = true
+    \\    return
+    \\  end
+    \\  entry.wait = value or 0
+    \\end
+    \\-- Pauses the current coroutine for `seconds` of game time.
+    \\--
+    \\-- The method form, `self:wait(1.0)`, is what a script reaches for: it
+    \\-- reads like the rest of the behavior API and it cannot be shadowed by
+    \\-- an unrelated global. The global form, `wait(1.0)`, is the same
+    \\-- function and exists because it is the spelling the roadmap names.
+    \\function M.wait_self(self, seconds)
+    \\  return M.wait(seconds)
+    \\end
+    \\-- Pauses the current coroutine for `seconds` of game time.
+    \\function M.wait(seconds)
+    \\  local _, is_main = coroutine.running()
+    \\  if is_main then
+    \\    error("wait() only works inside a coroutine: start one with self:async(function() ... end)", 2)
+    \\  end
+    \\  return coroutine.yield(seconds or 0)
+    \\end
+    \\-- Advances every coroutine of every instance by `dt`.
+    \\function M.drive_co(insts, dt)
+    \\  local n = #insts
+    \\  local i = 1
+    \\  while i <= n do
+    \\    local inst = insts[i]
+    \\    local list = inst[LIST]
+    \\    if list ~= nil then
+    \\      local k = #list
+    \\      while k >= 1 do
+    \\        local entry = list[k]
+    \\        if entry.dead then
+    \\          table.remove(list, k)
+    \\        else
+    \\          entry.wait = entry.wait - dt
+    \\          if entry.wait <= 0 then
+    \\            M.resume(inst, entry)
+    \\            if entry.dead then table.remove(list, k) end
+    \\          end
+    \\        end
+    \\        k = k - 1
+    \\      end
+    \\    end
+    \\    i = i + 1
+    \\  end
+    \\  local errors = pending_errors
+    \\  pending_errors = 0
+    \\  return errors
+    \\end
+    \\return M
+;
+
 /// The behavior system: owns the VM, the script cache and the dense instance
 /// array, and drives the lifecycle. The runtime creates one, reserves capacity
 /// at load, and calls `startAll`/`update`/`fixedUpdate` from the frame loop.
@@ -188,6 +293,14 @@ pub const Behaviors = struct {
     grid: spatial_mod.Grid,
     /// Registry ref of the steering module's `for` constructor.
     steer_ref: i32 = no_ref,
+    /// The coroutine layer's `async` method, injected into every instance's
+    /// `self` table so a script can start a coroutine: `self:async(fn)`.
+    async_ref: i32 = no_ref,
+    /// The coroutine layer's `wait` method, injected into every instance's
+    /// `self` table: `self:wait(seconds)`.
+    wait_ref: i32 = no_ref,
+    /// The coroutine layer's resume loop, driven once per fixed step.
+    co_driver_ref: i32 = no_ref,
     /// The mounted GLOBAL scripts (see `GlobalInstance`). Kept in a second
     /// dense array rather than mixed into `instances` on purpose: an actor
     /// lifecycle question (`world.isAlive`, the sweep) has a definite answer
@@ -208,6 +321,7 @@ pub const Behaviors = struct {
         .ctx = null,
         .push_self = pushGlobalSelf,
         .exists = globalExistsHook,
+        .global_ref_of_self = globalRefOfSelfHook,
     },
     /// Per-frame counters for the acceptance report (M3 criteria).
     updates: u32 = 0,
@@ -343,6 +457,21 @@ pub const Behaviors = struct {
         lua.getField(L, -1, "drive"); // [module, drive]
         // Keep `drive` (the top) and drop the module table under it.
         self.driver_ref = self.vm.refTop2();
+
+        // The coroutine layer: the `async` method every instance carries, the
+        // global `wait`, and the resume loop.
+        if (lua.luaL_loadbuffer(L, coroutine_src, coroutine_src.len, "@behavior_coroutine") != 0)
+            return error.DriverCompilationFailed;
+        if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.DriverCompilationFailed;
+        // [module]
+        lua.getField(L, -1, "async"); // [module, async]
+        self.async_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "wait_self"); // [module, wait_self]
+        self.wait_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "wait"); // [module, wait]
+        lua.setGlobal(L, "wait"); // the global a coroutine calls to pause
+        lua.getField(L, -1, "drive_co"); // [module, drive_co]
+        self.co_driver_ref = self.vm.refTop2(); // keep it, drop the module
     }
 
     pub fn deinit(self: *Behaviors) void {
@@ -366,6 +495,9 @@ pub const Behaviors = struct {
         }
         self.globals.deinit(self.allocator);
         if (self.driver_ref != no_ref) self.vm.unref(self.driver_ref);
+        if (self.async_ref != no_ref) self.vm.unref(self.async_ref);
+        if (self.wait_ref != no_ref) self.vm.unref(self.wait_ref);
+        if (self.co_driver_ref != no_ref) self.vm.unref(self.co_driver_ref);
         if (self.insts_table_ref != no_ref) self.vm.unref(self.insts_table_ref);
         if (self.globals_table_ref != no_ref) self.vm.unref(self.globals_table_ref);
         // The spatial grid is allocated by `init` (a cell table plus the
@@ -462,6 +594,16 @@ pub const Behaviors = struct {
         //    should be talking to `world.*`, not to an actor that does not
         //    belong to it).
         self.scripts.instantiate(script_id); // leaves `self` on top
+        // The coroutine method, the same injection a behavior gets: a global
+        // can sequence too (it just cannot touch an actor).
+        if (self.async_ref != no_ref) {
+            self.vm.pushRef(self.async_ref); // [self, async]
+            lua.setField(L, -2, "async"); // self.async = async (pops async)
+        }
+        if (self.wait_ref != no_ref) {
+            self.vm.pushRef(self.wait_ref); // [self, wait]
+            lua.setField(L, -2, "wait"); // self.wait = wait (pops wait)
+        }
         const self_ref = self.vm.refTop(); // ref + pop `self`
 
         // 2. Record the instance and resolve its cached method refs. From the
@@ -611,6 +753,18 @@ pub const Behaviors = struct {
         // 1. Fresh `self` with the shared metatable; stamp the entity handle.
         self.scripts.instantiate(script_id); // leaves `self` on top
         bindings.stampSelfEntity(L, entity);
+        // The coroutine method goes on the INSTANCE's table, so it is found
+        // before the prototype's `__index` — a script that defines its own
+        // `async` would be shadowed, which is why the name is documented as
+        // the engine's.
+        if (self.async_ref != no_ref) {
+            self.vm.pushRef(self.async_ref); // [self, async]
+            lua.setField(L, -2, "async"); // self.async = async (pops async)
+        }
+        if (self.wait_ref != no_ref) {
+            self.vm.pushRef(self.wait_ref); // [self, wait]
+            lua.setField(L, -2, "wait"); // self.wait = wait (pops wait)
+        }
         const self_ref = self.vm.refTop(); // ref + pop `self`
 
         // 2. Record the instance and resolve its cached method refs.
@@ -727,7 +881,10 @@ pub const Behaviors = struct {
         // behavior's `update` reads `sm.state()`. Ticking machines first means a
         // behavior sees the state its machine just entered, rather than the one
         // it left last frame.
-        if (self.machines.binding_count != 0) self.machines.tick();
+        // The flow counts too: it is a GLOBAL machine, and a game whose only
+        // state machine is the flow has no entity bindings at all — so the
+        // "are there any bindings" shortcut used to leave the flow frozen.
+        if (self.machines.binding_count != 0 or self.machines.hasFlow()) self.machines.tick();
         // The grid is rebuilt AFTER the machines tick and BEFORE the behaviors
         // run: a machine that moved actors must be visible to the neighbours
         // those actors query this same frame, or the flock lags a frame behind.
@@ -861,6 +1018,33 @@ pub const Behaviors = struct {
             lua.pushF32(L, dt);
             self.callMethod(inst, 2); // fn(self, dt)
         }
+        // The coroutines advance on the FIXED step, after the behaviors: a
+        // `wait(1.0)` is a second of game time, it slows down with the global
+        // time scale, and it replays identically.
+        if (self.co_driver_ref != no_ref) self.driveCoroutines(dt);
+    }
+
+    /// Advances every coroutine of every instance by `dt`.
+    fn driveCoroutines(self: *Behaviors, dt: f32) void {
+        const state = self.vm.state() orelse return;
+        self.vm.pushRef(self.co_driver_ref); // [drive_co]
+        self.vm.pushRef(self.insts_table_ref); // [drive_co, insts]
+        lua.pushF32(state, dt); // [drive_co, insts, dt]
+        if (lua.lua_pcall(state, 2, 1, 0) != 0) {
+            self.errors += 1;
+            var buf: [256]u8 = undefined;
+            if (self.vm.readError(&buf)) |msg| {
+                core_log.err("coroutine driver failed: {s}", .{msg});
+            }
+            return;
+        }
+        // The driver returns how many coroutines errored; `report` already
+        // logged each one, so this is only the counter the report reads.
+        if (lua.isNumber(state, -1)) {
+            const reported: u64 = @intFromFloat(lua.lua_tonumber(state, -1));
+            if (reported > 0) self.errors += @intCast(reported);
+        }
+        lua.pop(state, 1); // []
     }
 
     /// One field of a signal payload, as Lua sees it: a name and a value.
@@ -1087,6 +1271,109 @@ fn globalExistsHook(ctx: ?*anyopaque, name: []const u8) bool {
     const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return false));
     const id = b.scripts.idOf(name) orelse return false;
     return b.indexOfGlobal(id) != null;
+}
+
+/// The registry ref of the global whose `self` table is the one at `idx`.
+///
+/// The table IDENTITY is what matches, not its contents: two globals can hold
+/// equal tables, and the one that CALLS is the one the flow belongs to. The
+/// comparison is a pointer compare, which is why the table is pushed first:
+/// `lua_topointer` is the only way to ask "is this the same table".
+fn globalRefOfSelfHook(ctx: ?*anyopaque, L: ?*lua_State, idx: c_int) i32 {
+    const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return statemachine_mod.no_ref));
+    const want = lua.lua_topointer(L, idx) orelse return statemachine_mod.no_ref;
+    for (b.globals.items) |*g| {
+        if (g.self_ref == statemachine_mod.no_ref) continue;
+        b.vm.pushRef(g.self_ref); // [table]
+        const got = lua.lua_topointer(L, -1);
+        lua.pop(L, 1); // []
+        if (got != null and got == want) return g.self_ref;
+    }
+    return statemachine_mod.no_ref;
+}
+
+// ── The flow: the global state machine with a stack ─────────────────────────
+
+const flow_global_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.log = {}
+    \\  flow.add_state(self, "menu", {
+    \\    enter = function(self) table.insert(self.log, "enter:menu") end,
+    \\  })
+    \\  flow.add_state(self, "playing", {
+    \\    enter = function(self) table.insert(self.log, "enter:playing") end,
+    \\    exit = function(self) table.insert(self.log, "exit:playing") end,
+    \\  })
+    \\  flow.add_state(self, "paused", {
+    \\    enter = function(self) table.insert(self.log, "enter:paused") end,
+    \\  })
+    \\  flow.add_transition(self, "menu", "start", "playing")
+    \\  flow.set_initial(self, "menu")
+    \\end
+    \\function M:update(dt)
+    \\  self.ticks = (self.ticks or 0) + 1
+    \\  if self.ticks == 2 then flow.fire(self, "start") end
+    \\end
+    \\return M
+;
+
+test "the flow is a global machine with a stack of states" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const gid = try h.b.loadGlobal("flow.lua", flow_global_src);
+    try h.b.attachGlobal(gid);
+    h.b.startAll();
+
+    const self_ref = h.b.globalSelfRef("flow.lua").?;
+    const reg = h.b.ctx.machines.?;
+
+    // The flow starts in its initial state on its first tick, and the state's
+    // `enter` ran.
+    try std.testing.expect(reg.hasFlow());
+    h.b.update(1.0 / 60.0);
+    try std.testing.expectEqualStrings("menu", reg.flowStateName());
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 0, "enter:menu"));
+
+    // A transition REPLACES the whole stack: the phase changed. The event is
+    // fired on the second update and applied on the third, because a
+    // transition is applied at the TOP of the next tick.
+    h.b.update(1.0 / 60.0); // the global's update fires the event
+    h.b.update(1.0 / 60.0); // the machine's tick applies it
+    try std.testing.expectEqualStrings("playing", reg.flowStateName());
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 1, "enter:playing"));
+
+    // A push LAYERS: the state below stays, and a pop returns to it.
+    const paused = reg.stateIndex(reg.flow.machine, "paused").?;
+    try std.testing.expect(reg.flowPush(paused));
+    try std.testing.expectEqualStrings("paused", reg.flowStateName());
+    try std.testing.expect(reg.flowIsIn("paused"));
+    try std.testing.expect(reg.flowPop());
+    try std.testing.expectEqualStrings("playing", reg.flowStateName());
+
+    // The stack, bottom to top.
+    var names: [statemachine_mod.max_stack][]const u8 = undefined;
+    const n = reg.flowStackNames(&names);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqualStrings("playing", names[0]);
+}
+
+test "the flow's callbacks run with the OWNING global's self" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const gid = try h.b.loadGlobal("flow.lua", flow_global_src);
+    try h.b.attachGlobal(gid);
+    h.b.startAll();
+
+    const self_ref = h.b.globalSelfRef("flow.lua").?;
+    // The `enter` hook wrote to the global's own table — the flow's self IS
+    // the global's, so a flow callback can read the game's state.
+    h.b.update(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), readSelfLogLength(&h.b, self_ref));
 }
 
 // ── End-to-end tests ─────────────────────────────────────────────────────────
@@ -1582,6 +1869,115 @@ const Harness = struct {
 };
 
 const script_Input = @import("input.zig").Input;
+
+// ── Coroutines: `self:async(fn)` and the global `wait(seconds)` ─────────────
+
+const coroutine_script_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.log = {}
+    \\  self:async(function(self)
+    \\    table.insert(self.log, "a")
+    \\    wait(0.5)
+    \\    table.insert(self.log, "b")
+    \\    wait(0.5)
+    \\    table.insert(self.log, "c")
+    \\  end)
+    \\end
+    \\return M
+;
+
+const coroutine_broken_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self:async(function(self)
+    \\    error("the coroutine exploded")
+    \\  end)
+    \\end
+    \\return M
+;
+
+test "a coroutine runs, waits, and resumes on the fixed step" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("coroutine.lua", coroutine_script_src);
+    const e = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e, sid);
+    h.b.startAll();
+
+    // The coroutine starts immediately and runs until its first `wait`.
+    const self_ref = h.b.instances.items[0].self_ref;
+    try std.testing.expectEqual(@as(usize, 1), readSelfLogLength(&h.b, self_ref));
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 0, "a"));
+
+    // Half a second of fixed steps: still waiting.
+    var i: usize = 0;
+    while (i < 29) : (i += 1) h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), readSelfLogLength(&h.b, self_ref));
+
+    // One more step crosses the half second: the coroutine resumes.
+    h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 2), readSelfLogLength(&h.b, self_ref));
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 1, "b"));
+
+    // And the second wait.
+    i = 0;
+    while (i < 30) : (i += 1) h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 3), readSelfLogLength(&h.b, self_ref));
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 2, "c"));
+}
+
+test "a coroutine that errors is reported, not fatal" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("coroutine_broken.lua", coroutine_broken_src);
+    const e = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e, sid);
+
+    // The error happens inside the coroutine, at its FIRST resume — which is
+    // when `start` starts it. The frame survives it: a broken coroutine is a
+    // logged error, like a broken behavior.
+    const before = h.b.errors;
+    h.b.startAll();
+
+    // The count lands on the next drive, the same place a behavior's errors
+    // land: the driver is what reports them.
+    h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expect(h.b.errors > before);
+
+    // And the frame after that is unaffected: the dead coroutine is dropped,
+    // not resumed again.
+    const after = h.b.errors;
+    h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expectEqual(after, h.b.errors);
+}
+
+/// The number of entries in the instance's `self.log`.
+fn readSelfLogLength(b: *Behaviors, self_ref: i32) usize {
+    const L = b.vm.state().?;
+    b.vm.pushRef(self_ref); // [self]
+    lua.getField(L, -1, "log"); // [self, log]
+    const n = lua.lua_objlen(L, -1);
+    lua.pop(L, 2); // []
+    return n;
+}
+
+/// Whether the `index`-th entry of the instance's `self.log` is `expected`.
+/// Compared in place: the string belongs to the Lua heap and copying it out
+/// would leak it.
+fn selfLogEntryIs(b: *Behaviors, self_ref: i32, index: usize, expected: []const u8) bool {
+    const L = b.vm.state().?;
+    b.vm.pushRef(self_ref); // [self]
+    lua.getField(L, -1, "log"); // [self, log]
+    lua.lua_rawgeti(L, -1, @intCast(index + 1)); // [self, log, entry]
+    const ok = std.mem.eql(u8, lua.toString(L, -1), expected);
+    lua.pop(L, 3); // []
+    return ok;
+}
 
 // ── M13 method track: `call_lua(script_id, fn)` ─────────────────────────────
 

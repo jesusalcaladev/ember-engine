@@ -36,6 +36,9 @@ pub const max_event_len = 16;
 pub const max_states = 16;
 pub const max_transitions = 32;
 pub const max_machines = 64;
+/// How many states a flow's stack holds. A game's phases nest a couple of
+/// levels deep: playing → paused → a confirmation dialog on top of that.
+pub const max_stack = 16;
 /// How many entities can be attached to machines at once. Sized for a full
 /// enemy roster; the tick walks this array, so it is the number that decides the
 /// frame cost of the whole subsystem.
@@ -125,6 +128,22 @@ pub const Error = error{
 ///
 /// Lives inside `Behaviors` (which owns the VM the refs point into) and is
 /// reachable from Lua through `Context.machines`.
+pub const Flow = struct {
+    /// The machine the flow runs. 0 = "no flow".
+    machine: u32 = 0,
+    /// The owning global's `self` table: what the callbacks receive.
+    self_ref: i32 = no_ref,
+    /// The state stack, bottom to top. The current state is the TOP.
+    stack: [max_stack]u8 = undefined,
+    len: u8 = 0,
+    /// A transition requested by `fire` during the previous tick, applied
+    /// at the top of the next one. Deferred like the per-entity machine's,
+    /// so a callback that fires cannot re-enter the flow mid-traversal.
+    pending: Inline = .{},
+    /// The state the flow enters when it starts.
+    entered: bool = false,
+};
+
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     /// Nullable ON PURPOSE. Declaring a machine — adding states, wiring
@@ -142,6 +161,10 @@ pub const Registry = struct {
 
     bindings: [max_bindings]Binding = undefined,
     binding_count: u16 = 0,
+
+    /// The global flow. One at a time: the game has one phase, and a second
+    /// flow would be a second game.
+    flow: Flow = .{},
 
     pub fn init(allocator: std.mem.Allocator, vm: ?*vm_mod.Vm) Registry {
         var r = Registry{ .allocator = allocator, .vm = vm };
@@ -312,6 +335,10 @@ pub const Registry = struct {
 
             self.callState(m, b, b.current, .update);
         }
+        // The flow, after the per-entity machines: the game's phase is the
+        // slowest thing in the game, and a state that reads the world reads
+        // the world as it is this frame.
+        self.tickFlow();
     }
 
     /// Finds and applies the first transition matching the pending event.
@@ -427,6 +454,172 @@ pub const Registry = struct {
         }
         self.binding_count = 0;
     }
+    // ── The flow: one global machine with a state STACK ─────────────────────
+
+    /// The game's own phases, as a machine with a stack of states: menu →
+    /// playing → paused → game over.
+    ///
+    /// WHY A STACK: the phases are not a flat list. "Paused" sits ON TOP of
+    /// "playing", and leaving it must return to "playing" — not to whatever
+    /// came before it. A flat machine cannot express that, which is why the
+    /// flow is a stack and the per-entity machine is not.
+    ///
+    /// It is GLOBAL (no entity) because the flow belongs to the GAME, not to
+    /// an actor: a menu is not an actor, and a game-over screen is not one
+    /// either. That is also why the callbacks receive the OWNING global's
+    /// `self` table.
+
+    /// Declares the flow: the machine it runs and the global whose `self` the
+    /// callbacks receive. Re-declaring replaces the previous flow, which is
+    /// what a hot-reload of the owning global needs.
+    pub fn declareFlow(self: *Registry, machine_id: u32, self_ref: i32) bool {
+        if (machine_id == 0 or machine_id >= self.machine_count) return false;
+        self.flow.machine = machine_id;
+        self.flow.self_ref = self_ref;
+        self.flow.len = 0;
+        self.flow.entered = false;
+        self.flow.pending = .{};
+        return true;
+    }
+
+    /// True when a flow is declared.
+    pub fn hasFlow(self: *const Registry) bool {
+        return self.flow.machine != 0 and self.flow.machine < self.machine_count;
+    }
+
+    /// The state on the top of the stack, or `Binding.no_state` when the flow
+    /// has not started.
+    pub fn flowCurrent(self: *const Registry) u8 {
+        if (self.flow.len == 0) return Binding.no_state;
+        return self.flow.stack[self.flow.len - 1];
+    }
+
+    /// Pushes a state on the stack. The state below stays: `pop` returns to
+    /// it. False for an unknown state or a full stack.
+    pub fn flowPush(self: *Registry, state: u8) bool {
+        if (!self.hasFlow()) return false;
+        const m = &self.machines[self.flow.machine];
+        if (state >= m.state_count) return false;
+        if (self.flow.len >= max_stack) return false;
+        self.flow.stack[self.flow.len] = state;
+        self.flow.len += 1;
+        return true;
+    }
+
+    /// Pops the top of the stack, returning to the one below. False when the
+    /// stack has only the bottom state: the flow always has a phase.
+    pub fn flowPop(self: *Registry) bool {
+        if (self.flow.len <= 1) return false;
+        self.flow.len -= 1;
+        return true;
+    }
+
+    /// Replaces the WHOLE stack with one state: the game's phase changed
+    /// completely. This is what a transition does.
+    pub fn flowReplace(self: *Registry, state: u8) bool {
+        if (!self.hasFlow()) return false;
+        const m = &self.machines[self.flow.machine];
+        if (state >= m.state_count) return false;
+        self.flow.len = 0;
+        self.flow.stack[0] = state;
+        self.flow.len = 1;
+        return true;
+    }
+
+    /// The names on the stack, bottom to top. `out` is filled with the
+    /// machine's own inline names, so the caller must not free them.
+    pub fn flowStackNames(self: *const Registry, out: [][]const u8) usize {
+        if (!self.hasFlow()) return 0;
+        const m = &self.machines[self.flow.machine];
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < self.flow.len and n < out.len) : (i += 1) {
+            const s = self.flow.stack[i];
+            if (s >= m.state_count) continue;
+            out[n] = m.states[s].name.slice();
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The name of the state on the top of the stack.
+    pub fn flowStateName(self: *const Registry) []const u8 {
+        if (!self.hasFlow()) return "";
+        const cur = self.flowCurrent();
+        if (cur == Binding.no_state) return "";
+        const m = &self.machines[self.flow.machine];
+        if (cur >= m.state_count) return "";
+        return m.states[cur].name.slice();
+    }
+
+    /// Whether the top of the stack is `name`.
+    pub fn flowIsIn(self: *const Registry, name: []const u8) bool {
+        if (!self.hasFlow()) return false;
+        const cur = self.flowCurrent();
+        if (cur == Binding.no_state) return false;
+        const m = &self.machines[self.flow.machine];
+        if (cur >= m.state_count) return false;
+        return m.states[cur].name.eql(name);
+    }
+
+    /// Requests a transition. Applied at the top of the next tick, like the
+    /// per-entity machine's `fire`.
+    pub fn flowFire(self: *Registry, event: []const u8) void {
+        if (!self.hasFlow()) return;
+        self.flow.pending.set(event);
+    }
+
+    /// The tick, for the flow. Same rules as a binding's: a pending
+    /// transition is applied first, then the new state's `update` runs.
+    fn tickFlow(self: *Registry) void {
+        if (!self.hasFlow()) return;
+        const m = &self.machines[self.flow.machine];
+
+        if (!self.flow.entered) {
+            self.flow.entered = true;
+            self.flow.len = 0;
+            self.flow.stack[0] = m.initial;
+            self.flow.len = 1;
+            self.callFlowState(m, m.initial, .enter);
+        }
+
+        if (self.flow.pending.len != 0) {
+            // The transition replaces the WHOLE stack: the phase changed, not
+            // the layer on top of it.
+            for (m.transitions[0..m.transition_count]) |t| {
+                const from = self.flowCurrent();
+                if (t.from != from) continue;
+                if (!t.event.eql(self.flow.pending.slice())) continue;
+                if (t.to == from) continue;
+                self.callFlowState(m, from, .exit);
+                if (self.flowReplace(t.to)) {
+                    self.callFlowState(m, t.to, .enter);
+                }
+                break;
+            }
+            self.flow.pending.len = 0;
+        }
+
+        const cur = self.flowCurrent();
+        if (cur != Binding.no_state) self.callFlowState(m, cur, .update);
+    }
+
+    /// Calls a flow state's hook with the OWNING global's `self`.
+    fn callFlowState(self: *Registry, m: *Machine, state_index: u8, hook: Hook) void {
+        if (state_index >= m.state_count) return;
+        const ref = switch (hook) {
+            .enter => m.states[state_index].enter_ref,
+            .update => m.states[state_index].update_ref,
+            .exit => m.states[state_index].exit_ref,
+        };
+        if (ref == no_ref or self.flow.self_ref == no_ref) return;
+        const vm = self.vm orelse return;
+        const L = vm.state() orelse return;
+        vm.pushRef(ref); // [fn]
+        vm.pushRef(self.flow.self_ref); // [fn, self]
+        _ = lua.lua_pcall(L, 1, 0, 0);
+    }
+
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

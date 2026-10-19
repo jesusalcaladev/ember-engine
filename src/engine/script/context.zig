@@ -130,6 +130,13 @@ pub const GlobalsHooks = struct {
     push_self: *const fn (ctx: ?*anyopaque, L: ?*lua_c.lua_State, name: []const u8) bool,
     /// True when a global script with this name is mounted (has a live `self`).
     exists: *const fn (ctx: ?*anyopaque, name: []const u8) bool,
+    /// The registry ref of the global whose `self` table is the one at `idx`,
+    /// or `no_ref`.
+    ///
+    /// The FLOW needs this: it is a global machine with no entity, and its
+    /// callbacks run with the OWNING global's `self` table — so a binding that
+    /// has to find "which global is calling" needs a way to ask.
+    global_ref_of_self: *const fn (ctx: ?*anyopaque, L: ?*lua_c.lua_State, idx: c_int) i32,
 };
 
 /// The M14 `ui.*` bindings that need the runtime's font cache and the frame's

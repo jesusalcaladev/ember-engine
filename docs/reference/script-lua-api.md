@@ -13,6 +13,7 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`time`](#time) | The game clock and the global time scale (slow motion, pause) |
 | [`timer`](#timer) | The gameplay clock: "in N seconds, fire this signal" |
 | [`tween`](#tween) | A value that travels to another value over time |
+| [`flow`](#flow) | The global state machine: the game's phases, with a stack |
 | [`math`](#math) | Scalar math: clamping, interpolation, easing, rounding, trigonometry |
 | [`vec2`](#vec2) | 2D vector math: distance, length, normalization, dot/cross, rotation |
 | [`rand`](#rand) | Deterministic random numbers (floats, ints, chance, gauss, shuffle, choice) |
@@ -773,6 +774,130 @@ for _, name in ipairs(tween.properties()) do print(name) end
 
 ---
 
+## `flow`
+
+The game's own phases — menu → playing → paused → game over — as a **global**
+state machine with a **stack** of states.
+
+It is global because the flow belongs to the GAME, not to an actor: a menu is
+not an actor, and a game-over screen is not one either. It has a stack because
+"paused" sits **on top of** "playing", and leaving it must return to
+"playing" — not to whatever came before it.
+
+Every function takes the **owning global's** `self` first, the same shape as
+`sm.*`: the flow's callbacks run with that table, and a global that does not
+own the flow cannot drive it.
+
+### `flow.add_state(self, name, hooks)`
+
+| | |
+|---|---|
+| **Signature** | `flow.add_state(self, name, hooks) -> boolean` |
+| **Parameters** | `self` — the global that owns the flow; `name` — `string`; `hooks` — `table` — optional `{ enter, update, exit }` |
+| **Returns** | `boolean` — true when the state was declared |
+| **Description** | Declares a state of the flow. The first call creates the flow and binds it to this global. The hooks receive the global's `self`. |
+
+```lua
+flow.add_state(self, "menu", {
+  enter = function(self) log.info("menu") end,
+})
+```
+
+### `flow.add_transition(self, from, event, to)`
+
+| | |
+|---|---|
+| **Signature** | `flow.add_transition(self, from, event, to) -> boolean` |
+| **Description** | A transition between the flow's states. It **replaces the whole stack**: the game's phase changed, not the layer on top of it. |
+
+```lua
+flow.add_transition(self, "menu", "start", "playing")
+```
+
+### `flow.set_initial(self, name)`
+
+| | |
+|---|---|
+| **Signature** | `flow.set_initial(self, name) -> boolean` |
+| **Description** | The state the flow enters when it starts. |
+
+### `flow.fire(self, event)`
+
+| | |
+|---|---|
+| **Signature** | `flow.fire(self, event)` |
+| **Description** | Requests a transition. It is applied at the **top of the next tick**, like `sm.fire`: a callback that fires cannot re-enter the flow. |
+
+```lua
+flow.fire(self, "start")
+```
+
+### `flow.set_state(self, name)`
+
+| | |
+|---|---|
+| **Signature** | `flow.set_state(self, name) -> boolean` |
+| **Description** | Jumps to a state **now**, replacing the whole stack. For a layered change use `flow.push`. |
+
+### `flow.push(self, name)` · `flow.pop(self)`
+
+| | |
+|---|---|
+| **Signature** | `flow.push(self, name) -> boolean` / `flow.pop(self) -> boolean` |
+| **Description** | `push` puts a state on top of the stack and keeps the one below; `pop` takes the top off and returns to it. `pop` is false when the stack has only the bottom state: the flow always has a phase. |
+
+```lua
+flow.push(self, "paused")   -- the stack is now {"playing", "paused"}
+flow.pop(self)               -- and back to {"playing"}
+```
+
+### `flow.state(self)` · `flow.is_in(self, name)` · `flow.stack(self)`
+
+| | |
+|---|---|
+| **Signature** | `flow.state(self) -> string` / `flow.is_in(self, name) -> boolean` / `flow.stack(self) -> table` |
+| **Description** | The state on the top of the stack, whether it is a given state, and the whole stack (bottom to top). |
+
+```lua
+if flow.is_in(self, "paused") then time.pause() end
+```
+
+---
+
+## Behavior methods: `async` and `wait`
+
+Two methods the **engine** injects into every behavior's and global's `self`
+table. They are not module functions: they belong to the actor whose coroutine
+they belong to.
+
+### `self:async(fn)`
+
+| | |
+|---|---|
+| **Signature** | `self:async(fn) -> boolean` |
+| **Parameters** | `fn` — `function` — called with the actor's `self` |
+| **Returns** | `boolean` — true when the coroutine started |
+| **Description** | Starts `fn` as a **coroutine**. The function may call `self:wait(seconds)` to pause; the engine resumes it on the fixed step. A coroutine that raises an error is **logged** and the frame survives it. The name `async` is the engine's: a script that defines its own `async` in the prototype would be shadowed by it. |
+
+### `self:wait(seconds)`
+
+| | |
+|---|---|
+| **Signature** | `self:wait(seconds)` |
+| **Parameters** | `seconds` — `number` — how long to pause, in **game** seconds |
+| **Description** | Pauses the current coroutine. The wait is measured on the fixed step, so it slows down with the global time scale and replays identically. Only valid inside a coroutine; the global `wait(seconds)` is the same function. |
+
+```lua
+function M:start()
+  self:async(function(self)
+    actor.set_position(self, 0, 0)
+    self:wait(1.0)              -- one second of game time
+    actor.set_position(self, 100, 0)
+  end)
+end
+```
+
+---
 ## `math`
 
 The scalar math set. These are thin wrappers over the engine's `core.math` — no allocation, no branches that can trap, and every function is total on its domain. Registered from Zig (rather than shadowing LuaJIT's own `math`) so semantics are fixed across the LuaJIT and Lua 5.4 backends.

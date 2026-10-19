@@ -268,6 +268,9 @@ const Args = struct {
     gpu_smoke: bool = false,
     sprites: u32 = 50_000,
     sort: batcher_mod.SortMode = .none,
+    /// The scene to load: a `.zson` file, relative to the project root. Empty
+    /// = the built-in canonical scene.
+    scene: []const u8 = "",
 };
 
 fn parseArgs(init: std.process.Init.Minimal) Args {
@@ -293,6 +296,8 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
             if (it.next()) |n| args.sprites = std.fmt.parseInt(u32, n, 10) catch 50_000;
         } else if (std.mem.eql(u8, arg, "--sort")) {
             if (it.next()) |v| args.sort = parseSort(v);
+        } else if (std.mem.eql(u8, arg, "--scene")) {
+            if (it.next()) |v| args.scene = v;
         }
     }
     return args;
@@ -569,6 +574,88 @@ fn mountGlobalScripts(
     behaviors.startAll();
 }
 
+/// Loads a scene file and the behaviors its actors run.
+///
+/// THE ID CONTRACT: the `scripts { behavior "..." }` list's ORDER is the id.
+/// A scene file says `Script {script: 1}`, and "1" is the FIRST entry of that
+/// list; `0` means "no script", the same convention the component documents.
+/// The scene file stays free of paths — the PROJECT decides what "script 1"
+/// means, the scene decides that an actor runs it.
+///
+/// A failure is logged and skipped, one piece at a time: a scene that does not
+/// load costs the game its scene, not its boot.
+fn loadScene(
+    behaviors: *script.Behaviors,
+    world: *ecs.World,
+    cfg: *const project.config.Config,
+    scene_path: []const u8,
+    alloc: std.mem.Allocator,
+) void {
+    // 1. The behavior scripts, in the config's order. The index in the list is
+    //    the id a scene file refers to.
+    var ids = alloc.alloc(u32, cfg.scripts.behavior.len) catch {
+        log.warn("no memory for the behavior script table", .{});
+        return;
+    };
+    defer alloc.free(ids);
+    @memset(ids, 0);
+    for (cfg.scripts.behavior, 0..) |path, i| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(assets.script_asset.default_max_bytes)) catch {
+            log.warn("behavior script '{s}': file not found, skipping it", .{path});
+            continue;
+        };
+        defer alloc.free(bytes);
+        const v = assets.script_asset.validate(bytes, assets.script_asset.default_max_bytes) catch |err| {
+            log.warn("behavior script '{s}' rejected ({s}), skipping it", .{ path, @errorName(err) });
+            continue;
+        };
+        ids[i] = behaviors.load(path, v.source) catch |err| {
+            log.warn("behavior script '{s}' failed to compile ({s})", .{ path, @errorName(err) });
+            continue;
+        };
+    }
+
+    // 2. The scene itself.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const text = std.Io.Dir.cwd().readFileAlloc(io, scene_path, alloc, .limited(64 * 1024 * 1024)) catch |err| {
+        log.warn("scene '{s}': {s}", .{ scene_path, @errorName(err) });
+        return;
+    };
+    defer alloc.free(text);
+    // `replace`, not `apply`: `apply` is the PREFAB applier (it patches an
+    // existing world by name), and `replace` rebuilds the world from the
+    // document IN PLACE — the address does not move, so every subsystem that
+    // holds a `*World` keeps a valid pointer.
+    ecs.zson.replace(world, text) catch |err| {
+        log.warn("scene '{s}': {s}", .{ scene_path, @errorName(err) });
+        return;
+    };
+    log.info("scene '{s}': {d} entities", .{ scene_path, world.entityCount() });
+
+    // 3. The behaviors: every entity that carries a `Script` component.
+    var q = world.query(.{components.Script});
+    while (q.nextBatch()) |batch| {
+        const scripts = batch.slice(components.Script);
+        const entities = batch.entitySlice();
+        for (scripts, entities) |*sc, e| {
+            const index = sc.script;
+            if (index == 0 or index > ids.len) {
+                log.warn("entity {d} wants script {d}, which the project does not declare", .{ e.index, index });
+                continue;
+            }
+            const id = ids[index - 1];
+            if (id == 0) continue; // the script failed to load
+            behaviors.attach(e, id) catch |err| {
+                log.warn("entity {d}: script {d} failed to attach ({s})", .{ e.index, index, @errorName(err) });
+            };
+        }
+    }
+    // The behaviors' `start` runs here, after every actor is attached, so a
+    // script can already see the whole scene.
+    behaviors.startAll();
+}
+
 /// M9: the payload a finished scene transition carries on the world bus.
 ///
 /// The signal is what a Lua `on_signal("scene_faded")` handler and a Zig
@@ -727,7 +814,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var i: u32 = 0;
     var row: u32 = 0;
-    while (row < capped_sprites / cols + 1) : (row += 1) {
+    // The canonical scene is the DEFAULT: a project that ships its own scene
+    // (`--scene game.zson`) must not also get 50 000 demo sprites under it.
+    while (args.scene.len == 0 and row < capped_sprites / cols + 1) : (row += 1) {
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
             if (i >= capped_sprites) break;
@@ -859,6 +948,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // for the same reason every other config section is: headless runs the
     // defaults, so `zig build run -- --headless` measures the empty world.
     if (!args.headless) mountGlobalScripts(&behaviors, &project_config, boot_alloc);
+
+    // ── The scene, and the behaviors its actors run ────────────────────────
+    // AFTER the globals are mounted (a global's `start` may want to know what
+    // the scene contains) and BEFORE the first frame, so the world that the
+    // first frame draws is the one the project asked for.
+    //
+    // The built-in canonical scene is the default: `--scene game.zson` is how
+    // a project ships its own.
+    if (args.scene.len != 0) {
+        loadScene(&behaviors, &world, &project_config, args.scene, boot_alloc);
+    }
 
     // ── M9: the scene-transition fader. Owned by the runtime like the camera:
     // it is engine state that outlives a script, and the `scene.*` bindings

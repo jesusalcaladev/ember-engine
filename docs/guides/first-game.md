@@ -1,348 +1,311 @@
 # First Game: A Simple Collector
 
-This tutorial builds a complete mini-game: a player that moves with arrow keys,
-collects coins, and tracks score. It combines a `.zson` scene with Lua behaviors.
+This tutorial builds a complete mini-game with the engine's own API: a player
+that moves with the arrow keys, a game that moves through phases, and a HUD
+score. Every function it calls **exists** — the list is the
+[Lua API Reference](../reference/script-lua-api.md), and the code below is
+checked against it.
 
-> **Editor Note:** In a real workflow, the Ember Editor generates the scene
-> and all the scripts for you. You would create entities visually, attach
-> behaviors from a palette, and configure properties in the inspector. This
-> tutorial walks through the generated files so you understand what the
-> editor does for you.
+The finished project lives in [`samples/first-game/`](../../samples/first-game/),
+and it runs:
 
-## What We Are Building
-
-- A **player** that moves with arrow keys (or WASD)
-- **Coins** that spawn randomly and disappear when collected
-- A **score counter** that increments on each coin
-- A **game over** condition when time runs out
-
-## Project Structure
-
-```
-my_game/
-├── game.zson          # The scene
-├── player.lua         # Player behavior
-├── coin.lua           # Coin behavior
-└── spawner.lua        # Coin spawner behavior
+```bash
+cd samples/first-game
+../../zig-out/bin/ember --scene game.zson
 ```
 
-## Step 1: The Scene
+---
 
-In the editor, you would create the camera, player, and spawner entities,
-position them, and attach sprites. The editor generates the following
-`game.zson` for you:
+## What we are building
+
+- A **player** that moves with the arrow keys (or WASD), at the same speed in
+  every direction.
+- A **flow** — the game's phases — with a stack, so "paused" sits on top of
+  "playing" and leaving it returns there.
+- A **sequence** in the player, written as a coroutine: "one second, then half
+  a second", with no frame counter anywhere.
+
+---
+
+## The three files
 
 ```
+first-game/
+├── project.config      # the project settings: the scripts, the input map
+├── game.zson           # the scene: the entities and their components
+└── scripts/
+    ├── player.lua      # the behavior the player actor runs
+    └── globals/
+        └── flow.lua    # the game's phases — a GLOBAL script, with no actor
+```
+
+**How a project is put together:**
+
+- `project.config` lists the scripts and the input actions. The `scripts`
+  section has two lists: `behavior` (the scripts an actor can run) and `global`
+  (the scripts that run with no actor at all).
+- The `.zson` file is the scene: the entities and their components.
+- A script named in `behavior` is **attached to an actor** by the scene's
+  `Script {script: N}` component. `N` is the **index in the `behavior` list**,
+  one-based: the first entry is script 1.
+
+---
+
+## Step 1: `project.config`
+
+```ini
+project "First Game"
+version "0.1.0"
+
+display {
+  width 1280
+  height 720
+  vsync true
+}
+
+scripts {
+  behavior "scripts/player.lua"
+  global "scripts/globals/flow.lua"
+}
+
+input_map {
+  move_left ["KEY_A", "KEY_LEFT"]
+  move_right ["KEY_D", "KEY_RIGHT"]
+  move_up ["KEY_W", "KEY_UP"]
+  move_down ["KEY_S", "KEY_DOWN"]
+  pause ["KEY_ESCAPE"]
+}
+```
+
+Two things to notice:
+
+- **`behavior` and `global` are different things.** A `behavior` runs on an
+  actor; a `global` runs with **no actor at all** — it is the game manager, the
+  score, the flow. A global is reached from anywhere with
+  `globals.get("flow")`.
+- **The input map is actions, not keys.** A script asks for `"move_left"`, not
+  for `KEY_A`. Rebinding the game is editing this file, and no script changes.
+
+---
+
+## Step 2: the scene
+
+```zson
 zson 1
 
 entity 1 {
-  Name "camera"
-  Transform {position: {x: 640, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
-}
-
-entity 2 {
   Name "player"
   Transform {position: {x: 640, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
-  Parent {parent: 1}
   Sprite {atlas: 0, layer: 0, size: {x: 32, y: 32}, tint: [0.2, 0.6, 1, 1], blend: alpha, visible: true}
   Script {script: 1}
 }
-
-entity 3 {
-  Name "spawner"
-  Transform {position: {x: 0, y: 0}, rotation: 0, scale: {x: 1, y: 1}}
-  Parent {parent: 1}
-  Script {script: 3}
-}
 ```
 
-This creates:
-- A **camera** at the center of a 1280x720 screen
-- A **player** (blue square) with script id 1
-- A **spawner** (invisible) with script id 3
+- `Name` — the actor's name in the scene and in the inspector.
+- `Transform` — where it is and how it is turned.
+- `Sprite` — what it looks like.
+- `Script {script: 1}` — **the behavior it runs**. Script 1 is the first entry
+  of the project's `behavior` list: `scripts/player.lua`.
 
-## Step 2: The Player Script
+The full list of components and their fields is in the
+[Component Index](../reference/components/README.md).
 
-In the editor, you would attach a movement behavior to the player entity.
-The editor generates the following `player.lua` for you:
+---
+
+## Step 3: the player
 
 ```lua
+-- scripts/player.lua
 local M = {}
 
 function M:start()
   self.speed = 300
-  self.score = 0
   self.alive = true
 end
 
 function M:update(dt)
   if not self.alive then return end
 
-  -- Read input as a signed axis
-  local dx = input.get_axis("move_left", "move_right")
-  local dy = input.get_axis("move_up", "move_down")
+  -- The input, as a signed axis per direction.
+  local dir = vec2.new(
+    input.get_axis("move_left", "move_right"),
+    input.get_axis("move_up", "move_down"))
 
-  -- Normalize diagonal movement
-  local len = math.sqrt(dx * dx + dy * dy)
-  if len > 0 then
-    dx = dx / len
-    dy = dy / len
+  -- NORMALIZE, with `vec2` — the `math` module is for SCALARS and has no
+  -- vector functions. Without this, walking diagonally is 1.41 times faster
+  -- than walking straight, which is the bug every 2D game has to fix once.
+  if vec2.length(dir) > 0 then
+    dir = vec2.normalized(dir)
   end
 
-  -- Move
-  actor.move_by(self, dx * self.speed * dt, dy * self.speed * dt)
+  -- Move. `dt` is the frame's delta, already scaled by the global time scale,
+  -- so the player moves at the same speed the world does.
+  actor.move_by(self, dir.x * self.speed * dt, dir.y * self.speed * dt)
 
-  -- Clamp to screen bounds
+  -- Clamp to the screen. `math.clamp` is the scalar one, and it is the right
+  -- one here: the bounds are numbers.
   local x, y = actor.get_position(self)
-  x = math.clamp(x, 16, 1264)
-  y = math.clamp(y, 16, 704)
-  actor.set_position(self, x, y)
-end
-
-function M:on_signal(name)
-  if name == "collect" then
-    self.score = self.score + 1
-    log.info("score: " .. self.score)
-  end
-end
-
-function M:on_destroy()
-  log.info("game over! final score: " .. self.score)
+  actor.set_position(self,
+    math.clamp(x, 16, 1264),
+    math.clamp(y, 16, 704))
 end
 
 return M
 ```
 
-## Step 3: The Coin Script
+**The normalization, and where it lives.** `math` is the **scalar** module:
+`math.clamp`, `math.lerp`, `math.sqrt`, `math.ease`. The **vector** module is
+`vec2`: `vec2.new`, `vec2.length`, `vec2.normalized`, `vec2.lerp`,
+`vec2.clamped`, `vec2.dist`. A diagonal normalized by hand is three lines of
+arithmetic that `vec2.normalized` does in one, and it is the version that
+cannot get the zero-length case wrong.
 
-In the editor, you would attach a collection behavior to coin entities.
-The editor generates the following `coin.lua` for you:
+`vec2.new` returns a **table** with `x` and `y` fields. The other `vec2`
+functions take and return **numbers**, so a per-frame computation does zero
+Lua allocation and one C call.
+
+---
+
+## Step 4: the flow
+
+The game's phases — menu, playing, paused, game over — belong to the **game**,
+not to an actor. That is what a **global script** is for, and what the `flow`
+module is for.
 
 ```lua
+-- scripts/globals/flow.lua
 local M = {}
 
 function M:start()
-  self.collected = false
-  -- Random tint for variety
-  self.tint_r = rand.float(0.5, 1)
-  self.tint_g = rand.float(0.5, 1)
-  self.tint_b = rand.float(0, 0.3)
-end
-
-function M:update(dt)
-  if self.collected then return end
-
-  -- Check distance to player
-  local player = self.world.player_ref
-  if not player then return end
-
-  local d = actor.distance_to(self, player)
-  if d < 24 then
-    self.collected = true
-    actor.emit(player, "collect")
-    actor.destroy(self)
-  end
-end
-
-return M
-```
-
-## Step 4: The Spawner Script
-
-In the editor, you would attach a spawner behavior to the spawner entity.
-The editor generates the following `spawner.lua` for you:
-
-```lua
-local M = {}
-
-function M:start()
-  self.spawn_timer = 0
-  self.spawn_interval = 1.5
-  self.max_coins = 10
-  self.coin_count = 0
-  self.time_left = 30
-  self.game_over = false
-end
-
-function M:update(dt)
-  if self.game_over then return end
-
-  -- Countdown
-  self.time_left = self.time_left - dt
-  if self.time_left <= 0 then
-    self.time_left = 0
-    self.game_over = true
-    log.info("time's up!")
-    return
-  end
-
-  -- Spawn coins
-  self.spawn_timer = self.spawn_timer + dt
-  if self.spawn_timer >= self.spawn_interval and self.coin_count < self.max_coins then
-    self.spawn_timer = 0
-    self:spawn_coin()
-  end
-end
-
-function M:spawn_coin()
-  -- Find the player to set as target
-  local player = self.world.player_ref
-  if not player then return end
-
-  -- Spawn at random position
-  local x = rand.float(50, 1230)
-  local y = rand.float(50, 670)
-
-  -- Create coin entity
-  local coin = actor.spawn(self, "coin")
-  actor.set_position(coin, x, y)
-  actor.add_component(coin, "Sprite", {
-    atlas = 0,
-    layer = 1,
-    size = {x = 16, y = 16},
-    tint = {1, 0.8, 0.2, 1},
-    blend = "alpha",
-    visible = true,
+  -- The states. The hooks receive this global's `self`, so a phase can read
+  -- the game's state directly.
+  flow.add_state(self, "menu", {
+    enter = function(self)
+      log.info("flow: menu")
+    end,
   })
-  actor.add_component(coin, "Script", {script = 2})
+  flow.add_state(self, "playing", {
+    enter = function(self)
+      log.info("flow: playing")
+    end,
+  })
+  flow.add_state(self, "paused", {
+    enter = function(self)
+      time.pause()
+    end,
+    exit = function(self)
+      time.resume()
+    end,
+  })
 
-  self.coin_count = self.coin_count + 1
-end
+  -- The transitions. A transition REPLACES the whole stack: the phase
+  -- changed, not the layer on top of it.
+  flow.add_transition(self, "menu", "start", "playing")
 
-function M:on_signal(name)
-  if name == "coin_collected" then
-    self.coin_count = self.coin_count - 1
-  end
-end
-
-return M
-```
-
-## Step 5: Wire It Up
-
-The scripts reference `self.world.player_ref`. This is a bridge the engine
-provides. In the editor, you would set this up by linking entities in the
-inspector. For this tutorial, the editor generates this wiring in
-`spawner.lua`'s `start`:
-
-```lua
-function M:start()
-  -- ... existing code ...
-
-  -- Find the player entity and store the reference
-  -- In a real game, the editor or a bootstrap script would do this
-  self.world.player_ref = actor.find_by_name(self, "player")
-end
-```
-
-## Step 7: A HUD with text, a button and a bar
-
-The game is playable but silent about its own state. In the editor, you would
-add a small hierarchy of HUD actors — **one widget per actor**, because each
-`ui.*` setter addresses the widget on the actor it is given — and attach a HUD
-behavior to the root. The editor generates this hierarchy:
-
-```
-hud          (root)   UiCanvas
-├── hud_panel         UiPanel      a backdrop
-├── hud_score         Label        "Score: 0"
-├── hud_bar           UiProgressBar
-└── hud_pause         UiButton     "Pause"
-```
-
-and the following `hud.lua` on the root:
-
-```lua
-local M = {}
-
-function M:start()
-  self.score = 0
-  self.time_left = 30
-
-  -- Address the widgets by name (one actor each).
-  self.score_actor = actor.find_by_name(self, "hud_score")
-  self.bar_actor   = actor.find_by_name(self, "hud_bar")
-
-  -- A backdrop. The panel actor was authored with `interactive = false`
-  -- in the scene, so the HUD does not swallow clicks meant for the world.
-  local panel = actor.find_by_name(self, "hud_panel")
-  ui.set_color(panel, 0.05, 0.06, 0.09, 0.75)
-  ui.set_border(panel, 1, 1, 1, 0.15, 1)
-
-  ui.set_text(self.score_actor, "Score: 0")
-  ui.set_show_text(self.bar_actor, true)
+  flow.set_initial(self, "menu")
 end
 
 function M:update(dt)
-  self.time_left = math.max(self.time_left - dt, 0)
-  ui.set_text(self.score_actor, "Score: " .. self.score)
-  ui.set_value(self.bar_actor, self.time_left / 30)
-  ui.set_text(self.bar_actor, string.format("%ds", math.ceil(self.time_left)))
-end
-
-function M:on_signal(name, payload)
-  if name == "ui_pressed" and payload.id == 1 then
-    log.info("pause pressed — dimming the canvas")
-    scene.tint(0.35, 0.35, 0.5, 0.6) -- dims world + UI together
-    scene.tint_mode("multiply")
-  elseif name == "collect" then
-    self.score = self.score + 1
+  if input.is_action_pressed("pause") then
+    if flow.is_in(self, "paused") then
+      flow.pop(self)             -- back to "playing"
+    elseif flow.is_in(self, "playing") then
+      flow.push(self, "paused")   -- "paused" sits ON TOP of "playing"
+    end
   end
 end
 
 return M
 ```
 
-> **Update from Step 2:** the player's `on_signal` set `self.score`. Let the
-> HUD keep the score instead: have `coin.lua` emit `collect`, and this
-> `on_signal` receive it (add `collection` to the HUD's actor, or keep the
-> player's score and mirror it in `update`). What matters here is that the HUD
-> reads its own fields and writes its own widgets.
+**The stack is the point.** A flat state machine cannot express "paused",
+because leaving "paused" has to return to "playing" and not to whatever came
+before it. `flow.push` puts a state on top and keeps the one below;
+`flow.pop` takes the top off. A **transition** is different: it replaces the
+whole stack, because the game's phase changed.
 
-Two things are doing real work:
+Any script can read the flow — `flow.state(self)` and `flow.is_in(self, ...)`
+answer "which phase are we in" from anywhere.
 
-- **Anchoring.** The panel and label are pinned `top_left`; the pause button is
-  placed `top_right` with `pivot = {x = 1, y = 0}`, so it stays in the corner at
-  **any** window size. No branch in the script.
-- **Input capture.** `input.pointer_over_ui()` is `true` while the pointer is
-  over the button, so world input is untouched — the UI never consumes the
-  world's input.
+---
 
-## Step 8: Run It
+## Step 5: a sequence, without a frame counter
 
-In the editor, you would press Play. From the command line:
+```lua
+function M:start_sequence()
+  self:async(function(self)
+    log.info("player: the sequence begins")
+    self:wait(1.0)
+    log.info("player: one second later")
+    self:wait(0.5)
+    log.info("player: and another half")
+  end)
+end
+```
+
+`self:async` starts the function as a **coroutine**, and `self:wait` pauses it
+for a number of **game** seconds. The engine resumes it on the fixed step, so:
+
+- the wait is measured in game time — it slows down with the global time scale
+  and replays identically;
+- there is no frame counter, no `self.t` to add up, and no "did the timer
+  finish" branch.
+
+A coroutine that raises an error is **logged**, and the frame survives it —
+exactly like a behavior that raises one.
+
+---
+
+## Step 6: run it
 
 ```bash
-zig build run -- game.zson
+cd samples/first-game
+../../zig-out/bin/ember --scene game.zson
 ```
 
-You should see:
-- A blue square (player) that moves with arrow keys
-- Yellow squares (coins) that spawn randomly
-- Coins disappear when you touch them
-- A **HUD**: a "Score: 0" label and a countdown bar in the top-left, a
-  **Pause** button in the top-right that dims the whole canvas when clicked
-- Game ends after 30 seconds
+You should see a blue square in the middle of the screen that moves with the
+arrow keys, and the log should show the flow entering `menu`.
 
-## What You Learned
+---
 
-- **Scenes**: How the editor represents entities, components, and hierarchy in `.zson`
-- **Behaviors**: The lifecycle (`start`, `update`, `on_signal`, `on_destroy`)
-- **Input**: Reading action-based input with `input.get_axis`
-- **Movement**: `actor.move_by` for per-frame movement
-- **Spatial queries**: `actor.distance_to` for proximity checks
-- **Signals**: `actor.emit` for communication between actors
-- **Spawning**: `actor.spawn` and `actor.add_component` at runtime
-- **Determinism**: `rand.float` for reproducible randomness
-- **Game UI**: `Label`/`UiButton`/`UiPanel`/`UiProgressBar` + anchors, the
-  `ui.*` setters and queries, `ui_pressed`, `input.pointer_over_ui()` and
-  `scene.tint` — see [Game UI](game-ui.md) for the full surface
+## What you learned
 
-## Next Steps
+- **The project**: `project.config` declares the scripts and the input map;
+  the `.zson` is the scene.
+- **Behaviors**: the lifecycle (`start`, `update`, `fixed_update`, `on_signal`,
+  `on_destroy`) and the `self` table that carries the actor's handle.
+- **Global scripts**: the game manager, the score, the flow — code with no
+  actor, reached with `globals.get("name")`.
+- **The flow**: a global state machine with a stack of states.
+- **Coroutines**: `self:async(fn)` and `self:wait(seconds)` — a sequence
+  without a frame counter.
+- **Input**: actions, not keys (`input.get_axis`, `input.is_action_pressed`).
+- **Movement**: `actor.move_by`, and the `vec2` normalization that keeps a
+  diagonal from being faster.
+- **The clock**: `time.pause()`, `time.set_scale(0.5)` — the world and the
+  animations, slowed down.
 
-- [Learning Lua](learning-lua.md) — Deepen your Lua knowledge
-- [Game UI](../reference/game-ui.md) — HUD, menus and the full `ui.*` surface
-- [Lua API Reference](../reference/script-lua-api.md) — Every function available
-- [Global Scripts](../reference/global-scripts.md) — Move the score into a manager with no actor
-- [State Machines](../reference/script-state-machines.md) — Add idle/run/jump states
-- [Steering Behaviors](../reference/script-lua-api.md#steer) — Add enemy AI
+---
+
+## What the engine cannot do yet
+
+The gaps are listed here so the tutorial does not pretend. Each one is a
+missing API, not a missing idea:
+
+| You want | Today | The gap |
+|---|---|---|
+| Spawn an actor from a script | — | there is no `actor.spawn`. Declare the actors in the scene |
+| Remove an actor | `actor.remove_component(self, "Sprite")` | there is no `actor.destroy`. Removing the `Sprite` hides it |
+| Find an actor by name | — | there is no `actor.find_by_name`. Publish the reference from a global script instead |
+| Give an actor a new component with values | `actor.add_component(self, "Sprite")` | the component gets its **defaults**; there is no per-field setter from Lua |
+| Read a component's fields | `actor.get_all(self)` | a table of everything the actor carries |
+
+---
+
+## Next steps
+
+- [Tweens and Timers](../reference/tween-and-timer.md) — animating a value over time
+- [Component Index](../reference/components/README.md) — every component, one page each
+- [Global Scripts](../reference/global-scripts.md) — the manager pattern in depth
+- [Lua API Reference](../reference/script-lua-api.md) — every function that exists
+- [Core Loop](../reference/core-loop.md) — the fixed step and the time scale

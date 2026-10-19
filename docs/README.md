@@ -49,8 +49,9 @@ New to Ember? Follow this path. Each step builds on the previous one.
 ### Level 3 — I want the full API reference
 
 - [Lua API Reference](reference/script-lua-api.md) — Every binding, with examples
-- [Component Catalog](reference/component-catalog.md) — All 28 components: what they are, what drives them, how they connect
+- [Component Index](reference/components/README.md) — Every component, one page each: what it is, what drives it, how they connect
 - [Tweens and Timers](reference/tween-and-timer.md) — The sequencing toolkit: the clock, the timer, the tween
+- [First Game](guides/first-game.md) — A real project: a scene, a behavior, a flow, a coroutine
 - [Core Math](reference/core-math.md) — Vec2, Mat4, Rect2, scalar functions
 - [Core Loop](reference/core-loop.md) — The fixed step, the game clock, the global time scale
 - [Random](reference/core-random.md) — Deterministic PRNG
@@ -73,7 +74,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 - [First Game](guides/first-game.md) — A complete collector game tutorial
 - [State Machines](reference/script-state-machines.md) — Declarative state management
 - [Tweens and Timers](reference/tween-and-timer.md) — Sequencing without a frame counter
-- [Component Catalog](reference/component-catalog.md) — Which component do I need?
+- [Component Index](reference/components/README.md) — Which component do I need?
 - [Steering Behaviors](reference/script-lua-api.md#steer) — AI movement
 - [Collision Layers](reference/ecs-collision-layers.md) — What hits what, by name
 - [Open World Physics](reference/physics-open-world.md) — 200k bodies at 60 Hz
@@ -89,8 +90,9 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | Physics: activity tiers, open world | [physics-open-world](reference/physics-open-world.md) |
 | Collision layers & tuning | [ecs-collision-layers](reference/ecs-collision-layers.md) |
 | Components (the registry) | [ecs-components](reference/ecs-components.md) |
-| Components (all 28, and how they connect) | [component-catalog](reference/component-catalog.md) |
+| Components (one page each, and how they connect) | [components/](reference/components/README.md) |
 | The clock, the timer, the tween | [tween-and-timer](reference/tween-and-timer.md) |
+| A whole project, end to end | [first-game](guides/first-game.md) + [samples/first-game](../samples/first-game/) |
 | Entities, actors, queries, signals, hierarchy, serialization | [ecs-entities](reference/ecs-entities.md) and siblings |
 | Animation clips, tracks, root motion | [ecs-animation](reference/ecs-animation.md) |
 | Math, random, noise, time | `core-*` |

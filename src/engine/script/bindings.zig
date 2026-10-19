@@ -4024,6 +4024,172 @@ fn lua_time_is_paused(L: ?*lua_State) callconv(.c) c_int {
     return pushBool(L, if (ctx.time) |t| t.isPaused() else false);
 }
 
+
+// ── flow: the global state machine, with a stack of states ───────────────────
+//
+// The game's own phases: menu → playing → paused → game over. It is GLOBAL
+// (no entity) because the flow belongs to the GAME, and it has a STACK because
+// "paused" sits ON TOP of "playing" and leaving it must return there.
+//
+// Every function takes the OWNING global's `self` first, the same shape as
+// `sm.*`: the flow's callbacks run with that table, and a global that does not
+// own the flow cannot drive it.
+
+/// The registry ref of the global whose `self` table is at `idx`.
+fn globalSelfRef(L: ?*lua_State, idx: c_int) i32 {
+    const ctx = ctxOf(L);
+    const hooks = ctx.globals orelse return statemachine_mod.no_ref;
+    return hooks.global_ref_of_self(hooks.ctx, L, idx);
+}
+
+/// The flow, when the caller at `idx` OWNS it. A global that does not own the
+/// flow gets nothing: one game, one flow.
+fn ownedFlow(L: ?*lua_State, idx: c_int) ?*statemachine_mod.Registry {
+    const ctx = ctxOf(L);
+    const reg = ctx.machines orelse return null;
+    if (!reg.hasFlow()) return null;
+    const self_ref = globalSelfRef(L, idx);
+    if (self_ref == statemachine_mod.no_ref) return null;
+    if (self_ref != reg.flow.self_ref) return null;
+    return reg;
+}
+
+/// `flow.add_state(self, name, hooks) -> boolean`.
+///
+/// Declares a state of the flow. The first call creates the flow and binds it
+/// to this global. The hooks are the same `{ enter, update, exit }` the
+/// per-entity state machine takes, and they receive THIS global's `self`.
+fn lua_flow_add_state(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const reg = ctx.machines orelse return 0;
+    const self_ref = globalSelfRef(L, 1);
+    if (self_ref == statemachine_mod.no_ref) return 0; // not a global
+    const name = lua.toSlice(L, 2) orelse return 0;
+
+    // The flow's machine, created on first use.
+    var machine_id = reg.flow.machine;
+    if (machine_id == 0) {
+        machine_id = reg.createMachine();
+        if (machine_id == 0) return 0;
+        _ = reg.declareFlow(machine_id, self_ref);
+    }
+    const idx = reg.addState(machine_id, name) catch return 0;
+    const st = &reg.machines[machine_id].states[idx];
+    st.enter_ref = refStateHook(L, reg, 3, "enter");
+    st.update_ref = refStateHook(L, reg, 3, "update");
+    st.exit_ref = refStateHook(L, reg, 3, "exit");
+    return pushTrue(L);
+}
+
+/// `flow.add_transition(self, from, event, to) -> boolean`.
+fn lua_flow_add_transition(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    const from = lua.toSlice(L, 2) orelse return 0;
+    const event = lua.toSlice(L, 3) orelse return 0;
+    const to = lua.toSlice(L, 4) orelse return 0;
+    reg.addTransition(reg.flow.machine, from, event, to) catch return 0;
+    return pushTrue(L);
+}
+
+/// `flow.set_initial(self, name) -> boolean` — the state the flow starts in.
+fn lua_flow_set_initial(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    reg.setInitial(reg.flow.machine, name) catch return 0;
+    return pushTrue(L);
+}
+
+/// `flow.fire(self, event)` — requests a transition.
+///
+/// Applied at the TOP of the next tick, like `sm.fire`: a callback that fires
+/// cannot re-enter the flow. A transition REPLACES the whole stack: the game's
+/// phase changed, not the layer on top of it.
+fn lua_flow_fire(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    const event = lua.toSlice(L, 2) orelse return 0;
+    reg.flowFire(event);
+    return 0;
+}
+
+/// `flow.set_state(self, name) -> boolean` — jumps to a state NOW.
+///
+/// The whole stack is replaced. For a layered change use `flow.push`.
+fn lua_flow_set_state(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    const idx = reg.stateIndex(reg.flow.machine, name) orelse return 0;
+    if (!reg.flowReplace(idx)) return 0;
+    return pushTrue(L);
+}
+
+/// `flow.push(self, name) -> boolean` — pushes a state on the stack.
+///
+/// The state below stays: `flow.pop()` returns to it. This is how "paused"
+/// sits on top of "playing".
+fn lua_flow_push(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    const idx = reg.stateIndex(reg.flow.machine, name) orelse return 0;
+    if (!reg.flowPush(idx)) return 0;
+    return pushTrue(L);
+}
+
+/// `flow.pop(self) -> boolean` — leaves the top of the stack.
+///
+/// False when the stack has only the bottom state: the flow always has a
+/// phase.
+fn lua_flow_pop(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return 0;
+    return pushBool(L, reg.flowPop());
+}
+
+/// `flow.state(self) -> string` — the state on the top of the stack.
+fn lua_flow_state(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse {
+        lua.pushNil(L);
+        return 1;
+    };
+    lua.pushSlice(L, reg.flowStateName());
+    return 1;
+}
+
+/// `flow.is_in(self, name) -> boolean`.
+fn lua_flow_is_in(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse return pushBool(L, false);
+    const name = lua.toSlice(L, 2) orelse return pushBool(L, false);
+    return pushBool(L, reg.flowIsIn(name));
+}
+
+/// `flow.stack(self) -> table` — the states on the stack, bottom to top.
+fn lua_flow_stack(L: ?*lua_State) callconv(.c) c_int {
+    const reg = ownedFlow(L, 1) orelse {
+        lua.lua_createtable(L, 0, 0);
+        return 1;
+    };
+    var names: [statemachine_mod.max_stack][]const u8 = undefined;
+    const n = reg.flowStackNames(&names);
+    lua.lua_createtable(L, 0, @intCast(n));
+    for (names[0..n], 0..) |name, i| {
+        lua.pushSlice(L, name);
+        lua.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+const flow_regs = [_]luaL_Reg{
+    .{ .name = "add_state", .func = lua_flow_add_state },
+    .{ .name = "add_transition", .func = lua_flow_add_transition },
+    .{ .name = "set_initial", .func = lua_flow_set_initial },
+    .{ .name = "fire", .func = lua_flow_fire },
+    .{ .name = "set_state", .func = lua_flow_set_state },
+    .{ .name = "push", .func = lua_flow_push },
+    .{ .name = "pop", .func = lua_flow_pop },
+    .{ .name = "state", .func = lua_flow_state },
+    .{ .name = "is_in", .func = lua_flow_is_in },
+    .{ .name = "stack", .func = lua_flow_stack },
+    .{ .name = null, .func = null },
+};
+
 const time_regs = [_]luaL_Reg{
     .{ .name = "delta", .func = lua_time_delta },
     .{ .name = "unscaled_delta", .func = lua_time_unscaled_delta },
@@ -6012,6 +6178,17 @@ pub const registered_names = [_][]const u8{
     "tween.time_scale",
     "tween.set_time_scale",
     "tween.properties",
+    // flow: the global state machine, with a stack of states
+    "flow.add_state",
+    "flow.add_transition",
+    "flow.set_initial",
+    "flow.fire",
+    "flow.set_state",
+    "flow.push",
+    "flow.pop",
+    "flow.state",
+    "flow.is_in",
+    "flow.stack",
     // M13: the per-actor AnimationPlayer surface. Same rule as above: every
     // name here must have a metadata entry, or `assertAllDocumented` fails.
     "anim.new",
@@ -6096,6 +6273,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "timer", &timer_regs);
     installModule(L, ctx, "time", &time_regs);
     installModule(L, ctx, "tween", &tween_regs);
+    installModule(L, ctx, "flow", &flow_regs);
     installModule(L, ctx, "anim", &anim_regs);
     // M14: the game UI (Label/Button/Panel/ProgressBar + layout + queries).
     installModule(L, ctx, "ui", &ui_regs);

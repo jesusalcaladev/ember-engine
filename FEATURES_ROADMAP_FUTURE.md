@@ -17,6 +17,9 @@
 - [x] **Behavior System** - LuaJIT, hot-reload, lifecycle (init/update/destroy), signals
 - [x] **Tweens** - `tween.to`, `chain`, `kill`, `time_scale`; 28 curvas de easing (`math.ease`)
 - [x] **Reloj de juego** - `time.*` + escala global (pausa, slow-mo) + `Timer` completo (por-timer `time_scale`, `restart`, getters, ciclos descartados contados)
+- [x] **Corrutinas** - `self:async(fn)` + `self:wait(segundos)`, reanudadas en el paso fijo (el wait es tiempo de JUEGO)
+- [x] **Flow** - máquina de estados GLOBAL con PILA: `flow.push`/`flow.pop` (pausa encima de jugando), transiciones que reemplazan la pila
+- [x] **Carga de escena en runtime** - `--scene game.zson` + `scripts { behavior "..." }` (el ORDEN es el id) → el actor con `Script {script: N}` ejecuta ese behaviour
 - [x] **Steering** - Seek, flee, arrive, pursue, evade, wander, flock, obstacle avoidance
       - ⚠️ **escrito y probado, pero detrás de `-Dsteering` (off)**: `world.nearby` mide ~16 µs por llamada
 - [ ] **Pathfinding** - **NO EXISTE.** No hay A*, ni navmesh, ni navegación. `line_of_sight` sí (`physics.line_of_sight`).

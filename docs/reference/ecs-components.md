@@ -2,10 +2,11 @@
 
 **Source:** `src/engine/ecs/components.zig`
 
-> **Looking for a component to use?** The [Component Catalog](component-catalog.md)
-> is the per-component reference: what each one is for, which system drives it,
-> which Lua bindings touch it, and how they connect. This document is the other
-> half — **how** components are registered, stored and serialized.
+> **Looking for a component to use?** The [Component Index](components/README.md)
+> is the per-component reference: one page per component, what it is for, which
+> system drives it, which Lua bindings touch it, and how they connect. This
+> document is the other half — **how** components are registered, stored and
+> serialized.
 
 ## Overview
 

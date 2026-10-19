@@ -2738,6 +2738,201 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "actor.async",
+        .module = "actor",
+        .signature = "actor.async(self, fn) -> boolean",
+        .summary = "Starts `fn` as a coroutine on this actor. The function is called with the actor's `self` and may call `self:wait(seconds)` to pause; the engine resumes it on the fixed step, so a wait is a measure of GAME time. The engine injects this method into every behavior's `self` table — it is not a module function, and the name `async` is reserved.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "fn", .kind = .any, .doc = "the function to run as a coroutine" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the coroutine started" },
+        },
+        .example =
+        \\self:async(function(self)
+        \\  actor.set_position(self, 0, 0)
+        \\  self:wait(1.0)              -- one second of game time
+        \\  actor.set_position(self, 100, 0)
+        \\end)
+        ,
+    },
+    .{
+        .name = "actor.wait",
+        .module = "actor",
+        .signature = "actor.wait(self, seconds)",
+        .summary = "Pauses the current coroutine for `seconds` of game time. The wait is measured in the fixed step, so it slows down with the global time scale and replays identically. Only valid inside a coroutine; the global `wait(seconds)` is the same function.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "seconds", .kind = .number, .doc = "how long to pause, in game seconds" },
+        },
+        .returns = &.{},
+        .example =
+        \\self:async(function(self)
+        \\  self:wait(0.5)
+        \\  self:fire()
+        \\end)
+        ,
+    },
+    .{
+        .name = "flow.add_state",
+        .module = "flow",
+        .signature = "flow.add_state(self, name, hooks) -> boolean",
+        .summary = "Declares a state of the game's flow. The first call creates the flow and binds it to this global. The hooks are the same `{ enter, update, exit }` the per-entity state machine takes, and they receive this global's `self`.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "name", .kind = .string, .doc = "the state's name" },
+            .{ .name = "hooks", .kind = .table, .doc = "optional: enter, update, exit" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the state was declared" },
+        },
+        .example =
+        \\flow.add_state(self, "menu", { enter = function(self) scene.fade_in(0.2) end })
+        ,
+    },
+    .{
+        .name = "flow.add_transition",
+        .module = "flow",
+        .signature = "flow.add_transition(self, from, event, to) -> boolean",
+        .summary = "A transition between the flow's states. It REPLACES the whole stack: the game's phase changed, not the layer on top of it.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "from", .kind = .string, .doc = "the state the transition leaves" },
+            .{ .name = "event", .kind = .string, .doc = "the event that triggers it" },
+            .{ .name = "to", .kind = .string, .doc = "the state the transition enters" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the transition was declared" },
+        },
+        .example =
+        \\flow.add_transition(self, "menu", "start", "playing")
+        ,
+    },
+    .{
+        .name = "flow.set_initial",
+        .module = "flow",
+        .signature = "flow.set_initial(self, name) -> boolean",
+        .summary = "The state the flow enters when it starts.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "name", .kind = .string, .doc = "the starting state" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the initial state was set" },
+        },
+        .example =
+        \\flow.set_initial(self, "menu")
+        ,
+    },
+    .{
+        .name = "flow.fire",
+        .module = "flow",
+        .signature = "flow.fire(self, event)",
+        .summary = "Requests a transition. It is applied at the TOP of the next tick, like `sm.fire`: a callback that fires cannot re-enter the flow.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "event", .kind = .string, .doc = "the event to fire" },
+        },
+        .returns = &.{},
+        .example =
+        \\flow.fire(self, "start")
+        ,
+    },
+    .{
+        .name = "flow.set_state",
+        .module = "flow",
+        .signature = "flow.set_state(self, name) -> boolean",
+        .summary = "Jumps to a state NOW, replacing the whole stack. For a layered change use `flow.push`.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "name", .kind = .string, .doc = "the state to enter" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the state was entered" },
+        },
+        .example =
+        \\flow.set_state(self, "game_over")
+        ,
+    },
+    .{
+        .name = "flow.push",
+        .module = "flow",
+        .signature = "flow.push(self, name) -> boolean",
+        .summary = "Pushes a state on the flow's stack. The state below stays: `flow.pop` returns to it. This is how \"paused\" sits on top of \"playing\".",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "name", .kind = .string, .doc = "the state to push" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the state was pushed" },
+        },
+        .example =
+        \\flow.push(self, "paused")
+        ,
+    },
+    .{
+        .name = "flow.pop",
+        .module = "flow",
+        .signature = "flow.pop(self) -> boolean",
+        .summary = "Leaves the top of the flow's stack, returning to the one below. False when the stack has only the bottom state: the flow always has a phase.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when a state was left" },
+        },
+        .example =
+        \\flow.pop(self)   -- back to "playing"
+        ,
+    },
+    .{
+        .name = "flow.state",
+        .module = "flow",
+        .signature = "flow.state(self) -> string",
+        .summary = "The state on the top of the flow's stack.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+        },
+        .returns = &.{
+            .{ .kind = .string, .doc = "the current state's name" },
+        },
+        .example =
+        \\if flow.state(self) == "playing" then ... end
+        ,
+    },
+    .{
+        .name = "flow.is_in",
+        .module = "flow",
+        .signature = "flow.is_in(self, name) -> boolean",
+        .summary = "Whether the top of the flow's stack is `name`.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+            .{ .name = "name", .kind = .string, .doc = "the state's name" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the flow is in that state" },
+        },
+        .example =
+        \\if flow.is_in(self, "paused") then time.pause() end
+        ,
+    },
+    .{
+        .name = "flow.stack",
+        .module = "flow",
+        .signature = "flow.stack(self) -> table",
+        .summary = "The states on the flow's stack, bottom to top. The last one is the current state.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the global that owns the flow" },
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "the stack, as an array of names" },
+        },
+        .example =
+        \\for _, name in ipairs(flow.stack(self)) do print(name) end
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",
@@ -4790,7 +4985,13 @@ pub fn isDocumented(name: []const u8) bool {
 /// Plus a completeness check on each entry, so a half-filled Binding cannot
 /// pass by accident.
 pub fn assertAllDocumented(comptime registered: []const []const u8) void {
-    @setEvalBranchQuota(100_000);
+    // The quota is the SIZE of the registry, squared: `find` is a linear scan
+    // and the gate calls it once per registered name. At 100 000 branches the
+    // gate stopped compiling at 317 bindings — the build failed with an
+    // evaluation error about a stub generator, on a change that had nothing to
+    // do with it. The quota is raised with the registry, not by hand: a
+    // binding added later must not need a second trip to this file.
+    @setEvalBranchQuota(2_000_000);
     // Direction 1: every registered name must have an entry.
     inline for (registered) |name| {
         const b = comptime find(name) orelse

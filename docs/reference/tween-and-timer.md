@@ -329,5 +329,5 @@ tween.chain(b, c)
 ## See also
 
 - [Lua API Reference](script-lua-api.md#tween) — every `tween.*` and `timer.*` binding.
-- [Component Catalog](component-catalog.md#timer--id-19) — the `Timer` component's fields.
+- [Timer](components/Timer.md) — the `Timer` component's fields.
 - [Core Loop](core-loop.md) — the clock and the fixed step.

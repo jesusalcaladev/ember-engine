@@ -259,6 +259,10 @@ pub const Audio = struct {
 };
 
 pub const max_global_scripts = 64;
+/// The project's BEHAVIOR scripts: the ones an actor runs. The list's ORDER is
+/// the id: the first entry is script 0, the second is script 1, and that is
+/// what a scene file's `Script {script: N}` refers to.
+pub const max_behavior_scripts = 64;
 
 /// The project's GLOBAL scripts: Lua behavior scripts mounted with no actor —
 /// the game manager, the score, the spawner, the flow. Each path is relative to
@@ -267,6 +271,13 @@ pub const max_global_scripts = 64;
 /// order, which is start order: list the manager before the things that read it.
 pub const Scripts = struct {
     global: []const []const u8 = &.{},
+    /// The behavior scripts, in LOAD order — and the order IS the id.
+    ///
+    /// A scene file says `Script {script: 1}`, and "1" is the index in THIS
+    /// list. That is the same contract as the global scripts' (the order is
+    /// the start order) and it keeps the scene file free of paths: the project
+    /// decides what "script 1" means, the scene decides that an actor runs it.
+    behavior: []const []const u8 = &.{},
 };
 
 /// One named action and the device names that trigger it. Bindings are names,

@@ -132,6 +132,17 @@ function Actor:has_component(name) end
 ---@return boolean true when removed
 function Actor:remove_component(name) end
 
+---Starts `fn` as a coroutine on this actor. The function is called with the actor's `self` and may call `self:wait(seconds)` to pause; the engine resumes it on the fixed step, so a wait is a measure of GAME time. The engine injects this method into every behavior's `self` table — it is not a module function, and the name `async` is reserved.
+---@param self Actor 
+---@param fn any the function to run as a coroutine
+---@return boolean true when the coroutine started
+function Actor:async(fn) end
+
+---Pauses the current coroutine for `seconds` of game time. The wait is measured in the fixed step, so it slows down with the global time scale and replays identically. Only valid inside a coroutine; the global `wait(seconds)` is the same function.
+---@param self Actor 
+---@param seconds number how long to pause, in game seconds
+function Actor:wait(seconds) end
+
 ---Sets the velocity outright. Leaves the angular velocity alone.
 ---@param self Actor 
 ---@param vx number velocity x in units/second
@@ -1205,6 +1216,67 @@ function math.rad_to_deg(radians) end
 ---@param tolerance number maximum acceptable difference
 ---@return boolean true when |a-b| <= tolerance
 function math.is_close(a, b, tolerance) end
+
+
+-- ── flow ──
+---Declares a state of the game's flow. The first call creates the flow and binds it to this global. The hooks are the same `{ enter, update, exit }` the per-entity state machine takes, and they receive this global's `self`.
+---@param self Actor the global that owns the flow
+---@param name string the state's name
+---@param hooks table optional: enter, update, exit
+---@return boolean true when the state was declared
+function flow.add_state(self, name, hooks) end
+
+---A transition between the flow's states. It REPLACES the whole stack: the game's phase changed, not the layer on top of it.
+---@param self Actor the global that owns the flow
+---@param from string the state the transition leaves
+---@param event string the event that triggers it
+---@param to string the state the transition enters
+---@return boolean true when the transition was declared
+function flow.add_transition(self, from, event, to) end
+
+---The state the flow enters when it starts.
+---@param self Actor the global that owns the flow
+---@param name string the starting state
+---@return boolean true when the initial state was set
+function flow.set_initial(self, name) end
+
+---Requests a transition. It is applied at the TOP of the next tick, like `sm.fire`: a callback that fires cannot re-enter the flow.
+---@param self Actor the global that owns the flow
+---@param event string the event to fire
+function flow.fire(self, event) end
+
+---Jumps to a state NOW, replacing the whole stack. For a layered change use `flow.push`.
+---@param self Actor the global that owns the flow
+---@param name string the state to enter
+---@return boolean true when the state was entered
+function flow.set_state(self, name) end
+
+---Pushes a state on the flow's stack. The state below stays: `flow.pop` returns to it. This is how "paused" sits on top of "playing".
+---@param self Actor the global that owns the flow
+---@param name string the state to push
+---@return boolean true when the state was pushed
+function flow.push(self, name) end
+
+---Leaves the top of the flow's stack, returning to the one below. False when the stack has only the bottom state: the flow always has a phase.
+---@param self Actor the global that owns the flow
+---@return boolean true when a state was left
+function flow.pop(self) end
+
+---The state on the top of the flow's stack.
+---@param self Actor the global that owns the flow
+---@return string the current state's name
+function flow.state(self) end
+
+---Whether the top of the flow's stack is `name`.
+---@param self Actor the global that owns the flow
+---@param name string the state's name
+---@return boolean true when the flow is in that state
+function flow.is_in(self, name) end
+
+---The states on the flow's stack, bottom to top. The last one is the current state.
+---@param self Actor the global that owns the flow
+---@return table the stack, as an array of names
+function flow.stack(self) end
 
 
 -- ── tween ──
