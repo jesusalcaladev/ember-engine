@@ -58,7 +58,7 @@ The vertex buffer is a centered unit quad (4 vertices, 6 indices). The shader sc
 
 ## Sprite shader (`sprite.wgsl`)
 
-The M2 instanced sprite shader. One 32-byte record per sprite; the four quad corners are derived from `vertex_index` with a triangle-strip topology — no index buffer, no CPU-side vertex expansion.
+The M2 instanced sprite shader. One 36-byte record per sprite; the four quad corners are derived from `vertex_index` with a triangle-strip topology — no index buffer, no CPU-side vertex expansion.
 
 ### Globals uniform
 
@@ -84,6 +84,9 @@ struct Instance {
     @location(2) uv: vec4f,       // (u0, v0, u1, v1) unorm16
     @location(3) color: vec4f,    // rgba unorm8
     @location(4) slot: u32,       // atlas slot (drives batching)
+    @location(5) shape: u32,      // 0 = quad, 1 = circle
+    @location(6) layer: u32,      // the light layer this sprite is on
+    @location(7) rot: f32,        // the rotation about the center, in radians
 };
 ```
 
@@ -99,7 +102,14 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VSOut {
     let corner = vec2f(cx, cy) * 2.0 - 1.0; // -1..1
 
     var out: VSOut;
-    out.pos = globals.vp * vec4f(inst.pos + corner * inst.half, 0.0, 1.0);
+    // The corner in the sprite's own frame, turned by the instance's
+    // rotation. The local coordinate the fragment stage masks with is the
+    // UNROTATED one: a circle is a circle whichever way it points.
+    let local = corner * inst.half;
+    let c = cos(inst.rot);
+    let s = sin(inst.rot);
+    let turned = vec2f(local.x * c - local.y * s, local.x * s + local.y * c);
+    out.pos = globals.vp * vec4f(inst.pos + turned, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, vec2f(cx, cy));
     out.color = inst.color;
     return out;
@@ -332,7 +342,7 @@ fn createShader(device: wgpu.WGPUDevice, source: []const u8, label: [:0]const u8
 
 ### Sprite pipeline instance layout
 
-The instance buffer is a single 32-byte record per sprite, stepping per instance:
+The instance buffer is a single 36-byte record per sprite, stepping per instance:
 
 ```zig
 const sprite_instance_attrs = [_]wgpu.VertexAttribute{
@@ -344,7 +354,7 @@ const sprite_instance_attrs = [_]wgpu.VertexAttribute{
 };
 const sprite_vlayout = wgpu.VertexBufferLayout{
     .stepMode = wgpu.VertexStepMode_Instance,
-    .arrayStride = SpriteInstanceBytes,  // 32
+    .arrayStride = SpriteInstanceBytes,  // 36
     .attributeCount = 5,
     .attributes = &sprite_instance_attrs,
 };

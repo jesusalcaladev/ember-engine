@@ -53,6 +53,7 @@ pub const TextureUsage_CopyDst: Flags = 0x2;
 pub const TextureUsage_TextureBinding: Flags = 0x4;
 pub const TextureUsage_StorageBinding: Flags = 0x8;
 pub const TextureUsage_RenderAttachment: Flags = 0x10;
+pub const VertexFormat_Float32: c_uint = 0x0000001C;
 pub const VertexFormat_Float32x2: c_uint = 0x0000001D;
 pub const VertexFormat_Float32x4: c_uint = 0x0000001F;
 pub const VertexFormat_Unorm16x4: c_uint = 0x00000015;

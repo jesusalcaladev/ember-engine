@@ -63,15 +63,23 @@ pub const quad_indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
 ///
 /// Why instanced and not 6 vertices per sprite: 6 vertices x 36 B x 50k =
 /// 10.8 MB uploaded EVERY FRAME, which breaks spec §4 ("staging uploads
-/// <= 2 MB/frame in steady state") by 5x. One instance record of 32 B keeps
-/// the same scene at 1.6 MB — inside the budget — and the vertex shader
+/// <= 2 MB/frame in steady state") by 5x. One instance record of 36 B keeps
+/// the same scene at 1.8 MB — inside the budget — and the vertex shader
 /// derives the 4 corners from `vertex_index` with a triangle-strip topology,
 /// so there is no index buffer and no per-vertex expansion at all.
 ///
-/// Field packing (the reason it is 32 and not 52): uv as 4x u16 unorm and
+/// Field packing (the reason it is 36 and not 52): uv as 4x u16 unorm and
 /// tint as 4x u8 unorm are visually lossless for 2D sprites and save 20
 /// bytes per sprite = 1 MB per frame at the 50k scene.
-pub const SpriteInstance = struct {
+///
+/// An EXTERN struct, and that is not a style choice: this record's bytes ARE
+/// the vertex layout the backend declares, field by field and offset by
+/// offset. Zig's default struct layout is free to REORDER fields to save
+/// padding — and it did, the moment a `f32` joined the record — which moved
+/// the shape and the layer out from under the shader's attribute offsets.
+/// `extern` pins the declaration order, and the offsets below are asserted
+/// against it at compile time.
+pub const SpriteInstance = extern struct {
     /// World-space center.
     pos: [2]f32,
     /// Half extents in world units.
@@ -98,11 +106,39 @@ pub const SpriteInstance = struct {
     /// distinct layers is not a scene anyone has.
     layer: u8 = 0,
     _pad: [1]u8 = .{0},
+    /// The sprite's rotation about its centre, in radians.
+    ///
+    /// Four bytes, and they are the difference between a 2D engine that can
+    /// turn something and one that cannot: the transform has carried a
+    /// rotation since M1, the physics reads it, the editor's gizmo writes it
+    /// — and the renderer threw it away, so a rotated body turned and its
+    /// sprite did not.
+    ///
+    /// The instance is 36 bytes now, not 32, and the extra four are the price
+    /// of a quad whose corners are rotated in the vertex shader. At the 50k
+    /// scene that is 1.8 MB a frame against a 2 MB ceiling — inside the
+    /// budget, with less room in it, and the number is printed by the bench
+    /// so the room that is left is visible rather than assumed.
+    rot: f32 = 0,
 };
 
 comptime {
     // The backend hardcodes the stride; this assert keeps the two in sync.
-    if (@sizeOf(SpriteInstance) != 32) @compileError("SpriteInstance must stay 32 bytes");
+    if (@sizeOf(SpriteInstance) != 36) @compileError("SpriteInstance must stay 36 bytes");
+
+    // The vertex layout in `backend_dawn.zig` names the OFFSET of every
+    // field, and those offsets are the struct's byte positions. They were off
+    // by one for the shape and the layer — so the shape mask was the layer
+    // (a sprite on layer 1 drew as a circle) and the light layer was the
+    // padding (always zero, so a light mask matched nothing).
+    //
+    // A number in a table is a number nobody reads. These asserts make the
+    // table and the struct agree by construction: move a field and the build
+    // breaks instead of the picture.
+    if (@offsetOf(SpriteInstance, "slot") != 28) @compileError("SpriteInstance.slot must stay at byte 28");
+    if (@offsetOf(SpriteInstance, "shape") != 29) @compileError("SpriteInstance.shape must stay at byte 29");
+    if (@offsetOf(SpriteInstance, "layer") != 30) @compileError("SpriteInstance.layer must stay at byte 30");
+    if (@offsetOf(SpriteInstance, "rot") != 32) @compileError("SpriteInstance.rot must stay at byte 32");
 }
 
 /// Converts a float 0..1 to unorm16 (the atlas uv packing).
@@ -570,11 +606,11 @@ test "quad has 4 vertices and valid indices" {
     for (quad_indices) |i| try std.testing.expect(i < quad_vertices.len);
 }
 
-test "sprite instance is 32 bytes (the 50k scene stays inside the 2 MB upload budget)" {
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(SpriteInstance));
+test "sprite instance is 36 bytes (the 50k scene stays inside the 2 MB upload budget)" {
+    try std.testing.expectEqual(@as(usize, 36), @sizeOf(SpriteInstance));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(SpriteInstance));
     // spec §4: <= 2 MB/frame of staging uploads.
-    try std.testing.expect(@as(usize, 32) * 50_000 <= 2 * 1024 * 1024);
+    try std.testing.expect(@as(usize, 36) * 50_000 <= 2 * 1024 * 1024);
 }
 
 test "unorm packing round-trips within its resolution" {

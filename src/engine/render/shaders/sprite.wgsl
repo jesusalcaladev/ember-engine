@@ -35,6 +35,14 @@ struct Instance {
     /// per-pixel-varying integer would be flat, and flat on a sprite that spans
     /// the screen is fine, but it costs an interpolator for one byte.
     @location(6) layer: u32,
+    /// The rotation about the sprite's centre, in radians.
+    ///
+    /// The corners are derived here, so this is where the rotation belongs: a
+    /// quad's corners are a centre plus two half extents, and a turned quad
+    /// needs a third number. It used to be missing, and the transform's
+    /// rotation was carried by the ECS, read by the physics and written by the
+    /// editor's gizmo — and thrown away on the way to the screen.
+    @location(7) rot: f32,
 };
 
 struct VSOut {
@@ -58,7 +66,14 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VSOut {
     let corner = vec2f(cx, cy) * 2.0 - 1.0; // -1..1
 
     var out: VSOut;
-    out.pos = globals.vp * vec4f(inst.pos + corner * inst.half, 0.0, 1.0);
+    // The corner in the sprite's own frame, turned by the instance's rotation.
+    // The local coordinate the fragment stage masks with is the UNROTATED
+    // one: a circle is a circle whichever way it points.
+    let local = corner * inst.half;
+    let c = cos(inst.rot);
+    let s = sin(inst.rot);
+    let turned = vec2f(local.x * c - local.y * s, local.x * s + local.y * c);
+    out.pos = globals.vp * vec4f(inst.pos + turned, 0.0, 1.0);
     out.uv = mix(inst.uv.xy, inst.uv.zw, vec2f(cx, cy));
     out.color = inst.color;
     // Carried so the fragment stage can mask the quad without recomputing where

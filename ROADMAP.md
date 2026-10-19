@@ -63,7 +63,7 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 - **Frame-rate cap (Godot-style `max_fps`)**: the game target owns the cap (30 or 60 FPS) with the 60 Hz simulation untouched; vsync alone cannot do it. Lives in `core/loop.FrameLimiter`: absolute schedule, no debt accumulation, spins the last 250 µs so sleeping does not jitter p99.
 - **Overdraw rule**: opaque geometry front-to-back (early-Z), alpha back-to-front. The default path does NOT sort per frame (see below).
 
-**Instanced, 32-byte instances (measured, not assumed)**: 6 vertices x 36 B x 50k sprites = 10.8 MB uploaded per frame, which breaks spec §4 ("staging uploads <= 2 MB/frame") 5x. One 32-byte instance record (pos, half, uv as unorm16x4, tint as unorm8x4, slot) with the 4 quad corners derived from `vertex_index` in a triangle-strip pipeline keeps the same scene at **1.6 MB**, with no index buffer and no CPU vertex expansion.
+**Instanced, 36-byte instances (measured, not assumed)**: 6 vertices x 36 B x 50k sprites = 10.8 MB uploaded per frame, which breaks spec §4 ("staging uploads <= 2 MB/frame") 5x. One 36-byte instance record (pos, half, uv as unorm16x4, tint as unorm8x4, slot, shape, layer, rotation) with the 4 quad corners derived from `vertex_index` in a triangle-strip pipeline keeps the same scene at **1.72 MB**, with no index buffer and no CPU vertex expansion. The record was 32 bytes until M5.8: the four extra ones are the sprite's ROTATION, which the renderer had been throwing away — a body could turn in the physics and stay square on the screen.
 
 **Batching: why the default does not sort.** A per-frame comparison sort of 50k sprites costs ~200 ms of pure cache misses (measured: insertion sort first, heap sort after), against ~30 µs for a counting sort by layer and ~0 for the fast path. So: the emitter writes instances directly when the scene is already layer-monotonic (the normal case — painter's order IS layer order); `by_layer` uses the O(n) counting sort; `front_to_back` / `back_to_front` are opt-in per scene and are documented as costing O(n log n).
 
@@ -73,7 +73,7 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 |---|---|---|
 | 50k sprites in draw calls | ≤ 4 | **4** (1 scene + 3 SMAA passes) |
 | Render CPU, encoding 50k sprites | ≤ 1.5 ms | **0.54 ms p50** (headless), 1.22 ms p50 windowed |
-| Staging upload per frame | ≤ 2 MB | **1.6 MB** |
+| Staging upload per frame | ≤ 2 MB | **1.72 MB** (36 B/instance — the rotation is four of them) |
 | GPU objects created in frame | 0 | **0** |
 | Allocations in the frame loop | 0 | **0** (arena high-water 0 B) |
 | Frame time @ 60 FPS | 16.6 ms | **16.66 ms p50** (vsync-locked, p99 17.7 ms) |

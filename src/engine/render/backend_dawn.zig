@@ -412,9 +412,10 @@ pub const Backend = struct {
     const UniformSize: u64 = 256;
     /// 2 u64 timestamps per instrumented pass.
     const TimestampBytes: u64 = GPU_TIMESTAMP_SLOTS * @sizeOf(u64);
-    /// Instance record: pos(8) + half(8) + uv4xu16(8) + color4xu8(4) + slot(1)
-    /// + pad(3) = 32 bytes, exactly @sizeOf(render.SpriteInstance).
-    const SpriteInstanceBytes: u32 = 32;
+    /// Instance record: pos(8) + half(8) + uv4xu16(8) + color4xu8(4) +
+    /// slot(1) + shape(1) + layer(1) + pad(1) + rot(4) = 36 bytes, exactly
+    /// @sizeOf(render.SpriteInstance) — which asserts it at compile time.
+    const SpriteInstanceBytes: u32 = 36;
     /// `Globals` in light.wgsl: mat4(64) + vec2 + vec2 + vec4(16) = 96. The
     /// ambient colour is here rather than in the instance because it is the
     /// same for every light in the frame, and per-instance means per-vertex.
@@ -826,25 +827,34 @@ pub const Backend = struct {
             .{ .format = wgpu.VertexFormat_Float32x2, .offset = 8, .shaderLocation = 1 },
             .{ .format = wgpu.VertexFormat_Unorm16x4, .offset = 16, .shaderLocation = 2 },
             .{ .format = wgpu.VertexFormat_Unorm8x4, .offset = 24, .shaderLocation = 3 },
+            // The slot, the shape and the layer share one word. The shader
+            // reads the slot as a u32 and never uses it (the BATCHING is the
+            // CPU's job), so this attribute exists to keep the word's first
+            // four bytes addressable.
             .{ .format = wgpu.VertexFormat_Uint32, .offset = 28, .shaderLocation = 4 },
-            // The light layer, in the byte `SpriteInstance` used to pad. One
-            // attribute for one byte rather than folding it into the u32 above,
-            // because slot and shape already share that word and a third field
-            // there would mean a shift at every vertex.
-            .{ .format = wgpu.VertexFormat_Uint8, .offset = 30, .shaderLocation = 5 },
-            // The light layer this sprite is on, for `item_cull_mask`.
+            // The SHAPE, and the LIGHT LAYER, and they were off by one byte.
             //
-            // CLAMPED to a byte, and that is not a silent truncation: the shader
-            // reads an 8-bit attribute and the layer target is R8, so a sprite on
-            // layer 300 arriving as 44 would be lit by lights masked for layer 44.
-            // The clamp puts every out-of-range layer on 255, which the light pass
-            // treats as the wildcard -- the safe direction.
-            .{ .format = wgpu.VertexFormat_Uint8, .offset = 31, .shaderLocation = 6 },
+            // The instance's bytes are `slot` (28), `shape` (29), `layer`
+            // (30) and the pad (31) — and this layout read the shape from 30
+            // and the layer from 31. So the shape mask was the LAYER (a sprite
+            // on layer 1 drew as a circle) and the light layer was the pad
+            // (always 0, so `light.set_mask` matched nothing). The two
+            // symptoms looked like two bugs in two systems; they were one
+            // off-by-one in a table nobody read against the header.
+            //
+            // The offsets are pinned to the struct in `render.zig`, which
+            // fails the build if the struct's field order ever moves.
+            .{ .format = wgpu.VertexFormat_Uint8, .offset = 29, .shaderLocation = 5 },
+            .{ .format = wgpu.VertexFormat_Uint8, .offset = 30, .shaderLocation = 6 },
+            // The rotation, in radians. Four bytes at the end of the record:
+            // the quad's corners are turned in the vertex shader, which is the
+            // only place that knows what a corner is.
+            .{ .format = wgpu.VertexFormat_Float32, .offset = 32, .shaderLocation = 7 },
         };
         const sprite_vlayout = wgpu.VertexBufferLayout{
             .stepMode = wgpu.VertexStepMode_Instance,
             .arrayStride = SpriteInstanceBytes,
-            .attributeCount = 7,
+            .attributeCount = 8,
             .attributes = &sprite_instance_attrs,
         };
 

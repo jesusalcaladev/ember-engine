@@ -337,7 +337,7 @@ The canonical scene (50k sprites, 1280×720, ReleaseSafe) measures:
 |---|---|---|
 | Allocations in the frame loop | 0 | **0** |
 | GPU objects created in frame | 0 | **0** |
-| Staging upload / frame | ≤ 2 MB | 1.6 MB |
+| Staging upload / frame | ≤ 2 MB | 1.72 MB |
 
 The frame arena's 8 MB capacity is the ceiling for all transient frame
 memory; the tracked allocator's `in_frame` panic is the backstop for

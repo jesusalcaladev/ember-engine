@@ -59,30 +59,49 @@ pub const Renderer = struct {
 
 ## SpriteInstance — the GPU record
 
-Each sprite is a 32-byte instanced record. The vertex shader derives the four quad corners from `vertex_index`, so there is no index buffer and no per-vertex expansion:
+Each sprite is a 36-byte instanced record. The vertex shader derives the four quad corners from `vertex_index`, so there is no index buffer and no per-vertex expansion:
 
 ```zig
-pub const SpriteInstance = struct {
+pub const SpriteInstance = extern struct {
     pos: [2]f32,       // world-space center
     half: [2]f32,      // half extents in world units
     uv: [4]u16,        // atlas rect (u0, v0, u1, v1) as unorm16
     color: [4]u8,      // tint RGBA as unorm8
     slot: u8,          // atlas slot; consecutive instances with the same slot batch together
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    shape: u8 = 0,     // 0 = quad, 1 = circle
+    layer: u8 = 0,     // the light layer this sprite is on
+    _pad: [1]u8 = .{0},
+    rot: f32 = 0,      // the rotation about the centre, in radians
 };
 ```
 
-A compile-time assertion enforces the 32-byte size:
+It is an **extern** struct on purpose: this record's bytes ARE the vertex
+layout the backend declares, field by field and offset by offset. Zig's
+default struct layout may REORDER fields to save padding — and it did, the
+moment a `f32` joined the record — which moved the shape and the layer out
+from under the shader's attribute offsets.
+
+A compile-time assertion enforces the size, and one enforces the offsets:
 
 ```zig
 comptime {
-    if (@sizeOf(SpriteInstance) != 32) @compileError("SpriteInstance must stay 32 bytes");
+    if (@sizeOf(SpriteInstance) != 36) @compileError("SpriteInstance must stay 36 bytes");
+    if (@offsetOf(SpriteInstance, "shape") != 29) @compileError("SpriteInstance.shape must stay at byte 29");
+    if (@offsetOf(SpriteInstance, "layer") != 30) @compileError("SpriteInstance.layer must stay at byte 30");
+    if (@offsetOf(SpriteInstance, "rot") != 32) @compileError("SpriteInstance.rot must stay at byte 32");
 }
 ```
 
-### Why 32 bytes and not 52
+### Why 36 bytes and not 52
 
-UV as 4× u16 unorm and tint as 4× u8 unorm are visually lossless for 2D sprites and save 20 bytes per sprite — 1 MB per frame at the 50k scene. The 50k scene at 32 B/sprite = 1.6 MB, inside the spec §4 budget of 2 MB/frame.
+UV as 4× u16 unorm and tint as 4× u8 unorm are visually lossless for 2D sprites and save 20 bytes per sprite — 1 MB per frame at the 50k scene. The 50k scene at 36 B/sprite = **1.72 MB**, inside the spec §4 budget of 2 MB/frame.
+
+The record was 32 bytes until M5.8. The four extra ones are the sprite's
+**rotation**: the transform has carried a rotation since M1, the physics
+reads it and the editor's gizmo writes it, and the renderer used to throw it
+away — so a body could turn in the physics and stay square on the screen.
+The rotation is applied to the quad's corners in the vertex shader, which is
+the only place that knows what a corner is.
 
 ### Unorm packing helpers
 
@@ -226,7 +245,7 @@ pub fn deinit(self: *Renderer2D) void
 
 ### The collect pass
 
-`collect` walks every `(Transform, Sprite)` entity in column batches, applies the interpolated world transform, and writes 32-byte GPU instances:
+`collect` walks every `(Transform, Sprite)` entity in column batches, applies the interpolated world transform, and writes 36-byte GPU instances:
 
 ```zig
 pub fn collect(self: *Renderer2D, world: *World, alpha: f32) void {

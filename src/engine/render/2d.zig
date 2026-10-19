@@ -451,15 +451,15 @@ pub const Renderer2D = struct {
 /// atlas rect. The corners are derived in the vertex shader, so this is the
 /// whole per-sprite cost.
 fn instanceFor(t: Transform, sprite: *const Sprite) render.SpriteInstance {
-    // Rotation is applied by shearing the half-extents into a parallelogram
-    // only when it matters: a 32-bit instance has no rotation field, so an
-    // unrotated sprite (the overwhelming majority, and every UI element) pays
-    // nothing for it.
+    // The rotation travels with the instance and is applied to the quad's
+    // corners in the vertex shader. It used to be dropped here, which is how
+    // a body could turn in the physics and stay square on the screen.
     const size_x = sprite.size.x * t.scale.x;
     const size_y = sprite.size.y * t.scale.y;
     return .{
         .pos = .{ t.position.x, t.position.y },
         .half = .{ @abs(size_x) * 0.5, @abs(size_y) * 0.5 },
+        .rot = t.rotation,
         .shape = @intFromEnum(sprite.shape),
         .uv = .{
             render.toUnorm16(sprite.uv[0]),
@@ -826,7 +826,29 @@ test "render light 2d: a sprite's layer reaches the instance, clamped to the byt
     // and the one a truncating cast would have given.
     try testing.expectEqual(@as(u8, 255), instanceFor(t, &Sprite{ .layer = 300 }).layer);
 
-    // And the instance is still 32 bytes, because a megabyte at 32k instances is
-    // not worth a layer.
-    try testing.expectEqual(@as(usize, 32), @sizeOf(render.SpriteInstance));
+    // And the instance is 36 bytes: the four extra ones are the rotation,
+    // and a rotation nobody can see is a rotation nobody can use.
+    try testing.expectEqual(@as(usize, 36), @sizeOf(render.SpriteInstance));
+}
+
+test "the rotation reaches the instance, and the corners turn with it" {
+    // The transform's rotation used to be dropped between the ECS and the
+    // GPU, so a body could turn in the physics and stay square on the
+    // screen. The instance carries it, and the shader turns the corners.
+    const t = Transform{ .position = .{ .x = 10, .y = 20 }, .rotation = 0.5 };
+    const inst = instanceFor(t, &Sprite{ .size = .{ .x = 4, .y = 2 } });
+    try testing.expectApproxEqAbs(@as(f32, 0.5), inst.rot, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 10), inst.pos[0], 0.0001);
+
+    // A quarter turn swaps the extents: the corner that was at (+2, -1) is
+    // now at (+1, +2). This is the same arithmetic the shader does.
+    const c = @cos(inst.rot);
+    const s = @sin(inst.rot);
+    const corner = [2]f32{ inst.half[0], -inst.half[1] };
+    const turned = [2]f32{
+        corner[0] * c - corner[1] * s,
+        corner[0] * s + corner[1] * c,
+    };
+    try testing.expectApproxEqAbs(@as(f32, 1), turned[0], 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2), turned[1], 0.0001);
 }
