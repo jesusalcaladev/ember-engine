@@ -197,13 +197,16 @@ fn runHeadless(allocator: std.mem.Allocator, args: Args) !void {
 /// A 6×4 checker of tiles, so the panel and the 2D batcher have something to
 /// show the moment the editor opens. Painted through the same `Store` the
 /// brushes use, which is what makes it a smoke test rather than a fixture.
+///
+/// The pattern sits ABOVE the origin (the world's y grows up), where the demo
+/// scene's floor is not, so the two never overlap and both read at a glance.
 fn seedTilePattern(store: *tilemap_panel.Store) void {
     var y: i32 = 0;
     while (y < 4) : (y += 1) {
         var x: i32 = 0;
         while (x < 6) : (x += 1) {
             const tile: ecs.components.Tile = .{ .atlas_index = @intCast(1 + @mod(x + y * 6, 8)) };
-            _ = store.setTile(x - 3, y - 12, tile) catch {};
+            _ = store.setTile(x - 3, y, tile) catch {};
         }
     }
 }
@@ -215,6 +218,10 @@ fn seedTilePattern(store: *tilemap_panel.Store) void {
 /// It exists so the editor opens with something in it. An editor that boots to
 /// an empty viewport reads as broken, and "is the tool broken or is my scene
 /// empty" is a question nobody should have to answer to get started.
+///
+/// The layout is around the ORIGIN and compact, because the viewport opens
+/// framed on the content: a scene spread over 800 units reads as a speck on
+/// a big canvas, and a speck is not a first impression.
 fn spawnDemoScene(world: *ecs.World) !void {
     const Transform = ecs.components.Transform;
     const Sprite = ecs.components.Sprite;
@@ -222,17 +229,18 @@ fn spawnDemoScene(world: *ecs.World) !void {
     const Collider2D = ecs.components.Collider2D;
 
     // The floor. `body_type = 0` is fixed: it is the immovable green one.
+    // It is BELOW the origin, because the world's y grows up.
     _ = try world.spawn(.{
-        Transform{ .position = .{ .x = 0, .y = 200 }, .rotation = 0 },
-        Sprite{ .size = .{ .x = 800, .y = 32 }, .tint = .{ 0.35, 0.37, 0.42, 1 } },
+        Transform{ .position = .{ .x = 0, .y = -120 }, .rotation = 0 },
+        Sprite{ .size = .{ .x = 400, .y = 24 }, .tint = .{ 0.35, 0.37, 0.42, 1 } },
         RigidBody2D{ .body_type = 0 },
-        Collider2D{ .size = .{ .x = 400, .y = 16 } },
+        Collider2D{ .size = .{ .x = 200, .y = 12 } },
     });
 
     // A box that falls. Orange while it moves, which is what makes the solver's
     // work visible: the overlay shows the body where the solver actually put it.
     _ = try world.spawn(.{
-        Transform{ .position = .{ .x = -120, .y = -180 }, .rotation = 0 },
+        Transform{ .position = .{ .x = -130, .y = 20 }, .rotation = 0 },
         Sprite{ .size = .{ .x = 32, .y = 32 }, .tint = .{ 0.9, 0.5, 0.2, 1 } },
         RigidBody2D{ .body_type = 2 },
         Collider2D{ .size = .{ .x = 16, .y = 16 } },
@@ -240,18 +248,20 @@ fn spawnDemoScene(world: *ecs.World) !void {
 
     // A kinematic platform: moved by code, pushes the dynamic box, never falls.
     _ = try world.spawn(.{
-        Transform{ .position = .{ .x = 160, .y = 40 }, .rotation = 0 },
-        Sprite{ .size = .{ .x = 160, .y = 16 }, .tint = .{ 0.2, 0.7, 0.7, 1 } },
+        Transform{ .position = .{ .x = 100, .y = -40 }, .rotation = 0 },
+        Sprite{ .size = .{ .x = 120, .y = 16 }, .tint = .{ 0.2, 0.7, 0.7, 1 } },
         RigidBody2D{ .body_type = 1 },
-        Collider2D{ .size = .{ .x = 80, .y = 8 } },
+        Collider2D{ .size = .{ .x = 60, .y = 8 } },
     });
 
     // A sensor. Blue whatever it sits on: it detects, it never pushes, and that
-    // is the one thing the overlay has to be able to show at a glance.
+    // is the one thing the overlay has to be able to show at a glance. It has
+    // a sprite so it can be picked and dragged like anything else.
     _ = try world.spawn(.{
-        Transform{ .position = .{ .x = -120, .y = 120 }, .rotation = 0 },
+        Transform{ .position = .{ .x = -130, .y = -95 }, .rotation = 0 },
+        Sprite{ .size = .{ .x = 48, .y = 8 }, .tint = .{ 0.25, 0.45, 0.9, 0.85 } },
         RigidBody2D{ .body_type = 2 },
-        Collider2D{ .size = .{ .x = 48, .y = 8 }, .is_sensor = true },
+        Collider2D{ .size = .{ .x = 24, .y = 4 }, .is_sensor = true },
     });
 }
 
@@ -686,6 +696,17 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // The layout, and with it the region the scene is drawn in.
+        //
+        // The layout is computed HERE, before the frame, and not inside the
+        // shell's draw: the camera shows the viewport's rectangle and the
+        // pointer is measured from that rectangle's origin, so both need the
+        // numbers before the pointer is read. The shell draws the same
+        // numbers (it is handed them), which is what keeps the docks and the
+        // viewport from disagreeing about where the scene is.
+        const geom = editor_shell.layout(&editor, view_w, view_h);
+        editor.viewport.region = geom.centerRect();
+
         // The camera, and the lighting mask sized for it.
         //
         // BOTH of these allocate — the mask, the SDF, the EDT scratch — and both
@@ -752,8 +773,10 @@ pub fn main(init: std.process.Init) !void {
             editor.viewport.tool == .tile)
         {
             const m = window.input.mouse;
-            const inside = m.x >= 0 and m.y >= 0 and m.x < @as(f32, @floatFromInt(fb_w)) and m.y < @as(f32, @floatFromInt(fb_h));
-            const world_pos = camera_view.?.screenToWorld(.{ .x = m.x, .y = m.y });
+            // The brush belongs to the VIEWPORT, so the pointer has to be
+            // over the viewport: a click on the console is not a tile.
+            const inside = editor.viewport.region.contains(.{ .x = m.x, .y = m.y });
+            const world_pos = camera_view.?.targetToWorld(.{ .x = m.x, .y = m.y });
             const tx: i32 = @intFromFloat(@floor(world_pos.x / tilemap.tile_size));
             const ty: i32 = @intFromFloat(@floor(world_pos.y / tilemap.tile_size));
             tilemap.hover = .{ tx, ty };
@@ -802,6 +825,10 @@ pub fn main(init: std.process.Init) !void {
         if (editor.should_quit) break;
         if (editor.takeSceneReplaced()) {
             physics_dirty = true;
+            // A new scene is a new set of contents: the viewport frames them
+            // again, unless the user has already taken the camera somewhere
+            // of their own.
+            if (!editor.viewport.camera_touched) editor.viewport.needs_frame = true;
         }
 
         // ── Autosave ───────────────────────────────────────────────────────
@@ -834,12 +861,20 @@ pub fn main(init: std.process.Init) !void {
         // tilemap tool. Drawing them here as well is what used to put two
         // copies of each window on screen.
         ui_ctx.newFrame(real_dt);
-        editor_shell.draw(&editor, &ui_ctx, fb_w, fb_h);
+        editor_shell.draw(&editor, &ui_ctx, fb_w, geom);
 
-        // The viewport's tool pill: a floating window (it captures the
-        // pointer only over itself), placed after the shell's docks so it
-        // draws above them the way a tool strip should.
-        editor.viewport.drawToolbar(&ui_ctx, fb_w);
+        // The viewport's gizmo: the selection, the handles and the hover
+        // ghost. Drawn on ImGui's BACKGROUND list, so it is over the scene
+        // (the overlay pass runs after the scene is resolved) and under the
+        // panels.
+        if (editor.workspace == .scene) {
+            editor.viewport.drawOverlay(&editor, &ui_ctx);
+        }
+
+        // The viewport's HUD: the tools, the gizmo modes, the toggles and the
+        // readouts. It lives INSIDE the viewport region, so it never covers a
+        // dock.
+        editor.viewport.drawHud(&ui_ctx);
 
         // ── Fixed-step simulation ──────────────────────────────────────────
         // The Play menu is not decoration: stopped means the world does not
@@ -926,10 +961,6 @@ pub fn main(init: std.process.Init) !void {
 
         const tiles = tilemap.pushTiles(&r2d);
         tiles_pushed = tiles;
-
-        // Selection + gizmo quads, above the scene and below the physics
-        // overlay. Reads the pointer's hover state from `update` above.
-        editor.viewport.pushOverlay(&editor, &r2d);
 
         r2d.submit(renderer);
 

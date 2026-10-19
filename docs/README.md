@@ -41,6 +41,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 
 - [Code Editor core](internals/code-editor.md) — Buffer, cursor, highlighter, find
 - [Editor recovery & prefabs](reference/editor-recovery-prefabs.md) — Autosave, hot reload, flat prefabs
+- [Editor viewport](reference/editor-viewport.md) — The region, the camera, the gizmo, the HUD
 - [Asset pipeline](reference/asset-pipeline.md) — Import, `.pak`, VFS, hot reload
 - [Benchmarks](internals/benchmarks.md) — What is measured and what it costs
 - [Build system](internals/build-system.md) — Modules, steps, tests

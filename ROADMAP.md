@@ -302,12 +302,71 @@ Docks shared by both tabs: actor hierarchy, component inspector, console, asset 
 
 **Still missing before that v1 editor is honest** (from [docs/EDITOR-SURFACE.md](docs/EDITOR-SURFACE.md)):
 
-- [ ] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state).
+- [ ] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state). **Partly done**: the current object and its gizmo are here (M5.8); the MULTI-select and the drag-select marquee are not.
 - [x] **Undo/redo** — an engine-side command journal on top of bit-exact serialization (M1). The single biggest gap. **Done**: `session/model.zig` journals every act; the editor drives it and never keeps a second stack.
 - [ ] **Project file + file dialogs** — open/save `.zson`, no ad-hoc paths.
 - [x] **Flat prefab authoring** — create from selection, instantiate, overrides visible and revertable. Storage exists since M1; the UI does not. **Done**: see below.
 - [x] **Save/load UI + crash-safe autosave** (M5 bullet, still open). **Done**: see below.
 - [x] **Hot reload** of scenes and assets while a tab is open (M6). **Done**: see below.
+
+#### The viewport, done properly (M5.8)
+
+The 2D tab is the editor's centre, and it was the one part of the shell that
+was drawn rather than designed: the camera framed the WINDOW instead of the
+viewport, the pointer was measured in the wrong axis, the gizmo was three
+axis-aligned quads, and every dock wore ImGui's title bar on top of the
+editor's own header. Four bugs, all of them visible, and all of them in the
+same place — the part of the editor the user looks at most.
+
+**The viewport is a REGION, and the camera is the region's camera.** The
+hierarchy is on the left, the inspector on the right, the console at the
+bottom, and the scene is what is left over. So the camera shows that
+rectangle (`ecs.camera.View` grew an origin and a target size), the pointer is
+measured from its top-left, the culler culls against it, and the middle of
+the viewport is the middle of the camera's view. Before this the camera
+centred on the window: the middle of the viewport was off-centre, the scene sat
+under the docks, and half of what the camera showed was hidden.
+
+**The world is y-up and the screen is y-down, and the pointer now agrees with
+the renderer.** `ecs.camera.View` is the one place the two meet, and it used
+to meet them the WRONG WAY UP: the renderer drew the world y-up (Box2D's
+convention) while `screenToWorld` read the screen y-down, so every click in
+the editor landed mirrored across the horizontal midline of the viewport. The
+scene looked right and the picking did not, which is the worst kind of bug:
+the two halves of the engine agreed on the picture and disagreed on the
+pointer. The convention is now pinned by tests, in `ecs/camera.zig` and
+`render/ui_draw.zig`.
+
+**The gizmo is a gizmo.** Move (the object itself, plus the two local-axis
+arrows), rotate (a ring with a knob) and scale (four corners, plus a centre
+handle for a uniform scale), on the keyboard (W/E/R) and in a HUD that lives
+INSIDE the region. The handles are drawn with ImGui's draw list, not with the
+2D batcher: the batcher's quads do not rotate, so a selection outline that
+follows the object's rotation, an arrow along a rotated axis and a rotation
+ring are all impossible with it. The gizmo is drawn on the BACKGROUND list —
+over the scene, under the panels — which is the layer it belongs to.
+
+**A rotation you can see.** `Transform.rotation` had been carried by the ECS,
+read by the physics and written by the gizmo, and thrown away on the way to
+the screen: the sprite instance had no rotation field, so a body could turn
+and its sprite stayed square. The instance is 36 bytes now (was 32), the
+vertex shader turns the corners, and the 50k scene uploads 1.72 MB against
+the 2 MB ceiling. The `SpriteInstance` struct is `extern` and its field
+offsets are asserted at compile time, because the backend's vertex layout
+names those offsets — and they were off by one, which is how a sprite on
+layer 1 drew as a circle and `light.set_mask` matched nothing.
+
+**Every ImGui flag was off by one bit.** `WindowFlags.NoTitleBar` was
+ImGui's `NoResize`, `AlwaysAutoResize` was `NoBackground`, and the whole
+table was shifted, so every dock in the editor grew ImGui's own title bar on
+top of the editor's designed header and the menu bar never appeared. The
+table is now pinned to the pinned `imgui.h`, and the docks spell out the
+flags they want (a dock that lists a thousand entities has to scroll, and
+`NoDecoration` takes the scrollbar with it).
+
+What is still open, and is next: **multi-select and the drag-select
+marquee**, and the handles over `physics.reshape` / `occluder.set_polygon`
+that the 2D tab promises.
 
 #### Autosave, hot reload and flat prefabs
 

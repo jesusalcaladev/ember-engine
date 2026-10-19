@@ -56,12 +56,26 @@ const hierarchy_mod = @import("hierarchy.zig");
 const inspector_mod = @import("inspector.zig");
 const console_mod = @import("console.zig");
 const tilemap_panel_mod = @import("tilemap_panel.zig");
+const viewport_mod = @import("viewport.zig");
 const ecs = @import("engine").ecs;
 
 // ── Layout constants ───────────────────────────────────────────────────────
 //
 // One place, so the panels line up by construction and a change to the console
 // height moves the two columns above it instead of leaving a gap.
+
+/// The floating TileMap tool: where the shell last put it, and whether the
+/// user has moved it since.
+var tool_applied = ui.cimgui.Vec2{ .x = 0, .y = 0 };
+var tool_placed: bool = false;
+var tool_moved: bool = false;
+
+/// The floating tool's window flags: no saved settings (it is placed by the
+/// layout, not remembered), and it does not come to the front when it is
+/// clicked — a tool that jumps over the panel you were reading is a tool
+/// that interrupts.
+const tool_flags: u32 = cimgui.WindowFlags.NoSavedSettings |
+    cimgui.WindowFlags.NoBringToFrontOnFocus;
 
 const top_h: f32 = 30;
 const tabs_h: f32 = 34;
@@ -70,13 +84,23 @@ const status_h: f32 = 22;
 /// is a divider nobody can grab, and the visible thing stays 2px.
 const grip_w: f32 = 7;
 const transport_w: f32 = 104;
+/// The viewport HUD's height, so a tool that belongs to the viewport can sit
+/// BELOW it instead of on top of it.
+const hud_h: f32 = 100;
 /// The viewport may never be squeezed below this by the side docks.
 const min_center: f32 = 260;
 
 /// The extra `WindowFlags` every pinned dock shares: no frame, no dragging, no
 /// remembered geometry. `NoBringToFrontOnFocus` is what stops a click in the
 /// hierarchy from putting the hierarchy on top of the inspector.
-const dock_flags: u32 = cimgui.WindowFlags.NoDecoration |
+///
+/// The flags are spelled out rather than written as `NoDecoration`, because
+/// `NoDecoration` includes `NoScrollbar` — and a dock that lists a thousand
+/// entities has to scroll. A dock is a PANEL: it draws its own header, so it
+/// has no title bar, but its content is a document and the document scrolls.
+const dock_flags: u32 = cimgui.WindowFlags.NoTitleBar |
+    cimgui.WindowFlags.NoResize |
+    cimgui.WindowFlags.NoCollapse |
     cimgui.WindowFlags.NoMove |
     cimgui.WindowFlags.NoSavedSettings |
     cimgui.WindowFlags.NoBringToFrontOnFocus;
@@ -90,7 +114,13 @@ const no_scroll: u32 = cimgui.WindowFlags.NoScrollbar | cimgui.WindowFlags.NoScr
 
 /// Where every region goes this frame. Computed once, so two panels cannot
 /// disagree about where the console starts.
-const Geometry = struct {
+///
+/// It is computed by `main` BEFORE the frame, not inside `draw`, because the
+/// viewport needs it: the scene is drawn into the centre rectangle, and the
+/// pointer is measured from that rectangle's origin. A layout that only
+/// existed while the docks were drawing would leave the viewport a frame
+/// behind the panel it sits in.
+pub const Geometry = struct {
     y0: f32,
     left: f32,
     right: f32,
@@ -100,9 +130,18 @@ const Geometry = struct {
     center_h: f32,
     status_y: f32,
     hierarchy_h: f32,
+
+    /// The rectangle the scene is drawn in: the centre column, from the tab
+    /// bar down to the console.
+    pub fn centerRect(self: Geometry) viewport_mod.Region {
+        return .{ .x = self.center_x, .y = self.y0, .w = self.center_w, .h = self.center_h };
+    }
 };
 
-fn layoutFor(ed: *const Editor, w: f32, h: f32) Geometry {
+/// The layout for this frame. Public because the viewport needs the same
+/// numbers the docks do, and two computations of the same layout are two
+/// answers waiting to disagree.
+pub fn layout(ed: *const Editor, w: f32, h: f32) Geometry {
     var g: Geometry = .{
         .y0 = top_h + tabs_h,
         .left = 0,
@@ -331,6 +370,14 @@ fn drawConsole(ctx: *ui.Context) void {
 
 fn drawTilemap(ctx: *ui.Context) void {
     const ed = ed_mod.active.?;
+    // Did the user drag the tool? The window's position is not the one the
+    // shell put there, so the tool is theirs now and stops following the
+    // layout.
+    const p = ui.draw.windowPos();
+    if (tool_placed and (p.x != tool_applied.x or p.y != tool_applied.y)) {
+        tool_moved = true;
+    }
+
     if (ed.tilemap) |panel| {
         panel.drawContents(ctx);
     } else {
@@ -367,15 +414,18 @@ fn header(ctx: *ui.Context, name: []const u8) void {
 
 /// Draws the entire editor UI for one frame. Called from `main.zig` inside the
 /// ImGui frame, after `ui_ctx.newFrame` and before `ui_ctx.drawCommands`.
-pub fn draw(ed: *Editor, ctx: *ui.Context, fb_w: u32, fb_h: u32) void {
+///
+/// The geometry comes in from the caller: `main` computes it before the
+/// frame, because the viewport needs the same numbers (the scene is drawn
+/// into the centre rectangle) and two computations of a layout are two
+/// answers waiting to disagree.
+pub fn draw(ed: *Editor, ctx: *ui.Context, fb_w: u32, g: Geometry) void {
     ed_mod.active = ed;
     defer ed_mod.active = null;
 
     handleShortcuts(ed, ctx);
 
     const w: f32 = @floatFromInt(fb_w);
-    const h: f32 = @floatFromInt(fb_h);
-    const g = layoutFor(ed, w, h);
 
     // ── Menu bar ──────────────────────────────────────────────────────────
     dock(ctx, "editor.menubar", .{
@@ -536,18 +586,35 @@ pub fn draw(ed: *Editor, ctx: *ui.Context, fb_w: u32, fb_h: u32) void {
     // ImGui title bar so it can be moved and closed like one. It belongs to the
     // SCENE workspace — a paint palette floating over the code editor is a tool
     // for a document that is not on screen.
+    //
+    // It FOLLOWS the viewport's right edge until the user drags it: a tool
+    // that stays where the layout used to be is a tool parked in the middle
+    // of the scene.
+    //
+    // The window is begun HERE rather than through `ui.layout.floating`,
+    // because the placement needs the LAST word on ImGui's position
+    // condition: `SetNextWindowPos` keeps the condition of the last call, and
+    // a "first use" condition is ignored from the second frame on — which
+    // would leave the tool exactly where the layout used to be.
     if (ed.panels.tilemap and ed.workspace == .scene) {
         const tw: f32 = 300;
         const th: f32 = 430;
-        ui.layout.floating(ctx, "TileMap", .{
-            .x = @max(g.center_x + g.center_w - tw - 12, g.center_x + 8),
-            .y = g.y0 + 12,
-            .w = tw,
-            .h = th,
-            .first_use = true,
-            .resizable = true,
-            .flags = cimgui.WindowFlags.NoSavedSettings,
-        }, drawTilemap);
+        const tx = @max(g.center_x + g.center_w - tw - 12, g.center_x + 8);
+        // Below the viewport's HUD, not beside it: in a narrow viewport the
+        // two would overlap, and two panels on top of each other is not a
+        // layout.
+        const ty = g.y0 + 12 + hud_h;
+        if (!tool_moved and (!tool_placed or tx != tool_applied.x or ty != tool_applied.y)) {
+            cimgui.ember_ui_set_next_window_pos(tx, ty, @intFromEnum(cimgui.Cond.Always));
+            tool_applied = .{ .x = tx, .y = ty };
+            tool_placed = true;
+        }
+        // The size is set ONCE: after that the user's own resize stands.
+        cimgui.ember_ui_set_next_window_size(tw, th, @intFromEnum(cimgui.Cond.FirstUseEver));
+        if (cimgui.ember_ui_begin(cimgui.text("TileMap"), @bitCast(tool_flags)) != 0) {
+            drawTilemap(ctx);
+        }
+        cimgui.ember_ui_end();
     }
 
     // ── Component picker ──────────────────────────────────────────────────
@@ -904,6 +971,12 @@ fn handleShortcuts(ed: *Editor, ctx: *ui.Context) void {
         ed.viewport.tool = .cursor;
     } else if (keyPressed(.T)) {
         ed.viewport.tool = .tile;
+    } else if (keyPressed(.W)) {
+        ed.viewport.gizmo = .move;
+    } else if (keyPressed(.E)) {
+        ed.viewport.gizmo = .rotate;
+    } else if (keyPressed(.R)) {
+        ed.viewport.gizmo = .scale;
     } else if (keyPressed(.F)) {
         ed.viewport.centerOnSelection(ed);
     } else if (keyPressed(.Home)) {

@@ -29,15 +29,78 @@ const Entity = @import("entity.zig").Entity;
 const Vec2 = math.Vec2;
 
 /// The camera's output: everything the renderer needs, nothing more.
+///
+/// ## The two axes, and which way each one grows
+///
+/// The WORLD is **y-up** (Box2D's convention, and the renderer's: a larger
+/// world y is drawn HIGHER on the screen). The SCREEN is **y-down** (the
+/// framebuffer's convention: pixel row 0 is the top, and that is what the
+/// mouse, ImGui and every widget in this engine speak).
+///
+/// The two meet here, and this is the ONE place they are allowed to meet: a
+/// screen position is a pixel in the view with y growing DOWN, so the world's
+/// top edge (`cy + half_h`) is the view's row 0 and the world's bottom edge
+/// (`cy - half_h`) is the view's last row.
+///
+/// It used to be the other way round, and the mismatch was invisible in the
+/// code and glaring on the screen: the renderer drew the world y-up while
+/// `screenToWorld` assumed y-down, so every editor click landed mirrored
+/// across the horizontal midline of the viewport. The two halves of the engine
+/// agreed on the RENDER and disagreed on the POINTER, which is why the scene
+/// looked right and the picking did not.
+///
+/// ## The view inside a target
+///
+/// A view does not have to fill its render target. The editor's viewport is a
+/// rectangle in the middle of a window, and the scene is projected INTO that
+/// rectangle: `origin_x`/`origin_y` say where it sits, `target_w`/`target_h`
+/// say how big the target is. Zero means "the view IS the target", which is
+/// the runtime's case and the default.
 pub const View = struct {
     cx: f32 = 0,
     cy: f32 = 0,
     zoom: f32 = 1,
+    /// The view's size in pixels.
     viewport_w: f32 = 1280,
     viewport_h: f32 = 720,
 
+    /// The view's top-left corner inside the render target, in pixels (y down
+    /// from the target's top-left). Zero = the view starts at the target's
+    /// origin.
+    origin_x: f32 = 0,
+    origin_y: f32 = 0,
+    /// The render target's size in pixels. Zero = the view's own size.
+    target_w: f32 = 0,
+    target_h: f32 = 0,
+
+    /// Places the view inside a render target of `w` x `h` pixels, with its
+    /// top-left corner at (`x`, `y`).
+    ///
+    /// The view keeps its own size: what changes is WHERE it is projected and
+    /// where a pointer position has to be measured from. Both the matrix and
+    /// the pointer maths read these fields, so they cannot disagree.
+    pub fn setTarget(self: *View, x: f32, y: f32, w: f32, h: f32) void {
+        self.origin_x = x;
+        self.origin_y = y;
+        self.target_w = w;
+        self.target_h = h;
+    }
+
+    /// The render target's size, resolving the "zero means the view itself"
+    /// default.
+    pub fn targetSize(self: View) Vec2 {
+        return .{
+            .x = if (self.target_w > 0) self.target_w else self.viewport_w,
+            .y = if (self.target_h > 0) self.target_h else self.viewport_h,
+        };
+    }
+
     /// The world rectangle visible this frame (no margin: this is the exact
     /// view; the culler adds its own edge margin).
+    ///
+    /// A `Rect2` is a y-DOWN rectangle (see `core.math.Rect2`), so its `top`
+    /// is the SMALLER world y — the bottom of the screen. Use `worldBounds`
+    /// when the direction matters.
     pub fn worldRect(self: View) math.Rect2 {
         return math.Rect2.fromCenter(
             .{ .x = self.cx, .y = self.cy },
@@ -46,20 +109,64 @@ pub const View = struct {
         );
     }
 
-    pub fn worldToScreen(self: View, world: Vec2) Vec2 {
-        const rect = self.worldRect();
+    /// The world's visible bounds, with `min` at the bottom-left and `max` at
+    /// the top-right. The direction is explicit because the world's y grows UP
+    /// and a `Rect2`'s does not.
+    pub const Bounds = struct {
+        min: Vec2,
+        max: Vec2,
+    };
+
+    pub fn worldBounds(self: View) Bounds {
+        const half_w = self.viewport_w / self.zoom * 0.5;
+        const half_h = self.viewport_h / self.zoom * 0.5;
         return .{
-            .x = (world.x - rect.position.x) * self.zoom,
-            .y = (world.y - rect.position.y) * self.zoom,
+            .min = .{ .x = self.cx - half_w, .y = self.cy - half_h },
+            .max = .{ .x = self.cx + half_w, .y = self.cy + half_h },
         };
     }
 
-    pub fn screenToWorld(self: View, screen: Vec2) Vec2 {
-        const rect = self.worldRect();
+    /// The half extents of the visible world, in world units.
+    pub fn halfExtents(self: View) Vec2 {
         return .{
-            .x = rect.position.x + screen.x / self.zoom,
-            .y = rect.position.y + screen.y / self.zoom,
+            .x = self.viewport_w / self.zoom * 0.5,
+            .y = self.viewport_h / self.zoom * 0.5,
         };
+    }
+
+    /// A world point, as a pixel in the VIEW (y down from the view's top-left).
+    pub fn worldToScreen(self: View, world: Vec2) Vec2 {
+        const half = self.halfExtents();
+        return .{
+            .x = (world.x - (self.cx - half.x)) * self.zoom,
+            .y = ((self.cy + half.y) - world.y) * self.zoom,
+        };
+    }
+
+    /// The world point under a pixel in the VIEW (y down from the view's
+    /// top-left) — the inverse of `worldToScreen`.
+    pub fn screenToWorld(self: View, screen: Vec2) Vec2 {
+        const half = self.halfExtents();
+        return .{
+            .x = self.cx - half.x + screen.x / self.zoom,
+            .y = self.cy + half.y - screen.y / self.zoom,
+        };
+    }
+
+    /// The world point under a pixel given in the TARGET's coordinates (the
+    /// window's). The view's origin inside the target is subtracted, so a
+    /// caller can hand the pointer's raw coordinates straight in.
+    pub fn targetToWorld(self: View, target_point: Vec2) Vec2 {
+        return self.screenToWorld(.{
+            .x = target_point.x - self.origin_x,
+            .y = target_point.y - self.origin_y,
+        });
+    }
+
+    /// The inverse of `targetToWorld`: a world point as a pixel of the target.
+    pub fn worldToTarget(self: View, world: Vec2) Vec2 {
+        const s = self.worldToScreen(world);
+        return .{ .x = s.x + self.origin_x, .y = s.y + self.origin_y };
     }
 
     /// The column-major view-projection matrix for this view, in the layout
@@ -71,15 +178,28 @@ pub const View = struct {
     /// stays a single multiply, and so a cull and a draw can never disagree
     /// about where the camera is (that disagreement is the classic "things
     /// vanish while still on screen" bug).
+    ///
+    /// The matrix projects into the TARGET, not into the view: a view that
+    /// sits in a rectangle of a larger target keeps that rectangle's place in
+    /// it. With no target set (`origin` 0, target = the view) this is exactly
+    /// the matrix it always was.
     pub fn viewProjection(self: View) [16]f32 {
-        const sx = self.zoom * 2.0 / self.viewport_w;
-        const sy = self.zoom * 2.0 / self.viewport_h;
+        const target = self.targetSize();
+        const sx = self.zoom * 2.0 / target.x;
+        const sy = self.zoom * 2.0 / target.y;
+        // The view's size as a fraction of the target: the world is projected
+        // into the TARGET and the view is the rectangle of it the camera
+        // shows, so the view's own size enters the translation.
+        const vw = self.viewport_w / target.x;
+        const vh = self.viewport_h / target.y;
+        const tx = 2.0 * self.origin_x / target.x - self.cx * sx + vw - 1.0;
+        const ty = 1.0 - 2.0 * self.origin_y / target.y - self.cy * sy - vh;
         // Column-major: [sx 0 0 tx, 0 sy 0 ty, 0 0 1 0, 0 0 0 1]
         return .{
             sx, 0,  0, 0,
             0,  sy, 0, 0,
             0,  0,  1, 0,
-            -self.cx * sx, -self.cy * sy, 0, 1,
+            tx, ty, 0, 1,
         };
     }
 };
@@ -331,6 +451,81 @@ test "zoom_to eases toward the target and trauma decays to nothing" {
     // Same inputs, same shake: the noise is seeded from the scene id.
     const again = update(&world, step_dt, 1280, 720).?;
     try testing.expectApproxEqAbs(@as(f32, 0), again.cx, 0.0001);
+}
+
+// ── The screen space ────────────────────────────────────────────────────────
+//
+// These tests exist because the two halves of this file used to disagree: the
+// matrix drew the world y-up and `screenToWorld` read the screen y-down, so
+// every pointer position in the editor was mirrored across the viewport's
+// horizontal midline. A test that pins the CONVENTION is what stops that from
+// coming back, because the convention is invisible in the code and obvious on
+// the screen.
+
+test "the screen is y-down and the world is y-up" {
+    const v = View{ .cx = 0, .cy = 0, .zoom = 1, .viewport_w = 800, .viewport_h = 600 };
+
+    // A point ABOVE the camera (larger world y) is HIGHER on the screen, and
+    // the screen's y grows down — so its pixel row is SMALLER.
+    const above = v.worldToScreen(.{ .x = 0, .y = 100 });
+    const below = v.worldToScreen(.{ .x = 0, .y = -100 });
+    try testing.expect(above.y < below.y);
+    try testing.expectApproxEqAbs(@as(f32, 200), above.y, 0.001); // 300 - 100
+    try testing.expectApproxEqAbs(@as(f32, 400), below.y, 0.001); // 300 + 100
+
+    // And the inverse agrees: the pixel row 0 is the world's TOP.
+    const top = v.screenToWorld(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, 300), top.y, 0.001);
+}
+
+test "the projection agrees with the screen mapping" {
+    // The matrix is what the GPU does; `worldToScreen` is what the CPU does
+    // with the pointer. If they disagree, the scene is drawn somewhere the
+    // click did not go.
+    const v = View{ .cx = 120, .cy = -40, .zoom = 2.5, .viewport_w = 800, .viewport_h = 600 };
+    const world = Vec2{ .x = 33, .y = 77 };
+
+    const screen = v.worldToScreen(world);
+    const vp = v.viewProjection();
+    const ndc_x = vp[0] * world.x + vp[12];
+    const ndc_y = vp[5] * world.y + vp[13];
+    // WebGPU's viewport transform: NDC +1 is the TOP of the framebuffer.
+    const px = (ndc_x + 1.0) * 0.5 * v.targetSize().x;
+    const py = (1.0 - ndc_y) * 0.5 * v.targetSize().y;
+    try testing.expectApproxEqAbs(screen.x, px, 0.001);
+    try testing.expectApproxEqAbs(screen.y, py, 0.001);
+}
+
+test "a view inside a target keeps its place in it" {
+    // The editor's viewport: a 1000x700 rectangle in the middle of a
+    // 1600x900 window.
+    var v = View{ .cx = 0, .cy = 0, .zoom = 1, .viewport_w = 1000, .viewport_h = 700 };
+    v.setTarget(300, 100, 1600, 900);
+
+    // The camera's centre is the CENTRE OF THE REGION, not the centre of the
+    // window: that is the whole point of the region existing.
+    const centre = v.worldToTarget(.{ .x = 0, .y = 0 });
+    try testing.expectApproxEqAbs(@as(f32, 300 + 500), centre.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 100 + 350), centre.y, 0.001);
+
+    // The region's top-left corner is the world's top-left.
+    const corner = v.worldToTarget(.{ .x = -500, .y = 350 });
+    try testing.expectApproxEqAbs(@as(f32, 300), corner.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 100), corner.y, 0.001);
+
+    // And the pointer maths is measured from the region's origin, so a raw
+    // window pixel lands where the user clicked.
+    const under = v.targetToWorld(.{ .x = 300, .y = 100 });
+    try testing.expectApproxEqAbs(@as(f32, -500), under.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 350), under.y, 0.001);
+}
+
+test "the screen mapping round-trips" {
+    const v = View{ .cx = -12, .cy = 40, .zoom = 0.75, .viewport_w = 640, .viewport_h = 480 };
+    const world = Vec2{ .x = 91.5, .y = -13.25 };
+    const back = v.screenToWorld(v.worldToScreen(world));
+    try testing.expectApproxEqAbs(world.x, back.x, 0.001);
+    try testing.expectApproxEqAbs(world.y, back.y, 0.001);
 }
 
 test "the first ENABLED camera wins, deterministically" {

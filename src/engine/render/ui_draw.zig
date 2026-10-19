@@ -20,12 +20,13 @@
 //!
 //! The batcher applies ONE MVP per scene (the camera's), so an instance is
 //! positioned in WORLD units. A UI rect is in framebuffer pixels with y growing
-//! DOWN from the top-left; the camera's `screenToWorld` is y-up from the world
-//! rect's bottom-left. `Mapper` is the single place that bridges the two —
-//! `screen_y_up = viewport_h - screen_y_down` and `half_world = half_screen /
-//! zoom` — so a widget stays pinned to the screen at any zoom without a second
-//! draw call. With no camera the runtime renders `makeCamera(w, h)`, whose world
-//! origin is the screen centre; `defaultView` reproduces exactly that.
+//! DOWN from the top-left, and so is the camera's `screenToWorld` — the world
+//! is y-up and the screen is y-down, and the camera is the one place that
+//! translates between them. `Mapper` is the single place that bridges the two:
+//! `half_world = half_screen / zoom` — so a widget stays pinned to the screen
+//! at any zoom without a second draw call. With no camera the runtime renders
+//! `makeCamera(w, h)`, whose world origin is the screen centre;
+//! `defaultView` reproduces exactly that.
 //!
 //! ## Paint order and the draw-call budget
 //!
@@ -92,8 +93,14 @@ const Mapper = struct {
     view: ecs.camera.View,
 
     /// Screen-pixel point (y down) to world units.
+    ///
+    /// No flip: the camera's `screenToWorld` already speaks the screen's
+    /// convention (y down from the top-left), which is the convention a UI
+    /// rect is measured in. There used to be a `viewport_h - y` here, a
+    /// leftover from a camera that read the screen y-up; with it, every widget
+    /// was drawn a full screen height away from where it was measured.
     fn world(self: Mapper, p: Vec2) Vec2 {
-        return self.view.screenToWorld(.{ .x = p.x, .y = self.view.viewport_h - p.y });
+        return self.view.screenToWorld(p);
     }
 
     /// Screen-pixel half extents to world units. The camera scales world by

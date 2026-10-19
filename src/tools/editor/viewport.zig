@@ -2,20 +2,53 @@
 //!
 //! ## What it is, in one line
 //!
-//! A persistent camera (pan, zoom-at-cursor), an adaptive grid, click-to-select
-//! in the scene itself, and the three Godot-style edit gizmos: drag the body to
-//! move, the corner disc to scale, the top disc to rotate.
+//! A camera over a REGION of the editor window, an adaptive grid, click-to-
+//! select in the scene itself, and the three Godot-style gizmos: drag the body
+//! to move it, the arrows to move it along one axis, the ring to rotate it and
+//! the corners to scale it.
+//!
+//! ## The region, and why the camera is not the window
+//!
+//! The viewport is a RECTANGLE in the middle of the editor: the hierarchy is
+//! on the left, the inspector on the right, the console at the bottom, and the
+//! scene is what is left over. So the camera shows the REGION, the pointer is
+//! measured from the region's origin, and the scene is projected into the
+//! region (`View.setTarget`).
+//!
+//! It used to be the whole window, and the difference was visible every
+//! frame: the camera centred on the WINDOW, so the middle of the viewport was
+//! off-centre, the scene sat under the docks, and a good half of what the
+//! camera showed was hidden behind the hierarchy. The grid made it obvious —
+//! the axes were in the middle of the WINDOW, not the middle of the viewport.
+//!
+//! ## The two axes
+//!
+//! The world is y-UP (Box2D's convention, and the renderer's: a larger world
+//! y is drawn HIGHER). The screen is y-DOWN (the framebuffer's convention, and
+//! the mouse's). `ecs.camera.View` is the one place that translates between
+//! them, and the viewport measures the pointer in the screen's convention
+//! everywhere. A viewport that mixed the two would pick the entity mirrored
+//! across the middle of the window, which is exactly what it used to do.
 //!
 //! ## Why there is no ImGui window behind it
 //!
-//! The center of the shell is deliberately window-less: any window there would
+//! The centre of the shell is deliberately window-less: any window there would
 //! swallow every pointer event before scene interaction could see one. So this
-//! module draws THROUGH the 2D batcher (grid and gizmos are ordinary
-//! `SpriteInstance` quads — the same budget every entity already uses) and it
-//! reads the pointer from the raw platform `Mouse`, the exact source the
-//! tilemap brush already uses. `ui.wantsMouse()` is the gate that keeps the two
-//! worlds from fighting: an interaction happens only when the last frame said
-//! the pointer was over empty scene, never over a dock or a floating tool.
+//! module reads the pointer from the raw platform `Mouse` — the exact source
+//! the tilemap brush already uses — and `ui.wantsMouse()` is the gate that
+//! keeps the two worlds from fighting: an interaction happens only when the
+//! last frame said the pointer was over empty scene, never over a dock or a
+//! floating tool.
+//!
+//! ## Why the gizmo is drawn with ImGui and not with the 2D batcher
+//!
+//! The batcher's quads do not rotate: a `SpriteInstance` is a centre and two
+//! half extents. A selection outline that follows the object's rotation, an
+//! arrow that points along a rotated axis and a rotation ring are all
+//! impossible with it. ImGui's draw list can do all three, and the BACKGROUND
+//! list is drawn after the scene (the whole editor overlay is one pass over
+//! the resolved frame) and before the windows — so the gizmo is over the scene
+//! and under the panels, which is the layer it belongs to.
 //!
 //! ## Why the edits go through `queueSet` during a drag
 //!
@@ -54,8 +87,30 @@ const Vec2 = @TypeOf(@as(ecs.components.Transform, undefined).position);
 /// scene editor: picking and gizmos.
 pub const Tool = enum { cursor, tile };
 
+/// Which gizmo the cursor tool shows. The three verbs every 2D editor has,
+/// and the three keys that go with them (W, E, R).
+pub const Gizmo = enum { move, rotate, scale };
+
 /// Which part of the selection the pointer is touching.
-pub const Handle = enum { none, body, scale, rotate };
+pub const Handle = enum {
+    none,
+    /// The object itself: a free move.
+    body,
+    /// The local X arrow: a move along the object's OWN X axis.
+    move_x,
+    /// The local Y arrow.
+    move_y,
+    /// The rotation ring.
+    rotate,
+    /// The four scale corners, in screen order: top-left, top-right,
+    /// bottom-right, bottom-left.
+    scale_nw,
+    scale_ne,
+    scale_se,
+    scale_sw,
+    /// The centre handle: a uniform scale.
+    scale_center,
+};
 
 const min_zoom: f32 = 0.1;
 const max_zoom: f32 = 12.0;
@@ -67,32 +122,87 @@ const grid_base: f32 = 32.0;
 const grid_min_px: f32 = 24.0;
 /// Handle hit radius, in screen pixels.
 const handle_hit_px: f32 = 11.0;
-/// The rotate handle sits this many screen pixels above the box's top edge.
-const rotate_offset_px: f32 = 22.0;
-/// The same white-slot / top-layer constants the physics overlay uses, so the
-/// gizmos share its single white page and sit directly under its layer.
+/// How long the move arrows are, in screen pixels.
+const arrow_len: f32 = 74.0;
+/// How far the rotation ring sits outside the box, in screen pixels.
+const ring_pad: f32 = 20.0;
+/// The rotation snap step, in radians (15°, Godot's default).
+const rotate_snap: f32 = std.math.pi / 12.0;
+
+/// The same white-slot constant the physics overlay uses, so the editor's
+/// own quads share its single white page.
 const debug_slot: u8 = 255;
-const overlay_layer: u16 = 254;
 const grid_layer: u16 = 0;
 
-/// Overlay colors. Literal, like the physics overlay's, because a gizmo color
+/// Grid colors. Literal, like the physics overlay's, because a gizmo color
 /// is an editor decision the runtime theme has no stake in.
 const col_grid_minor = [4]u8{ 128, 140, 160, 22 };
 const col_grid_major = [4]u8{ 150, 165, 190, 52 };
 const col_axis_x = [4]u8{ 235, 84, 84, 150 };
 const col_axis_y = [4]u8{ 96, 224, 128, 150 };
-const col_accent = [4]u8{ 47, 129, 247, 240 }; // the theme accent, hex baked
-const col_accent_hover = [4]u8{ 68, 147, 248, 255 };
-const col_hover_ghost = [4]u8{ 47, 129, 247, 90 };
+
+/// The rectangle of the editor window the scene is drawn in.
+pub const Region = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    w: f32 = 1,
+    h: f32 = 1,
+
+    /// Is a window-space point inside the region?
+    pub fn contains(self: Region, p: Vec2) bool {
+        return p.x >= self.x and p.x < self.x + self.w and
+            p.y >= self.y and p.y < self.y + self.h;
+    }
+
+    /// The region as a rect, for ImGui's clip and hit tests.
+    pub fn rect(self: Region) ui.cimgui.Rect {
+        return ui.draw.rect(self.x, self.y, self.x + self.w, self.y + self.h);
+    }
+};
+
+/// The selection's geometry, in SCREEN pixels (the window's).
+///
+/// Everything the gizmo draws and everything the pointer hits is in this
+/// space: the pointer's coordinates are window pixels, so a handle that is
+/// drawn in world units would have to be converted before every comparison.
+/// One conversion, here, and the rest of the module never thinks about it.
+const Box = struct {
+    entity: Entity,
+    /// The four corners in screen space, in the order top-left, top-right,
+    /// bottom-right, bottom-left.
+    corners: [4]Vec2,
+    /// The pivot, in screen space.
+    centre: Vec2,
+    /// The tips of the two move arrows, in screen space.
+    x_tip: Vec2,
+    y_tip: Vec2,
+    /// The rotation ring's radius, in screen pixels.
+    ring_radius: f32,
+    /// The entity's transform, for the drags.
+    position: Vec2,
+    rotation: f32,
+    scale: Vec2,
+    /// The sprite's size in world units (before the scale).
+    size: Vec2,
+};
 
 pub const Viewport = struct {
     tool: Tool = .cursor,
+    /// Which gizmo the cursor tool shows.
+    gizmo: Gizmo = .move,
     show_grid: bool = true,
+    /// Whether a drag snaps to the grid. Ctrl holds the override, so this is
+    /// the default rather than a lock.
+    snap: bool = true,
 
     /// The camera, persistent across frames and scenes (a viewport that snaps
     /// home on every undo is not a viewport). The runtime's own shape: the
     /// same `ecs.camera.View` a project camera would produce.
     cam: ecs.camera.View = .{ .cx = 0, .cy = 0, .zoom = 1 },
+
+    /// Where the scene is drawn, in window pixels. Set by the shell's layout,
+    /// once a frame, before the pointer is read.
+    region: Region = .{},
 
     /// What the pointer is over this frame. Recomputed every `update` — a
     /// hover is never carried state.
@@ -107,12 +217,29 @@ pub const Viewport = struct {
     grabbed_rot: f32 = 0,
     grabbed_scale: Vec2 = .{ .x = 1, .y = 1 },
     grabbed_size: Vec2 = .{ .x = 1, .y = 1 },
-    /// Mouse minus entity position at grab (a body drag keeps the corner you
-    /// clicked on, not the center).
-    grab_offset: Vec2 = .{},
+    /// The world point under the pointer at the grab. Every drag is measured
+    /// from it, so a drag is a DELTA and not an absolute position — which is
+    /// what makes an axis-constrained move along a rotated axis work.
+    grab_mouse: Vec2 = .{},
+    /// The angle around the pivot at the grab (the rotation drag's zero).
+    grab_angle: f32 = 0,
+    /// The distance from the pivot at the grab (the uniform scale's zero).
+    grab_radius: f32 = 0,
     /// Write-only flag for main: a completed drag means collider hosts moved
     /// while Box2D was not stepping them (`takeEdited` reads and clears it).
     edited_this_frame: bool = false,
+    /// The world point under the pointer, for the HUD's readout.
+    cursor_world: Vec2 = .{},
+    /// Set when the viewport should fit the scene into the region: at boot,
+    /// and after a scene is replaced. It is cleared the frame it is acted on.
+    needs_frame: bool = true,
+    /// Has the user moved the camera? A window resize re-frames the scene
+    /// only while the camera is still where the editor put it: the moment
+    /// somebody pans or zooms, the view is THEIRS and a resize leaves it
+    /// alone.
+    camera_touched: bool = false,
+    /// The region's size last frame, so a resize is noticed.
+    last_region: Vec2 = .{},
 
     pub const Hover = union(enum) {
         none,
@@ -122,33 +249,93 @@ pub const Viewport = struct {
 
     // ── Camera helpers ───────────────────────────────────────────────────
 
-    /// Sizes the camera to the framebuffer (every frame; a resize is the same
-    /// code path) and returns the view the renderer consumes.
+    /// Sizes the camera to the REGION and tells it where that region sits in
+    /// the render target, then returns the view the renderer consumes.
     pub fn cameraView(vp: *Viewport, fb_w: f32, fb_h: f32) ecs.camera.View {
-        vp.cam.viewport_w = fb_w;
-        vp.cam.viewport_h = fb_h;
+        vp.cam.viewport_w = @max(vp.region.w, 1);
+        vp.cam.viewport_h = @max(vp.region.h, 1);
+        vp.cam.setTarget(vp.region.x, vp.region.y, fb_w, fb_h);
         return vp.cam;
     }
 
-    /// Center the camera on the selection and lift the zoom to at least
-    /// one-to-one — the F key. A no-op without a selection.
+    /// Center the camera on the selection and fit it — the F key. A no-op
+    /// without a selection.
+    ///
+    /// Fitting as well as centring is the difference between "focused on" and
+    /// "a 32-pixel sprite at 400 %": the second is technically centred and
+    /// practically useless.
     pub fn centerOnSelection(vp: *Viewport, ed: *Editor) void {
         const e = ed.selection orelse return;
         const t = ed.world().get(e, ecs.components.Transform) orelse return;
-        vp.centerOn(t.position);
+        vp.cam.cx = t.position.x;
+        vp.cam.cy = t.position.y;
+        if (ed.world().get(e, ecs.components.Sprite)) |sp| {
+            const w = @max(sp.size.x * @abs(t.scale.x), 1);
+            const h = @max(sp.size.y * @abs(t.scale.y), 1);
+            const zoom = @min(@min(vp.region.w / (w * 4.0), vp.region.h / (h * 4.0)), 8.0);
+            vp.cam.zoom = std.math.clamp(zoom, min_zoom, max_zoom);
+        } else if (vp.cam.zoom < 1) {
+            vp.cam.zoom = 1;
+        }
+        vp.hover = null;
+        vp.camera_touched = true;
     }
 
-    pub fn centerOn(vp: *Viewport, world: Vec2) void {
-        vp.cam.cx = world.x;
-        vp.cam.cy = world.y;
-        if (vp.cam.zoom < 1) vp.cam.zoom = 1;
+    /// Fits everything in the scene into the region: the zoom that shows the
+    /// lot, centred on the middle of it.
+    ///
+    /// This is what the editor opens on. A viewport that opens on the origin
+    /// of a world whose content is 600 units away is a viewport that opens
+    /// EMPTY, and an empty viewport reads as a broken one.
+    pub fn frameAll(vp: *Viewport, ed: *Editor) void {
+        const world = ed.world();
+        var min_x = std.math.inf(f32);
+        var min_y = std.math.inf(f32);
+        var max_x = -std.math.inf(f32);
+        var max_y = -std.math.inf(f32);
+        var found = false;
+
+        var slot: usize = 0;
+        while (slot < world.slotCount()) : (slot += 1) {
+            const e = world.entityAtSlot(slot) orelse continue;
+            const t = world.get(e, ecs.components.Transform) orelse continue;
+            const sp = world.get(e, ecs.components.Sprite) orelse continue;
+            if (!sp.visible) continue;
+            const hx = sp.size.x * 0.5 * @abs(t.scale.x);
+            const hy = sp.size.y * 0.5 * @abs(t.scale.y);
+            if (hx <= 0 or hy <= 0) continue;
+            min_x = @min(min_x, t.position.x - hx);
+            max_x = @max(max_x, t.position.x + hx);
+            min_y = @min(min_y, t.position.y - hy);
+            max_y = @max(max_y, t.position.y + hy);
+            found = true;
+        }
+
+        if (!found) {
+            vp.recenter();
+            return;
+        }
+
+        const w = @max(max_x - min_x, 1);
+        const h = @max(max_y - min_y, 1);
+        // A margin, so the content does not touch the edge of the region: an
+        // object flush against the border reads as cut off.
+        const margin: f32 = 1.15;
+        const zoom_x = vp.region.w / (w * margin);
+        const zoom_y = vp.region.h / (h * margin);
+        vp.cam.zoom = std.math.clamp(@min(zoom_x, zoom_y), min_zoom, max_zoom);
+        vp.cam.cx = (min_x + max_x) * 0.5;
+        vp.cam.cy = (min_y + max_y) * 0.5;
         vp.hover = null;
     }
 
     /// Home view: the origin, one-to-one.
     pub fn recenter(vp: *Viewport) void {
-        vp.cam = .{ .zoom = 1 };
+        vp.cam.cx = 0;
+        vp.cam.cy = 0;
+        vp.cam.zoom = 1;
         vp.hover = null;
+        vp.camera_touched = true;
     }
 
     /// The grid pitch that IS drawn this frame — and what Move-snap follows.
@@ -156,6 +343,12 @@ pub const Viewport = struct {
         var cell = grid_base;
         while (cell * vp.cam.zoom < grid_min_px) cell *= 2;
         return cell;
+    }
+
+    /// The pointer in the region's own coordinates (the space the camera's
+    /// screen maths speaks).
+    pub fn localPoint(vp: *const Viewport, window_point: Vec2) Vec2 {
+        return .{ .x = window_point.x - vp.region.x, .y = window_point.y - vp.region.y };
     }
 
     // ── Pointer handling (main calls this outside the frame guard) ───────
@@ -174,34 +367,64 @@ pub const Viewport = struct {
         );
         const over_ui = ui_ctx.wantsMouse();
         const mouse: Vec2 = .{ .x = m.x, .y = m.y };
+        // The pointer belongs to the scene only while it is over the scene.
+        // The docks are ImGui windows and `wantsMouse` covers them, but the
+        // seams between them are not windows, and a click on a seam must not
+        // pick whatever happens to be behind it.
+        const in_region = vp.region.contains(mouse);
+        const local = vp.localPoint(mouse);
+        vp.cursor_world = vp.cam.targetToWorld(mouse);
+
+        // The first frame with a known region — and every frame after a scene
+        // is replaced — fits the content into the view. An editor that opens
+        // on the origin of a world whose content is elsewhere opens EMPTY.
+        //
+        // A RESIZE re-frames too, while the camera is still the editor's:
+        // the compositor resizes the window right after it opens, and a
+        // framing computed for the old size is a framing for a window that
+        // is not there any more.
+        const region_size = Vec2{ .x = vp.region.w, .y = vp.region.h };
+        if (region_size.x != vp.last_region.x or region_size.y != vp.last_region.y) {
+            vp.last_region = region_size;
+            if (!vp.camera_touched) vp.needs_frame = true;
+        }
+        if (vp.needs_frame) {
+            vp.needs_frame = false;
+            vp.frameAll(ed);
+        }
 
         // Wheel zoom: multiplicative (so the same wheel travel feels the same
         // at any depth), anchored at the cursor (the world point under it
         // stays under it), and it only plays over the scene.
-        if (!over_ui and m.inside and m.wheel_y != 0) {
-            const anchor = vp.cam.screenToWorld(mouse);
+        if (!over_ui and in_region and m.wheel_y != 0) {
+            const anchor = vp.cursor_world;
             vp.cam.zoom *= std.math.pow(f32, 2, m.wheel_y * 0.25);
             vp.cam.zoom = std.math.clamp(vp.cam.zoom, min_zoom, max_zoom);
-            // The rect's top-left is derived from the center; re-touch it so
-            // `anchor` sits exactly under the cursor at the new zoom.
-            vp.cam.cx = anchor.x - mouse.x / vp.cam.zoom + vp.cam.viewport_w / (2 * vp.cam.zoom);
-            vp.cam.cy = anchor.y - mouse.y / vp.cam.zoom + vp.cam.viewport_h / (2 * vp.cam.zoom);
+            // The anchor must still be under the cursor at the new zoom: the
+            // camera's centre moves by exactly what the zoom took away.
+            const half = vp.cam.halfExtents();
+            vp.cam.cx = anchor.x + half.x - local.x / vp.cam.zoom;
+            vp.cam.cy = anchor.y - half.y + local.y / vp.cam.zoom;
+            vp.camera_touched = true;
         }
 
         // Pan: middle-button drag. Free in both tools, over everything — the
         // one gesture that always means "move my window onto the world".
-        if (!over_ui and m.inside and m.buttons[2]) {
+        if (!over_ui and in_region and m.buttons[2]) {
             vp.cam.cx -= m.dx / vp.cam.zoom;
-            vp.cam.cy -= m.dy / vp.cam.zoom;
+            // The screen's y grows DOWN and the world's grows UP, so a drag
+            // downwards moves the camera UP.
+            vp.cam.cy += m.dy / vp.cam.zoom;
+            vp.camera_touched = true;
         }
 
-        if (vp.tool == .cursor and !over_ui and m.inside) {
-            const mouse_w = vp.cam.screenToWorld(mouse);
+        if (vp.tool == .cursor and !over_ui and in_region) {
+            const mouse_w = vp.cursor_world;
             if (vp.grabbed == .none) vp.refreshHover(ed, mouse, mouse_w);
 
             if (m.justPressed(0)) vp.beginGrab(ed, mouse_w);
             if (m.buttons[0] and vp.grabbed != .none) {
-                vp.dragTo(ed, mouse_w, m.ctrl);
+                vp.dragTo(ed, mouse_w, m.ctrl, m.shift);
             } else if (!m.buttons[0]) {
                 vp.releaseGrab();
             }
@@ -212,7 +435,7 @@ pub const Viewport = struct {
             // the user's trust.
             if (vp.grabbed != .none) {
                 if (m.buttons[0]) {
-                    vp.dragTo(ed, vp.cam.screenToWorld(mouse), m.ctrl);
+                    vp.dragTo(ed, vp.cursor_world, m.ctrl, m.shift);
                 } else {
                     vp.releaseGrab();
                 }
@@ -246,15 +469,10 @@ pub const Viewport = struct {
         // top of it, so they must win the pick that way too.
         if (ed.selection) |sel| {
             if (ed.world().isAlive(sel)) {
-                if (near(worldToScreen(vp.cam, vp.scaleHandleWorldPos(ed, sel)), mouse, handle_hit_px)) {
-                    vp.hover = .{ .handle = .scale };
+                if (vp.hitHandle(ed, sel, mouse)) |h| {
+                    vp.hover = .{ .handle = h };
                     return;
                 }
-                if (near(worldToScreen(vp.cam, vp.rotateHandleWorldPos(ed, sel)), mouse, handle_hit_px)) {
-                    vp.hover = .{ .handle = .rotate };
-                    return;
-                }
-                // the body remains pickable through the generic path below
             }
         }
 
@@ -273,33 +491,44 @@ pub const Viewport = struct {
                 if (!ed.world().isAlive(e)) return;
                 const t = ed.world().get(e, ecs.components.Transform) orelse return;
                 ed.select(e);
-                vp.grabbed = .body;
-                vp.grab_entity = e;
-                vp.grab_offset = mouse_w.sub(t.position);
-                vp.snapshot(ed, e, t);
+                // Dragging the object itself MOVES it, but only when the
+                // gizmo says so: in the rotate and scale modes a drag on the
+                // body does nothing, exactly as it does in Godot.
+                if (vp.gizmo == .move) {
+                    vp.grabbed = .body;
+                    vp.grab_entity = e;
+                    vp.snapshot(ed, e, t, mouse_w);
+                }
             },
             .handle => |handle| {
                 const sel = ed.selection orelse return;
                 const t = ed.world().get(sel, ecs.components.Transform) orelse return;
                 vp.grabbed = handle;
                 vp.grab_entity = sel;
-                vp.snapshot(ed, sel, t);
+                vp.snapshot(ed, sel, t, mouse_w);
             },
         }
     }
 
-    fn snapshot(vp: *Viewport, ed: *Editor, e: Entity, t: *const ecs.components.Transform) void {
+    fn snapshot(vp: *Viewport, ed: *Editor, e: Entity, t: *const ecs.components.Transform, mouse_w: Vec2) void {
         vp.grab_entity = e;
         vp.grabbed_pos = t.position;
         vp.grabbed_rot = t.rotation;
         vp.grabbed_scale = t.scale;
+        vp.grab_mouse = mouse_w;
         // The sprite's size is what scale multiplies. A selection without one
         // (picked in an earlier frame, sprite removed since) still moves.
         const sp = ed.world().get(e, ecs.components.Sprite);
         vp.grabbed_size = if (sp) |s| s.size else .{ .x = 1, .y = 1 };
+        // The angle and the radius at the grab: the rotation and the uniform
+        // scale are both measured from here, so the handle does not jump when
+        // the drag starts.
+        const rel = mouse_w.sub(t.position);
+        vp.grab_angle = std.math.atan2(rel.y, rel.x);
+        vp.grab_radius = @sqrt(rel.x * rel.x + rel.y * rel.y);
     }
 
-    fn dragTo(vp: *Viewport, ed: *Editor, mouse_w: Vec2, ctrl: bool) void {
+    fn dragTo(vp: *Viewport, ed: *Editor, mouse_w: Vec2, ctrl: bool, shift: bool) void {
         const e = vp.grab_entity orelse return;
         const world = ed.world();
         if (!world.isAlive(e)) {
@@ -311,55 +540,94 @@ pub const Viewport = struct {
             return;
         };
 
+        const snap = ctrl and vp.snap;
+
         switch (vp.grabbed) {
             .none => {},
             .body => {
-                var pos = mouse_w.sub(vp.grab_offset);
-                if (ctrl) {
-                    // Ctrl snaps to the grid cell that is DRAWN — snapping
-                    // and seeing must agree, or one of them is lying.
-                    const cell = vp.gridCell();
-                    pos.x = @round(pos.x / cell) * cell;
-                    pos.y = @round(pos.y / cell) * cell;
-                }
+                // A free move: the delta from the grab, so the object keeps
+                // the point of itself that was clicked.
+                const delta = mouse_w.sub(vp.grab_mouse);
+                var pos = vp.grabbed_pos.add(delta);
+                if (snap) pos = vp.snapToGrid(pos);
                 t.position = pos;
             },
-            .scale => {
-                // The pointer in the entity's LOCAL frame (rotation removed):
+            .move_x, .move_y => {
+                // The drag follows the object's OWN axis, so a rotated object
+                // moves along the arrow the user is holding.
+                const axis = if (vp.grabbed == .move_x)
+                    Vec2{ .x = @cos(vp.grabbed_rot), .y = @sin(vp.grabbed_rot) }
+                else
+                    Vec2{ .x = -@sin(vp.grabbed_rot), .y = @cos(vp.grabbed_rot) };
+                const delta = mouse_w.sub(vp.grab_mouse);
+                const along = delta.x * axis.x + delta.y * axis.y;
+                var pos = vp.grabbed_pos.add(axis.scale(along));
+                if (snap) pos = vp.snapToGrid(pos);
+                t.position = pos;
+            },
+            .rotate => {
+                // The handle rides the pointer's angle around the pivot. The
+                // angle at the grab is the zero, so the rotation is a DELTA
+                // and the object does not snap to a hard angle when the drag
+                // starts.
+                const rel = mouse_w.sub(vp.grabbed_pos);
+                const a = std.math.atan2(rel.y, rel.x);
+                var rot = vp.grabbed_rot + wrapPi(a - vp.grab_angle);
+                if (snap) rot = @round(rot / rotate_snap) * rotate_snap;
+                t.rotation = rot;
+            },
+            .scale_nw, .scale_ne, .scale_se, .scale_sw => {
+                // The pointer in the object's LOCAL frame (rotation removed):
                 // scale multiplies the sprite's size along each axis, so the
                 // pointer's offset along those axes IS the new scale.
-                const rel = mouse_w.sub(t.position);
-                const c = @cos(t.rotation);
-                const s = @sin(t.rotation);
+                const rel = mouse_w.sub(vp.grabbed_pos);
+                const c = @cos(vp.grabbed_rot);
+                const s = @sin(vp.grabbed_rot);
                 const local: Vec2 = .{
                     .x = rel.x * c + rel.y * s,
                     .y = -rel.x * s + rel.y * c,
                 };
-                var sx = local.x / (vp.grabbed_size.x * 0.5);
-                var sy = local.y / (vp.grabbed_size.y * 0.5);
-                // Degenerate scales are a rendering bug, not a feature: keep
-                // at least a sliver on each axis, either sign (flipping
-                // across the center stays legal).
-                if (sx > 0 and sx < 0.01) sx = 0.01;
-                if (sx < 0 and sx > -0.01) sx = -0.01;
-                if (sy > 0 and sy < 0.01) sy = 0.01;
-                if (sy < 0 and sy > -0.01) sy = -0.01;
-                t.scale.x = sx;
-                t.scale.y = sy;
-            },
-            .rotate => {
-                // The handle rests ABOVE the center — local (0, −r) — which
-                // is the angle `rotation − 90°`. A pointer at world angle `a`
-                // therefore means rotation `a + 90°`, kept continuous with
-                // the grab via wrapPi so 359°→1° does not spin the long way.
-                const rel = mouse_w.sub(t.position);
-                const a = std.math.atan2(rel.y, rel.x);
-                var rot = vp.grabbed_rot + wrapPi(a - vp.grabbed_rot + std.math.pi / 2.0);
-                if (ctrl) {
-                    const step: f32 = std.math.pi / 12.0; // 15°, Godot's default
-                    rot = @round(rot / step) * step;
+                // The corner's own sign: the top-right corner is at +x, +y in
+                // the local frame (which is y-up), so dragging it right and up
+                // grows both axes.
+                const sign: Vec2 = switch (vp.grabbed) {
+                    .scale_nw => .{ .x = -1, .y = 1 },
+                    .scale_ne => .{ .x = 1, .y = 1 },
+                    .scale_se => .{ .x = 1, .y = -1 },
+                    .scale_sw => .{ .x = -1, .y = -1 },
+                    else => .{ .x = 1, .y = 1 },
+                };
+                const hx = @max(vp.grabbed_size.x * 0.5, 0.0001);
+                const hy = @max(vp.grabbed_size.y * 0.5, 0.0001);
+                var sx = (local.x * sign.x) / hx;
+                var sy = (local.y * sign.y) / hy;
+                if (shift) {
+                    // Uniform: the larger of the two wins, and the other
+                    // follows it.
+                    const m = @max(@abs(sx), @abs(sy));
+                    sx = if (sx < 0) -m else m;
+                    sy = if (sy < 0) -m else m;
                 }
-                t.rotation = rot;
+                if (snap) {
+                    sx = @round(sx * 10.0) / 10.0;
+                    sy = @round(sy * 10.0) / 10.0;
+                }
+                t.scale.x = clampScale(sx);
+                t.scale.y = clampScale(sy);
+            },
+            .scale_center => {
+                // Uniform: the ratio of the distances from the pivot.
+                const rel = mouse_w.sub(vp.grabbed_pos);
+                const d = @sqrt(rel.x * rel.x + rel.y * rel.y);
+                const ratio = if (vp.grab_radius > 0.0001) d / vp.grab_radius else 1.0;
+                var s = vp.grabbed_scale;
+                s.x = clampScale(s.x * ratio);
+                s.y = clampScale(s.y * ratio);
+                if (snap) {
+                    s.x = @round(s.x * 10.0) / 10.0;
+                    s.y = @round(s.y * 10.0) / 10.0;
+                }
+                t.scale = s;
             },
         }
 
@@ -373,39 +641,102 @@ pub const Viewport = struct {
         vp.edited_this_frame = true;
     }
 
+    /// The grid cell a position snaps to. The cell that is DRAWN, so what you
+    /// snap to is exactly what you see.
+    fn snapToGrid(vp: *const Viewport, p: Vec2) Vec2 {
+        const cell = vp.gridCell();
+        return .{
+            .x = @round(p.x / cell) * cell,
+            .y = @round(p.y / cell) * cell,
+        };
+    }
+
     // ── Handle geometry (hit-testing and drawing share it) ───────────────
 
-    fn selectionSprite(ed: *Editor, sel: Entity) ?*ecs.components.Sprite {
-        return ed.world().get(sel, ecs.components.Sprite);
+    /// The selection's geometry in screen pixels, or null when it has no
+    /// sprite (a selection without one still moves, but there is no box to
+    /// draw and no corners to hit).
+    fn selectionBox(vp: *Viewport, ed: *Editor, sel: Entity) ?Box {
+        const t = ed.world().get(sel, ecs.components.Transform) orelse return null;
+        const sp = ed.world().get(sel, ecs.components.Sprite) orelse return null;
+        const hx = sp.size.x * 0.5 * @abs(t.scale.x);
+        const hy = sp.size.y * 0.5 * @abs(t.scale.y);
+
+        // The local corners, in the object's frame (y up): the top-left is at
+        // (-x, +y).
+        const local = [_]Vec2{
+            .{ .x = -hx, .y = hy },
+            .{ .x = hx, .y = hy },
+            .{ .x = hx, .y = -hy },
+            .{ .x = -hx, .y = -hy },
+        };
+        const c = @cos(t.rotation);
+        const s = @sin(t.rotation);
+        var corners: [4]Vec2 = undefined;
+        for (local, 0..) |l, i| {
+            const world = Vec2{
+                .x = t.position.x + l.x * c - l.y * s,
+                .y = t.position.y + l.x * s + l.y * c,
+            };
+            corners[i] = vp.cam.worldToTarget(world);
+        }
+
+        const centre = vp.cam.worldToTarget(t.position);
+        // The arrows point along the object's own axes. The screen's y grows
+        // down, so a world direction (x, y) is a screen direction (x, -y).
+        const x_dir = Vec2{ .x = c, .y = -s };
+        const y_dir = Vec2{ .x = -s, .y = -c };
+        const half_screen_x = hx * vp.cam.zoom;
+        const half_screen_y = hy * vp.cam.zoom;
+
+        return .{
+            .entity = sel,
+            .corners = corners,
+            .centre = centre,
+            .x_tip = centre.add(x_dir.scale(half_screen_x + arrow_len)),
+            .y_tip = centre.add(y_dir.scale(half_screen_y + arrow_len)),
+            .ring_radius = @max(half_screen_x, half_screen_y) + ring_pad,
+            .position = t.position,
+            .rotation = t.rotation,
+            .scale = t.scale,
+            .size = sp.size,
+        };
     }
 
-    fn scaleHandleWorldPos(vp: *Viewport, ed: *Editor, sel: Entity) Vec2 {
-        const t = ed.world().get(sel, ecs.components.Transform) orelse return vp.cam.screenToWorld(.{});
-        const sp = selectionSprite(ed, sel) orelse return t.position;
-        const corner: Vec2 = .{
-            .x = sp.size.x * 0.5 * @abs(t.scale.x),
-            .y = sp.size.y * 0.5 * @abs(t.scale.y),
+    /// Which handle, if any, is under the pointer.
+    fn hitHandle(vp: *Viewport, ed: *Editor, sel: Entity, mouse: Vec2) ?Handle {
+        const box = vp.selectionBox(ed, sel) orelse return null;
+        return switch (vp.gizmo) {
+            .move => vp.hitMoveHandle(box, mouse),
+            .rotate => vp.hitRotateHandle(box, mouse),
+            .scale => vp.hitScaleHandle(box, mouse),
         };
-        return rotateVec(t.position, corner, t.rotation);
     }
 
-    fn rotateHandleWorldPos(vp: *Viewport, ed: *Editor, sel: Entity) Vec2 {
-        const t = ed.world().get(sel, ecs.components.Transform) orelse return vp.cam.screenToWorld(.{});
-        const sp = selectionSprite(ed, sel) orelse
-            return t.position.add(.{ .y = -rotate_offset_px });
-        const above: Vec2 = .{
-            .x = 0,
-            .y = -(sp.size.y * 0.5 * @abs(t.scale.y) + rotate_offset_px / vp.cam.zoom),
-        };
-        return rotateVec(t.position, above, t.rotation);
+    fn hitMoveHandle(vp: *Viewport, box: Box, mouse: Vec2) ?Handle {
+        _ = vp;
+        // The arrows first: they are drawn on top of the box.
+        if (near(box.x_tip, mouse, handle_hit_px)) return .move_x;
+        if (near(box.y_tip, mouse, handle_hit_px)) return .move_y;
+        if (pointInBox(box, mouse)) return .body;
+        return null;
     }
 
-    fn hoverHandle(h: ?Hover, kind: Handle) bool {
-        const u = h orelse return false;
-        return switch (u) {
-            .handle => |handle| handle == kind,
-            else => false,
-        };
+    fn hitRotateHandle(vp: *Viewport, box: Box, mouse: Vec2) ?Handle {
+        _ = vp;
+        const d = distance(mouse, box.centre);
+        if (@abs(d - box.ring_radius) <= handle_hit_px) return .rotate;
+        return null;
+    }
+
+    fn hitScaleHandle(vp: *Viewport, box: Box, mouse: Vec2) ?Handle {
+        _ = vp;
+        if (near(box.corners[0], mouse, handle_hit_px)) return .scale_nw;
+        if (near(box.corners[1], mouse, handle_hit_px)) return .scale_ne;
+        if (near(box.corners[2], mouse, handle_hit_px)) return .scale_se;
+        if (near(box.corners[3], mouse, handle_hit_px)) return .scale_sw;
+        if (near(box.centre, mouse, handle_hit_px)) return .scale_center;
+        return null;
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
@@ -417,7 +748,7 @@ pub const Viewport = struct {
     pub fn pushUnderlay(vp: *Viewport, r2d: *render2d.Renderer2D) void {
         if (!vp.show_grid) return;
 
-        const rect = vp.cam.worldRect();
+        const bounds = vp.cam.worldBounds();
         const cell = vp.gridCell();
         const zoom = vp.cam.zoom;
 
@@ -429,12 +760,11 @@ pub const Viewport = struct {
 
         // A major line every 4 minors — 128 world units at the base pitch.
         const major_every = 4.0 * cell;
-        var gx = @floor(rect.left() / cell) * cell;
-        var gy = @floor(rect.top() / cell) * cell;
 
-        const cols: usize = @intFromFloat(@ceil(rect.size.x / cell) + 1);
-        var i: usize = 0;
-        while (i < cols) : (i += 1) {
+        // The world's y grows UP, so the TOP of the screen is the world's
+        // LARGEST y. The grid starts there and walks down.
+        var gx = @floor(bounds.min.x / cell) * cell;
+        while (gx <= bounds.max.x) : (gx += cell) {
             if (quads >= cap) break;
             if (!isOriginLine(gx, thin)) {
                 const major = @abs(@rem(gx, major_every)) < thin;
@@ -449,12 +779,10 @@ pub const Viewport = struct {
                 });
                 quads += 1;
             }
-            gx += cell;
         }
 
-        const rows: usize = @intFromFloat(@ceil(rect.size.y / cell) + 1);
-        i = 0;
-        while (i < rows) : (i += 1) {
+        var gy = @floor(bounds.max.y / cell) * cell;
+        while (gy >= bounds.min.y) : (gy -= cell) {
             if (quads >= cap) break;
             if (!isOriginLine(gy, thin)) {
                 const major = @abs(@rem(gy, major_every)) < thin;
@@ -469,7 +797,6 @@ pub const Viewport = struct {
                 });
                 quads += 1;
             }
-            gy += cell;
         }
 
         // World axes through the origin, in the two colors Godot taught
@@ -494,9 +821,18 @@ pub const Viewport = struct {
         });
     }
 
-    /// Hover ghost, selection box, and the scale/rotate handles: pushed after
-    /// the tiles, on their own layer, under the physics overlay.
-    pub fn pushOverlay(vp: *Viewport, ed: *Editor, r2d: *render2d.Renderer2D) void {
+    /// The gizmo, the selection box and the hover ghost.
+    ///
+    /// Drawn on ImGui's BACKGROUND list and clipped to the region: over the
+    /// scene (the overlay pass runs after the scene is resolved) and under the
+    /// panels (the background list is drawn before the windows).
+    pub fn drawOverlay(vp: *Viewport, ed: *Editor, ctx: *ui.Context) void {
+        const list = ui.draw.backgroundList();
+        list.pushClip(vp.region.rect(), true);
+        defer list.popClip();
+
+        const t = &ctx.theme;
+
         // An entity the pointer is over but has not picked: a ghost outline.
         if (vp.hover) |h| switch (h) {
             .entity => |e| {
@@ -504,154 +840,136 @@ pub const Viewport = struct {
                 if (ed.selection) |sel| {
                     if (sel.index == e.index and sel.generation == e.generation) ghost = false;
                 }
-                if (ghost) vp.outlineBox(ed, r2d, e, col_hover_ghost, 1.0);
+                if (ghost) {
+                    if (vp.selectionBox(ed, e)) |box| {
+                        drawBoxOutline(list, box, t.colors.accent.withAlpha(0.45), 1.0);
+                    }
+                }
             },
             else => {},
         };
 
         const sel = ed.selection orelse return;
         if (!ed.world().isAlive(sel)) return;
-        const t = ed.world().get(sel, ecs.components.Transform) orelse return;
+        const box = vp.selectionBox(ed, sel) orelse return;
 
         // The selection's own box, above everything it edits.
-        vp.outlineBox(ed, r2d, sel, col_accent, 1.5);
+        drawBoxOutline(list, box, t.colors.accent, 1.5);
 
-        // Handles live only under the cursor tool (the tile tool does not
-        // edit entities). They show while a simulation runs, too: Godot edits
-        // live, and a running behavior fighting a drag is a fair fight.
+        // The gizmo belongs to the cursor tool (the tile tool does not edit
+        // entities). It shows while a simulation runs, too: Godot edits live,
+        // and a running behavior fighting a drag is a fair fight.
         if (vp.tool != .cursor) return;
 
-        const sp = selectionSprite(ed, sel);
-        const scale_pos = vp.scaleHandleWorldPos(ed, sel);
-        const rot_pos = vp.rotateHandleWorldPos(ed, sel);
-        const s = 4.5 / vp.cam.zoom; // constant screen size
-
-        const scale_color: [4]u8 = if (vp.grabbed == .scale or hoverHandle(vp.hover, .scale))
-            col_accent_hover
-        else
-            col_accent;
-        const rot_color: [4]u8 = if (vp.grabbed == .rotate or hoverHandle(vp.hover, .rotate))
-            col_accent_hover
-        else
-            col_accent;
-
-        // Scale: a disc on the corner (bottom-right of the local rect).
-        _ = r2d.pushInstance(.{
-            .pos = .{ scale_pos.x, scale_pos.y },
-            .half = .{ s, s },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = scale_color,
-            .slot = debug_slot,
-            .shape = 1,
-            .layer = overlay_layer,
-        });
-
-        // Rotate: a stem from the box's top edge up to a disc.
-        if (sp) |sprite| {
-            const top: Vec2 = .{ .x = 0, .y = -(sprite.size.y * 0.5 * @abs(t.scale.y)) };
-            const top_w = rotateVec(t.position, top, t.rotation);
-            const stem: Vec2 = rot_pos.sub(top_w);
-            _ = r2d.pushInstance(.{
-                .pos = .{ (top_w.x + rot_pos.x) / 2, (top_w.y + rot_pos.y) / 2 },
-                .half = .{ 1.0 / vp.cam.zoom, @abs(stem.y) / 2 + 1.0 / vp.cam.zoom },
-                .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-                .color = rot_color,
-                .slot = debug_slot,
-                .shape = 0,
-                .layer = overlay_layer,
-            });
+        switch (vp.gizmo) {
+            .move => vp.drawMoveGizmo(list, box, t),
+            .rotate => vp.drawRotateGizmo(list, box, t),
+            .scale => vp.drawScaleGizmo(list, box, t),
         }
-        _ = r2d.pushInstance(.{
-            .pos = .{ rot_pos.x, rot_pos.y },
-            .half = .{ s, s },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = rot_color,
-            .slot = debug_slot,
-            .shape = 1,
-            .layer = overlay_layer,
-        });
     }
 
-    /// The selection's rectangle: a translucent fill plus a four-quad border.
-    /// Axis-aligned, because `SpriteInstance` quads do not rotate — and the
-    /// hit-test uses the same box, so neither can be surprised by the other.
-    fn outlineBox(vp: *Viewport, ed: *Editor, r2d: *render2d.Renderer2D, e: Entity, color: [4]u8, thick_px: f32) void {
-        const t = ed.world().get(e, ecs.components.Transform) orelse return;
-        const sp = ed.world().get(e, ecs.components.Sprite) orelse return;
-        const hx = sp.size.x * 0.5 * @abs(t.scale.x);
-        const hy = sp.size.y * 0.5 * @abs(t.scale.y);
-        const w = thick_px / vp.cam.zoom;
+    fn drawMoveGizmo(vp: *Viewport, list: ui.draw.List, box: Box, t: *const ui.Theme) void {
+        const hot_x = vp.grabbed == .move_x or hoverHandle(vp.hover, .move_x);
+        const hot_y = vp.grabbed == .move_y or hoverHandle(vp.hover, .move_y);
 
-        _ = r2d.pushInstance(.{
-            .pos = .{ t.position.x, t.position.y },
-            .half = .{ hx, hy },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = translucent(color),
-            .slot = debug_slot,
-            .shape = 0,
-            .layer = overlay_layer,
-        });
-        _ = r2d.pushInstance(.{ // top
-            .pos = .{ t.position.x, t.position.y - hy },
-            .half = .{ hx + w, w },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = color,
-            .slot = debug_slot,
-            .shape = 0,
-            .layer = overlay_layer,
-        });
-        _ = r2d.pushInstance(.{ // bottom
-            .pos = .{ t.position.x, t.position.y + hy },
-            .half = .{ hx + w, w },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = color,
-            .slot = debug_slot,
-            .shape = 0,
-            .layer = overlay_layer,
-        });
-        _ = r2d.pushInstance(.{ // left
-            .pos = .{ t.position.x - hx, t.position.y },
-            .half = .{ w, hy + w },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = color,
-            .slot = debug_slot,
-            .shape = 0,
-            .layer = overlay_layer,
-        });
-        _ = r2d.pushInstance(.{ // right
-            .pos = .{ t.position.x + hx, t.position.y },
-            .half = .{ w, hy + w },
-            .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
-            .color = color,
-            .slot = debug_slot,
-            .shape = 0,
-            .layer = overlay_layer,
-        });
+        // The pivot: a small disc where the object's origin is.
+        list.circle(drawVec(box.centre), 3.5, t.colors.accent);
+
+        drawArrow(list, box.centre, box.x_tip, axisColor(t, true, hot_x));
+        drawArrow(list, box.centre, box.y_tip, axisColor(t, false, hot_y));
     }
 
-    // ── The tool pill ────────────────────────────────────────────────────
+    fn drawRotateGizmo(vp: *Viewport, list: ui.draw.List, box: Box, t: *const ui.Theme) void {
+        const hot = vp.grabbed == .rotate or hoverHandle(vp.hover, .rotate);
+        const col = if (hot) t.colors.accent_hover else t.colors.accent;
+        list.circleOutline(drawVec(box.centre), box.ring_radius, col.withAlpha(0.75), 1.5);
+
+        // The knob: where the pointer was at the grab, or at the top when
+        // nothing is being dragged. It is the handle, so it is where the
+        // user expects to grab it.
+        const angle = if (vp.grabbed == .rotate) vp.grab_angle else std.math.pi * 0.5;
+        const knob = Vec2{
+            .x = box.centre.x + @cos(angle) * box.ring_radius,
+            .y = box.centre.y - @sin(angle) * box.ring_radius,
+        };
+        list.circle(drawVec(knob), if (hot) 6.0 else 5.0, col);
+    }
+
+    fn drawScaleGizmo(vp: *Viewport, list: ui.draw.List, box: Box, t: *const ui.Theme) void {
+        const hot = vp.grabbed == .scale_nw or vp.grabbed == .scale_ne or
+            vp.grabbed == .scale_se or vp.grabbed == .scale_sw or
+            vp.grabbed == .scale_center or hoverHandle(vp.hover, .scale_center);
+        const col = if (hot) t.colors.accent_hover else t.colors.accent;
+
+        for (box.corners) |corner| {
+            list.rect(ui.draw.rect(corner.x - 4, corner.y - 4, corner.x + 4, corner.y + 4), col, 1);
+        }
+        // The centre handle: the uniform scale.
+        list.rect(ui.draw.rect(box.centre.x - 3.5, box.centre.y - 3.5, box.centre.x + 3.5, box.centre.y + 3.5), col, 1);
+    }
+
+    // ── The HUD ──────────────────────────────────────────────────────────
 
     var drawing_vp: ?*Viewport = null;
 
-    /// A small floating window, top-right of the framebuffer: the tool pair,
-    /// the grid toggle, and Home. A pill and not a dock — the viewport is the
-    /// one region without a window behind it, and this is how it keeps one.
-    pub fn drawToolbar(vp: *Viewport, ctx: *ui.Context, fb_w: u32) void {
+    /// The strip along the top-left of the viewport: the tools, the gizmo
+    /// modes, the toggles and the readouts.
+    ///
+    /// It lives INSIDE the region, so it never covers a dock — the old pill
+    /// floated over the inspector, which is where a tool has no business
+    /// being. It is a real ImGui window (its buttons are real buttons), which
+    /// means it takes the pointer over itself and the scene does not see the
+    /// clicks there. That is the point of a HUD.
+    ///
+    /// It is three ROWS, not one long one: a single row of nine controls is
+    /// wider than a narrow viewport, and a HUD that spills out of the region
+    /// it belongs to is a HUD over the inspector.
+    pub fn drawHud(vp: *Viewport, ctx: *ui.Context) void {
         drawing_vp = vp;
-        const x = @as(f32, @floatFromInt(fb_w)) - 96;
-        ui.floating(ctx, "ViewportTools", .{ .x = x, .y = 14, .w = 60, .h = 90, .resizable = false }, toolbarBody);
-        drawing_vp = null;
+        defer drawing_vp = null;
+        cimgui.ember_ui_set_next_window_bg_alpha(0.88);
+        ui.layout.floating(ctx, "ViewportHud", .{
+            .x = vp.region.x + 10,
+            .y = vp.region.y + 10,
+            .w = 0,
+            .h = 0,
+            .resizable = false,
+            // The HUD is PINNED: it belongs to the region, it cannot be
+            // dragged away, and the region moves when the layout does. So its
+            // position is applied every frame, not remembered from the first
+            // use — a remembered position is a HUD that stays where the layout
+            // used to be.
+            .fixed = true,
+            .flags = cimgui.WindowFlags.NoTitleBar |
+                cimgui.WindowFlags.NoResize |
+                cimgui.WindowFlags.NoCollapse |
+                cimgui.WindowFlags.NoMove |
+                cimgui.WindowFlags.NoScrollbar |
+                cimgui.WindowFlags.NoScrollWithMouse |
+                cimgui.WindowFlags.NoSavedSettings,
+        }, hudBody);
     }
 
-    fn toolbarBody(ctx: *ui.Context) void {
-        const vp = drawing_vp orelse return;
+    fn hudBody(ctx: *ui.Context) void {
+        // No `SameLine` at the end of a row: ImGui breaks the line by itself
+        // when the next item does not ask to share it, which is how three
+        // rows of controls fit in a strip without a layout call that moves
+        // the cursor (and that trips ImGui's own boundary check when the
+        // window is still finding its size).
+        hudTools(ctx);
+        hudGizmos(ctx);
+        hudToggles(ctx);
+    }
 
+    /// The pointer's tools: pick, or paint.
+    fn hudTools(ctx: *ui.Context) void {
+        const vp = drawing_vp orelse return;
         if (ui.button.render(.{
             .ctx = ctx,
             .id = "tool.cursor",
             .text = "Cursor",
             .variant = if (vp.tool == .cursor) .primary else .ghost,
-            .tooltip = "Q — pick and edit entities in the scene",
+            .tooltip = "Q — pick entities in the scene",
         })) vp.tool = .cursor;
         cimgui.ember_ui_same_line(0, 4);
         if (ui.button.render(.{
@@ -660,16 +978,119 @@ pub const Viewport = struct {
             .text = "Tiles",
             .variant = if (vp.tool == .tile) .primary else .ghost,
             .tooltip = "T — the TileMap brush owns left-click",
-        })) {
-            vp.tool = .tile;
-        }
+        })) vp.tool = .tile;
+    }
+
+    /// The gizmo's three verbs.
+    fn hudGizmos(ctx: *ui.Context) void {
+        const vp = drawing_vp orelse return;
+        if (ui.button.render(.{
+            .ctx = ctx,
+            .id = "gizmo.move",
+            .text = "Move",
+            .variant = if (vp.gizmo == .move) .primary else .ghost,
+            .tooltip = "W — drag the object, or an arrow to move along one axis",
+        })) vp.gizmo = .move;
+        cimgui.ember_ui_same_line(0, 4);
+        if (ui.button.render(.{
+            .ctx = ctx,
+            .id = "gizmo.rotate",
+            .text = "Rotate",
+            .variant = if (vp.gizmo == .rotate) .primary else .ghost,
+            .tooltip = "E — drag the ring to rotate",
+        })) vp.gizmo = .rotate;
+        cimgui.ember_ui_same_line(0, 4);
+        if (ui.button.render(.{
+            .ctx = ctx,
+            .id = "gizmo.scale",
+            .text = "Scale",
+            .variant = if (vp.gizmo == .scale) .primary else .ghost,
+            .tooltip = "R — drag a corner to scale, the middle for uniform",
+        })) vp.gizmo = .scale;
+    }
+
+    /// The toggles and the readouts: what the viewport is showing, and where
+    /// the pointer is.
+    fn hudToggles(ctx: *ui.Context) void {
+        const vp = drawing_vp orelse return;
+        if (ui.button.render(.{
+            .ctx = ctx,
+            .id = "vp.grid",
+            .text = "Grid",
+            .variant = if (vp.show_grid) .primary else .ghost,
+            .tooltip = "the adaptive grid",
+        })) vp.show_grid = !vp.show_grid;
+        cimgui.ember_ui_same_line(0, 4);
+        if (ui.button.render(.{
+            .ctx = ctx,
+            .id = "vp.snap",
+            .text = "Snap",
+            .variant = if (vp.snap) .primary else .ghost,
+            .tooltip = "Ctrl while dragging snaps to the grid",
+        })) vp.snap = !vp.snap;
+
+        cimgui.ember_ui_same_line(0, 10);
+
+        var zoom_buf: [32]u8 = undefined;
+        const zoom_text = std.fmt.bufPrint(&zoom_buf, "{d:.0}%", .{vp.cam.zoom * 100}) catch "100%";
+        ui.text.caption(ctx, zoom_text);
+        cimgui.ember_ui_same_line(0, 8);
+        var pos_buf: [64]u8 = undefined;
+        const pos_text = std.fmt.bufPrint(&pos_buf, "{d:.0}, {d:.0}", .{
+            vp.cursor_world.x,
+            vp.cursor_world.y,
+        }) catch "0, 0";
+        ui.text.caption(ctx, pos_text);
     }
 };
 
 // ── Module helpers ───────────────────────────────────────────────────────────
 
-fn worldToScreen(cam: ecs.camera.View, world: Vec2) Vec2 {
-    return cam.worldToScreen(world);
+/// ImGui's draw list speaks its own `Vec2`, and the engine's math type is a
+/// different struct with the same two fields. One conversion, here, so no
+/// call site has to remember which one it is holding.
+fn drawVec(v: Vec2) ui.cimgui.Vec2 {
+    return .{ .x = v.x, .y = v.y };
+}
+
+/// The X and Y axis colors: red and green, the two everyone already reads.
+fn axisColor(t: *const ui.Theme, x_axis: bool, hot: bool) ui.Rgba {
+    const base = if (x_axis) t.colors.danger else t.colors.success;
+    return if (hot) base.lerp(ui.Rgba.of(1, 1, 1, 1), 0.35) else base;
+}
+
+fn drawBoxOutline(list: ui.draw.List, box: Box, col: ui.Rgba, thickness: f32) void {
+    // A translucent fill plus a border: the fill says "this is the object",
+    // the border says "this is the selection".
+    list.pathReset();
+    for (box.corners) |c| list.pathLine(drawVec(c));
+    list.pathFill(col.withAlpha(col.a * 0.12));
+    list.pathReset();
+    for (box.corners) |c| list.pathLine(drawVec(c));
+    list.pathStroke(col, thickness, true);
+}
+
+fn drawArrow(list: ui.draw.List, from: Vec2, tip: Vec2, col: ui.Rgba) void {
+    const dx = tip.x - from.x;
+    const dy = tip.y - from.y;
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len < 0.001) return;
+    const dir = Vec2{ .x = dx / len, .y = dy / len };
+    const perp = Vec2{ .x = -dir.y, .y = dir.x };
+    const head: f32 = 9.0;
+
+    list.line(drawVec(from), drawVec(tip), col, 2.0);
+    list.pathReset();
+    list.pathLine(drawVec(tip));
+    list.pathLine(drawVec(Vec2{
+        .x = tip.x - dir.x * head + perp.x * head * 0.55,
+        .y = tip.y - dir.y * head + perp.y * head * 0.55,
+    }));
+    list.pathLine(drawVec(Vec2{
+        .x = tip.x - dir.x * head - perp.x * head * 0.55,
+        .y = tip.y - dir.y * head - perp.y * head * 0.55,
+    }));
+    list.pathFill(col);
 }
 
 fn near(a: Vec2, b: Vec2, px: f32) bool {
@@ -678,13 +1099,43 @@ fn near(a: Vec2, b: Vec2, px: f32) bool {
     return dx * dx + dy * dy <= px * px;
 }
 
-fn rotateVec(origin: Vec2, offset: Vec2, radians: f32) Vec2 {
-    const c = @cos(radians);
-    const s = @sin(radians);
-    return .{
-        .x = origin.x + offset.x * c - offset.y * s,
-        .y = origin.y + offset.x * s + offset.y * c,
+fn distance(a: Vec2, b: Vec2) f32 {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return @sqrt(dx * dx + dy * dy);
+}
+
+/// Is the point inside the selection's (possibly rotated) box?
+fn pointInBox(box: Box, p: Vec2) bool {
+    // The corners are in screen space and the box is a parallelogram, so the
+    // test is done in the box's own frame: the vectors from the top-left
+    // corner to the top-right and to the bottom-left are the box's axes.
+    const ex = Vec2{ .x = box.corners[1].x - box.corners[0].x, .y = box.corners[1].y - box.corners[0].y };
+    const ey = Vec2{ .x = box.corners[3].x - box.corners[0].x, .y = box.corners[3].y - box.corners[0].y };
+    const rel = Vec2{ .x = p.x - box.corners[0].x, .y = p.y - box.corners[0].y };
+    const det = ex.x * ey.y - ex.y * ey.x;
+    if (@abs(det) < 0.0001) return false;
+    const u = (rel.x * ey.y - rel.y * ey.x) / det;
+    const v = (ex.x * rel.y - ex.y * rel.x) / det;
+    return u >= 0 and u <= 1 and v >= 0 and v <= 1;
+}
+
+fn hoverHandle(h: ?Viewport.Hover, kind: Handle) bool {
+    const u = h orelse return false;
+    return switch (u) {
+        .handle => |handle| handle == kind,
+        else => false,
     };
+}
+
+/// A scale of zero is a rendering bug, not a feature: keep at least a sliver
+/// on each axis, either sign (flipping across the center stays legal).
+fn clampScale(s: f32) f32 {
+    if (s > 0 and s < 0.01) return 0.01;
+    if (s < 0 and s > -0.01) return -0.01;
+    // Exactly zero is a hole, not a sprite.
+    if (s == 0) return 0.01;
+    return s;
 }
 
 fn wrapPi(a: f32) f32 {
@@ -697,12 +1148,6 @@ fn wrapPi(a: f32) f32 {
 /// their own colored lines through 0).
 fn isOriginLine(v: f32, thin: f32) bool {
     return @abs(v) < thin;
-}
-
-fn translucent(color: [4]u8) [4]u8 {
-    var c = color;
-    c[3] = @intCast(color[3] / 4);
-    return c;
 }
 
 /// Topmost entity under the world point. "Topmost" = the highest sprite
@@ -767,4 +1212,29 @@ test "viewport: the origin line is never drawn twice" {
     try testing.expect(isOriginLine(0, 1.0));
     try testing.expect(isOriginLine(0.5, 1.0)); // within the line's thickness
     try testing.expect(!isOriginLine(2.0, 1.0));
+}
+
+test "viewport: the region decides where the pointer is measured from" {
+    // The pointer is in WINDOW pixels and the camera speaks REGION pixels, so
+    // the region is subtracted. Getting this wrong is what put a click
+    // half a screen away from the thing it hit.
+    const vp = Viewport{ .region = .{ .x = 300, .y = 100, .w = 800, .h = 600 } };
+    const local = vp.localPoint(.{ .x = 500, .y = 250 });
+    try testing.expectApproxEqAbs(@as(f32, 200), local.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 150), local.y, 0.001);
+
+    // And the region is a real hit test: a click on the inspector is not a
+    // click on the scene.
+    try testing.expect(vp.region.contains(.{ .x = 300, .y = 100 }));
+    try testing.expect(!vp.region.contains(.{ .x = 299, .y = 100 }));
+    try testing.expect(!vp.region.contains(.{ .x = 300, .y = 99 }));
+}
+
+test "viewport: a scale of zero is a sliver, not a hole" {
+    try testing.expectApproxEqAbs(@as(f32, 0.01), clampScale(0.0), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), clampScale(-0.0), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), clampScale(0.001), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2.5), clampScale(2.5), 0.0001);
+    // A flip across the centre stays legal: negative scales are legal.
+    try testing.expectApproxEqAbs(@as(f32, -3.0), clampScale(-3.0), 0.0001);
 }

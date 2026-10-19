@@ -126,7 +126,10 @@ pub fn popup(c: Completion) ?usize {
     const body_h: f32 = @as(f32, @floatFromInt(win.len)) * c.row_height;
     const h = header_h + body_h + m.gap() * 2.0;
 
-    const flags: u32 = cimgui.WindowFlags.NoDecoration |
+    const flags: u32 = cimgui.WindowFlags.NoTitleBar |
+        cimgui.WindowFlags.NoResize |
+        cimgui.WindowFlags.NoCollapse |
+        cimgui.WindowFlags.NoScrollbar |
         cimgui.WindowFlags.NoSavedSettings |
         cimgui.WindowFlags.NoFocusOnAppearing |
         cimgui.WindowFlags.NoNav |

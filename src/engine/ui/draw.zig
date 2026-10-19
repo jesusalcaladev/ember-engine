@@ -321,6 +321,17 @@ pub fn cursorScreenPos() Vec2 {
     return .{ .x = out[0], .y = out[1] };
 }
 
+/// The current window's position, in screen pixels.
+///
+/// The only question it answers is "did the user move this window?", which is
+/// what a floating tool needs to know: it follows the region it belongs to
+/// until somebody drags it, and then it stays where it was dropped.
+pub fn windowPos() Vec2 {
+    var out: [2]f32 = undefined;
+    cimgui.ember_ui_get_window_pos(&out);
+    return .{ .x = out[0], .y = out[1] };
+}
+
 pub fn contentAvail() Vec2 {
     var out: [2]f32 = undefined;
     cimgui.ember_ui_get_content_region_avail(&out);

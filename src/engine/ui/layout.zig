@@ -253,7 +253,9 @@ pub fn fullscreen(ctx: *Context, id: []const u8, body: *const fn (ctx: *Context)
         .h = h,
         .resizable = false,
         .fixed = true,
-        .flags = cimgui.WindowFlags.NoDecoration |
+        .flags = cimgui.WindowFlags.NoTitleBar |
+            cimgui.WindowFlags.NoResize |
+            cimgui.WindowFlags.NoCollapse |
             cimgui.WindowFlags.NoMove |
             cimgui.WindowFlags.NoSavedSettings |
             cimgui.WindowFlags.NoBringToFrontOnFocus,

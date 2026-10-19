@@ -393,6 +393,19 @@ extern "C" void ember_ui_get_cursor_screen_pos(float* out_xy) {
     out_xy[1] = p.y;
 }
 
+// The CURRENT window's position, in screen pixels.
+//
+// It exists for one reason: a floating tool that belongs to a region has to
+// know whether the USER moved it. The shell places the tool at the region's
+// edge every frame, and stops the moment the window's position is not the
+// one it put there — which is the only way to tell "the user dragged this"
+// from "the layout changed".
+extern "C" void ember_ui_get_window_pos(float* out_xy) {
+    ImVec2 p = ImGui::GetWindowPos();
+    out_xy[0] = p.x;
+    out_xy[1] = p.y;
+}
+
 extern "C" void ember_ui_get_content_region_avail(float* out_wh) {
     ImVec2 a = ImGui::GetContentRegionAvail();
     out_wh[0] = a.x;

@@ -101,6 +101,7 @@ pub extern fn ember_ui_push_item_width(width: f32) void;
 pub extern fn ember_ui_get_cursor_pos(out_xy: [*]f32) void;
 pub extern fn ember_ui_set_cursor_pos(x: f32, y: f32) void;
 pub extern fn ember_ui_get_cursor_screen_pos(out_xy: [*]f32) void;
+pub extern fn ember_ui_get_window_pos(out_xy: [*]f32) void;
 pub extern fn ember_ui_get_content_region_avail(out_wh: [*]f32) void;
 pub extern fn ember_ui_get_item_rect_min(out_xy: [*]f32) void;
 pub extern fn ember_ui_get_item_rect_max(out_xy: [*]f32) void;
@@ -293,31 +294,45 @@ pub const Cond = enum(c_int) { None = 0, Always = 1, Once = 2, FirstUseEver = 4,
 /// WindowFlags — ImGui takes these as ONE integer, so they are integers here.
 ///
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
+/// WindowFlags — ImGui takes these as ONE integer, so they are integers here.
+///
+/// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
+///
+/// They were OFF BY ONE BIT for a long time, and the symptom was everywhere
+/// at once: every window in the editor grew ImGui's own title bar (so each
+/// dock had TWO headers — ImGui's, with the internal name, and the editor's
+/// designed one), the "no title bar" flag actually turned off the RESIZE
+/// grip, and "always auto-resize" actually turned off the BACKGROUND. A flag
+/// that names the wrong bit is a flag that lies, and the only way to keep it
+/// honest is to pin every value to the header.
 pub const WindowFlags = struct {
     pub const @"None": u32 = 0;
-    pub const NoTitleBar: u32 = (1 << @as(u32,1));
-    pub const NoResize: u32 = (1 << @as(u32,2));
-    pub const NoMove: u32 = (1 << @as(u32,3));
-    pub const NoScrollbar: u32 = (1 << @as(u32,4));
-    pub const NoScrollWithMouse: u32 = (1 << @as(u32,5));
-    pub const NoCollapse: u32 = (1 << @as(u32,6));
-    pub const AlwaysAutoResize: u32 = (1 << @as(u32,7));
-    pub const NoBackground: u32 = (1 << @as(u32,8));
-    pub const NoSavedSettings: u32 = (1 << @as(u32,9));
-    pub const NoMouseInputs: u32 = (1 << @as(u32,10));
-    pub const MenuBar: u32 = (1 << @as(u32,11));
-    pub const HorizontalScrollbar: u32 = (1 << @as(u32,12));
-    pub const NoFocusOnAppearing: u32 = (1 << @as(u32,13));
-    pub const NoBringToFrontOnFocus: u32 = (1 << @as(u32,14));
-    pub const AlwaysVerticalScrollbar: u32 = (1 << @as(u32,15));
-    pub const AlwaysHorizontalScrollbar: u32 = (1 << @as(u32,16));
-    pub const AlwaysUseWindowPadding: u32 = (1 << @as(u32,17));
-    pub const NoNavInputs: u32 = (1 << @as(u32,18));
-    pub const NoNavFocus: u32 = (1 << @as(u32,19));
-    pub const UnsavedDocument: u32 = (1 << @as(u32,20));
-    pub const NoNav: u32 = (1 << @as(u32,18)) | (1 << @as(u32,19));
-    pub const NoDecoration: u32 = (1 << @as(u32,1)) | (1 << @as(u32,2)) | (1 << @as(u32,4)) | (1 << @as(u32,6));
-    pub const NoInputs: u32 = (1 << @as(u32,10)) | (1 << @as(u32,18)) | (1 << @as(u32,19));
+    pub const NoTitleBar: u32 = (1 << @as(u32,0));
+    pub const NoResize: u32 = (1 << @as(u32,1));
+    pub const NoMove: u32 = (1 << @as(u32,2));
+    pub const NoScrollbar: u32 = (1 << @as(u32,3));
+    pub const NoScrollWithMouse: u32 = (1 << @as(u32,4));
+    pub const NoCollapse: u32 = (1 << @as(u32,5));
+    pub const AlwaysAutoResize: u32 = (1 << @as(u32,6));
+    pub const NoBackground: u32 = (1 << @as(u32,7));
+    pub const NoSavedSettings: u32 = (1 << @as(u32,8));
+    pub const NoMouseInputs: u32 = (1 << @as(u32,9));
+    pub const MenuBar: u32 = (1 << @as(u32,10));
+    pub const HorizontalScrollbar: u32 = (1 << @as(u32,11));
+    pub const NoFocusOnAppearing: u32 = (1 << @as(u32,12));
+    pub const NoBringToFrontOnFocus: u32 = (1 << @as(u32,13));
+    pub const AlwaysVerticalScrollbar: u32 = (1 << @as(u32,14));
+    pub const AlwaysHorizontalScrollbar: u32 = (1 << @as(u32,15));
+    pub const NoNavInputs: u32 = (1 << @as(u32,16));
+    pub const NoNavFocus: u32 = (1 << @as(u32,17));
+    pub const UnsavedDocument: u32 = (1 << @as(u32,18));
+    pub const NoDocking: u32 = (1 << @as(u32,19));
+    pub const NoNav: u32 = (1 << @as(u32,16)) | (1 << @as(u32,17));
+    /// No title bar, no resize grip, no scrollbar, no collapse. NOT the same
+    /// as "no scrollbar": a panel that lists a thousand entities needs to
+    /// scroll, and `NoDecoration` takes that away with it.
+    pub const NoDecoration: u32 = (1 << @as(u32,0)) | (1 << @as(u32,1)) | (1 << @as(u32,3)) | (1 << @as(u32,5));
+    pub const NoInputs: u32 = (1 << @as(u32,9)) | (1 << @as(u32,16)) | (1 << @as(u32,17));
 };
 
 /// ChildFlags — ImGui takes these as ONE integer, so they are integers here.
@@ -325,15 +340,15 @@ pub const WindowFlags = struct {
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
 pub const ChildFlags = struct {
     pub const @"None": u32 = 0;
-    pub const Borders: u32 = 0;
-    pub const ResizeX: u32 = (1 << @as(u32,1));
-    pub const AlwaysUseWindowPadding: u32 = (1 << @as(u32,2));
+    pub const Borders: u32 = (1 << @as(u32,0));
+    pub const ResizeX: u32 = (1 << @as(u32,2));
+    pub const AlwaysUseWindowPadding: u32 = (1 << @as(u32,1));
     pub const BorderSize: u32 = (1 << @as(u32,3));
     pub const AutoResizeX: u32 = (1 << @as(u32,4));
     pub const AutoResizeY: u32 = (1 << @as(u32,5));
     pub const AlwaysVerticalScrollbar: u32 = (1 << @as(u32,6));
     pub const AlwaysHorizontalScrollbar: u32 = (1 << @as(u32,7));
-    pub const FrameStyle: u32 = (1 << @as(u32,10));
+    pub const FrameStyle: u32 = (1 << @as(u32,8));
 };
 
 /// ButtonFlags — ImGui takes these as ONE integer, so they are integers here.
@@ -341,7 +356,7 @@ pub const ChildFlags = struct {
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
 pub const ButtonFlags = struct {
     pub const @"None": u32 = 0;
-    pub const Left: u32 = 0;
+    pub const Left: u32 = (1 << @as(u32,0));
     pub const Right: u32 = (1 << @as(u32,1));
     pub const Middle: u32 = (1 << @as(u32,2));
 };
@@ -351,10 +366,10 @@ pub const ButtonFlags = struct {
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
 pub const ItemFlags = struct {
     pub const @"None": u32 = 0;
-    pub const NoTabStop: u32 = 0;
-    pub const Disabled: u32 = (1 << @as(u32,1));
-    pub const NoNav: u32 = (1 << @as(u32,2));
-    pub const Selectable: u32 = (1 << @as(u32,3));
+    pub const NoTabStop: u32 = (1 << @as(u32,0));
+    pub const Disabled: u32 = (1 << @as(u32,6));
+    pub const NoNav: u32 = (1 << @as(u32,1));
+    pub const Selectable: u32 = (1 << @as(u32,4));
 };
 
 /// HoveredFlags — ImGui takes these as ONE integer, so they are integers here.
@@ -362,7 +377,7 @@ pub const ItemFlags = struct {
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
 pub const HoveredFlags = struct {
     pub const @"None": u32 = 0;
-    pub const ChildWindows: u32 = 0;
+    pub const ChildWindows: u32 = (1 << @as(u32,0));
     pub const AllowWhenBlockedByPopup: u32 = (1 << @as(u32,1));
     pub const AllowWhenBlockedByActiveItem: u32 = (1 << @as(u32,2));
     pub const ForTooltip: u32 = (1 << @as(u32,3));
@@ -383,11 +398,11 @@ pub const MenuItemFlags = struct {
 /// `flags(a, b)` ORs them. Every value comes from the pinned imgui.h.
 pub const SelectableFlags = struct {
     pub const @"None": u32 = 0;
-    pub const DontClosePopups: u32 = 0;
+    pub const DontClosePopups: u32 = (1 << @as(u32,0));
     pub const SpanAllColumns: u32 = (1 << @as(u32,1));
     pub const AllowDoubleClick: u32 = (1 << @as(u32,2));
     pub const Disabled: u32 = (1 << @as(u32,3));
-    pub const AllowOverlap: u32 = (1 << @as(u32,5));
+    pub const AllowOverlap: u32 = (1 << @as(u32,4));
 };
 
 /// TreeNodeFlags — ImGui takes these as ONE integer, so they are integers here.

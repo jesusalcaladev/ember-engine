@@ -181,7 +181,9 @@ const Gallery = struct {
         // one hides the inner one's padding.
         // The flags are already integers: `cimgui.WindowFlags` is a struct of
         // u32 constants, not an enum, so they OR directly.
-        const flags: u32 = ui.cimgui.WindowFlags.NoDecoration |
+        const flags: u32 = ui.cimgui.WindowFlags.NoTitleBar |
+            ui.cimgui.WindowFlags.NoResize |
+            ui.cimgui.WindowFlags.NoCollapse |
             ui.cimgui.WindowFlags.NoMove |
             ui.cimgui.WindowFlags.NoSavedSettings;
         ui.cimgui.ember_ui_set_next_window_pos(

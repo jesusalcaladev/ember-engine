@@ -194,15 +194,15 @@ Build against this list as things to request, not things to use.
 
 | Missing | Why it matters for the editor |
 |---|---|
-| **UI widgets** (button, panel, label, text input) | There is no UI layer at all. M14 (Text+UI) is unstarted. An editor drawn with sprites and no input handling is not an editor. |
-| **Viewport / camera control** | `render.set_view` sets the view, but there is no camera object, no zoom, no pan, no viewport stacking. |
-| **Undo / redo** | Nothing. This is the single biggest gap for anything that edits a scene, and it is engine work: it needs a command journal or a scene-diff, not editor-local state. |
-| **Asset / project management** | No project file, no asset database, no import step, no hot reload of assets on disk. |
-| **Prefab / scene instantiation** | `SceneId` exists on the ECS side; there is no binding to instantiate one from another. |
-| **File dialogs / paths** | None. The editor will need an IO binding that does not exist. |
-| **Docking / panels / tabs** | No UI, so no answer, and the generic component API is the only lever. |
-| **Selection state** | There is `physics.overlap_rect` for picking, but no engine-side selection model, no multi-select, no a "current object" the inspector binds to. |
-| **Gizmos / handles** | No. `physics.reshape` is the primitive they would drive, but drawing and hitting them is editor work. |
+| **UI widgets** (button, panel, label, text input) | There is no UI layer at all. M14 (Text+UI) is unstarted. An editor drawn with sprites and no input handling is not an editor. **Done in the editor's own right**: the editor has a widget library (`engine/ui`) for its chrome — but the GAME has no UI layer yet, and that is what this row is about. |
+| **Viewport / camera control** | `render.set_view` sets the view, but there is no camera object, no zoom, no pan, no viewport stacking. **Done for the editor** (M5.8): the viewport is a region of the window, the camera is that region's camera, and the pointer is measured from the region's origin. |
+| **Undo / redo** | Nothing. This is the single biggest gap for anything that edits a scene, and it is engine work: it needs a command journal or a scene-diff, not editor-local state. **Done**: `session/model.zig`. |
+| **Asset / project management** | No project file, no asset database, no import step, no hot reload of assets on disk. **Partly done**: the asset browser and the scene hot reload are here; the import pipeline (M6) is not. |
+| **Prefab / scene instantiation** | `SceneId` exists on the ECS side; there is no binding to instantiate one from another. **Done**: flat prefabs with a sidecar (M5.7). |
+| **File dialogs / paths** | None. The editor will need an IO binding that does not exist. **Still open**: the editor writes paths it is given. |
+| **Docking / panels / tabs** | No UI, so no answer, and the generic component API is the only lever. **Done in the editor's own right**: fixed docks, draggable seams, one workspace tab bar (M5.7). |
+| **Selection state** | There is `physics.overlap_rect` for picking, but no engine-side selection model, no multi-select, no a "current object" the inspector binds to. **Partly done**: the current object, its gizmo and the inspector's binding are here (M5.8); the multi-select and the marquee are not. |
+| **Gizmos / handles** | No. `physics.reshape` is the primitive they would drive, but drawing and hitting them is editor work. **Done**: move / rotate / scale handles over the selection (M5.8). The handles over `physics.reshape` and `occluder.set_polygon` are still open. |
 | **Rich text** | M14. `sprite.texture` is the only text you can draw today. |
 
 ## Things that will bite you

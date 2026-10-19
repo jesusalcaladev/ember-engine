@@ -564,7 +564,9 @@ pub const Pane = struct {
     /// for the `--frames` smoke test); the editor shell calls `drawContents`
     /// inside its centre panel so the pane shares the dock with the viewport.
     pub fn draw(self: *Pane, ctx: *ui.Context, dt: f32) void {
-        const flags: u32 = cimgui.WindowFlags.NoDecoration |
+        const flags: u32 = cimgui.WindowFlags.NoTitleBar |
+            cimgui.WindowFlags.NoResize |
+            cimgui.WindowFlags.NoCollapse |
             cimgui.WindowFlags.NoMove |
             cimgui.WindowFlags.NoSavedSettings |
             cimgui.WindowFlags.NoBringToFrontOnFocus;
