@@ -215,6 +215,29 @@ pub const Model = struct {
         try self.selection.append(self.allocator, entity);
     }
 
+    /// Replaces the whole selection with a list — the drag-select marquee.
+    ///
+    /// It REPLACES rather than merges, because a marquee is a statement about
+    /// what is selected, not an addition to what was. The handles are checked
+    /// for liveness first: a marquee that caught an entity which died in the
+    /// same frame would leave a dead handle in the selection, and a dead
+    /// handle in the selection is an entity nothing can act on.
+    pub fn setSelection(self: *Model, entities: []const Entity) !void {
+        self.selection.clearRetainingCapacity();
+        for (entities) |e| {
+            if (!self.cell.isAlive(e)) continue;
+            var already = false;
+            for (self.selection.items) |s| {
+                if (s.index == e.index and s.generation == e.generation) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            try self.selection.append(self.allocator, e);
+        }
+    }
+
     /// Drops dead handles from the selection. Called after every undo
     /// and redo, because those are the only moments a handle can die
     /// without the editor asking for it.

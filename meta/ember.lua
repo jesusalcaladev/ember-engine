@@ -508,6 +508,11 @@ function sprite.get_size(self) end
 ---@return number alpha
 function sprite.get_tint(self) end
 
+---Loads an image, packs it into the shared atlas, and sets the sprite's texture slot and UV. The path is relative to the project root. It is a LOAD-TIME call: it reads a file and packs pixels, so it does not belong in a frame loop.
+---@param self Actor 
+---@param path string the image path, relative to the project root
+function sprite.set_image(self, path) end
+
 
 -- ── point ──
 ---Adds a PointLight2D: a lamp, torch or candle. Falls off in every direction.

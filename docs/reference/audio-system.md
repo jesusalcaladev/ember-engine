@@ -18,7 +18,7 @@ fixed-size event ring.
 
 ```
                 main thread (game / editor)              device thread
-  audio.play(slot) ──► CommandRing ──────────────► mixCallback (RT-safe)
+  audio.play_file(path) ─► CommandRing ───────────► mixCallback (RT-safe)
   audio.stop / set_volume   (SPSC, drop+count)      │ pops commands
   bus gains · listener · master                      ▼
                                           VoicePool + Bank PCM (read)

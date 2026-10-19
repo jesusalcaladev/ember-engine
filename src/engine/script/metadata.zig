@@ -2933,6 +2933,20 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "sprite.set_image",
+        .module = "sprite",
+        .signature = "sprite.set_image(self, path)",
+        .summary = "Loads an image, packs it into the shared atlas, and sets the sprite's texture slot and UV. The path is relative to the project root. It is a LOAD-TIME call: it reads a file and packs pixels, so it does not belong in a frame loop.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "path", .kind = .string, .doc = "the image path, relative to the project root" },
+        },
+        .returns = &.{},
+        .example =
+        \\sprite.set_image(self, "assets/sprites/player.png")
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

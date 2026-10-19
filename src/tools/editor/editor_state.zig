@@ -310,6 +310,18 @@ pub const Editor = struct {
     pending: [32]PendingSet = [_]PendingSet{.{}} ** 32,
     pending_len: usize = 0,
     pending_select: ?Entity = null,
+    /// An entity to ADD to the selection (the Ctrl+click). Separate from
+    /// `pending_select` because the two are different statements: one says
+    /// "this is the selection now", the other says "and this is in it too".
+    pending_select_add: ?Entity = null,
+    /// Clear the whole selection (a click on empty space).
+    pending_clear_select: bool = false,
+    /// The entities a drag-select marquee caught, waiting for the frame's end
+    /// to be applied. The model's selection is an act like any other, and an
+    /// act that allocates runs outside the frame.
+    marquee: [256]Entity = undefined,
+    marquee_len: usize = 0,
+    marquee_pending: bool = false,
     pending_add_component: ?u16 = null,
     /// Open the component picker modal.
     pending_add_component_list: bool = false,
@@ -756,9 +768,51 @@ pub const Editor = struct {
         self.actions_len += 1;
     }
 
+    /// Replaces the selection with one object: it becomes the CURRENT object
+    /// (the one the inspector binds to) and the only member of the set.
     pub fn select(self: *Editor, e: Entity) void {
         self.selection = e;
         self.pending_select = e;
+    }
+
+    /// Adds an object to the selection and makes it current — the Ctrl+click.
+    ///
+    /// The SET lives in the session model (`model.selected()`), which has had
+    /// a multi-selection since M1: the editor simply was not using it, and
+    /// kept a single entity of its own. Two selections is worse than none, so
+    /// the editor's `selection` is now only the CURRENT object and the model
+    /// holds the set.
+    pub fn selectAdd(self: *Editor, e: Entity) void {
+        self.selection = e;
+        self.pending_select_add = e;
+    }
+
+    /// Is this entity in the selection?
+    pub fn isSelected(self: *const Editor, e: Entity) bool {
+        for (self.model.selected()) |s| {
+            if (s.index == e.index and s.generation == e.generation) return true;
+        }
+        return false;
+    }
+
+    /// Empties the selection: the current object and the whole set.
+    ///
+    /// Both, because they are two different things: the current object is
+    /// what the inspector binds to, and the set is what the hierarchy
+    /// highlights. Clearing one and not the other leaves an editor that says
+    /// "nothing is selected" and "four things are selected" at the same time.
+    pub fn clearSelection(self: *Editor) void {
+        self.selection = null;
+        self.pending_select = null;
+        self.pending_select_add = null;
+        self.pending_clear_select = true;
+    }
+
+    /// How many objects are selected. The HUD says it, because a selection of
+    /// five that looks like a selection of one is a lie the user cannot see
+    /// through.
+    pub fn selectedCount(self: *const Editor) usize {
+        return self.model.selected().len;
     }
 
     /// The inspector's write path: the widget wrote into a local copy of the
@@ -889,6 +943,22 @@ pub const Editor = struct {
             if (self.world().isAlive(e)) {
                 self.model.select(e) catch {};
             }
+        }
+        if (self.pending_select_add) |e| {
+            self.pending_select_add = null;
+            if (self.world().isAlive(e)) {
+                self.model.addSelection(e) catch {};
+            }
+        }
+        if (self.pending_clear_select) {
+            self.pending_clear_select = false;
+            self.model.clearSelection();
+        }
+        if (self.marquee_pending) {
+            self.marquee_pending = false;
+            // The marquee REPLACES the selection: a box is a statement about
+            // what is selected, not an addition to what was.
+            self.model.setSelection(self.marquee[0..self.marquee_len]) catch {};
         }
     }
 

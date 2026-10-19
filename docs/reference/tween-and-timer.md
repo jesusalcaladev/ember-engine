@@ -269,7 +269,7 @@ The order inside the fixed step is a **contract**:
 
 ```lua
 function M:start()
-  self.bar = ui.set_value(self.ui_bar, 0)
+  ui.set_value(self.ui_bar, 0)
   timer.new(self, 3.0, 2)                      -- during
   timer.set_signals(self, "cooldown_tick", "")
 end

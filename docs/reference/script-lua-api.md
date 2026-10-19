@@ -692,7 +692,7 @@ A tween drives a **component** of an actor, so the renderer draws the result. Se
 
 ```lua
 tween.to(self, "position.x", 200, 0.5, { easing = "out_back" })
-tween.to(self, "tint.a", 0, 0.3, { on_complete = function(self) actor.set_visible(self, false) end })
+tween.to(self, "tint.a", 0, 0.3, { on_complete = function(self) sprite.set_visible(self, false) end })
 ```
 
 ### `tween.chain(parent, child)`

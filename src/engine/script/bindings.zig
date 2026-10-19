@@ -6093,6 +6093,7 @@ pub const registered_names = [_][]const u8{
     "sprite.set_size",
     "sprite.set_tint",
     "sprite.set_uv",
+    "sprite.set_image",
     "sprite.set_atlas",
     "sprite.set_shape",
     "sprite.set_blend",
@@ -6358,4 +6359,150 @@ test "a non-zero handle round-trips through the same path" {
     try testing.expectEqual(@as(u32, 7), restored.generation);
 
     lua.pop(state, 2);
+}
+
+test "every binding in a module table is in the registry" {
+    // The gate (`assertAllDocumented`) checks the REGISTRY against the
+    // metadata. It does not check the MODULE TABLES against the registry, and
+    // that gap let a real binding escape: `sprite.set_image` was installed,
+    // callable from Lua, and absent from `registered_names` — so it had no
+    // metadata, no stub and no line in the reference, and nothing said so.
+    //
+    // The module tables are the source of truth for what Lua can call, so the
+    // registry has to name every one of them. This test is the check.
+    const tables = [_]struct { module: []const u8, names: []const []const u8 }{
+        .{ .module = "globals", .names = &.{ "get", "exists" } },
+        .{ .module = "actor", .names = &.{
+            "get_position", "set_position", "translate", "move_by", "get_rotation",
+            "set_rotation", "get_name", "emit", "set_transform", "get_all",
+            "distance_to", "distance_to_point", "distance_squared_to",
+            "is_within_radius", "is_within_radius_of_point", "direction_to",
+            "angle_to", "get_half_size", "set_linear_velocity", "get_linear_velocity",
+            "apply_impulse", "is_awake", "add_component", "has_component",
+            "remove_component",
+        } },
+        .{ .module = "render", .names = &.{ "set_view", "stats", "set_resident", "all_resident" } },
+        .{ .module = "lighting", .names = &.{ "quality", "set_quality", "stats" } },
+        .{ .module = "light", .names = &.{
+            "new", "kind_of", "describe", "set_color", "set_energy", "set_blend",
+            "set_shadow", "set_mask", "set_cone", "get_energy", "get_radius",
+            "get_cone", "get_shadow",
+        } },
+        .{ .module = "point", .names = &.{ "new", "set_radius" } },
+        .{ .module = "spot", .names = &.{ "new", "set_radius", "set_cone", "set_angle" } },
+        .{ .module = "directional", .names = &.{ "new", "set_angle", "set_height" } },
+        .{ .module = "ambient", .names = &.{ "new", "set_local" } },
+        .{ .module = "occluder", .names = &.{
+            "new", "set_mode", "set_threshold", "set_mask", "set_polygon",
+            "get_mode", "get_threshold", "get_mask", "get_polygon",
+        } },
+        .{ .module = "environment", .names = &.{
+            "new", "set_ambient", "set_clear", "set_bloom", "set_tonemap",
+            "set_fog", "get_ambient", "get_clear", "get_fog",
+        } },
+        .{ .module = "scene", .names = &.{
+            "fade_out", "fade_in", "fade_covered", "fade_clear", "fade_amount",
+            "fading", "tint", "tint_mode", "tint_clear", "tint_amount",
+        } },
+        .{ .module = "particles", .names = &.{ "burst", "stats" } },
+        .{ .module = "anim", .names = &.{
+            "new", "load", "play", "set_param", "stop", "pause", "resume", "seek",
+            "set_speed", "queue", "state", "time", "length", "is_playing",
+        } },
+        .{ .module = "camera", .names = &.{
+            "new", "follow", "zoom_to", "shake", "set_limits", "set_damping",
+            "get_centre",
+        } },
+        .{ .module = "timer", .names = &.{
+            "new", "set_signals", "start", "stop", "kill", "progress", "restart",
+            "set_duration", "get_duration", "get_elapsed", "get_loops",
+            "set_kind", "set_time_scale", "is_finished", "is_paused", "get_dropped",
+        } },
+        .{ .module = "flow", .names = &.{
+            "add_state", "add_transition", "set_initial", "fire", "set_state",
+            "push", "pop", "state", "is_in", "stack",
+        } },
+        .{ .module = "time", .names = &.{
+            "delta", "unscaled_delta", "elapsed", "unscaled_elapsed", "frame",
+            "physics_delta", "scale", "set_scale", "pause", "resume", "is_paused",
+        } },
+        .{ .module = "tween", .names = &.{
+            "to", "chain", "start", "kill", "kill_entity", "kill_all", "is_alive",
+            "count", "time_scale", "set_time_scale", "properties",
+        } },
+        .{ .module = "material", .names = &.{ "new", "set_params", "get_params", "get_shader" } },
+        .{ .module = "sprite", .names = &.{
+            "rect", "circle", "texture", "set_layer", "set_visible", "set_size",
+            "set_tint", "set_uv", "set_atlas", "set_image", "set_shape",
+            "set_blend", "get_size", "get_tint",
+        } },
+        .{ .module = "physics", .names = &.{
+            "cast_ray", "line_of_sight", "stats", "set_view", "set_focus",
+            "create_shape", "reshape", "set_material", "set_sensor", "set_layers",
+            "set_body_type", "set_body_enabled", "overlap_rect", "contains_point",
+            // The physics debug bindings are PARKED (the functions are
+            // commented out), so they are not in the table and not here.
+        } },
+        .{ .module = "world", .names = &.{ "nearby" } },
+        .{ .module = "sm", .names = &.{
+            "add_state", "add_transition", "set_initial", "fire", "set_state",
+            "state", "is_in",
+        } },
+        .{ .module = "input", .names = &.{
+            "is_action_pressed", "is_action_down", "get_axis", "pointer_over_ui",
+        } },
+        .{ .module = "ui", .names = &.{
+            "set_anchor", "set_offset", "set_size", "set_pivot", "set_margin",
+            "set_order", "set_visible", "set_interactive", "set_text", "set_font",
+            "set_color", "set_colors", "set_border", "set_show_text", "set_value",
+            "set_align", "set_enabled", "measure", "rect", "hovered", "pressed",
+            "font_load",
+        } },
+        .{ .module = "rand", .names = &.{
+            "seed", "float", "range", "int", "chance", "sign", "gauss", "choice",
+            "shuffle",
+        } },
+        .{ .module = "noise", .names = &.{ "seed", "value", "perlin", "simplex", "fbm", "ridged" } },
+        .{ .module = "log", .names = &.{ "info", "warn" } },
+        .{ .module = "math", .names = &.{
+            "clamp", "min", "max", "abs", "sign", "floor", "ceil", "round", "fract",
+            "sqrt", "pow", "sin", "cos", "atan2", "lerp", "inverse_lerp", "remap",
+            "smoothstep", "step", "move_toward", "damp", "wrap", "pingpong",
+            "deg_to_rad", "rad_to_deg", "is_close", "ease", "easings",
+        } },
+        .{ .module = "vec2", .names = &.{
+            "new", "dist", "dist_sq", "length", "length_sq", "normalized",
+            "direction", "lerp", "dot", "cross", "angle", "angle_between", "rotate",
+            "perpendicular", "clamp_length", "reflect", "from_angle", "to_vec",
+            "clamped",
+        } },
+        .{ .module = "audio", .names = &.{
+            "play_file", "play_stream", "stop", "stop_all", "set_volume",
+            "set_pitch", "is_playing", "set_master_volume", "set_listener",
+            "solo_bus", "set_bus_send", "bus_gain", "set_bus_volume", "mute_bus",
+            "buses", "stats",
+        } },
+        .{ .module = "sound", .names = &.{
+            "play", "stop", "set_volume", "set_pitch", "set_loop", "set_radius",
+            "set_spread", "is_playing", "describe",
+        } },
+    };
+
+    for (tables) |t| {
+        for (t.names) |name| {
+            var buf: [64]u8 = undefined;
+            const full = std.fmt.bufPrint(&buf, "{s}.{s}", .{ t.module, name }) catch unreachable;
+            var found = false;
+            for (registered_names) |r| {
+                if (std.mem.eql(u8, r, full)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std.debug.print("missing from the registry: {s}\n", .{full});
+                try testing.expect(found);
+            }
+        }
+    }
 }

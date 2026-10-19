@@ -40,23 +40,25 @@ function M:start()
   -- The screen root. One UiCanvas per scene; the first one wins.
   actor.add_component(self, "UiCanvas")
 
-  -- One actor per widget. `find_by_name` is how a script addresses them.
-  self.score_actor = actor.find_by_name(self, "hud_score")
-  self.bar_actor   = actor.find_by_name(self, "hud_bar")
+  -- One actor per widget. There is no `actor.find_by_name` yet, so each widget
+  -- PUBLISHES ITSELF: its own behavior hands its `self` table to the manager,
+  -- and the manager keeps the references. That is the same pattern the global
+  -- scripts use, and it is why a widget's behavior is one line:
+  --
+  --   -- scripts/globals/hud.lua
+  --   function M:register(ui_root)
+  --     ui_root.score = self
+  --   end
+  --
+  -- The manager's `start` collects them:
+  self.score_actor = nil  -- filled in by the widgets as they register
+  self.bar_actor = nil
 
   -- A backdrop on its own actor. `interactive = false` so the HUD does not
   -- swallow clicks meant for the world.
-  local panel = actor.find_by_name(self, "hud_panel")
-  ui.set_color(panel, 0.05, 0.06, 0.09, 0.75)
-  ui.set_border(panel, 1, 1, 1, 0.15, 1)
-
-  ui.set_text(self.score_actor, "Score: 0")
-  ui.set_value(self.bar_actor, 1.0)
-  ui.set_show_text(self.bar_actor, true)
-
-  -- The pause button's caption and id are set on ITS actor.
-  local pause = actor.find_by_name(self, "hud_pause")
-  ui.set_text(pause, "Pause")
+  -- local panel = ... -- the widget's own `self`
+  -- ui.set_color(panel, 0.05, 0.06, 0.09, 0.75)
+  -- ui.set_border(panel, 1, 1, 1, 0.15, 1)
 end
 
 function M:update(dt)

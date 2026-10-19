@@ -322,7 +322,7 @@ this is compile-checked, not a review comment.
 | `audio.set_volume(voice, v)` / `audio.set_pitch(voice, p)` | Live control. |
 | `audio.is_playing(voice) -> bool` | Handle resolves through the generation check. |
 | `audio.set_master_volume(v)` | Bus 0. |
-| `audio.bus_volume(name) -> number` | Read (missing name → 1, documented). |
+| `audio.bus_gain(name) -> number` | Read (missing name → 1, documented). |
 | `audio.set_bus_volume(name, v)` / `audio.mute_bus(name, on)` | The mixer panel's writes. |
 | `audio.buses() -> table` | `{ name = { gain, muted, peak } }` — what the UI reads. |
 | `audio.set_listener(x, y)` | Overrides camera-derived placement. |

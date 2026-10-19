@@ -591,7 +591,8 @@ Emit a custom signal and listen for it:
 ```lua
 function M:start()
   self.speed = 200
-  actor.listen(self, "bounced")  -- start listening for "bounced"
+  -- The `on_signal` method below IS the listener: it is called for every
+  -- signal that fires, and the handler picks the ones it cares about.
 end
 
 function M:update(dt)
@@ -616,9 +617,10 @@ Run the game. When the sprite reaches the right edge, it should reverse
 direction and log "I bounced!".
 
 > **What you learned:** Signals are a way for entities to communicate
-> without direct references. You can emit a signal with `actor.emit` and
-> listen for it with `actor.listen`. The `on_signal` method is called when
-> a signal fires.
+> without direct references. You can emit a signal with `actor.emit`, and
+> you listen for it by DEFINGING `on_signal(name)` — there is no
+> `actor.listen` to call: the method is the subscription, and it is called
+> for every signal that fires. The handler picks the ones it cares about.
 
 ### Exercise 4: Modify a Script While the Game is Running
 

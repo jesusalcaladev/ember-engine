@@ -458,7 +458,7 @@ Imagine you wrote:
 
 ```lua
 -- BAD: reading a physical key
-if input.key_pressed("space") then
+if input.is_action_pressed("jump") then
   -- jump
 end
 ```

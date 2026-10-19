@@ -122,7 +122,7 @@ allowed globals.
 ### Memory usage grows over time
 
 1. Check that you are not creating tables in `update` (use scalar forms).
-2. Check that you are not leaking Lua references (use `actor.destroy` to remove entities).
+2. Check that you are not leaking Lua references (remove the `Sprite` component to hide an entity).
 3. Run with `EMBER_TRACK=1` to enable the tracked allocator.
 
 ## Getting Help

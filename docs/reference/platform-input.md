@@ -164,7 +164,9 @@ fn find(self: *const Input, name: []const u8) ?*const Action {
 }
 ```
 
-## Typical usage from Lua bindings
+## Typical usage
+
+The **Zig** side, which is what the runtime does:
 
 ```zig
 // At setup:
@@ -178,8 +180,13 @@ input.set("move_left",  platform.input.down(glfw.KEY_A),  platform.input.pressed
 input.set("move_right", platform.input.down(glfw.KEY_D), platform.input.pressed(glfw.KEY_D));
 input.set("jump",      platform.input.down(glfw.KEY_SPACE), platform.input.pressed(glfw.KEY_SPACE));
 
-// Lua reads:
-//   input.down("move_left")     -- held
-//   input.pressed("jump")       -- edge
-//   input.axis("move_left", "move_right")  -- -1, 0, or +1
+// The LUA side is a different, smaller surface. The actions come from the
+// project's input map, and a script never sees a key:
+//
+//   input.is_action_down("move_left")              -- held
+//   input.is_action_pressed("jump")                -- the edge this frame
+//   input.get_axis("move_left", "move_right")      -- -1, 0, or +1
+//
+// The names are ACTIONS, not keys: rebinding the game is editing the input
+// map in `project.config`, and no script changes.
 ```

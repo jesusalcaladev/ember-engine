@@ -263,7 +263,7 @@ end
 ```
 
 > **Why This Matters for Games:** You'll write conditions like
-> `if player.hp <= 0 then ... end` or `if input.is_pressed("jump") then ... end`.
+> `if player.hp <= 0 then ... end` or `if input.is_action_pressed("jump") then ... end`.
 > Understanding truthiness prevents bugs where a health of `0` accidentally
 > triggers a "player is alive" branch.
 
@@ -380,7 +380,7 @@ end
 ```
 
 > **Why This Matters for Games:** Control flow is the skeleton of game logic.
-> `if input.is_pressed("jump") then` is an if statement. `for i = 1, #enemies do`
+> `if input.is_action_pressed("jump") then` is an if statement. `for i = 1, #enemies do`
 > is a for loop. `while player.is_alive do` is a while loop. You'll use
 > these constantly.
 

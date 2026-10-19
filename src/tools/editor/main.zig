@@ -869,6 +869,9 @@ pub fn main(init: std.process.Init) !void {
         // panels.
         if (editor.workspace == .scene) {
             editor.viewport.drawOverlay(&editor, &ui_ctx);
+            // The marquee is drawn on the same list: it is the selection that
+            // does not exist yet.
+            editor.viewport.drawMarquee(&ui_ctx);
         }
 
         // The viewport's HUD: the tools, the gizmo modes, the toggles and the

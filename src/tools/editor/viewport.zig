@@ -230,6 +230,20 @@ pub const Viewport = struct {
     edited_this_frame: bool = false,
     /// The world point under the pointer, for the HUD's readout.
     cursor_world: Vec2 = .{},
+    /// The drag-select marquee: the box the user is dragging, in SCREEN
+    /// pixels (the window's).
+    ///
+    /// It starts on empty space and it does NOT clear the selection when it
+    /// starts: a press that turns into a drag must not have cleared the
+    /// selection on the way, or a drag to select four things would have
+    /// deselected first and reselected second, and the undo would show it.
+    marquee_active: bool = false,
+    marquee_start: Vec2 = .{},
+    marquee_now: Vec2 = .{},
+    /// How many objects are selected, read once a frame for the HUD. The
+    /// viewport does not own the selection — the editor does — so it is a
+    /// copy, refreshed where the editor is in reach.
+    selected_count: usize = 0,
     /// Set when the viewport should fit the scene into the region: at boot,
     /// and after a scene is replaced. It is cleared the frame it is acted on.
     needs_frame: bool = true,
@@ -374,6 +388,7 @@ pub const Viewport = struct {
         const in_region = vp.region.contains(mouse);
         const local = vp.localPoint(mouse);
         vp.cursor_world = vp.cam.targetToWorld(mouse);
+        vp.selected_count = ed.selectedCount();
 
         // The first frame with a known region — and every frame after a scene
         // is replaced — fits the content into the view. An editor that opens
@@ -420,9 +435,9 @@ pub const Viewport = struct {
 
         if (vp.tool == .cursor and !over_ui and in_region) {
             const mouse_w = vp.cursor_world;
-            if (vp.grabbed == .none) vp.refreshHover(ed, mouse, mouse_w);
+            if (vp.grabbed == .none and !vp.marquee_active) vp.refreshHover(ed, mouse, mouse_w);
 
-            if (m.justPressed(0)) vp.beginGrab(ed, mouse_w);
+            if (m.justPressed(0)) vp.beginGrab(ed, mouse, mouse_w, m.ctrl);
             if (m.buttons[0] and vp.grabbed != .none) {
                 vp.dragTo(ed, mouse_w, m.ctrl, m.shift);
             } else if (!m.buttons[0]) {
@@ -442,6 +457,14 @@ pub const Viewport = struct {
             } else {
                 vp.hover = null;
             }
+        }
+
+        // The marquee follows the pointer wherever it goes, and it ends on
+        // the release — not on the press, because a press that turns into a
+        // drag must not clear the selection on the way.
+        if (vp.marquee_active) {
+            vp.marquee_now = mouse;
+            if (!m.buttons[0]) vp.finishMarquee(ed);
         }
     }
 
@@ -479,17 +502,28 @@ pub const Viewport = struct {
         if (pickEntity(ed.world(), mouse_w)) |e| vp.hover = .{ .entity = e };
     }
 
-    fn beginGrab(vp: *Viewport, ed: *Editor, mouse_w: Vec2) void {
+    fn beginGrab(vp: *Viewport, ed: *Editor, mouse: Vec2, mouse_w: Vec2, ctrl: bool) void {
         const h = vp.hover orelse return;
         switch (h) {
             .none => {
-                // Empty space clears the selection — Godot's rule, and the
-                // only rule a "select what I clicked" editor can keep.
-                ed.selection = null;
+                // Empty space starts a MARQUEE. The selection is cleared when
+                // the drag ends without having caught anything — a click that
+                // turns into a drag must not have cleared the selection on
+                // the way.
+                vp.marquee_active = true;
+                vp.marquee_start = mouse;
+                vp.marquee_now = mouse;
             },
             .entity => |e| {
                 if (!ed.world().isAlive(e)) return;
                 const t = ed.world().get(e, ecs.components.Transform) orelse return;
+                // Ctrl+click ADDS to the selection and does not start a drag:
+                // the second Ctrl+click of a multi-select is a selection, not
+                // the beginning of a move.
+                if (ctrl) {
+                    ed.selectAdd(e);
+                    return;
+                }
                 ed.select(e);
                 // Dragging the object itself MOVES it, but only when the
                 // gizmo says so: in the rotate and scale modes a drag on the
@@ -507,6 +541,47 @@ pub const Viewport = struct {
                 vp.grab_entity = sel;
                 vp.snapshot(ed, sel, t, mouse_w);
             },
+        }
+    }
+
+    /// The marquee ends: the entities it caught become the selection.
+    fn finishMarquee(vp: *Viewport, ed: *Editor) void {
+        vp.marquee_active = false;
+        const w = @abs(vp.marquee_now.x - vp.marquee_start.x);
+        const h = @abs(vp.marquee_now.y - vp.marquee_start.y);
+        if (w < 4 and h < 4) {
+            // A click, not a drag: it clears the selection.
+            ed.clearSelection();
+            return;
+        }
+
+        // The box in world units. The pointer's two corners are enough: the
+        // camera is uniform, so a screen rectangle is a world rectangle.
+        const a = vp.cam.targetToWorld(vp.marquee_start);
+        const b = vp.cam.targetToWorld(vp.marquee_now);
+        const min_x = @min(a.x, b.x);
+        const max_x = @max(a.x, b.x);
+        const min_y = @min(a.y, b.y);
+        const max_y = @max(a.y, b.y);
+
+        const world = ed.world();
+        const count = entitiesInRect(
+            world,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            ed.marquee[0..],
+        );
+
+        ed.marquee_len = count;
+        ed.marquee_pending = true;
+        // The CURRENT object is the first one caught, so the inspector has
+        // something to bind to the moment the box is released.
+        if (count > 0) {
+            ed.selection = ed.marquee[0];
+        } else {
+            ed.clearSelection();
         }
     }
 
@@ -868,6 +943,28 @@ pub const Viewport = struct {
         }
     }
 
+    /// The drag-select marquee: the box the user is dragging.
+    ///
+    /// It is drawn on the same list as the gizmo and under the same clip, and
+    /// it is the one piece of the viewport that is drawn while the pointer is
+    /// DOWN — the selection it will produce does not exist yet.
+    pub fn drawMarquee(vp: *Viewport, ctx: *ui.Context) void {
+        if (!vp.marquee_active) return;
+        const list = ui.draw.backgroundList();
+        list.pushClip(vp.region.rect(), true);
+        defer list.popClip();
+
+        const r = ui.draw.rect(
+            @min(vp.marquee_start.x, vp.marquee_now.x),
+            @min(vp.marquee_start.y, vp.marquee_now.y),
+            @max(vp.marquee_start.x, vp.marquee_now.x),
+            @max(vp.marquee_start.y, vp.marquee_now.y),
+        );
+        const col = ctx.theme.colors.accent;
+        list.rect(r, col.withAlpha(0.12), 0);
+        list.rectOutline(r, col, 0, 1.0);
+    }
+
     fn drawMoveGizmo(vp: *Viewport, list: ui.draw.List, box: Box, t: *const ui.Theme) void {
         const hot_x = vp.grabbed == .move_x or hoverHandle(vp.hover, .move_x);
         const hot_y = vp.grabbed == .move_y or hoverHandle(vp.hover, .move_y);
@@ -1009,8 +1106,8 @@ pub const Viewport = struct {
         })) vp.gizmo = .scale;
     }
 
-    /// The toggles and the readouts: what the viewport is showing, and where
-    /// the pointer is.
+    /// The toggles and the readouts: what the viewport is showing, where the
+    /// pointer is, and how much is selected.
     fn hudToggles(ctx: *ui.Context) void {
         const vp = drawing_vp orelse return;
         if (ui.button.render(.{
@@ -1030,6 +1127,16 @@ pub const Viewport = struct {
         })) vp.snap = !vp.snap;
 
         cimgui.ember_ui_same_line(0, 10);
+
+        // How much is selected. A selection of five that looks like a
+        // selection of one is a lie the user cannot see through.
+        const count = vp.selected_count;
+        if (count > 1) {
+            var count_buf: [32]u8 = undefined;
+            const count_text = std.fmt.bufPrint(&count_buf, "{d} selected", .{count}) catch "?";
+            ui.text.caption(ctx, count_text);
+            cimgui.ember_ui_same_line(0, 8);
+        }
 
         var zoom_buf: [32]u8 = undefined;
         const zoom_text = std.fmt.bufPrint(&zoom_buf, "{d:.0}%", .{vp.cam.zoom * 100}) catch "100%";
@@ -1150,6 +1257,42 @@ fn isOriginLine(v: f32, thin: f32) bool {
     return @abs(v) < thin;
 }
 
+/// The entities whose box the rectangle TOUCHES, in world units.
+///
+/// It touches rather than contains: a marquee that only caught the entities
+/// it fully swallowed would be useless on small sprites, and "did the box
+/// touch it" is the question a user is really asking.
+///
+/// The result is written into `out` and its LENGTH returned — the caller
+/// owns the buffer, and a frame may not allocate.
+fn entitiesInRect(
+    world: *ecs.World,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+    out: []Entity,
+) usize {
+    var count: usize = 0;
+    var slot: usize = 0;
+    while (slot < world.slotCount()) : (slot += 1) {
+        const e = world.entityAtSlot(slot) orelse continue;
+        const t = world.get(e, ecs.components.Transform) orelse continue;
+        const sp = world.get(e, ecs.components.Sprite) orelse continue;
+        if (!sp.visible) continue;
+        const hx = sp.size.x * 0.5 * @abs(t.scale.x);
+        const hy = sp.size.y * 0.5 * @abs(t.scale.y);
+        if (t.position.x + hx < min_x) continue;
+        if (t.position.x - hx > max_x) continue;
+        if (t.position.y + hy < min_y) continue;
+        if (t.position.y - hy > max_y) continue;
+        if (count >= out.len) break;
+        out[count] = e;
+        count += 1;
+    }
+    return count;
+}
+
 /// Topmost entity under the world point. "Topmost" = the highest sprite
 /// layer, then the stable order inside it, then the later slot — the exact
 /// tie-breaks the renderer's painter's sort uses, so picking and drawing
@@ -1237,4 +1380,46 @@ test "viewport: a scale of zero is a sliver, not a hole" {
     try testing.expectApproxEqAbs(@as(f32, 2.5), clampScale(2.5), 0.0001);
     // A flip across the centre stays legal: negative scales are legal.
     try testing.expectApproxEqAbs(@as(f32, -3.0), clampScale(-3.0), 0.0001);
+}
+
+test "viewport: the marquee catches what it touches" {
+    var world = ecs.World.init(testing.allocator);
+    defer world.deinit();
+
+    const a = try world.spawn(.{
+        ecs.components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        ecs.components.Sprite{ .size = .{ .x = 20, .y = 20 } },
+    });
+    const b = try world.spawn(.{
+        ecs.components.Transform{ .position = .{ .x = 100, .y = 0 } },
+        ecs.components.Sprite{ .size = .{ .x = 20, .y = 20 } },
+    });
+    const hidden = try world.spawn(.{
+        ecs.components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        ecs.components.Sprite{ .size = .{ .x = 20, .y = 20 }, .visible = false },
+    });
+
+    var out: [8]Entity = undefined;
+
+    // A box around the first one catches it and NOT the one a hundred units
+    // away.
+    const one = entitiesInRect(&world, -15, 15, -15, 15, out[0..]);
+    try testing.expectEqual(@as(usize, 1), one);
+    try testing.expectEqual(a.index, out[0].index);
+
+    // A box that reaches the second one catches both.
+    const two = entitiesInRect(&world, -15, 115, -15, 15, out[0..]);
+    try testing.expectEqual(@as(usize, 2), two);
+
+    // An INVISIBLE sprite is not caught: a selection of something the user
+    // cannot see is a selection they cannot make.
+    _ = hidden;
+    const vis = entitiesInRect(&world, -1000, 1000, -1000, 1000, out[0..]);
+    try testing.expectEqual(@as(usize, 2), vis);
+
+    // A box that touches an entity's EDGE catches it: "did the box touch it"
+    // is the question, not "did the box swallow it".
+    const edge = entitiesInRect(&world, 9, 12, -2, 2, out[0..]);
+    try testing.expectEqual(@as(usize, 1), edge);
+    try testing.expectEqual(b.index, out[0].index);
 }

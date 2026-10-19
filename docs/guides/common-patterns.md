@@ -668,12 +668,13 @@ function M:start()
   self.pool_size = 50
   self.active = {}
 
-  -- Pre-spawn hidden actors
-  for i = 1, self.pool_size do
-    local obj = actor.spawn(self, "bullet")
+  -- The pool's actors are DECLARED IN THE SCENE: there is no `actor.spawn`
+  -- yet, so a pool is a set of actors that are hidden until they are needed.
+  -- Each one publishes itself to the manager when it starts.
+  for _, obj in ipairs(self.pool) do
     actor.set_position(obj, 0, 0)
-    actor.set_visible(obj, false)
-    table.insert(self.pool, obj)
+    sprite.set_visible(obj, false)
+    self.active[obj] = false
   end
 end
 
@@ -681,7 +682,7 @@ function M:get_from_pool()
   for _, obj in ipairs(self.pool) do
     if not self.active[obj] then
       self.active[obj] = true
-      actor.set_visible(obj, true)
+      sprite.set_visible(obj, true)
       return obj
     end
   end
@@ -690,7 +691,7 @@ end
 
 function M:return_to_pool(obj)
   self.active[obj] = nil
-  actor.set_visible(obj, false)
+  sprite.set_visible(obj, false)
 end
 
 function M:update(dt)
@@ -761,9 +762,15 @@ function M:update(dt)
 end
 
 function M:spawn()
-  local obj = actor.spawn(self, "enemy")
+  -- The enemies are DECLARED IN THE SCENE and reused: there is no
+  -- `actor.spawn` yet, so a spawner is a pool of actors that are hidden until
+  -- their turn comes. The pool is the scene's `enemy` actors; each one
+  -- publishes itself to the manager when it starts.
+  local obj = self:take_enemy()
+  if not obj then return end
   local x = rand.float(0, 1280)
   actor.set_position(obj, x, -50)
+  sprite.set_visible(obj, true)
   self.alive = self.alive + 1
 end
 
@@ -1155,7 +1162,9 @@ function M:on_signal(name)
     self.hp = self.hp - event_data.amount
     if self.hp <= 0 then
       actor.emit(self, "died")
-      actor.destroy(self)
+      -- There is no `actor.destroy` yet: removing the Sprite is how an actor
+      -- leaves the screen today.
+      actor.remove_component(self, "Sprite")
     end
   end
 end
@@ -1217,7 +1226,9 @@ function M:on_signal(name)
     self.hp = self.hp - event_data.amount
     if self.hp <= 0 then
       EventBus:emit("player_died", { score = self.score, time = self.time })
-      actor.destroy(self)
+      -- There is no `actor.destroy` yet: removing the Sprite is how an actor
+      -- leaves the screen today.
+      actor.remove_component(self, "Sprite")
     end
   end
 end
@@ -1699,7 +1710,7 @@ function M:update(dt)
     -- Update UV rect to show the current frame
     local u0 = self.frame / self.frames
     local u1 = (self.frame + 1) / self.frames
-    actor.set_sprite_uv(self, u0, 0, u1, 1)
+    sprite.set_uv(self, u0, 0, u1, 1)
   end
 end
 

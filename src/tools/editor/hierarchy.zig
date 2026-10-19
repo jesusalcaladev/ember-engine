@@ -243,9 +243,12 @@ fn scrollBody(ctx: *ui.Context) void {
     }
 }
 
+/// Is this entity in the selection?
+///
+/// The whole SET, not just the current object: a multi-selection the
+/// hierarchy does not show is a multi-selection the user cannot see.
 fn isSelected(ed: *Editor, e: Entity) bool {
-    const cur = ed.selection orelse return false;
-    return cur.index == e.index and cur.generation == e.generation;
+    return ed.isSelected(e);
 }
 
 /// The kinds a hierarchy row accepts, declared once — the row's `drop` needs a

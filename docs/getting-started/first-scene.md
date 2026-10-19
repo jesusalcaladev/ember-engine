@@ -528,7 +528,10 @@ enemy entity and the editor would generate this Lua for you:
 local M = {}
 
 function M:start()
-  self.center = 1  -- scene id of the player
+  -- The centre of the orbit is where the actor STARTED. There is no
+  -- "position by tag": the actor's own position is the anchor, and the
+  -- offset is kept in a field.
+  self.cx, self.cy = actor.get_position(self)
   self.radius = 100
   self.angle = 0
   self.speed = 2  -- radians per second
@@ -536,9 +539,8 @@ end
 
 function M:update(dt)
   self.angle = self.angle + self.speed * dt
-  local px, py = actor.get_position_by_tag(self, self.center)
-  local x = px + math.cos(self.angle) * self.radius
-  local y = py + math.sin(self.angle) * self.radius
+  local x = self.cx + math.cos(self.angle) * self.radius
+  local y = self.cy + math.sin(self.angle) * self.radius
   actor.set_position(self, x, y)
 end
 
