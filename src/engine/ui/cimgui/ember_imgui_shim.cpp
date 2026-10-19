@@ -423,6 +423,10 @@ extern "C" void ember_ui_same_line(float offset_from_start, float spacing) {
     ImGui::SameLine(offset_from_start, spacing);
 }
 
+extern "C" void ember_ui_set_scroll_here_y(float center_y_ratio) {
+    ImGui::SetScrollHereY(center_y_ratio);
+}
+
 extern "C" void ember_ui_indent(float width) {
     ImGui::Indent(width);
 }
@@ -641,13 +645,53 @@ extern "C" void ember_ui_end_menu_bar(void) {
     ImGui::EndMenuBar();
 }
 
+extern "C" int ember_ui_begin_menu(const char* label, int enabled) {
+    return ImGui::BeginMenu(label, enabled != 0) ? 1 : 0;
+}
+
+extern "C" void ember_ui_end_menu(void) {
+    ImGui::EndMenu();
+}
+
+extern "C" int ember_ui_is_key_pressed(int key, int repeat) {
+    return ImGui::IsKeyPressed((ImGuiKey)key, repeat != 0) ? 1 : 0;
+}
+
+// The size of the frame ImGui just rendered: draw lists, vertices, indices.
+// Read after `ImGui::Render()`, which `ember_ui_render` calls. A frame of
+// geometry with zero vertices is the difference between "the UI drew" and "the
+// UI's draw list was empty", and no log line can tell them apart otherwise.
+extern "C" void ember_ui_draw_stats(int* out) {
+    ImDrawData* dd = ImGui::GetDrawData();
+    out[0] = dd ? dd->CmdListsCount : 0;
+    out[1] = dd ? dd->TotalVtxCount : 0;
+    out[2] = dd ? dd->TotalIdxCount : 0;
+}
+
+extern "C" int ember_ui_is_key_down(int key) {
+    return ImGui::IsKeyDown((ImGuiKey)key) ? 1 : 0;
+}
+
+// A double click, asked of the ITEM the caller just submitted (ImGui tracks the
+// hovered item), not of the mouse in the abstract. `widget.submit` uses
+// InvisibleButton, which has no activation signal of its own — this is what
+// makes a hierarchy row's double-click mean something.
+extern "C" int ember_ui_is_mouse_double_clicked(int button) {
+    return ImGui::IsMouseDoubleClicked((ImGuiMouseButton)button) ? 1 : 0;
+}
+
+// Bit 0 of `flags` is "disabled" (see `MenuItemFlags` in cimgui.zig). The
+// previous version accepted the flag and then ignored it, which made every
+// greyed-out menu entry in the editor a lie: it looked enabled because it was.
 extern "C" int ember_ui_menu_item(const char* label, const char* shortcut, int* selected, int flags) {
     bool sel = selected != nullptr && *selected != 0;
-    (void)flags;
+    const bool disabled = (flags & 1) != 0;
+    if (disabled) ImGui::BeginDisabled();
     bool clicked = ImGui::MenuItem(label, shortcut, sel);
-    if (clicked && selected != nullptr)
+    if (disabled) ImGui::EndDisabled();
+    if (clicked && !disabled && selected != nullptr)
         *selected = sel ? 0 : 1;
-    return clicked ? 1 : 0;
+    return (clicked && !disabled) ? 1 : 0;
 }
 
 extern "C" int ember_ui_begin_tooltip(void) {
@@ -672,6 +716,49 @@ extern "C" int ember_ui_is_item_clicked(int button) {
 
 extern "C" int ember_ui_is_item_active(void) {
     return ImGui::IsItemActive() ? 1 : 0;
+}
+
+extern "C" int ember_ui_is_mouse_dragging(int button, float lock_threshold) {
+    return ImGui::IsMouseDragging((ImGuiMouseButton)button, lock_threshold) ? 1 : 0;
+}
+
+// ── Drag & drop ──────────────────────────────────────────────────────────────
+// The public half of ImGui's DragDrop API. Rows become sources (SetDragDrop-
+// Payload carries the row's data) and targets (AcceptDragDropPayload hands the
+// caller the bytes; those are valid ONLY between BeginDragDropTarget and
+// EndDragDropTarget, so the Zig side copies them out before returning).
+
+extern "C" int ember_ui_is_drag_drop_active(void) {
+    // GetDragDropPayload() is null whenever no drag is in flight, which is the
+    // active test a shim may ask without dragging imgui_internal.h in.
+    return ImGui::GetDragDropPayload() != nullptr ? 1 : 0;
+}
+
+extern "C" int ember_ui_begin_drag_drop_source(int flags) {
+    return ImGui::BeginDragDropSource((ImGuiDragDropFlags)flags) ? 1 : 0;
+}
+
+extern "C" int ember_ui_set_drag_drop_payload(const char* type, const void* data, unsigned int size) {
+    return ImGui::SetDragDropPayload(type, data, size, ImGuiCond_Always) ? 1 : 0;
+}
+
+extern "C" void ember_ui_end_drag_drop_source(void) {
+    ImGui::EndDragDropSource();
+}
+
+extern "C" int ember_ui_begin_drag_drop_target(void) {
+    return ImGui::BeginDragDropTarget() ? 1 : 0;
+}
+
+extern "C" const void* ember_ui_accept_drag_drop_payload(const char* type, int flags, unsigned int* out_size) {
+    const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(type, (ImGuiDragDropFlags)flags);
+    if (payload == nullptr) return nullptr;
+    if (out_size != nullptr) *out_size = payload->DataSize;
+    return payload->Data;
+}
+
+extern "C" void ember_ui_end_drag_drop_target(void) {
+    ImGui::EndDragDropTarget();
 }
 
 extern "C" int ember_ui_is_item_deactivated_after_edit(void) {

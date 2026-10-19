@@ -29,13 +29,19 @@ const Image = @import("asset_types.zig").Image;
 const AssetGUID = registry.AssetGUID;
 
 /// One asset that changed, as handed to the callback. The `image`, when
-/// present, is borrowed and only valid for the duration of the call.
+/// present, is borrowed and only valid for the duration of the call — and so is
+/// `bytes`, which is the same file's contents. A non-image consumer (the font
+/// layer, a future text-asset layer) gets the new bytes here instead of having
+/// to re-read the path, which would be a second syscall and a race against the
+/// next save.
 pub const Change = struct {
     path: []const u8,
     guid: AssetGUID,
     format: import.Format,
     content_hash: u64,
     image: ?*const Image = null,
+    /// The file's bytes as read for this change. Borrowed, call-duration only.
+    bytes: ?[]const u8 = null,
 };
 
 /// What `reloadPath`/`scanAll` report, without owning anything.
@@ -165,8 +171,10 @@ pub const HotReload = struct {
             .content_hash = hash,
         };
 
-        // Decode images so the callback can upload them; everything else only
-        // needs the bytes, which the caller can re-read.
+        // Decode images so the callback can upload them. Everything else
+        // receives its raw bytes on the `Change` (see `Change.bytes`): the font
+        // layer re-inits from them, and a consumer that only wants the format
+        // ignores them.
         var decoded: ?Image = null;
         if (format.kind() == .image) {
             decoded = image_mod.decodeMemory(self.allocator, bytes) catch null;
@@ -191,6 +199,7 @@ pub const HotReload = struct {
                 .format = format,
                 .content_hash = hash,
                 .image = if (decoded) |*img| img else null,
+                .bytes = bytes,
             });
         }
 

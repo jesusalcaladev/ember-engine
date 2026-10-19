@@ -149,6 +149,173 @@ pub fn decode(allocator: Allocator, text: []const u8) !World {
     return world;
 }
 
+/// Rebuilds an EXISTING world from a document, in place.
+///
+/// The address does not move, and that is the whole point: every subsystem
+/// holds a `*World` (the frame loop, the physics system, the Lua state), so
+/// "load a scene" cannot be "build a new world and hand out a new pointer" —
+/// the callers would keep the old one. Only the CONTENTS change.
+///
+/// Transactional: the document is decoded into a scratch world first, and the
+/// caller's world is replaced only once decoding succeeded. A parse error
+/// therefore leaves the editor exactly where it was instead of in a
+/// half-loaded scene nobody can undo out of.
+pub fn replace(world: *World, text: []const u8) !void {
+    const allocator = world.allocator;
+    const fresh = try decode(allocator, text);
+    // The old contents are released only now, and the scratch world's own
+    // fields move into the caller's cell (the same hand-off `session.Model.init`
+    // performs, and safe for the same reason: nothing in `World` points at its
+    // own address).
+    world.deinit();
+    world.* = fresh;
+}
+
+// ── Flat prefabs ─────────────────────────────────────────────────────────────
+
+/// The document is the same grammar a saved scene uses, and the semantics are
+/// what "flat prefab" needs (Godot's PackedScene, without the nesting):
+///
+/// - `encodeToStringEntities` picks a SUBSET of world entities out as
+///   standalone records. A `Parent` pointing at an entity outside the subset is
+///   dropped, so an instance spawns at the world's root; every other Entity
+///   field is written as the authoring world's scene id.
+/// - `instantiate` spawns every record at a FRESH identity (scene id 0 means
+///   "mint a new one") and keeps each record's tag → fresh-row association in
+///   the tag map. That does two things:
+///     * a reference to a MEMBER re-links to the new copy of the member, and
+///     * a reference to something OUTSIDE the prefab falls back to resolving
+///       against the target world by scene id — right when the target IS the
+///       authoring scene (the common case), and a plain old scene id otherwise.
+///   Then names are uniquified: a second instantiation of a template whose
+///   entity is called `enemy` may not create a second live `enemy`.
+///
+/// Instances are explicit entity lists, they are not applied by NAME — `apply`
+/// patches the matching live entity, which is the other thing a prefab tool
+/// means and not what dropping a prefab in a scene means.
+
+/// A subset of world entities as a standalone document.
+pub fn encodeToStringEntities(world: *World, entities: []const Entity, allocator: Allocator) ![]u8 {
+    var members: std.AutoHashMapUnmanaged(Entity, void) = .{};
+    defer members.deinit(allocator);
+    for (entities) |e| try members.put(allocator, e, {});
+
+    var out: Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try w.print("zson {d}\n", .{version});
+    for (entities) |e| {
+        if (!world.isAlive(e)) continue;
+        try encodePrefabEntity(world, e, &members, w);
+    }
+    return try out.toOwnedSlice();
+}
+
+/// One entity record for a prefab document: `encodeEntity` with the one
+/// prefab-specific rule — the drop-outside-parents rule described above.
+fn encodePrefabEntity(world: *World, e: Entity, members: *const std.AutoHashMapUnmanaged(Entity, void), w: *Writer) !void {
+    try w.print("entity {d} {{\n", .{world.sceneIdOf(e)});
+    const arch = world.archetypeAt(world.archIndexOf(e).?);
+    const row = world.rowOf(e);
+    for (arch.ids, 0..) |id, col| {
+        if (id == components.componentId(components.Parent)) {
+            const bytes = arch.columnBytes(col, row);
+            const link: *const components.Parent = @ptrCast(@alignCast(bytes.ptr));
+            // `invalid` means root already; keeping it writes an empty block —
+            // harmless, but the doc reads the same without it.
+            if (!members.contains(link.parent)) continue;
+        }
+        try w.print("  {s} ", .{components.nameOf(id)});
+        try encodeValueById(id, w, world, arch.columnBytes(col, row));
+        try w.writeByte('\n');
+    }
+    try w.writeAll("}\n");
+}
+
+/// Spawns a prefab document's entities at fresh identities, inside a world
+/// that already has other things in it. Returns how many entities were
+/// created, which is also the caller's journal size.
+///
+/// Anything short of full success leaves SOME instances behind (spawning is
+/// not transactional across an OOM mid-document); the caller logs the error and
+/// the journal stops at the last entity it was told about — so an undo removes
+/// only what the editor recorded. Partial failure surfaces as a smaller-than-
+/// expected instance, never as a dangling reference: every entity's value pass
+/// completes before the next spawn.
+pub fn instantiate(world: *World, text: []const u8) !usize {
+    const allocator = world.allocator;
+    var doc = try Document.scan(allocator, text);
+    defer doc.deinit();
+    var key_ids: [max_key_ids]ComponentId = undefined;
+
+    // Pass 1: every entity exists first, as in `decode` — nothing here knows
+    // how many references point at how many articles yet.
+    var tags = Tags{ .world = world, .allocator = allocator };
+    defer tags.deinit();
+    var created: usize = 0;
+    for (doc.records.items) |*record| {
+        const arch_index = try findArchetypeFor(world, &doc, allocator, record, key_ids[0..]);
+        record.entity = (try world.createRow(arch_index, 0)).entity; // fresh identity
+        try tags.map.put(allocator, record.tag, record.entity);
+        created += 1;
+    }
+
+    // Pass 2: values, members through the fresh map, non-members through the
+    // target world.
+    for (doc.records.items) |*record| {
+        const row = world.rowOf(record.entity);
+        const arch = world.archetypeAt(world.archIndexOf(record.entity).?);
+        for (record.blocks.items) |block| {
+            const col = arch.findColumn(block.id).?;
+            const bytes = arch.columnBytes(col, row);
+            components.writeDefault(block.id, bytes);
+            var cursor = Cursor{ .text = doc.text, .pos = block.body.start };
+            try decodeValueById(block.id, &cursor, bytes, &tags);
+        }
+    }
+
+    // Pass 3: a template's names are plain text, and a world can hold live
+    // entities by those names already (the original the prefab came from, at
+    // the very least). The first instantiation keeps the template's name; every
+    // instance after that gets the first suffix the world does not have.
+    for (doc.records.items) |*record| {
+        if (world.getById(record.entity, components.componentId(components.Name))) |cell| {
+            const name: *components.Name = @ptrCast(@alignCast(cell.ptr));
+            uniquifyName(world, record.entity, name);
+        }
+    }
+    return created;
+}
+
+/// First available `base`, `base_2`, `base_3`, … in the world. Duplicate live
+/// names break `findByName` — a name that resolves to the wrong entity is a bug
+/// that only gets worse — so instantiate makes duplicates impossible at the
+/// source instead of asking callers to lint.
+fn uniquifyName(world: *World, e: Entity, name: *components.Name) void {
+    const base = name.slice();
+    if (world.findByName(base)) |probe| {
+        if (probe.eql(e)) return; // found ourselves: the name is free
+        // A suffix needs room next to the base: the base is kept short enough
+        // that `base_999` — the widest candidate the loop's bound allows — is
+        // exactly `Name.max_len` wide, never truncated.
+        const keep = @min(base.len, components.Name.max_len - 4);
+        var n: u32 = 2;
+        while (n < 1000) : (n += 1) {
+            var buf: [components.Name.max_len]u8 = undefined;
+            const candidate = std.fmt.bufPrint(&buf, "{s}_{d}", .{ base[0..keep], n }) catch break;
+            name.set(candidate);
+            if (world.findByName(name.slice())) |again| {
+                if (again.eql(e)) return;
+            } else return;
+        }
+        // Probes exhausted (a thousand instances of one template in a row would
+        // be the only way to get here): give the original name back and let the
+        // collision be the caller's logged problem, not a panicking one.
+        name.set(base);
+        scoped.warn("could not find a free name for '{s}'", .{base});
+    }
+}
+
 /// Applies a prefab document, or a scene override, onto an existing world:
 /// - Entities are matched by their `Name`. A name that does not exist yet is
 ///   spawned, so the same document both instantiates and patches.
@@ -222,9 +389,230 @@ fn encodeValueById(id: ComponentId, w: *Writer, world: *World, bytes: []const u8
     std.debug.panic("zson: cannot encode component id {d}", .{id});
 }
 
+/// Writes one component's whole value, in the text a `.zson` file would hold
+/// for it.
+///
+/// The public face of the private `encodeValueById`: the editor needs to
+/// record a component's value as text (for a prefab override) and the
+/// reflective dispatch is not something a caller should re-implement.
+pub fn encodeComponentValue(id: ComponentId, w: *Writer, world: *World, bytes: []const u8) !void {
+    return encodeValueById(id, w, world, bytes);
+}
+
+/// Decodes one component's whole value from the text `encodeComponentValue`
+/// wrote.
+///
+/// The counterpart, and the reason the two are symmetric: an override records
+/// a component's value as text and a revert decodes that text back. A round
+/// trip through the same encoder and decoder is what makes the restored value
+/// the prefab's value and not merely a value that parses.
+pub fn decodeComponentValue(id: ComponentId, world: *World, bytes: []u8, text: []const u8) !void {
+    inline for (components.entries, 0..) |entry, i| {
+        if (i == id) {
+            var cursor = Cursor{ .text = text };
+            var tags = Tags{ .world = world, .allocator = world.allocator };
+            defer tags.deinit();
+            return decodeValue(entry.type, &cursor, bytes, &tags);
+        }
+    }
+    return error.UnknownComponent;
+}
+
+/// Spawns a prefab document's entities into an existing world, writing the
+/// created entities into `out` in DOCUMENT order.
+///
+/// The order is the contract: the caller pairs the i-th created entity with
+/// the i-th record of the document, which is how an instance knows the name it
+/// had in the prefab — a name the world may have changed (a second instance
+/// of the same prefab becomes `enemy_2`).
+///
+/// `out` is a caller-owned buffer, so this allocates nothing.
+pub fn instantiateInto(world: *World, text: []const u8, out: []Entity) !usize {
+    const allocator = world.allocator;
+    var doc = try Document.scan(allocator, text);
+    defer doc.deinit();
+    var key_ids: [max_key_ids]ComponentId = undefined;
+
+    // Pass 1: every entity exists first, as in `decode` — nothing here knows
+    // how many references point at how many articles yet.
+    var tags = Tags{ .world = world, .allocator = allocator };
+    defer tags.deinit();
+    var created: usize = 0;
+    for (doc.records.items) |*record| {
+        if (created >= out.len) return error.TooManyEntities;
+        const arch_index = try findArchetypeFor(world, &doc, allocator, record, key_ids[0..]);
+        record.entity = (try world.createRow(arch_index, 0)).entity; // fresh identity
+        try tags.map.put(allocator, record.tag, record.entity);
+        out[created] = record.entity;
+        created += 1;
+    }
+
+    // Pass 2: values, members through the fresh map, non-members through the
+    // target world.
+    for (doc.records.items) |*record| {
+        const row = world.rowOf(record.entity);
+        const arch = world.archetypeAt(world.archIndexOf(record.entity).?);
+        for (record.blocks.items) |block| {
+            const col = arch.findColumn(block.id).?;
+            const bytes = arch.columnBytes(col, row);
+            components.writeDefault(block.id, bytes);
+            var cursor = Cursor{ .text = doc.text, .pos = block.body.start };
+            try decodeValueById(block.id, &cursor, bytes, &tags);
+        }
+    }
+
+    // Pass 3: a template's names are plain text, and a world can hold live
+    // entities by those names already (the original the prefab came from, at
+    // the very least). The first instantiation keeps the template's name; every
+    // instance after that gets the first suffix the world does not have.
+    for (doc.records.items) |*record| {
+        if (world.getById(record.entity, components.componentId(components.Name))) |cell| {
+            const name: *components.Name = @ptrCast(@alignCast(cell.ptr));
+            uniquifyName(world, record.entity, name);
+        }
+    }
+    return created;
+}
+
+/// The names a document's records carry, in document order.
+///
+/// The counterpart of `instantiateInto`'s ordering: the i-th name belongs to
+/// the i-th created entity. A record without a `Name` component contributes an
+/// empty string, which the caller reads as "this one has no name".
+///
+/// The strings are owned by the caller (freed with the allocator that made
+/// them); the returned slice is a list of pointers into those allocations.
+pub fn recordNames(allocator: Allocator, text: []const u8) ![][]const u8 {
+    var doc = try Document.scan(allocator, text);
+    defer doc.deinit();
+
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |n| allocator.free(n);
+        out.deinit(allocator);
+    }
+    for (doc.records.items) |*record| {
+        const name = try doc.decodeName(record) orelse "";
+        try out.append(allocator, try allocator.dupe(u8, name));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// The names of a component's fields, in declaration order.
+///
+/// The editor needs this to draw a component (it draws one row per field) and
+/// to name a field in an override record. It comes from the TYPE, not from a
+/// hand-written table, so a field added to a component shows up in the editor
+/// without anyone updating a list.
+pub fn fieldNames(id: ComponentId, out: [][]const u8) [][]const u8 {
+    var count: usize = 0;
+    inline for (components.entries, 0..) |entry, i| {
+        if (i == id) {
+            inline for (@typeInfo(entry.type).@"struct".fields) |f| {
+                if (count < out.len) {
+                    out[count] = f.name;
+                    count += 1;
+                }
+            }
+        }
+    }
+    return out[0..count];
+}
+
+/// Writes ONE field of one component, in the same text the whole-component
+/// encoder would write for it.
+///
+/// This is what makes an override recordable as text: the value that goes
+/// into the sidecar is byte-for-byte what a `.zson` file would contain, so it
+/// decodes back through the same parser. A field that does not exist is an
+/// error, not a silent nothing — the caller asked for a specific field.
+pub fn encodeField(
+    world: *World,
+    entity: Entity,
+    id: ComponentId,
+    field: []const u8,
+    w: *Writer,
+) !void {
+    const arch = world.archetypeAt(world.archIndexOf(entity).?);
+    const row = world.rowOf(entity);
+    const col = arch.findColumn(id) orelse return error.NoSuchComponent;
+    const bytes = arch.columnBytes(col, row);
+    try encodeFieldOf(id, bytes, field, w, world);
+}
+
+fn encodeFieldOf(
+    comptime_id: ComponentId,
+    bytes: []const u8,
+    field: []const u8,
+    w: *Writer,
+    world: *World,
+) !void {
+    inline for (components.entries, 0..) |entry, i| {
+        if (i == comptime_id) {
+            const T = entry.type;
+            const value: *const T = @ptrCast(@alignCast(bytes.ptr));
+            inline for (@typeInfo(T).@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, field)) {
+                    const fv = @field(value.*, f.name);
+                    return encodeValue(@TypeOf(fv), w, world, std.mem.asBytes(&fv));
+                }
+            }
+            return error.UnknownField;
+        }
+    }
+    return error.UnknownComponent;
+}
+
+/// Decodes ONE field of one component from text, leaving the other fields of
+/// that component alone.
+///
+/// The counterpart of `encodeField`: an override written by the editor goes
+/// back into the component through exactly the parser a `.zson` file would
+/// use, so a value that reads back is a value that loads.
+pub fn decodeField(
+    world: *World,
+    entity: Entity,
+    id: ComponentId,
+    field: []const u8,
+    text: []const u8,
+) !void {
+    const arch = world.archetypeAt(world.archIndexOf(entity).?);
+    const row = world.rowOf(entity);
+    const col = arch.findColumn(id) orelse return error.NoSuchComponent;
+    const bytes = arch.columnBytes(col, row);
+
+    inline for (components.entries, 0..) |entry, i| {
+        if (i == id) {
+            const T = entry.type;
+            inline for (@typeInfo(T).@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, field)) {
+                    const fv: *@TypeOf(@field(@as(T, undefined), f.name)) =
+                        @ptrCast(@alignCast(bytes.ptr + @offsetOf(T, f.name)));
+                    var cursor = Cursor{ .text = text };
+                    var tags = Tags{ .world = world, .allocator = world.allocator };
+                    defer tags.deinit();
+                    return decodeValue(@TypeOf(fv.*), &cursor, std.mem.asBytes(fv), &tags);
+                }
+            }
+            return error.UnknownField;
+        }
+    }
+    return error.UnknownComponent;
+}
+
 fn encodeValue(comptime T: type, w: *Writer, world: *World, bytes: []const u8) !void {
     if (T == components.Name) {
         const value: *const components.Name = @ptrCast(@alignCast(bytes.ptr));
+        try encodeQuoted(w, value.slice());
+        return;
+    }
+    // `InlineText` is `Name`'s bigger sibling and takes the same treatment: it
+    // is a string in every sense an author cares about, so it encodes as a
+    // quoted string rather than as the `{bytes: [0, 0, ...], len: N}` struct it
+    // happens to be laid out as. Without this, a `Label`'s `text` is a 128-byte
+    // array in every scene file and the inspector has nothing to type into.
+    if (T == components.InlineText) {
+        const value: *const components.InlineText = @ptrCast(@alignCast(bytes.ptr));
         try encodeQuoted(w, value.slice());
         return;
     }
@@ -305,6 +693,15 @@ fn decodeValueById(id: ComponentId, cursor: *Cursor, bytes: []u8, tags: *Tags) !
 fn decodeValue(comptime T: type, cursor: *Cursor, bytes: []u8, tags: *Tags) !void {
     if (T == components.Name) {
         const value: *components.Name = @ptrCast(@alignCast(bytes.ptr));
+        const text = try cursor.quoted();
+        value.set(text);
+        return;
+    }
+    // The decode half of `InlineText`'s quoted form. `set` truncates at
+    // `max_len` the same way `Name` does, so a scene file with a long label
+    // loses the tail silently rather than failing to load.
+    if (T == components.InlineText) {
+        const value: *components.InlineText = @ptrCast(@alignCast(bytes.ptr));
         const text = try cursor.quoted();
         value.set(text);
         return;
@@ -629,6 +1026,14 @@ const Tags = struct {
     }
 
     fn resolve(self: *Tags, tag: []const u8) !Entity {
+        // The document's own tags win, and the ORDER matters for one caller:
+        // `instantiate` fills the map with the doc's NUMERIC ids mapped to the
+        // fresh rows it just created. Those ids were minted in an authoring
+        // world, so a live entity of the target world may carry the same number
+        // — the reference must go to the fresh instance, not to the squatter.
+        // Every other caller only ever puts word tags in the map, so the order
+        // is invisible to `decode` and `apply`.
+        if (self.map.get(tag)) |e| return e;
         if (std.fmt.parseInt(SceneId, tag, 10)) |id| {
             if (id == 0) return Entity.invalid;
             // O(1) for anything the document (or the patch target) declares;
@@ -638,7 +1043,6 @@ const Tags = struct {
                 if (index.lookup(self.world, id)) |e| return e;
             } else if (self.world.findBySceneId(id)) |e| return e;
         } else |_| {}
-        if (self.map.get(tag)) |e| return e;
         return error.DanglingReference;
     }
 
@@ -1009,4 +1413,305 @@ test "deeper hierarchy round-trips with references by tag" {
     const reloaded_leaf = reloaded.findByName("leaf").?;
     const reloaded_middle = reloaded.findByName("middle").?;
     try std.testing.expectEqual(reloaded_middle, reloaded.get(reloaded_leaf, components.Parent).?.parent);
+}
+
+test "replace keeps the address and swaps the contents" {
+    // The promise the editor's Open/New Scene path is built on: every subsystem
+    // cached a `*World`, so a load may change what the address holds and may
+    // never change where it is.
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{components.Name.init("old")});
+
+    const address = &world;
+    try replace(&world, "zson 1\nentity 1 {\n  Name \"new\"\n}\n");
+
+    try std.testing.expectEqual(address, &world);
+    try std.testing.expectEqual(@as(usize, 1), world.entityCount());
+    try std.testing.expect(world.findByName("old") == null);
+    try std.testing.expect(world.findByName("new") != null);
+}
+
+test "an empty document is a valid scene, and it is what New Scene writes" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{components.Name.init("a")});
+    _ = try world.spawn(.{components.Name.init("b")});
+
+    try replace(&world, "zson 1\n");
+    try std.testing.expectEqual(@as(usize, 0), world.entityCount());
+    // Still usable afterwards: the archetype table exists and a spawn lands.
+    _ = try world.spawn(.{components.Name.init("after")});
+    try std.testing.expect(world.findByName("after") != null);
+}
+
+test "a failed replace leaves the old world exactly as it was" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{components.Name.init("keeper")});
+    const before = hash(&world);
+
+    try std.testing.expectError(error.Malformed, replace(&world, "zson 1\nentity { nope"));
+    try std.testing.expectEqual(before, hash(&world));
+    try std.testing.expect(world.findByName("keeper") != null);
+}
+
+test "one field encodes and decodes on its own" {
+    // The prefab overrides need exactly this: a single field, as text, that
+    // the same parser reads back. If the field encoder and the field decoder
+    // disagreed with the whole-component ones, an override would restore a
+    // DIFFERENT value than the prefab had — a revert that quietly corrupts.
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const e = try world.spawn(.{
+        components.Name.init("thing"),
+        components.Transform{ .position = .{ .x = 5, .y = -6 } },
+        components.Sprite{ .size = .{ .x = 32, .y = 32 }, .tint = .{ 1, 0.5, 0, 1 } },
+    });
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try encodeField(&world, e, components.componentId(components.Transform), "position", &out.writer);
+    const text = try out.toOwnedSlice();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("{x: 5, y: -6}", text);
+
+    // The whole component writes the same shape, so a value read back from a
+    // field is the value a document would have carried.
+    const whole = try encodeToString(&world, std.testing.allocator);
+    defer std.testing.allocator.free(whole);
+    try std.testing.expect(std.mem.indexOf(u8, whole, "position: {x: 5, y: -6}") != null);
+
+    // And it decodes back into the same place.
+    world.get(e, components.Transform).?.position.x = 999;
+    try decodeField(&world, e, components.componentId(components.Transform), "position", text);
+    const t = world.get(e, components.Transform).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 5), t.position.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -6), t.position.y, 0.0001);
+}
+
+test "a field's names come from the type, not from a table" {
+    var names: [32][]const u8 = undefined;
+    const got = fieldNames(components.componentId(components.Sprite), &names);
+    try std.testing.expect(got.len > 0);
+    var found_tint = false;
+    for (got) |n| {
+        if (std.mem.eql(u8, n, "tint")) found_tint = true;
+    }
+    try std.testing.expect(found_tint);
+}
+
+test "a Label's text is a quoted string, and it round-trips" {
+    // The M14 UI components carry `InlineText`, which is `Name` at 128 bytes.
+    // Special-cased so a scene file reads `text: "Wave 3"` rather than a
+    // 128-element byte array — and so the inspector has a string to edit.
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const e = try world.spawn(.{
+        components.Name.init("hud"),
+        components.Label{ .text = components.InlineText.init("Wave 3") },
+        components.UiProgressBar{ .text = components.InlineText.init("72%"), .show_text = true },
+    });
+
+    const text = try encodeToString(&world, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "text: \"Wave 3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bytes:") == null);
+
+    var reloaded = try decode(std.testing.allocator, text);
+    defer reloaded.deinit();
+    const label = reloaded.get(reloaded.entityAtSlot(e.index).?, components.Label).?;
+    try std.testing.expect(label.text.eql("Wave 3"));
+}
+
+// ── Flat prefab tests ────────────────────────────────────────────────────────
+
+/// The scene the prefab tests author from: a floor (not selected) holding a
+/// letter and its child logo (selected), the letter pointing at the world (a
+/// link that must survive instantiate by resolving against the target world).
+fn prefabAuthoringWorld(a: std.mem.Allocator) !World {
+    var world = World.init(a);
+    errdefer world.deinit();
+    const floor = try world.spawn(.{ components.Name.init("floor"), components.Transform{} });
+    const letter = try world.spawn(.{
+        components.Name.init("letter"),
+        components.Transform{ .position = .{ .x = 5, .y = 6 } },
+        components.Parent{ .parent = floor },
+    });
+    const logo = try world.spawn(.{
+        components.Name.init("logo"),
+        components.Parent{ .parent = letter },
+        components.Sprite{ .size = .{ .x = 16, .y = 16 } },
+    });
+    _ = try world.spawn(.{ components.Name.init("target"), components.Transform{} });
+    _ = logo;
+    return world;
+}
+
+test "a prefab subset drops the outside parent and keeps member references" {
+    var world = try prefabAuthoringWorld(std.testing.allocator);
+    defer world.deinit();
+
+    const letter = world.findByName("letter").?;
+    const logo = world.findByName("logo").?;
+    const text = try encodeToStringEntities(&world, &.{ letter, logo }, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    // Both records are there, the floor is not.
+    try std.testing.expect(std.mem.count(u8, text, "entity ") == 2);
+    try std.testing.expect(std.mem.indexOf(u8, text, "floor") == null);
+    // The member-to-member parent link survived, pointing at the member's
+    // scene id: `logo`'s record points at `letter`, not at itself.
+    const letter_sid = world.sceneIdOf(letter);
+    var want_buf: [64]u8 = undefined;
+    const want_parent_value = try std.fmt.bufPrint(&want_buf, "parent: {d}", .{letter_sid});
+    try std.testing.expect(std.mem.indexOf(u8, text, want_parent_value) != null);
+
+    // And the document still loads as a plain scene of its own...
+    var standalone = try decode(std.testing.allocator, text);
+    defer standalone.deinit();
+    try std.testing.expectEqual(@as(usize, 2), standalone.entityCount());
+    try std.testing.expect(standalone.findByName("letter") != null);
+    try std.testing.expect(standalone.findByName("logo") != null);
+}
+
+test "instantiate spawns fresh identities, re-links members and resolves outsiders" {
+    var world = try prefabAuthoringWorld(std.testing.allocator);
+    defer world.deinit();
+
+    const letter = world.findByName("letter").?;
+    const logo = world.findByName("logo").?;
+    const text = try encodeToStringEntities(&world, &.{ letter, logo }, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    // The doc carries both records and drops the floor link; the `logo` record
+    // points at its member parent via the authoring scene id.
+    const letter_sid = world.sceneIdOf(letter);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "entity "));
+    try std.testing.expect(std.mem.indexOf(u8, text, "floor") == null);
+    var doc_buf: [64]u8 = undefined;
+    const doc_want = try std.fmt.bufPrint(&doc_buf, "parent: {d}", .{letter_sid});
+    try std.testing.expect(std.mem.indexOf(u8, text, doc_want) != null);
+
+    const unique: [6][]const u8 = .{ "letter_2", "logo_2", "letter_3", "logo_3", "letter_4", "logo_4" };
+    var fresh: [6]Entity = undefined;
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const created = try instantiate(&world, text);
+        try std.testing.expectEqual(@as(usize, 2), created);
+        // Names were uniquified against the world: member edges resolved by
+        // name are gone for good, and the fresh instances are reachable by
+        // their new names.
+        fresh[i * 2] = world.findByName(unique[i * 2]).?;
+        fresh[i * 2 + 1] = world.findByName(unique[i * 2 + 1]).?;
+    }
+
+    try std.testing.expectEqual(@as(usize, 4 + 6), world.entityCount());
+
+    // The instance's own parent link was re-stamped, per instance: the logo
+    // instance's parent is the letter instance from the SAME instantiation.
+    try std.testing.expect(fresh[0].eql(world.get(fresh[1], components.Parent).?.parent));
+    try std.testing.expect(fresh[2].eql(world.get(fresh[3], components.Parent).?.parent));
+
+    // And the ROOT instances have no parent at all: the floor was dropped, so
+    // an instance spawns at the world's root — no Parent component, literally,
+    // which is what a root row looks like everywhere else in the engine.
+    try std.testing.expect(world.get(fresh[0], components.Parent) == null);
+    try std.testing.expect(world.get(fresh[2], components.Parent) == null);
+
+    // The values travelled: the letter keeps the position it was authored at.
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 5),
+        world.get(fresh[0], components.Transform).?.position.x,
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 6),
+        world.get(fresh[0], components.Transform).?.position.y,
+        0.0001,
+    );
+
+    // The original template entities were not touched...
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 5),
+        world.get(letter, components.Transform).?.position.x,
+        0.0001,
+    );
+    // ...and `logo` keeps its sprite, which proves the values decoded onto the
+    // right rows rather than onto whatever was hottest.
+    try std.testing.expect(world.has(fresh[1], components.Sprite));
+    try std.testing.expect(world.has(fresh[0], components.Sprite) == false);
+}
+
+test "instantiate resolves a reference to a live NON-member entity" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    // A camera authored in the world, following a live actor OUTSIDE of the
+    // prefab being made. The `Camera2D.target` is the only non-Parent Entity
+    // field a prefab can carry.
+    const player = try world.spawn(.{ components.Name.init("player") });
+
+    const template = try world.spawn(.{
+        components.Name.init("cam"),
+        components.Transform{},
+        components.Camera2D{ .target = player },
+    });
+
+    const text = try encodeToStringEntities(&world, &.{template}, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    // The authoring world's scene id of `player`, written into the doc.
+    const player_sid = world.sceneIdOf(player);
+    var sid_buf: [32]u8 = undefined;
+    const sid_text = try std.fmt.bufPrint(&sid_buf, "{d}", .{player_sid});
+    try std.testing.expect(std.mem.indexOf(u8, text, sid_text) != null);
+
+    _ = try instantiate(&world, text);
+    const inst = world.findByName("cam_2").?;
+    // The non-member reference resolves against the target world: the instance
+    // follows the same `player` the template was authored following.
+    try std.testing.expect(player.eql(world.get(inst, components.Camera2D).?.target));
+}
+
+test "instantiateInto reports the entities in document order, and recordNames names them" {
+    // The editor pairs the i-th created entity with the i-th record of the
+    // prefab, to know the name the instance had IN THE PREFAB. A world may
+    // have renamed it (`enemy` → `enemy_2`), so the pairing has to come from
+    // the document, not from the world.
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const doc =
+        \\zson 1
+        \\entity 1 {
+        \\  Name "first"
+        \\}
+        \\entity 2 {
+        \\  Name "second"
+        \\}
+    ;
+
+    const names = try recordNames(std.testing.allocator, doc);
+    defer {
+        for (names) |n| std.testing.allocator.free(n);
+        std.testing.allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("first", names[0]);
+    try std.testing.expectEqualStrings("second", names[1]);
+
+    var out: [8]Entity = undefined;
+    const created = try instantiateInto(&world, doc, &out);
+    try std.testing.expectEqual(@as(usize, 2), created);
+    try std.testing.expectEqualStrings("first", world.get(out[0], components.Name).?.slice());
+    try std.testing.expectEqualStrings("second", world.get(out[1], components.Name).?.slice());
+}
+
+test "instantiate of an empty document creates nothing" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    const created = try instantiate(&world, "zson 1\n");
+    try std.testing.expectEqual(@as(usize, 0), created);
+    try std.testing.expectEqual(@as(usize, 0), world.entityCount());
 }

@@ -44,6 +44,7 @@ pub const input = @import("input.zig");
 pub const behavior = @import("behavior.zig");
 pub const context = @import("context.zig");
 pub const statemachine = @import("statemachine.zig");
+pub const tween = @import("tween.zig");
 pub const spatial = @import("spatial.zig");
 pub const steer = @import("steer.zig");
 pub const batch = @import("batch.zig");

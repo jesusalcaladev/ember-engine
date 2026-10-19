@@ -20,8 +20,11 @@
 const std = @import("std");
 const ecs = @import("ecs");
 const input_mod = @import("input.zig");
+const lua_c = @import("luajit.zig");
 const core_random = @import("core").random;
+const core_loop = @import("core").loop;
 const statemachine = @import("statemachine.zig");
+const tween_mod = @import("tween.zig");
 const spatial = @import("spatial.zig");
 const physics_mod = @import("physics");
 const assets = @import("assets");
@@ -71,6 +74,26 @@ pub const SceneHooks = struct {
     fading: *const fn (ctx: ?*anyopaque) bool,
 };
 
+/// The M14 CanvasModulate bindings (`scene.tint*`), as a vtable over the
+/// runtime's `Tint`.
+///
+/// Same shape as `SceneHooks` and for the same reason: the `script` module
+/// cannot import `render`, so the tint's state crosses as behaviour. The mode
+/// travels as a `u8` (0 off, 1 multiply, 2 add, 3 alpha) for the same reason it
+/// does in the uniform — the two modules must not each own an enum the other
+/// has to agree with. `ctx` points at the runtime's `Tint`.
+pub const TintHooks = struct {
+    ctx: ?*anyopaque,
+    /// Applies rgb + amount, turning the effect on (multiply) if it was off.
+    set: *const fn (ctx: ?*anyopaque, r: f32, g: f32, b: f32, a: f32) void,
+    /// Sets only the mix, 0 off, 1 multiply, 2 add, 3 alpha.
+    set_mode: *const fn (ctx: ?*anyopaque, mode: u8) void,
+    /// Disables the tint and forgets its colour.
+    clear: *const fn (ctx: ?*anyopaque) void,
+    /// Current strength, 0..1.
+    amount: *const fn (ctx: ?*anyopaque) f32,
+};
+
 /// The M9 `particles.*` bindings that need the pool rather than a component.
 ///
 /// Configuring an emitter is a plain component write and goes through
@@ -86,6 +109,59 @@ pub const ParticleHooks = struct {
     /// fixed array and not a struct, so the two modules cannot disagree about a
     /// layout: the count is what pairs each number with its name.
     stats: *const fn (ctx: ?*anyopaque, out: *[16]f64) u32,
+};
+
+/// The global-script surface (scripts mounted with NO actor), as a vtable over
+/// the `Behaviors` system that owns them.
+///
+/// Same shape and same reason as `LightingHooks`: the globals LIVE in the
+/// behavior system (they share its VM, its script cache and its Lua refs), and
+/// `bindings.zig` cannot import `behavior.zig` — that import is circular, since
+/// behavior.zig registers the bindings. So what a binding needs crosses as two
+/// function pointers, and the editor and a test keep separate globals because
+/// the pointer reaches through each Behaviors' own context upvalue.
+pub const GlobalsHooks = struct {
+    ctx: ?*anyopaque,
+    /// Pushes the named global script's `self` table onto the Lua stack and
+    /// returns true; false (nothing pushed) when no global with that name is
+    /// mounted. PUSHING instead of returning a registry ref keeps the ref
+    /// arithmetic inside the one module that owns the VM: a binding must never
+    /// `lua_getref` a table it cannot reliably unref.
+    push_self: *const fn (ctx: ?*anyopaque, L: ?*lua_c.lua_State, name: []const u8) bool,
+    /// True when a global script with this name is mounted (has a live `self`).
+    exists: *const fn (ctx: ?*anyopaque, name: []const u8) bool,
+};
+
+/// The M14 `ui.*` bindings that need the runtime's font cache and the frame's
+/// resolved UI state, as a vtable.
+///
+/// Two module boundaries meet here at once. The `script` module cannot import
+/// `render`, so the glyph rasterizer and its atlas cross as function pointers;
+/// and the per-frame `ui_system.State` lives in the RUNTIME (it is a local of
+/// the frame loop), not on the `Context`, so the hover/press queries cross the
+/// same way. It is the same erased shape as `LightingHooks`, and for the same
+/// reason: two runtimes (the editor and a test) can each have their own UI and
+/// must not share one. `ctx` points at the runtime's UI holder.
+///
+/// Null in a harness with no renderer wired (a headless tool, a unit test): the
+/// queries then report `false` and `font_load` returns 0, so a missing UI fails
+/// safe instead of dereferencing a null pointer.
+pub const UiHooks = struct {
+    ctx: ?*anyopaque,
+    /// Measures `text` in the font `font_id` (0 = the engine default) and writes
+    /// (width, height) into `out`. False when the id is unknown, in which case
+    /// the binding returns nil rather than a zero that looks like an empty
+    /// string.
+    measure: *const fn (ctx: ?*anyopaque, font_id: u32, text: []const u8, out: *[2]f32) bool,
+    /// Loads `path` at `pixel_height` (or returns an already-loaded font with
+    /// the same pair) and returns its id, or 0 when it could not be read. 0 is
+    /// the engine default and is only the answer to a failed load.
+    font_load: *const fn (ctx: ?*anyopaque, path: []const u8, pixel_height: f32) u32,
+    /// True when `entity_bits` (`Entity.bits()`) is the widget the pointer is
+    /// over this frame.
+    hovered: *const fn (ctx: ?*anyopaque, entity_bits: u64) bool,
+    /// True when `entity_bits` is the button currently being held down.
+    pressed: *const fn (ctx: ?*anyopaque, entity_bits: u64) bool,
 };
 
 pub const World = ecs.World;
@@ -214,6 +290,10 @@ pub const Context = struct {
     /// failure rather than reaching through a null pointer, the same rule every
     /// other optional system here follows.
     scene: ?*const SceneHooks = null,
+    /// M14: CanvasModulate — the full-screen tint. Null for the same reason as
+    /// `scene`: the `scene.tint*` bindings then report failure (or a zero
+    /// amount) rather than reaching through a null pointer.
+    tint: ?*const TintHooks = null,
     /// M9: the particle pool, for `particles.burst` and `particles.stats`.
     /// Null for the same reason; the CONFIGURE half of the API is component
     /// writes and works without it.
@@ -221,6 +301,33 @@ pub const Context = struct {
     /// M13: animation system, for clip length queries. Null means `anim.length`
     /// returns nil; component writes still work.
     animations: ?*ecs.animation.System = null,
+
+    /// The game clock and the global time scale (M4.5 follow-up), behind the
+    /// `time.*` bindings. Null when the runtime has no clock wired (a headless
+    /// tool, a test): the `time.*` bindings then report a zero delta and
+    /// refuse to change the scale, rather than reaching through a null
+    /// pointer. A zero delta is the SAFE answer — a script that multiplies by
+    /// `time.delta()` gets a still frame instead of a crash.
+    time: ?*core_loop.GameTime = null,
+
+    /// The tween pool, behind the `tween.*` bindings. Null in a harness that
+    /// never wires one: the `tween.*` bindings then report failure rather
+    /// than reaching through a null pointer, the same rule every other
+    /// optional system here follows.
+    tweens: ?*tween_mod.Manager = null,
+
+    /// The global scripts (mounted with no actor), as the vtable above. Null in
+    /// a harness that never mounts one: `globals.get` then returns nil and
+    /// `globals.exists` false, which is the right answer for a world with no
+    /// globals rather than a lookup the caller must guard.
+    globals: ?*const GlobalsHooks = null,
+
+    /// M14: the game-UI surface — the runtime's font cache and the frame's
+    /// resolved hover/press state. Null when nothing wired a UI (a headless
+    /// tool, a test): `ui.measure`/`ui.font_load` then fail cleanly and the
+    /// hover queries answer false, the same rule every optional system here
+    /// follows.
+    ui: ?*const UiHooks = null,
 
     /// The camera's view for RENDER culling, which is a different rectangle from
     /// the physics one on purpose: the renderer asks "can I see it", physics asks

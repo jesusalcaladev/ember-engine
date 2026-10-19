@@ -58,7 +58,13 @@ pub const Buffer = struct {
 /// allocation-free (it runs in a build step, but it also runs inside a `zig
 /// test`, where a failed allocation would be a confusing second error on top of
 /// the real one).
-const max_modules = 32;
+///
+/// 64, not 32: the registry grew past 32 modules and the limit turned the
+/// NEXT module added (the tween) into a `TooManyModules` build failure — an
+/// error about a stub generator on a change that had nothing to do with it.
+/// The headroom is the point: the bound exists to keep the generator
+/// allocation-free, not to ration modules.
+const max_modules = 64;
 
 /// Writes the complete stub file for every documented binding into `writer`.
 /// Deterministic: same registry → same bytes, which is what lets CI diff them.

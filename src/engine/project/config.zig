@@ -53,6 +53,8 @@ pub const Config = struct {
     physics: Physics = .{},
     layers: Layers = .{},
     audio: Audio = .{},
+    /// The Lua script section: the global scripts, in start order.
+    scripts: Scripts = .{},
     /// Ordered actions, because a UI wants them in file order and the runtime
     /// wants to iterate them once at boot. A plain slice, not a map: action
     /// names are unique (the parser rejects duplicates) and dozens long.
@@ -254,6 +256,17 @@ pub const Audio = struct {
     /// A bus's gain and mute are RUNTIME mixer state (the panel's sliders),
     /// not project settings, which is why they are not in this file.
     buses: []const []const u8 = &default_buses,
+};
+
+pub const max_global_scripts = 64;
+
+/// The project's GLOBAL scripts: Lua behavior scripts mounted with no actor —
+/// the game manager, the score, the spawner, the flow. Each path is relative to
+/// the project root and mounts under its file's basename
+/// (`"scripts/globals/game.lua"` is callable as `globals.get("game")`), in file
+/// order, which is start order: list the manager before the things that read it.
+pub const Scripts = struct {
+    global: []const []const u8 = &.{},
 };
 
 /// One named action and the device names that trigger it. Bindings are names,

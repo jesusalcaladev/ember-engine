@@ -32,6 +32,22 @@ const std = @import("std");
 const assets = @import("assets");
 const render = @import("render.zig");
 
+/// The render half of a FONT hot reload: hand the new bytes to whatever owns
+/// the `Font` for `path` on this side of the boundary.
+///
+/// A separate sink from `ImageSink` rather than a widened one, because the two
+/// share nothing below the `Change` event: an image reload swaps a rect's
+/// pixels, a font reload tears down and rebuilds a rasterizer. Forcing them
+/// into one struct would make every image-only runtime carry three unused
+/// function pointers.
+pub const FontSink = struct {
+    ctx: *anyopaque,
+    /// Re-initializes the font the owner keeps for `path` from `bytes`. Returns
+    /// true when a font was reloaded, false when the owner has no font for that
+    /// path — which is not a failure, just a `.ttf` nothing is drawing.
+    reload: *const fn (ctx: *anyopaque, path: []const u8, bytes: []const u8) bool,
+};
+
 /// The two renderer operations a reload needs, as a plain struct of function
 /// pointers rather than a `render.Renderer`.
 ///
@@ -95,6 +111,8 @@ pub const Stats = struct {
     reloaded: u32 = 0,
     /// Of those, how many had changed SIZE and were repacked to a new rect.
     repositioned: u32 = 0,
+    /// Font changes that reached a live `Font` (M14).
+    fonts_reloaded: u32 = 0,
     /// Changes this reloader saw but could not apply: a non-image asset, a file
     /// whose bytes do not decode, or a sink that refused the pack. Counted
     /// rather than swallowed, because a reload that quietly does nothing is
@@ -111,6 +129,10 @@ pub const Stats = struct {
 pub const Reloader = struct {
     sink: ImageSink,
     stats: Stats = .{},
+    /// Optional: the font half. A `.ttf` change reaches a live `Font` through
+    /// this when the runtime owns one; a runtime that draws no text leaves it
+    /// null and a font edit is simply not its business.
+    font_sink: ?FontSink = null,
 
     /// Called only when an edit resized an image and it was repacked to a NEW
     /// rect, so the caller can re-point whatever drew the old UVs. Optional: a
@@ -134,10 +156,22 @@ pub const Reloader = struct {
     /// One change, applied. Public so a tool (or a test) can drive a change it
     /// built itself without a file on disk.
     pub fn apply(self: *Reloader, change: assets.hot_reload.Change) void {
-        // Only images are this reloader's business. A `.lua` or `.wav` edit goes
-        // through the same manager and reaches every callback: the script layer
-        // and the audio layer each take the formats they own, and none of them
-        // should have to know which others exist.
+        // A font edit is the font half's. Handled before the image path so a
+        // `.ttf` is never mistaken for a change with no pixels.
+        if (change.format.kind() == .font) {
+            const sink = self.font_sink orelse return;
+            const bytes = change.bytes orelse {
+                self.stats.failed += 1;
+                return;
+            };
+            if (sink.reload(sink.ctx, change.path, bytes)) self.stats.fonts_reloaded += 1;
+            return;
+        }
+
+        // Only images are the rest of this reloader's business. A `.lua` or
+        // `.wav` edit goes through the same manager and reaches every callback:
+        // the script layer and the audio layer each take the formats they own,
+        // and none of them should have to know which others exist.
         if (change.format.kind() != .image) return;
 
         // A change with no decoded image is a file whose bytes did not decode —
@@ -360,6 +394,89 @@ test "a non-image change is left to the layers that own those formats" {
     try testing.expectEqual(@as(u32, 0), reload.stats.failed);
     try testing.expectEqual(@as(u32, 0), reload.stats.reloaded);
     try testing.expectEqual(@as(u32, 0), sink.refreshes);
+}
+
+/// A sink that is never supposed to be called: the font path returns before it
+/// touches the image half, and this makes "it did not" observable by faulting.
+fn unusedSink() ImageSink {
+    return .{ .ctx = undefined, .update = unusedUpdate, .refresh = unusedRefresh };
+}
+
+fn unusedUpdate(_: *anyopaque, _: []const u8, _: u32, _: u32, _: []const u8) ?render.AtlasUpdate {
+    @panic("image sink called for a font change");
+}
+
+fn unusedRefresh(_: *anyopaque) void {
+    @panic("image sink called for a font change");
+}
+
+/// Records what the font half of a reload saw.
+const FontSpy = struct {
+    calls: u32 = 0,
+    last_path: []const u8 = "",
+    last_len: usize = 0,
+    ok: bool = true,
+
+    fn sink(self: *FontSpy) FontSink {
+        return .{ .ctx = self, .reload = reload };
+    }
+
+    fn reload(ctx: *anyopaque, path: []const u8, bytes: []const u8) bool {
+        const self: *FontSpy = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.last_path = path;
+        self.last_len = bytes.len;
+        return self.ok;
+    }
+};
+
+fn fontChange(path: []const u8, bytes: ?[]const u8) assets.hot_reload.Change {
+    return .{
+        .path = path,
+        .guid = assets.AssetGUID.fromPath(path),
+        .format = .ttf,
+        .content_hash = 9,
+        .image = null,
+        .bytes = bytes,
+    };
+}
+
+test "a .ttf change reaches the font sink with its bytes" {
+    var spy = FontSpy{};
+    var reload = Reloader{ .sink = unusedSink(), .font_sink = spy.sink() };
+
+    reload.apply(fontChange("ui/hud.ttf", "OTTO...."));
+
+    try testing.expectEqual(@as(u32, 1), reload.stats.fonts_reloaded);
+    try testing.expectEqual(@as(u32, 0), reload.stats.failed);
+    try testing.expectEqual(@as(u32, 1), spy.calls);
+    try testing.expectEqualStrings("ui/hud.ttf", spy.last_path);
+    try testing.expectEqual(@as(usize, 8), spy.last_len);
+}
+
+test "a font edit no font owns is neither reloaded nor a failure" {
+    var spy = FontSpy{ .ok = false };
+    var reload = Reloader{ .sink = unusedSink(), .font_sink = spy.sink() };
+
+    reload.apply(fontChange("ui/unused.ttf", "OTTO...."));
+
+    // The owner had no font for the path: not an error, just nothing to do.
+    try testing.expectEqual(@as(u32, 0), reload.stats.fonts_reloaded);
+    try testing.expectEqual(@as(u32, 0), reload.stats.failed);
+}
+
+test "a font change with no sink or no bytes is handled without touching the image half" {
+    // No font sink at all: a `.ttf` is simply not this runtime's business.
+    var bare = Reloader{ .sink = unusedSink() };
+    bare.apply(fontChange("ui/hud.ttf", "OTTO...."));
+    try testing.expectEqual(@as(u32, 0), bare.stats.failed);
+
+    // A sink but no bytes: a change that could not be read is a real failure.
+    var spy = FontSpy{};
+    var reload = Reloader{ .sink = unusedSink(), .font_sink = spy.sink() };
+    reload.apply(fontChange("ui/hud.ttf", null));
+    try testing.expectEqual(@as(u32, 1), reload.stats.failed);
+    try testing.expectEqual(@as(u32, 0), spy.calls);
 }
 
 test "an image that does not decode fails loudly rather than blanking the sprite" {

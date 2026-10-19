@@ -51,8 +51,11 @@ const builtin = @import("builtin");
 pub const batcher = @import("batcher.zig");
 pub const atlas = @import("atlas.zig");
 pub const two_d = @import("2d.zig");
+pub const font = @import("font.zig");
+pub const ui_draw = @import("ui_draw.zig");
 pub const particles = @import("particles.zig");
 pub const fade = @import("fade.zig");
+pub const tint = @import("tint.zig");
 pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
 pub const backend_null = @import("backend_null.zig");
@@ -63,8 +66,11 @@ test {
     _ = batcher;
     _ = atlas;
     _ = two_d;
+    _ = font;
+    _ = ui_draw;
     _ = particles;
     _ = fade;
+    _ = tint;
     _ = light;
     _ = lighting_driver;
     _ = backend_null;
@@ -172,5 +178,11 @@ test "the renderer's tests are in this binary, not just its code" {
             @compileError("particles.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(fade.Fader))
             @compileError("fade.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(tint.Tint))
+            @compileError("tint.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(font.Font))
+            @compileError("font.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(ui_draw.FontSource))
+            @compileError("ui_draw.zig is reachable as a module, so its tests are compiled and never run");
     }
 }

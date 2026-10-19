@@ -48,6 +48,8 @@ pub const asset_manager = @import("asset_manager.zig");
 pub const audio_asset = @import("audio_asset.zig");
 /// Script asset validation: encoding and shape checks before the script layer.
 pub const script_asset = @import("script_asset.zig");
+/// Font asset validation: sfnt structure checks before the text rasterizer.
+pub const font_asset = @import("font_asset.zig");
 /// Hot reload: < 250 ms asset updates, driven by file mtimes.
 pub const hot_reload = @import("hot_reload.zig");
 

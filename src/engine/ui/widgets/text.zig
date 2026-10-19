@@ -157,12 +157,12 @@ pub fn space(ctx: *Context, units: f32) void {
 
 /// A title in the semibold face, at the TEXT colour.
 fn TitleInFont(c: *Context, text: []const u8) void {
-    cimgui.ember_ui_text_colored(c.theme.colors.text.u32(), cimgui.text(text));
+    cimgui.ember_ui_text_colored(c.theme.colors.text.pack(), cimgui.text(text));
 }
 
 /// A value in the mono face, at the DIM colour: numbers, paths, identifiers.
 fn ValueInFont(c: *Context, text: []const u8) void {
-    cimgui.ember_ui_text_colored(c.theme.colors.text_dim.u32(), cimgui.text(text));
+    cimgui.ember_ui_text_colored(c.theme.colors.text_dim.pack(), cimgui.text(text));
 }
 
 test "ui text: a badge's width comes from its text, so it cannot clip" {

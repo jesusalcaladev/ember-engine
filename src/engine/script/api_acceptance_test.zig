@@ -24,6 +24,8 @@ const physics = @import("physics");
 const audio = @import("audio");
 const behavior_mod = @import("behavior.zig");
 const build_options = @import("options");
+const core_loop = @import("core").loop;
+const tween_mod = @import("tween.zig");
 
 /// One named check. `text` is Lua source that must evaluate to `true`; the
 /// script does its own asserting so the failure message can quote the value it
@@ -1436,6 +1438,327 @@ fn checkAnimation(allocator: std.mem.Allocator) bool {
     return ok;
 }
 
+// ── Time: the game clock and the global time scale ───────────────────────────
+// The clock is the one surface whose ANSWER lives outside Lua — the same clock
+// the simulation runs on. A binding that returned a hardcoded 1/60 would pass a
+// purely-Lua test and break every slow-motion moment and every pause in a
+// game, so these run against a real `GameTime` that the test itself advances.
+
+fn checkTime(allocator: std.mem.Allocator) bool {
+    var vm = vm_mod.Vm.init(allocator) catch {
+        std.debug.print("  Vm.init failed\n", .{});
+        return false;
+    };
+    defer vm.deinit();
+    const L = vm.state() orelse {
+        std.debug.print("  Vm has no state\n", .{});
+        return false;
+    };
+
+    var world = ecs.World.init(allocator);
+    defer world.deinit();
+    const input = context_mod.Input{};
+    var ctx = bindings.Context.init(&world, &input);
+
+    // The real clock, and the real fixed step. `ctx.time` is what the `time.*`
+    // bindings read; with it null they report zeros, which is the safe answer
+    // for a harness that has no clock — and is exactly what makes a missing
+    // clock visible here instead of silent.
+    var clock = core_loop.GameTime.init(1.0 / 60.0);
+    ctx.time = &clock;
+    bindings.registerAll(L, &ctx);
+
+    // One frame at 60 fps.
+    _ = clock.beginFrame(1.0 / 60.0);
+
+    // 1. The clock reports what the frame actually was.
+    if (!runSrcBool(
+        &vm,
+        \\if math.abs(time.delta() - 1.0/60.0) > 0.0001 then return false end
+        \\if math.abs(time.unscaled_delta() - 1.0/60.0) > 0.0001 then return false end
+        \\if math.abs(time.physics_delta() - 1.0/60.0) > 0.0001 then return false end
+        \\if time.scale() ~= 1 then return false end
+        \\if time.is_paused() then return false end
+        \\if time.frame() < 1 then return false end
+        \\if time.elapsed() <= 0 then return false end
+        \\return true
+    , "time_read")) {
+        std.debug.print("  FAIL the clock did not report the frame it was given\n", .{});
+        return false;
+    }
+
+    // 2. Slow motion: the scale halves the delta the scripts see.
+    clock.setScale(0.5);
+    _ = clock.beginFrame(1.0 / 60.0);
+    if (!runSrcBool(
+        &vm,
+        \\if math.abs(time.delta() - 1.0/120.0) > 0.0001 then return false end
+        \\if time.scale() ~= 0.5 then return false end
+        \\if math.abs(time.unscaled_delta() - 1.0/60.0) > 0.0001 then return false end
+        \\return true
+    , "time_slowmo")) {
+        std.debug.print("  FAIL the scale did not slow the delta down\n", .{});
+        return false;
+    }
+
+    // 3. A pause freezes the delta and remembers the scale that was in force.
+    if (!runSrcBool(
+        &vm,
+        \\time.pause()
+        \\if not time.is_paused() then return false end
+        \\if time.scale() ~= 0 then return false end
+        \\return true
+    , "time_pause")) {
+        std.debug.print("  FAIL time.pause did not pause\n", .{});
+        return false;
+    }
+    _ = clock.beginFrame(1.0 / 60.0);
+    if (!runSrcBool(
+        &vm,
+        \\if time.delta() ~= 0 then return false end
+        \\return true
+    , "time_paused_delta")) {
+        std.debug.print("  FAIL a paused frame still had a delta\n", .{});
+        return false;
+    }
+
+    // 4. Resuming brings back the scale that was in force — slow motion, not
+    //    plain normal speed. A resume that reset the scale to 1 would silently
+    //    cancel the slow-motion moment the game was in.
+    if (!runSrcBool(
+        &vm,
+        \\time.resume()
+        \\if time.is_paused() then return false end
+        \\if time.scale() ~= 0.5 then return false end
+        \\return true
+    , "time_resume")) {
+        std.debug.print("  FAIL time.resume did not restore the scale\n", .{});
+        return false;
+    }
+
+    // 5. The scale is set from Lua and clamped to what the engine honours.
+    if (!runSrcBool(
+        &vm,
+        \\time.set_scale(2)
+        \\if time.scale() ~= 2 then return false end
+        \\time.set_scale(-1)
+        \\if time.scale() < 0 then return false end
+        \\time.set_scale(1)
+        \\return true
+    , "time_set_scale")) {
+        std.debug.print("  FAIL time.set_scale did not take, or took a negative scale\n", .{});
+        return false;
+    }
+
+    return true;
+}
+
+// ── Tween (M4.5 follow-up) ───────────────────────────────────────────────────
+// A tween drives a COMPONENT of an actor, so the checks below read the
+// component back: a binding that returned a handle without moving anything
+// would pass a "does it return a handle" test and break every game that
+// slides a panel in.
+
+fn checkTween(allocator: std.mem.Allocator) bool {
+    var vm = vm_mod.Vm.init(allocator) catch {
+        std.debug.print("  Vm.init failed\n", .{});
+        return false;
+    };
+    defer vm.deinit();
+    const L = vm.state() orelse {
+        std.debug.print("  Vm has no state\n", .{});
+        return false;
+    };
+
+    var world = ecs.World.init(allocator);
+    defer world.deinit();
+    const e = world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.Sprite{},
+    }) catch return false;
+
+    const input = context_mod.Input{};
+    var ctx = bindings.Context.init(&world, &input);
+    // The real tween pool, and the real world it writes to.
+    var pool = tween_mod.Manager.init(allocator, &vm);
+    pool.setWorld(&world);
+    ctx.tweens = &pool;
+    bindings.registerAll(L, &ctx);
+
+    // The actor's `self`, published as a global.
+    lua.lua_createtable(L, 0, 1); // [T]
+    lua.lua_createtable(L, 0, 1); // [T, self]
+    bindings.stampEntityForTest(L, e);
+    lua.setField(L, -2, "__actor_self");
+    lua.setGlobal(L, "T");
+
+    // A stepper, so the Lua checks can advance the tweens. Without it they
+    // would read a value no real frame ever produces.
+    const step_lua = struct {
+        fn call(state: ?*lua.lua_State) callconv(.c) c_int {
+            const c = bindings.ctxFromUpvalue(state);
+            const tweens = c.tweens orelse return 0;
+            const frames = lua.toF32(state, 1);
+            const dt = lua.toF32(state, 2);
+            var i: f32 = 0;
+            while (i < frames) : (i += 1) {
+                tweens.tick(dt);
+            }
+            return 0;
+        }
+    }.call;
+    const step_regs = [_]lua.luaL_Reg{.{ .name = "step", .func = step_lua }, .{ .name = null, .func = null }};
+    bindings.installModule(L, &ctx, "TSTEP", &step_regs);
+
+    const cases = [_]struct { name: []const u8, src: [:0]const u8 }{
+        .{
+            .name = "a tween moves the actor's real transform",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\local h = tween.to(self, "position.x", 100, 1.0)
+            \\if h == 0 then return false end
+            \\if tween.count() ~= 1 then return false end
+            \\TSTEP.step(1, 0.5)
+            \\local x = actor.get_position(self)
+            \\return x == 50
+            ,
+        },
+        .{
+            .name = "a tween reaches its target and then is gone",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\local h = tween.to(self, "position.x", 100, 1.0)
+            \\TSTEP.step(2, 0.5)
+            \\local x = actor.get_position(self)
+            \\if x ~= 100 then return false end
+            \\if tween.is_alive(h) then return false end
+            \\return tween.count() == 0
+            ,
+        },
+        .{
+            .name = "a tween of ONE part leaves the rest of the value alone",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\tween.to(self, "position.x", 100, 1.0)
+            \\TSTEP.step(1, 0.5)
+            \\local x, y = actor.get_position(self)
+            \\return x == 50 and y == 0
+            ,
+        },
+        .{
+            .name = "an easing changes where the tween is, not where it ends",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\tween.to(self, "position.x", 100, 1.0, { easing = "out_quad" })
+            \\TSTEP.step(1, 0.5)
+            \\local x = actor.get_position(self)
+            \\return x > 50 and x < 100
+            ,
+        },
+        .{
+            .name = "a delay holds the tween",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\tween.to(self, "position.x", 100, 1.0, { delay = 1.0 })
+            \\TSTEP.step(2, 0.25)
+            \\local x = actor.get_position(self)
+            \\return x == 0
+            ,
+        },
+        .{
+            .name = "killing a tween stops it where it is",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\local h = tween.to(self, "position.x", 100, 1.0)
+            \\TSTEP.step(1, 0.5)
+            \\if not tween.kill(h) then return false end
+            \\TSTEP.step(1, 0.5)
+            \\local x = actor.get_position(self)
+            \\return x == 50 and tween.count() == 0
+            ,
+        },
+        .{
+            .name = "the completion callback runs when the tween ends",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\T.done = false
+            \\tween.to(self, "position.x", 100, 1.0, { on_complete = function(s) T.done = true end })
+            \\TSTEP.step(1, 0.5)
+            \\if T.done then return false end
+            \\TSTEP.step(1, 0.5)
+            \\return T.done == true
+            ,
+        },
+        .{
+            .name = "a chain starts the child when the parent finishes",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\local parent = tween.to(self, "position.x", 100, 1.0)
+            \\local child = tween.to(self, "position.y", 100, 1.0, { hold = true })
+            \\if not tween.chain(parent, child) then return false end
+            \\TSTEP.step(1, 0.5)
+            \\local x, y = actor.get_position(self)
+            \\if x ~= 50 or y ~= 0 then return false end
+            \\TSTEP.step(1, 0.5)   -- the parent finishes
+            \\TSTEP.step(1, 0.5)   -- the child runs
+            \\local x2, y2 = actor.get_position(self)
+            \\return x2 == 100 and y2 == 50
+            ,
+        },
+        .{
+            .name = "the tween property list is discoverable from Lua",
+            .src =
+            \\local names = tween.properties()
+            \\if #names < 5 then return false end
+            \\local found = false
+            \\for _, name in ipairs(names) do
+            \\  if name == "position" then found = true end
+            \\end
+            \\return found
+            ,
+        },
+        .{
+            .name = "the global tween scale moves the animations, not the world",
+            .src =
+            \\local self = T.__actor_self
+            \\tween.kill_all()
+            \\actor.set_position(self, 0, 0)
+            \\tween.set_time_scale(0.5)
+            \\tween.to(self, "position.x", 100, 1.0)
+            \\TSTEP.step(1, 1.0)
+            \\local x = actor.get_position(self)
+            \\tween.set_time_scale(1)
+            \\return x == 50
+            ,
+        },
+    };
+
+    var ok = true;
+    for (cases) |c| {
+        if (!runSrcBool(&vm, c.src, "tween_acceptance")) {
+            std.debug.print("  FAIL {s}\n", .{c.name});
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 pub fn main() !void {
     // A page allocator: each check builds and tears down its own VM and world,
     // and the process is short-lived, so there is nothing to interleave and no
@@ -1468,6 +1791,20 @@ pub fn main() !void {
     std.debug.print("\naudio (M8):\n", .{});
     if (checkAudio(allocator)) {
         std.debug.print("  ok    play/stop/bus/stats through a real system\n", .{});
+    } else {
+        failed += 1;
+    }
+
+    std.debug.print("\ntime (global scale + clock):\n", .{});
+    if (checkTime(allocator)) {
+        std.debug.print("  ok    the clock reports the frame; the scale slows it, pauses it and resumes it\n", .{});
+    } else {
+        failed += 1;
+    }
+
+    std.debug.print("\ntween (M4.5 follow-up):\n", .{});
+    if (checkTween(allocator)) {
+        std.debug.print("  ok    a tween moves the real transform, eases, delays, chains, kills and calls back\n", .{});
     } else {
         failed += 1;
     }

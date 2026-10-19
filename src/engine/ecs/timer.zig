@@ -59,7 +59,10 @@ pub fn tick(world: *World, dt: f32, bridge: SignalBridge) void {
         const t = world.get(e, components.Timer) orelse continue;
         if (t.finished or t.paused) continue;
 
-        t.elapsed += dt;
+        // The timer's OWN speed, multiplied by the delta. The global time
+        // scale is already in the delta (the loop runs fewer steps), so this
+        // is the per-timer half of the same idea.
+        t.elapsed += dt * t.time_scale;
 
         // `.during` reports EVERY tick, and it reports it BEFORE the cycle it
         // may also complete. That order is the one the contract states and the
@@ -75,18 +78,24 @@ pub fn tick(world: *World, dt: f32, bridge: SignalBridge) void {
             t.elapsed -= t.duration;
             t.current_loop += 1;
             fire(world, e, t.done_signal.slice(), bridge);
+            // The stop is an explicit flag and not a `break` inside the
+            // switch: a `break` there leaves the SWITCH, not the loop, so a
+            // `loop` timer whose `loop_count` was reached would keep firing
+            // its done signal for every remaining cycle of the same tick.
+            var stop = false;
             switch (t.kind) {
                 .once => {
                     t.finished = true;
-                    break;
+                    stop = true;
                 },
                 .loop, .during => {
                     if (t.loop_count != 0 and t.current_loop >= t.loop_count) {
                         t.finished = true;
-                        break;
+                        stop = true;
                     }
                 },
             }
+            if (stop) break;
         }
         if (t.duration <= 0) {
             // Zero-duration timers fire their done signal once and finish: a
@@ -95,6 +104,22 @@ pub fn tick(world: *World, dt: f32, bridge: SignalBridge) void {
             fire(world, e, t.done_signal.slice(), bridge);
             t.finished = true;
             continue;
+        }
+
+        // The cycles the catch-up cap refused to run. They are COUNTED, not
+        // dropped in silence: a timer that asked for 30 cycles in one tick
+        // and got 16 is running late, and "late" is invisible unless
+        // something says so.
+        if (t.duration > 0 and t.elapsed >= t.duration) {
+            const pending: u32 = @intFromFloat(@floor(t.elapsed / t.duration));
+            const missed = pending -| cycles;
+            if (missed > 0) {
+                t.dropped_cycles += missed;
+                // The leftover time is dropped with them, so the timer starts
+                // its next cycle from a clean boundary instead of carrying a
+                // debt it can never pay.
+                t.elapsed -= @as(f32, @floatFromInt(missed)) * t.duration;
+            }
         }
     }
 }
@@ -201,6 +226,69 @@ test "timers on dead entities are skipped, not crashed into" {
     var rec = Recorder{};
     tick(&world, 1.0, rec.bridge());
     try testing.expectEqual(@as(usize, 0), rec.len);
+}
+
+test "a loop timer fires EXACTLY loop_count times, even when one tick covers them all" {
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+
+    var t = components.Timer{ .duration = 1.0, .kind = .loop, .loop_count = 2 };
+    t.done_signal.set("wave");
+    _ = try world.spawn(.{t});
+
+    // One tick of FIVE seconds covers five cycles. The timer must fire TWICE
+    // (its loop count) and not five times: the `break` that stopped the cycle
+    // loop used to leave the switch and not the loop, so every remaining cycle
+    // of the same tick fired the signal again.
+    var rec = Recorder{};
+    tick(&world, 5.0, rec.bridge());
+    try testing.expectEqual(@as(usize, 2), rec.len);
+}
+
+test "a once timer fires once, however many cycles the tick covered" {
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+
+    var t = components.Timer{ .duration = 0.5 };
+    t.done_signal.set("boom");
+    _ = try world.spawn(.{t});
+
+    var rec = Recorder{};
+    tick(&world, 10.0, rec.bridge());
+    try testing.expectEqual(@as(usize, 1), rec.len);
+}
+
+test "a timer's own time scale slows it down" {
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+
+    var t = components.Timer{ .duration = 1.0, .time_scale = 0.5 };
+    t.done_signal.set("slow");
+    _ = try world.spawn(.{t});
+
+    var rec = Recorder{};
+    // One second of real time is half a second of timer.
+    tick(&world, 1.0, rec.bridge());
+    try testing.expectEqual(@as(usize, 0), rec.len);
+    tick(&world, 1.0, rec.bridge());
+    try testing.expectEqual(@as(usize, 1), rec.len);
+}
+
+test "the cycles the catch-up cap refused are COUNTED, not dropped in silence" {
+    var world = World.init(testing.allocator);
+    defer world.deinit();
+
+    var t = components.Timer{ .duration = 0.01, .kind = .loop };
+    t.done_signal.set("x");
+    const e = try world.spawn(.{t});
+
+    var rec = Recorder{};
+    // 10 seconds of timer at 0.01 s per cycle is a thousand cycles. The tick
+    // runs at most `max_cycles_per_tick` of them, and the rest are REPORTED.
+    tick(&world, 10.0, rec.bridge());
+    const tm = world.get(e, components.Timer).?;
+    try testing.expect(tm.dropped_cycles > 0);
+    try testing.expectEqual(@as(usize, max_cycles_per_tick), rec.len);
 }
 
 test "an empty signal name fires nothing anywhere" {

@@ -680,13 +680,6 @@ function environment.set_bloom(self, intensity, threshold) end
 ---@param b number blue
 function environment.set_sky(self, r, g, b) end
 
----The sky's radiance as three numbers.
----@param self Actor 
----@return number red
----@return number green
----@return number blue
-function environment.get_sky(self) end
-
 ---What 'dark' means in this world. One per world, not per actor: a dungeon and a meadow differ in what their shadows are made of.
 ---@param self Actor 
 ---@param r number red 0..1
@@ -742,6 +735,66 @@ function environment.get_clear(self) end
 ---@return number near
 ---@return number far
 function environment.get_fog(self) end
+
+
+-- ── scene ──
+---Covers the screen with the given colour over `duration` real seconds. Zero duration is an instant cover. Restarting an existing fade replaces it.
+---@param duration number seconds; 0 = instant
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+function scene.fade_out(duration, r, g, b) end
+
+---Uncovers from wherever the curtain currently is. Zero duration is an instant clear.
+---@param duration number seconds; 0 = instant
+function scene.fade_in(duration) end
+
+---Jumps straight to a fully covered screen (a loading screen's first frame).
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+function scene.fade_covered(r, g, b) end
+
+---Jumps straight back to a clear screen.
+function scene.fade_clear() end
+
+---Current curtain coverage.
+---@return number coverage 0..1
+function scene.fade_amount() end
+
+---True while a transition is running.
+---@return boolean true = fading
+function scene.fading() end
+
+---Lays a colour over the whole canvas (world and game UI). Multiply by default; `a` is the strength 0..1, and 0 is a no-op.
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number strength 0..1; 0 turns the tint off
+function scene.tint(r, g, b, a) end
+
+---Sets how the tint mixes: "multiply" (default), "add" (a flash), "alpha" (a flat veil) or "off". Unknown names are ignored.
+---@param name string "multiply", "add", "alpha" or "off"
+function scene.tint_mode(name) end
+
+---Disables the tint and forgets its colour.
+function scene.tint_clear() end
+
+---The tint's current strength. The value a script animates a flash back down to zero against.
+---@return number strength 0..1
+function scene.tint_amount() end
+
+
+-- ── particles ──
+---Emits `count` particles NOW from this actor's ParticleEmitter2D. Returns how many were actually emitted (may be less if the emitter's slab is full).
+---@param self Actor 
+---@param count integer how many to emit
+---@return integer how many were emitted
+function particles.burst(self, count) end
+
+---Per-frame particle counters. `dropped_spawn` or `slab_denied` > 0 means the pool was too small at load time.
+---@return table counters
+function particles.stats() end
 
 
 -- ── material ──
@@ -890,8 +943,112 @@ function timer.kill(self) end
 ---@return number 0 at the start, 1 at the end of the cycle
 function timer.progress(self) end
 
+---Puts the timer back to zero and runs it again. The configuration survives — the duration, the kind, the loop count and the signals are all still there; only the progress is reset.
+---@param self Actor 
+function timer.restart(self) end
+
+---How long one cycle takes.
+---@param self Actor 
+---@param seconds number the cycle length
+function timer.set_duration(self, seconds) end
+
+---How long one cycle takes, in seconds.
+---@param self Actor 
+---@return number the cycle length in seconds
+function timer.get_duration(self) end
+
+---How far into the current cycle the timer is, in seconds.
+---@param self Actor 
+---@return number seconds into the current cycle
+function timer.get_elapsed(self) end
+
+---How many cycles the timer will run, and how many it has run. A count of 0 means it runs forever.
+---@param self Actor 
+---@return number the total cycle count (0 = forever)
+---@return number the cycles completed so far
+function timer.get_loops(self) end
+
+---The kind of timer: 0 once, 1 loop, 2 during. Changing the kind does not restart the timer — the elapsed time and the cycle counter stay where they were.
+---@param self Actor 
+---@param kind number 0 once, 1 loop, 2 during
+function timer.set_kind(self, kind) end
+
+---This timer's own speed. 1 is normal, 0.5 is half as fast, 0 stops the timer where it is. It multiplies with the GLOBAL scale (`time.scale`): a slow-motion game slows every timer, and a timer slower than the game is slower still.
+---@param self Actor 
+---@param scale number 0 stops the timer, 0.5 halves it, 2 doubles it
+function timer.set_time_scale(self, scale) end
+
+---True once the timer has done its job: a `once` that fired, or a `loop` that exhausted its cycle count.
+---@param self Actor 
+---@return boolean true when the timer is done
+function timer.is_finished(self) end
+
+---True while the timer is stopped. A stopped timer keeps its elapsed time, so starting it again resumes where it was.
+---@param self Actor 
+---@return boolean true while the timer is stopped
+function timer.is_paused(self) end
+
+---The cycles this timer could not run, because one tick asked for more than the engine runs at once. Zero in a healthy game; a number that grows says the timer is running late.
+---@param self Actor 
+---@return number the dropped cycle count
+function timer.get_dropped(self) end
+
+
+-- ── time ──
+---The last frame's delta in seconds, scaled by the global time scale. It is the same number the simulation advanced by, so a script can never move at a different speed than the world it is in.
+---@return number seconds; 0 while the game is paused
+function time.delta() end
+
+---The last frame's REAL delta in seconds, unaffected by the time scale. A UI that has to keep moving while the game is paused reads this one.
+---@return number seconds of wall clock
+function time.unscaled_delta() end
+
+---Scaled game time since boot. It slows down with the game, so it counts PLAY time, not wall-clock time.
+---@return number seconds of game time
+function time.elapsed() end
+
+---Real time since boot, unaffected by the time scale.
+---@return number seconds of wall clock
+function time.unscaled_elapsed() end
+
+---The frame counter, incremented once per frame since boot.
+---@return number frames since boot
+function time.frame() end
+
+---The fixed simulation step (1/60 s) — the step the solver uses. Integrate against this when the answer must not depend on the frame rate.
+---@return number the fixed step in seconds
+function time.physics_delta() end
+
+---The global time scale. 1 is normal, 0.5 is slow motion, 0 is paused.
+---@return number the global scale
+function time.scale() end
+
+---Sets the global time scale. It slows the simulation — physics, timers, animation, particles — and the delta the scripts are handed. Clamped to [0, 100]: a negative scale would run the world backwards.
+---@param s number 0 pauses, 0.5 is slow motion, 2 is double speed
+function time.set_scale(s) end
+
+---Pauses the simulation. The scale goes to 0 and the scale in force is remembered, so `resume` restores it. The frame loop keeps running: the UI and the input keep working.
+function time.pause() end
+
+---Unpauses the simulation, restoring the scale that was in force before the pause. A no-op when the game is not paused: a scale set by hand while paused is not stomped by a resume the game did not need.
+function time.resume() end
+
+---True while the game is paused.
+---@return boolean true while the scale is 0
+function time.is_paused() end
+
 
 -- ── math ──
+---An easing curve: the SHAPE of a movement over time. `t` goes from 0 to 1 and the result is how far along the movement is. The same curves the tween uses, so a value eased by hand and a value eased by a tween look the same.
+---@param name string "linear", "in_quad", "out_cubic", "in_out_back", "out_elastic", "out_bounce"…
+---@param t number 0 at the start, 1 at the end
+---@return number the eased value; nil for an unknown curve
+function math.ease(name, t) end
+
+---Every easing name, so a script can discover what exists without the documentation being the only source.
+---@return table the list of easing names
+function math.easings() end
+
 ---Clamps `v` into the range `[lo, hi]`.
 ---@param v number value to clamp
 ---@param lo number minimum allowed value
@@ -1048,6 +1205,63 @@ function math.rad_to_deg(radians) end
 ---@param tolerance number maximum acceptable difference
 ---@return boolean true when |a-b| <= tolerance
 function math.is_close(a, b, tolerance) end
+
+
+-- ── tween ──
+---Animates a component property of this actor towards a value. Returns a handle: a number that identifies the tween until it finishes. The property is a component field, optionally with a sub-field: "position", "position.x", "rotation", "scale", "tint", "tint.a", "color", "energy", "radius", "value", "duration".
+---@param self Actor 
+---@param property string the property to drive, e.g. "position.x"
+---@param value any the target: a number, or a table for a vector or a colour
+---@param duration number seconds
+---@param opts table optional: easing, delay, repeat, yoyo, hold, on_complete
+---@return number the tween handle; 0 when it could not be created
+function tween.to(self, property, value, duration, opts) end
+
+---The child tween starts when the parent finishes. The child is parked and reset to its start value, so chain it before it runs (or create it with `hold = true`) to avoid a visible jump.
+---@param parent number the tween handle that runs first
+---@param child number the tween handle that waits
+---@return boolean true when the chain was made
+function tween.chain(parent, child) end
+
+---Releases a parked tween: it starts now. A tween created with `hold = true` waits until it is released or chained.
+---@param handle number the tween handle
+---@return boolean true when the tween was released
+function tween.start(handle) end
+
+---Stops a tween where it is. The property keeps the value it had, and the completion callback does NOT run: a killed tween was cancelled, not finished.
+---@param handle number the tween handle
+---@return boolean true when a tween was stopped
+function tween.kill(handle) end
+
+---Stops every tween driving this actor. The count of stopped tweens comes back.
+---@param self Actor 
+---@return number how many tweens were stopped
+function tween.kill_entity(self) end
+
+---Stops every tween in the game. The count of tweens still running comes back.
+---@return number how many tweens are still running
+function tween.kill_all() end
+
+---True while the tween is running. False once it finished, was killed, or never existed.
+---@param handle number the tween handle
+---@return boolean true while the tween runs
+function tween.is_alive(handle) end
+
+---How many tweens are running right now.
+---@return number the number of live tweens
+function tween.count() end
+
+---The global tween speed. 1 is normal, 0 freezes every tween. It moves the ANIMATIONS, not the world: the world's speed is `time.scale`.
+---@return number the global tween scale
+function tween.time_scale() end
+
+---Sets the global tween speed. Clamped to [0, 100]; a negative speed would run the animations backwards.
+---@param s number 0 freezes the tweens, 0.5 halves them, 2 doubles them
+function tween.set_time_scale(s) end
+
+---Every property a tween can drive, as an array of names. The list is here so a script can discover what is tweenable without the documentation being the only source.
+---@return table the list of tweenable property names
+function tween.properties() end
 
 
 -- ── vec2 ──
@@ -1325,6 +1539,10 @@ function input.is_action_down(name) end
 ---@return number -1, 0 or +1 (fractional once more devices are mapped)
 function input.get_axis(negative, positive) end
 
+---True while the pointer is over an interactive game-UI widget, so a click on a button is not also a world action.
+---@return boolean true when an interactive UI widget captures the pointer this frame
+function input.pointer_over_ui() end
+
 
 -- ── log ──
 ---Logs an informational line. Strings are concatenated with `..`.
@@ -1334,5 +1552,299 @@ function log.info(message) end
 ---Logs a warning line.
 ---@param message string warning message
 function log.warn(message) end
+
+
+-- ── globals ──
+---The mounted global script's `self` table, or nil.
+---@param name string the global script's cache name (e.g. "game")
+---@return Actor the global's `self` table — call its methods (game:pause()) or read/write its fields; nil when no global by that name is mounted
+function globals.get(name) end
+
+---True when a global script with this name is mounted.
+---@param name string the global script's cache name (e.g. "flow")
+---@return boolean true while the global is mounted (a detached global returns false the moment it is gone)
+function globals.exists(name) end
+
+
+-- ── tilemap ──
+---Sets the TileSet (tile palette) this layer draws from. The GUID is in 'asset_XXXXXXXXXXXXXXXX' format.
+---@param self Actor 
+---@param tileset_guid string TileSet asset GUID from the asset registry
+function tilemap.set_tileset(self, tileset_guid) end
+
+---Sets a single tile at the given tile coordinates. Flip flags are optional.
+---@param self Actor 
+---@param tile_x integer tile coordinate X (not pixels)
+---@param tile_y integer tile coordinate Y (not pixels)
+---@param atlas_index integer index into the TileSet atlas (0 = empty)
+---@param flip_x boolean? #false# mirror horizontally
+---@param flip_y boolean? #false# mirror vertically
+function tilemap.set_tile(self, tile_x, tile_y, atlas_index, flip_x, flip_y) end
+
+---Returns the tile at the given coordinates, or 0/false/false if empty.
+---@param self Actor 
+---@param tile_x integer tile coordinate X
+---@param tile_y integer tile coordinate Y
+---@return integer atlas index (0 = empty)
+---@return boolean flip_x flag
+---@return boolean flip_y flag
+function tilemap.get_tile(self, tile_x, tile_y) end
+
+---Fills a rectangle (inclusive) with the same tile. Order of corners does not matter.
+---@param self Actor 
+---@param x1 integer first corner tile X
+---@param y1 integer first corner tile Y
+---@param x2 integer opposite corner tile X
+---@param y2 integer opposite corner tile Y
+---@param atlas_index integer tile atlas index to fill with
+function tilemap.fill_rect(self, x1, y1, x2, y2, atlas_index) end
+
+---Sets the render layer (draw order). Lower layers draw first.
+---@param self Actor 
+---@param layer integer render layer (0 = default, negative = behind, positive = front)
+function tilemap.set_layer(self, layer) end
+
+---Enables or disables physics collision for this tile layer.
+---@param self Actor 
+---@param enabled boolean true = collidable, false = no collision
+function tilemap.set_physics_enabled(self, enabled) end
+
+---Returns the world-space bounds of a chunk. Useful for spawning or querying.
+---@param self Actor 
+---@param cx integer chunk X coordinate
+---@param cy integer chunk Y coordinate
+---@return number minimum world X
+---@return number minimum world Y
+---@return number maximum world X
+---@return number maximum world Y
+function tilemap.get_chunk_bounds(self, cx, cy) end
+
+---Erases a rectangle (sets tiles to empty). Order of corners does not matter.
+---@param self Actor 
+---@param x1 integer first corner tile X
+---@param y1 integer first corner tile Y
+---@param x2 integer opposite corner tile X
+---@param y2 integer opposite corner tile Y
+function tilemap.erase_rect(self, x1, y1, x2, y2) end
+
+---Overrides the tile size for this layer. 0 = use TileSet default.
+---@param self Actor 
+---@param size number tile size in world units (0 = default)
+function tilemap.set_tile_size(self, size) end
+
+---Sets default flip flags for newly placed tiles via set_tile/fill_rect.
+---@param self Actor 
+---@param flip_x boolean mirror horizontally by default
+---@param flip_y boolean mirror vertically by default
+function tilemap.set_default_flip(self, flip_x, flip_y) end
+
+---Returns a table with debug info about this tilemap layer.
+---@param self Actor 
+---@return table fields: tileset_guid, layer, z_offset, physics_enabled, tile_size_override, default_flip_x, default_flip_y
+function tilemap.describe(self) end
+
+
+-- ── anim ──
+---Adds an AnimationPlayer to this actor when it does not already have one.
+---@param self Actor 
+function anim.new(self) end
+
+---Decodes a .anim clip file and registers it, returning the clip id for anim.play. Calling it again for the same path hot-reloads the clip under the same id, so playback position is kept.
+---@param path string path to a .anim clip file
+---@return integer clip id, or nil on failure
+function anim.load(path) end
+
+---Plays a clip. A positive blend crossfades over that many seconds instead of cutting.
+---@param self Actor 
+---@param clip_id integer? #current# clip handle to play (0 = nothing)
+---@param blend number? #0# crossfade seconds; 0 cuts
+function anim.play(self, clip_id, blend) end
+
+---Stops playback and clears the current clip.
+---@param self Actor 
+function anim.stop(self) end
+
+---Pauses playback by setting speed to 0; the clip and time are kept.
+---@param self Actor 
+function anim.pause(self) end
+
+---Resumes a paused player by restoring speed 1; a no-op otherwise.
+---@param self Actor 
+function anim.resume(self) end
+
+---Jumps to a time in seconds inside the current clip.
+---@param self Actor 
+---@param time number seconds from the clip start
+function anim.seek(self, time) end
+
+---Sets the playback rate: 1 is normal, negative plays in reverse.
+---@param self Actor 
+---@param speed number time multiplier
+function anim.set_speed(self, speed) end
+
+---Queues a clip to start when the current one finishes (up to four).
+---@param self Actor 
+---@param clip_id integer clip handle to queue
+function anim.queue(self, clip_id) end
+
+---Sets one playback parameter by name: speed, time, clip, blend or state. Unknown names are ignored.
+---@param self Actor 
+---@param name string 'speed' | 'time' | 'clip' | 'blend' | 'state'
+---@param value number new value for the parameter
+function anim.set_param(self, name, value) end
+
+---Current playback state (0 idle, 1 playing, 2 paused, 3 finished).
+---@param self Actor 
+---@return integer playback state
+function anim.state(self) end
+
+---Current time in seconds inside the playing clip.
+---@param self Actor 
+---@return number seconds from the clip start
+function anim.time(self) end
+
+---Duration in seconds of the current clip; 0 when the clip is unknown.
+---@param self Actor 
+---@return number clip duration in seconds
+function anim.length(self) end
+
+---True while the player is in the playing state.
+---@param self Actor 
+---@return boolean true when playing
+function anim.is_playing(self) end
+
+
+-- ── ui ──
+---Places the widget at an anchor preset: top_left … bottom_right, stretch_h, stretch_v or full_rect.
+---@param self Actor 
+---@param anchor string "top_left" | "top_center" | "top_right" | "middle_left" | "center" | "middle_right" | "bottom_left" | "bottom_center" | "bottom_right" | "stretch_h" | "stretch_v" | "full_rect"
+function ui.set_anchor(self, anchor) end
+
+---Displacement from the resolved anchor point, in canvas pixels.
+---@param self Actor 
+---@param x number horizontal offset
+---@param y number vertical offset, positive down
+function ui.set_offset(self, x, y) end
+
+---Widget size in canvas pixels (ignored by `full_rect` and by the axis a stretch preset fills).
+---@param self Actor 
+---@param w number width in canvas pixels
+---@param h number height in canvas pixels
+function ui.set_size(self, w, h) end
+
+---Where the anchor point sits on the widget: 0,0 is its top-left, 0.5,0.5 centres it.
+---@param self Actor 
+---@param x number 0..1 across the width
+---@param y number 0..1 down the height
+function ui.set_pivot(self, x, y) end
+
+---The insets the stretch presets use. Ignored by the nine point anchors.
+---@param self Actor 
+---@param top number 
+---@param right number 
+---@param bottom number 
+---@param left number 
+function ui.set_margin(self, top, right, bottom, left) end
+
+---Paint and hit-test tie-break: a higher order draws later and wins a click. Equal orders fall back to spawn order.
+---@param self Actor 
+---@param order integer any integer; additive across widgets
+function ui.set_order(self, order) end
+
+---Whether the widget is drawn this frame.
+---@param self Actor 
+---@param visible boolean 
+function ui.set_visible(self, visible) end
+
+---Whether the widget blocks world input and can be hovered/clicked. Labels and bars never capture regardless.
+---@param self Actor 
+---@param interactive boolean 
+function ui.set_interactive(self, interactive) end
+
+---The widget's string: a label's body, a button's caption or a bar's text. Truncated at 128 bytes.
+---@param self Actor 
+---@param text string the text to draw (max 128 bytes, silently truncated)
+function ui.set_text(self, text) end
+
+---Which font the text uses: 0 is the engine default, any other id comes from `ui.font_load`.
+---@param self Actor 
+---@param id integer font id from ui.font_load, or 0 for the default
+function ui.set_font(self, id) end
+
+---The widget's primary colour: a label's text, a panel's fill, a button's caption or a bar's fill.
+---@param self Actor 
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number alpha 0..1
+function ui.set_color(self, r, g, b, a) end
+
+---A button's four colours, each a `{ r, g, b, a }` array (alpha optional). A nil table leaves that colour unchanged.
+---@param self Actor 
+---@param normal table { r, g, b, a } when idle
+---@param hover table { r, g, b, a } under the pointer
+---@param pressed table { r, g, b, a } while held
+---@param text table { r, g, b, a } for the caption
+function ui.set_colors(self, normal, hover, pressed, text) end
+
+---A panel's outline. Zero width or zero alpha draws none.
+---@param self Actor 
+---@param r number red 0..1
+---@param g number green 0..1
+---@param b number blue 0..1
+---@param a number alpha 0..1
+---@param width number border thickness in pixels
+function ui.set_border(self, r, g, b, a, width) end
+
+---Whether a progress bar draws its text (e.g. "7 / 10") over the fill.
+---@param self Actor 
+---@param show boolean 
+function ui.set_show_text(self, show) end
+
+---A progress bar's fill, clamped to 0..1.
+---@param self Actor 
+---@param value number 0..1 fraction filled
+function ui.set_value(self, value) end
+
+---A label's horizontal alignment inside its rect: "left", "center" or "right".
+---@param self Actor 
+---@param align string "left" | "center" | "right"
+function ui.set_align(self, align) end
+
+---A button's enabled flag. A disabled button is inert: no hover, no click, no pointer capture.
+---@param self Actor 
+---@param enabled boolean 
+function ui.set_enabled(self, enabled) end
+
+---The pixel size `text` would occupy in this widget's font. Nil when no UI system is wired.
+---@param self Actor 
+---@param text string the string to measure
+---@return number width in pixels
+---@return number height in pixels (the line box)
+function ui.measure(self, text) end
+
+---The screen-pixel rect the UI system resolved this frame: x, y, width, height.
+---@param self Actor 
+---@return number x of the top-left corner
+---@return number y of the top-left corner
+---@return number width in pixels
+---@return number height in pixels
+function ui.rect(self) end
+
+---True while the pointer is over this widget.
+---@param self Actor 
+---@return boolean true when the pointer is over the widget
+function ui.hovered(self) end
+
+---True while this button is being held down.
+---@param self Actor 
+---@return boolean true while held
+function ui.pressed(self) end
+
+---Loads (or returns a cached) TTF at `px` pixels and returns its id for `ui.set_font`. 0 when unreadable.
+---@param path string TTF path, relative to the project root
+---@param px number pixel height to rasterize at
+---@return integer font id for ui.set_font; 0 when the file could not be read
+function ui.font_load(path, px) end
 
 

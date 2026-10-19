@@ -117,6 +117,8 @@ pub fn main() !void {
     try mathSet(alloc);
     try vec2All(alloc);
     try spatial(alloc);
+    try uiSurface(alloc);
+    try tintSurface(alloc);
 
     if (failures == 0) {
         std.debug.print("== M3 API acceptance: all green ==\n", .{});
@@ -282,6 +284,299 @@ fn spatial(alloc: std.mem.Allocator) !void {
     check("no behavior errors", b.errors == 0);
 }
 
+// ── 5. ui (M14) ──────────────────────────────────────────────────────────────
+
+/// One script, four actors: the widget kind is set from Zig before the first
+/// update (the same "field on `self`" pattern the chase test uses), so one
+/// `load` covers the button, label, panel and bar surfaces without a second
+/// script name (multiple different `load`s on one VM are a known LuaJIT crash).
+const ui_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.done = false
+    \\end
+    \\function M:update(dt)
+    \\  if self.done then return end
+    \\  self.done = true
+    \\  local k = self.kind
+    \\  if k == "button" then
+    \\    actor.add_component(self, "UiCanvas")
+    \\    actor.add_component(self, "UiButton")
+    \\    ui.set_anchor(self, "center")
+    \\    ui.set_offset(self, 10, 20)
+    \\    ui.set_size(self, 200, 60)
+    \\    ui.set_pivot(self, 0.5, 0.5)
+    \\    ui.set_order(self, 3)
+    \\    ui.set_interactive(self, false)
+    \\    ui.set_text(self, "Play")
+    \\    ui.set_font(self, 2)
+    \\    ui.set_enabled(self, true)
+    \\    ui.set_colors(self,
+    \\      { 0.1, 0.2, 0.3, 1 },
+    \\      { 0.2, 0.3, 0.4, 1 },
+    \\      { 0.05, 0.05, 0.05, 1 },
+    \\      { 0.9, 0.9, 0.9, 1 })
+    \\    ui.set_color(self, 0.5, 0.6, 0.7, 1)
+    \\    self.font_id = ui.font_load("assets/fonts/none.ttf", 16)
+    \\    self.mw, self.mh = ui.measure(self, "Play")
+    \\    local rx, ry = ui.rect(self)
+    \\    self.rx, self.ry = rx, ry
+    \\    self.hov = ui.hovered(self)
+    \\    self.pres = ui.pressed(self)
+    \\    self.pover = input.pointer_over_ui()
+    \\    self.has_label = actor.has_component(self, "Label")
+    \\  elseif k == "label" then
+    \\    actor.add_component(self, "Label")
+    \\    ui.set_text(self, "Score")
+    \\    ui.set_align(self, "right")
+    \\    ui.set_font(self, 3)
+    \\    ui.set_color(self, 1, 0.8, 0.2, 1)
+    \\  elseif k == "panel" then
+    \\    actor.add_component(self, "UiPanel")
+    \\    ui.set_anchor(self, "full_rect")
+    \\    ui.set_margin(self, 4, 4, 4, 4)
+    \\    ui.set_color(self, 0.1, 0.1, 0.1, 0.9)
+    \\    ui.set_border(self, 1, 1, 1, 0.5, 2)
+    \\  elseif k == "bar" then
+    \\    actor.add_component(self, "UiProgressBar")
+    \\    ui.set_value(self, 0.5)
+    \\    ui.set_show_text(self, true)
+    \\    ui.set_visible(self, false)
+    \\  end
+    \\end
+    \\return M
+;
+
+// The CanvasModulate surface. Three frames, one step each, because the mode is
+// write-only from Lua (there is no getter for it) and the test observes the
+// hook's state BETWEEN steps — the same way a runtime would see it.
+const tint_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.step = 0
+    \\end
+    \\function M:update(dt)
+    \\  self.step = self.step + 1
+    \\  if self.step == 1 then
+    \\    scene.tint(0.6, 0.5, 0.75, 0.8)
+    \\  elseif self.step == 2 then
+    \\    self.amt = scene.tint_amount()
+    \\    scene.tint_mode("add")
+    \\  elseif self.step == 3 then
+    \\    scene.tint_clear()
+    \\    self.amt_after = scene.tint_amount()
+    \\  end
+    \\end
+    \\return M
+;
+
+/// The vtable a runtime would provide. `measure` is a fixed 7 px per character
+/// so the test pins the plumbing, not a rasterizer (that is `font.zig`'s job),
+/// and `font_load` returns a known id.
+const MockUi = struct {
+    fn measure(_: ?*anyopaque, font_id: u32, text: []const u8, out: *[2]f32) bool {
+        _ = font_id;
+        out[0] = @floatFromInt(text.len * 7);
+        out[1] = 16;
+        return true;
+    }
+    fn fontLoad(_: ?*anyopaque, path: []const u8, px: f32) u32 {
+        _ = path;
+        _ = px;
+        return 7;
+    }
+    fn hovered(_: ?*anyopaque, _: u64) bool {
+        return false;
+    }
+    fn pressed(_: ?*anyopaque, _: u64) bool {
+        return false;
+    }
+};
+
+/// The CanvasModulate double. It keeps the SAME state a real `render.tint.Tint`
+/// keeps (`color` + the mode wire code) but is defined here because the `script`
+/// module cannot import `render`. The test asserts the plumbing — that each Lua
+/// call reaches the hook with the right arguments — which is what PR9 needs; the
+/// mix itself is `tint.zig`'s and `post.wgsl`'s job.
+const MockTint = struct {
+    const State = struct {
+        color: [4]f32 = .{ 1, 1, 1, 0 },
+        mode: u8 = 0,
+    };
+    fn set(ctx: ?*anyopaque, r: f32, g: f32, b: f32, a: f32) void {
+        const s: *State = @ptrCast(@alignCast(ctx.?));
+        s.color = .{ r, g, b, a };
+        if (s.mode == 0) s.mode = 1; // multiply by default, off -> on
+    }
+    fn setMode(ctx: ?*anyopaque, mode: u8) void {
+        const s: *State = @ptrCast(@alignCast(ctx.?));
+        s.mode = mode;
+    }
+    fn clear(ctx: ?*anyopaque) void {
+        const s: *State = @ptrCast(@alignCast(ctx.?));
+        s.color = .{ 1, 1, 1, 0 };
+        s.mode = 0;
+    }
+    fn amount(ctx: ?*anyopaque) f32 {
+        const s: *State = @ptrCast(@alignCast(ctx.?));
+        return s.color[3];
+    }
+};
+
+fn approx(a: f32, b: f32) bool {
+    return @abs(a - b) < 1e-3;
+}
+
+fn uiSurface(alloc: std.mem.Allocator) !void {
+    std.debug.print("-- ui: the M14 widget surface, from Lua --\n", .{});
+    var world = ecs.World.init(alloc);
+    defer world.deinit();
+    try world.reserveEntities(16);
+    try world.reserve(.{components.Transform}, 16);
+    var input = script.Input{};
+    var b: script.Behaviors = undefined;
+    try b.init(alloc, &world, &input);
+    defer b.deinit();
+
+    var hooks = script.context.UiHooks{
+        .ctx = null,
+        .measure = MockUi.measure,
+        .font_load = MockUi.fontLoad,
+        .hovered = MockUi.hovered,
+        .pressed = MockUi.pressed,
+    };
+    b.ctx.ui = &hooks;
+
+    _ = try b.load("ui.lua", ui_src);
+
+    const button = try world.spawn(.{components.Transform{}});
+    const label = try world.spawn(.{components.Transform{}});
+    const panel = try world.spawn(.{components.Transform{}});
+    const bar = try world.spawn(.{components.Transform{}});
+    inline for (.{ button, label, panel, bar }) |e| try b.attach(e, 0);
+    b.startAll();
+
+    // Set each actor's widget kind before the first update runs.
+    const L = b.vm.state().?;
+    const kinds = [_][]const u8{ "button", "label", "panel", "bar" };
+    for (kinds, 0..) |kind, i| {
+        b.vm.pushRef(b.instances.items[i].self_ref);
+        script.luajit.pushSlice(L, kind);
+        script.luajit.setField(L, -2, "kind");
+        script.luajit.pop(L, 1);
+    }
+    b.update(1.0 / 60.0);
+
+    // ── button ──────────────────────────────────────────────────────────────
+    const btn = world.get(button, components.UiButton) orelse {
+        check("actor.add_component(\"UiButton\") gave the actor a button", false);
+        return;
+    };
+    const bs = b.instances.items[0].self_ref;
+    check("ui.set_anchor(center) reached the layout", btn.layout.anchor == .center);
+    check("ui.set_offset(10, 20) reached the layout", approx(btn.layout.offset.x, 10) and approx(btn.layout.offset.y, 20));
+    check("ui.set_size(200, 60) reached the layout", approx(btn.layout.size.x, 200) and approx(btn.layout.size.y, 60));
+    check("ui.set_pivot(0.5, 0.5) reached the layout", approx(btn.layout.pivot.x, 0.5) and approx(btn.layout.pivot.y, 0.5));
+    check("ui.set_order(3) reached the layout", btn.layout.order == 3);
+    check("ui.set_interactive(false) reached the layout", !btn.layout.interactive);
+    check("ui.set_text(\"Play\") reached the button", btn.text.eql("Play"));
+    check("ui.set_font(2) reached the button", btn.font == 2);
+    check("ui.set_enabled(true) reached the button", btn.enabled);
+    check("ui.set_color on a button writes text_color", approx(btn.text_color[0], 0.5) and approx(btn.text_color[2], 0.7));
+    check("ui.set_colors wrote color_normal", approx(btn.color_normal[0], 0.1) and approx(btn.color_normal[2], 0.3));
+    check("ui.set_colors wrote color_hover", approx(btn.color_hover[1], 0.3));
+    check("ui.set_colors wrote color_pressed", approx(btn.color_pressed[0], 0.05));
+    check("ui.font_load reaches the hook and returns its id", readNumber(&b, bs, "font_id").? == 7);
+    check("ui.measure returns (width, height) from the hook", near(readNumber(&b, bs, "mw").?, 28) and near(readNumber(&b, bs, "mh").?, 16));
+    check("ui.rect is (0,0) before the system has laid the widget out", near(readNumber(&b, bs, "rx").?, 0) and near(readNumber(&b, bs, "ry").?, 0));
+    check("ui.hovered is false with no UI system", !readSelfBool(&b, bs, "hov"));
+    check("ui.pressed is false with no UI system", !readSelfBool(&b, bs, "pres"));
+    check("input.pointer_over_ui is false by default", !readSelfBool(&b, bs, "pover"));
+    check("actor.has_component(\"Label\") is false on a button", !readSelfBool(&b, bs, "has_label"));
+    check("actor.add_component(\"UiCanvas\") landed", world.get(button, components.UiCanvas) != null);
+
+    // ── label ───────────────────────────────────────────────────────────────
+    const lbl = world.get(label, components.Label) orelse {
+        check("actor.add_component(\"Label\") gave the actor a label", false);
+        return;
+    };
+    check("ui.set_text on a label", lbl.text.eql("Score"));
+    check("ui.set_align(\"right\") reached the label", lbl.alignment == .right);
+    check("ui.set_font(3) reached the label", lbl.font == 3);
+    check("ui.set_color on a label writes color", approx(lbl.color[1], 0.8) and approx(lbl.color[3], 1));
+
+    // ── panel ───────────────────────────────────────────────────────────────
+    const pnl = world.get(panel, components.UiPanel) orelse {
+        check("actor.add_component(\"UiPanel\") gave the actor a panel", false);
+        return;
+    };
+    check("ui.set_anchor(\"full_rect\") reached the panel", pnl.layout.anchor == .full_rect);
+    check("ui.set_margin(4,4,4,4) reached the panel", approx(pnl.layout.margin[0], 4) and approx(pnl.layout.margin[3], 4));
+    check("ui.set_color on a panel writes color", approx(pnl.color[0], 0.1) and approx(pnl.color[3], 0.9));
+    check("ui.set_border wrote the colour and width", approx(pnl.border_width, 2) and approx(pnl.border_color[3], 0.5));
+
+    // ── bar ─────────────────────────────────────────────────────────────────
+    const bar_c = world.get(bar, components.UiProgressBar) orelse {
+        check("actor.add_component(\"UiProgressBar\") gave the actor a bar", false);
+        return;
+    };
+    check("ui.set_value(0.5) reached the bar", approx(bar_c.value, 0.5));
+    check("ui.set_show_text(true) reached the bar", bar_c.show_text);
+    check("ui.set_visible(false) reached the bar", !bar_c.layout.visible);
+
+    // ── removal ─────────────────────────────────────────────────────────────
+    check("actor.remove_component(\"UiProgressBar\") removes it", world.remove(bar, components.UiProgressBar));
+    check("the bar component is gone", world.get(bar, components.UiProgressBar) == null);
+    check("no behavior errors", b.errors == 0);
+}
+
+// ── 5b. scene.tint (CanvasModulate) ──────────────────────────────────────────
+
+fn tintSurface(alloc: std.mem.Allocator) !void {
+    std.debug.print("-- scene.tint: the M14 CanvasModulate surface, from Lua --\n", .{});
+    var world = ecs.World.init(alloc);
+    defer world.deinit();
+    try world.reserveEntities(4);
+    try world.reserve(.{components.Transform}, 4);
+    var input = script.Input{};
+    var b: script.Behaviors = undefined;
+    try b.init(alloc, &world, &input);
+    defer b.deinit();
+
+    var state = MockTint.State{};
+    var hooks = script.context.TintHooks{
+        .ctx = &state,
+        .set = MockTint.set,
+        .set_mode = MockTint.setMode,
+        .clear = MockTint.clear,
+        .amount = MockTint.amount,
+    };
+    b.ctx.tint = &hooks;
+
+    _ = try b.load("tint.lua", tint_src);
+    const e = try world.spawn(.{components.Transform{}});
+    try b.attach(e, 0);
+    b.startAll();
+    const s = b.instances.items[0].self_ref;
+
+    // Step 1: a colour, which turns the effect on.
+    b.update(1.0 / 60.0);
+    check("scene.tint wrote the colour", approx(state.color[0], 0.6) and approx(state.color[1], 0.5) and
+        approx(state.color[2], 0.75) and approx(state.color[3], 0.8));
+    check("scene.tint enabled multiply by default", state.mode == 1);
+
+    // Step 2: the amount query, then an explicit mode.
+    b.update(1.0 / 60.0);
+    check("scene.tint_amount returns the hook's strength", near(readNumber(&b, s, "amt").?, 0.8));
+    check("scene.tint_mode(\"add\") switched the mix", state.mode == 2);
+
+    // Step 3: clear, and the amount reads back to zero.
+    b.update(1.0 / 60.0);
+    check("scene.tint_clear disabled it", state.mode == 0 and approx(state.color[3], 0));
+    check("scene.tint_amount is 0 after clear", near(readNumber(&b, s, "amt_after").?, 0));
+    check("no behavior errors", b.errors == 0);
+}
+
 // ── readers ──────────────────────────────────────────────────────────────────
 
 fn readNumber(b: *script.Behaviors, self_ref: i32, key: [*:0]const u8) ?f64 {
@@ -289,6 +584,17 @@ fn readNumber(b: *script.Behaviors, self_ref: i32, key: [*:0]const u8) ?f64 {
     b.vm.pushRef(self_ref);
     script.luajit.getField(L, -1, key);
     const v: ?f64 = if (script.luajit.isNumber(L, -1)) script.luajit.lua_tonumber(L, -1) else null;
+    script.luajit.pop(L, 2);
+    return v;
+}
+
+/// Reads a BOOLEAN field off a `self` table (the ui query bindings return
+/// true/false).
+fn readSelfBool(b: *script.Behaviors, self_ref: i32, key: [*:0]const u8) bool {
+    const L = b.vm.state().?;
+    b.vm.pushRef(self_ref);
+    script.luajit.getField(L, -1, key);
+    const v = script.luajit.lua_toboolean(L, -1) != 0;
     script.luajit.pop(L, 2);
     return v;
 }

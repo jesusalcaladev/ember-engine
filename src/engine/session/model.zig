@@ -252,6 +252,26 @@ pub const Model = struct {
         return e;
     }
 
+    /// Journals a row an EDITOR made outside the model's typed API — a prefab
+    /// instantiation lands rows through `zson.instantiate`, which creates
+    /// archetypes the typed spawn cannot spell — as a spawn act. Undo despawns
+    /// the row; redo rebuilds it from the captured cells, exactly like `spawn`'s
+    /// own payload. The row must already exist and hold its final components:
+    /// the cells are captured as they are NOW, so anything that changes them
+    /// afterwards (a name uniquification, say) has to happen BEFORE the
+    /// journaling, or the redo replays the older bytes.
+    pub fn journalSpawn(self: *Model, entity: Entity, label: []const u8) !void {
+        if (!self.cell.isAlive(entity)) return error.NoSuchEntity;
+        try self.push(.{
+            .kind = .spawn,
+            .entity = entity,
+            .arch = self.cell.archIndexOf(entity) orelse 0,
+            .scene = self.cell.sceneIdOf(entity),
+            .cells = try self.captureCells(entity),
+            .label = label,
+        });
+    }
+
     /// Destroys an entity. One act, and the expensive kind: the payload is a
     /// whole-world document, because what is destroyed may be a row another
     /// entity's parent field points at.

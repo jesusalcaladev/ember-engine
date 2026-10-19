@@ -1,0 +1,52 @@
+zson 1
+entity 1 {
+  Name "camera"
+  Transform {position: {x: 640, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
+}
+entity 2 {
+  Name "player"
+  Transform {position: {x: 640, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
+  Parent {parent: 1}
+  Sprite {atlas: 0, layer: 0, size: {x: 32, y: 32}, tint: [0.2, 0.6, 1, 1], blend: alpha, visible: true}
+  Script {script: 2}
+}
+entity 3 {
+  Name "hud"
+  UiCanvas {virtual_w: 1280, virtual_h: 720, scale_mode: fit}
+  Script {script: 1}
+}
+entity 4 {
+  Name "hud_panel"
+  UiPanel {
+    layout: {anchor: top_left, offset: {x: 16, y: 16}, size: {x: 260, y: 104}, interactive: false}
+    color: [0.05, 0.06, 0.09, 0.75]
+    border_color: [1, 1, 1, 0.15]
+    border_width: 1
+  }
+}
+entity 5 {
+  Name "hud_score"
+  Label {
+    layout: {anchor: top_left, offset: {x: 32, y: 28}, size: {x: 220, y: 28}}
+    text: "Score: 0"
+    color: [0.95, 0.96, 1, 1]
+    alignment: left
+  }
+}
+entity 6 {
+  Name "hud_bar"
+  UiProgressBar {
+    layout: {anchor: top_left, offset: {x: 32, y: 68}, size: {x: 220, y: 18}}
+    value: 1
+    show_text: true
+    text: "30s"
+  }
+}
+entity 7 {
+  Name "hud_pause"
+  UiButton {
+    layout: {anchor: top_right, offset: {x: -24, y: 24}, size: {x: 96, y: 36}, pivot: {x: 1, y: 0}}
+    text: "Pause"
+    id: 1
+  }
+}

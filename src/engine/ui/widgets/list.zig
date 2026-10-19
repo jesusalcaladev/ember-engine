@@ -52,6 +52,26 @@ pub const Row = struct {
     drop_target: bool = false,
     selected: bool = false,
     hovered: bool = false,
+
+    /// Drag SOURCE data. Set for rows that are draggable. `data`'s bytes are
+    /// copied by ImGui at `set_drag_drop_payload` time, so a stack buffer is
+    /// fine — but the slice must outlive this one `row()` call, which it does
+    /// by being built next to it.
+    drag: ?DragSrc = null,
+    /// Drop TARGET kinds the row accepts, e.g. entity drops and file drops on
+    /// one hierarchy row at once.
+    drop: ?[]const [:0]const u8 = null,
+};
+
+/// The bytes a source carries. ImGui serializes them at source-open, so they
+/// may live anywhere; the payload bytes handed BACK to a target are valid only
+/// between `begin_drag_drop_target` and `end_drag_drop_target`.
+pub const DragSrc = struct {
+    kind: [:0]const u8,
+    data: []const u8,
+    /// What shows under the cursor while the row is dragged. A row's label is
+    /// the honest default.
+    preview: []const u8 = "",
 };
 
 pub const RowOptions = struct {
@@ -64,6 +84,10 @@ pub const RowOptions = struct {
     icon_size: f32 = 16.0,
     on_click: ?*const fn (ctx: ?*anyopaque, row_id: []const u8) void = null,
     on_activate: ?*const fn (ctx: ?*anyopaque, row_id: []const u8) void = null,
+    /// A drop was ACCEPTED on a kind this row declared. `payload` points at
+    /// ImGui's drag buffer: the callback must copy what it keeps before
+    /// returning (the widget ends the target right after the callback).
+    on_drop: ?*const fn (ctx: ?*anyopaque, row_id: []const u8, kind: []const u8, payload: []const u8) void = null,
     ctx_arg: ?*anyopaque = null,
 };
 
@@ -87,7 +111,13 @@ pub fn row(r: Row, o: RowOptions) RowResult {
     const list = draw.itemList();
 
     const rect = hit.rect;
-    if (r.drop_target) {
+    // A row painted as a drop target while a drag is in flight over it: the
+    // widget knows the dragged state itself, so callers do not have to reach
+    // for ImGui flags and every list gets the same affordance.
+    const is_drop_target = r.drop != null and
+        cimgui.ember_ui_is_drag_drop_active() != 0 and
+        (r.hovered or hit.hovered);
+    if (r.drop_target or is_drop_target) {
         list.rect(rect, t.colors.accent_soft, m.radius_sm());
         list.rectOutline(rect, t.colors.accent, m.radius_sm(), 1.5);
     } else if (r.selected) {
@@ -134,14 +164,55 @@ pub fn row(r: Row, o: RowOptions) RowResult {
     );
 
     var result: RowResult = .{ .hovered = hit.hovered, .rect = rect };
+
+    // Drag source: open while the row is held and the pointer has moved at
+    // least the lock threshold. A plain click still falls through to the
+    // normal `clicked` path — a drag that never became a drag must not eat the
+    // selection it started on.
+    if (r.drag) |d| {
+        if (cimgui.ember_ui_is_item_active() != 0 and
+            cimgui.ember_ui_is_mouse_dragging(0, 4) != 0 and
+            cimgui.ember_ui_begin_drag_drop_source(0) != 0)
+        {
+            _ = cimgui.ember_ui_set_drag_drop_payload(d.kind.ptr, d.data.ptr, @intCast(d.data.len));
+            if (d.preview.len > 0) cimgui.ember_ui_text(cimgui.text(d.preview));
+            cimgui.ember_ui_end_drag_drop_source();
+        }
+    }
+
     if (r.selectable and hit.clicked) {
         result.clicked = true;
         if (o.on_click) |cb| cb(o.ctx_arg, r.id);
     }
-    if (r.selectable and hit.focused and cimgui.ember_ui_is_item_deactivated_after_edit() != 0) {
+    // Double click, while the pointer is over THIS row. The previous version
+    // asked `IsItemDeactivatedAfterEdit`, which is an InputText/InputFloat
+    // signal: an InvisibleButton never reports it, so a row could be clicked
+    // twice all day and never "activate" — which is why renaming in the
+    // hierarchy looked implemented and did nothing.
+    if (r.selectable and hit.hovered and
+        cimgui.ember_ui_is_mouse_double_clicked(@intFromEnum(cimgui.MouseButton.Left)) != 0)
+    {
         result.activated = true;
         if (o.on_activate) |cb| cb(o.ctx_arg, r.id);
     }
+    // Drop target: declare, accept, hand the bytes to the callback, close. The
+    // payload bytes belong to ImGui and die with `end_drag_drop_target`, which
+    // is why the callback is the contract and not a returned slice.
+    if (r.drop) |kinds| {
+        if (cimgui.ember_ui_begin_drag_drop_target() != 0) {
+            for (kinds) |kind| {
+                var size: c_uint = 0;
+                if (cimgui.ember_ui_accept_drag_drop_payload(kind.ptr, 0, &size)) |bytes| {
+                    // The bytes are an unknown-length pointer until cast; the
+                    // cast is free and the length is what the shim wrote.
+                    const data: [*]const u8 = @ptrCast(bytes);
+                    if (o.on_drop) |cb| cb(o.ctx_arg, r.id, kind, data[0..size]);
+                }
+            }
+            cimgui.ember_ui_end_drag_drop_target();
+        }
+    }
+
     cimgui.ember_ui_pop_id();
     return result;
 }

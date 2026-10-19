@@ -94,6 +94,18 @@ pub const AnimationPlayer = registry.AnimationPlayer;
 pub const anim_clip_loop = registry.anim_clip_loop;
 pub const anim_clip_ping_pong = registry.anim_clip_ping_pong;
 pub const anim_clip_root_motion = registry.anim_clip_root_motion;
+// ── M14: game UI components ─────────────────────────────────────────────────
+pub const InlineText = registry.InlineText;
+pub const UiAnchor = registry.UiAnchor;
+pub const UiScaleMode = registry.UiScaleMode;
+pub const TextAlign = registry.TextAlign;
+pub const UiButtonState = registry.UiButtonState;
+pub const UiLayout = registry.UiLayout;
+pub const UiCanvas = registry.UiCanvas;
+pub const Label = registry.Label;
+pub const UiButton = registry.UiButton;
+pub const UiPanel = registry.UiPanel;
+pub const UiProgressBar = registry.UiProgressBar;
 // M15: TileMap export surface. The types live in components/tilemap.zig (they
 // predate the registry entry, and the registry entry stays parked with the rest
 // of M15). The editor's tilemap workspace reaches them through this facade the
@@ -131,5 +143,6 @@ test {
     _ = @import("components/sound_emitter.zig");
     _ = @import("components/particle.zig");
     _ = @import("components/animation.zig");
+    _ = @import("components/ui.zig");
     _ = @import("components/registry.zig");
 }

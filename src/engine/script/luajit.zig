@@ -181,6 +181,14 @@ pub inline fn toBool(L: ?*lua_State, idx: c_int) bool {
     return lua_toboolean(L, idx) != 0;
 }
 
+/// Reads a number as an INTEGER, for the handles and counters that must not
+/// lose a digit to a float. Lua 5.1 has ONE number type, so a handle read
+/// with `toF32` would be wrong above 2^24 — the tween handles are small, but
+/// the rule is worth keeping.
+pub inline fn toInteger(L: ?*lua_State, idx: c_int) i64 {
+    return @intCast(lua_tointeger(L, idx));
+}
+
 /// Reads the value at `idx` as a borrowed slice (valid until the value leaves
 /// the stack). Null bytes are preserved; use this over a C-string read when the
 /// payload may be binary.

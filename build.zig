@@ -99,6 +99,16 @@ platform_mod.addImport("core", core_mod);
         .file = b.path("src/engine/assets/stb_image_impl.c"),
         .flags = &.{ "-I", "libs" },
     });
+    // M14: the one translation unit that compiles stb_truetype (glyph
+    // rasterizing for the game's own UI). Same pattern, same include path; the
+    // extern surface it exposes is declared by `render/font.zig`. It needs
+    // libm (sqrt/floor/ceil/pow), which every consumer of `assets` links
+    // through this module.
+    assets_mod.addCSourceFile(.{
+        .file = b.path("src/engine/assets/stb_truetype_impl.c"),
+        .flags = &.{ "-I", "libs" },
+    });
+    assets_mod.linkSystemLibrary("m", .{});
 
     // ── M8 audio module ─────────────────────────────────────────────────────
     // The port (`audio.zig`), the pure maths (`mixer.zig`), voices, buses, the
@@ -656,6 +666,15 @@ render_mod.addImport("assets", assets_mod);
     const project_step = b.step("test-project", "Run the project.config suite (parse, validate, round-trip)");
     project_step.dependOn(&b.addRunArtifact(project_tests).step);
 
+    // M3 scripting: the VM, the sandbox, the behavior lifecycle (actors AND the
+    // globals), the bindings and the metadata gate. LuaJIT but no Dawn, so it
+    // is headless and quick — its own step for the same reason `test-project`
+    // is: iterating on behavior.zig should not wait on the render suite.
+    const script_tests_only = b.addTest(.{ .root_module = script_mod });
+    test_step.dependOn(&b.addRunArtifact(script_tests_only).step);
+    const script_step = b.step("test-script", "Run the scripting suite (VM, behaviors, globals, bindings, metadata)");
+    script_step.dependOn(&b.addRunArtifact(script_tests_only).step);
+
 
     const physics_tests = b.addTest(.{ .root_module = physics_mod });
     test_step.dependOn(&b.addRunArtifact(physics_tests).step);
@@ -828,6 +847,14 @@ render_mod.addImport("assets", assets_mod);
     editor_step.dependOn(b.getInstallStep());
     const editor_run_step = b.step("run-editor", "Run the ember editor");
     editor_run_step.dependOn(&b.addRunArtifact(editor_exe).step);
+
+    // The editor TOOLS' own tests: the tilemap Store's chunk bookkeeping, the
+    // collision-layer name table and every pure helper the panels keep. They
+    // run with no window and no GPU — they test state, not pixels — and they
+    // belong in `test` for the same reason the UI suite does: the editor is
+    // served by the same suite every other panel is, or by none.
+    const editor_tools_tests = b.addTest(.{ .root_module = editor_ui_mod });
+    test_step.dependOn(&b.addRunArtifact(editor_tools_tests).step);
 
     // M3 scripting tests: the VM, the sandbox, hot-reload, the bindings and the
     // metadata/stub layers. They link LuaJIT but not Dawn, so they run headless.

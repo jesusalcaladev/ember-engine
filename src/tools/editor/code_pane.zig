@@ -560,16 +560,10 @@ pub const Pane = struct {
 
     // ── Drawing ──────────────────────────────────────────────────────────
 
-    /// Draws the panel. `dt` is unused today and taken anyway, so adding an
-    /// animation later does not change every call site.
+    /// Draws the pane as a full-window editor. Kept for a standalone run (and
+    /// for the `--frames` smoke test); the editor shell calls `drawContents`
+    /// inside its centre panel so the pane shares the dock with the viewport.
     pub fn draw(self: *Pane, ctx: *ui.Context, dt: f32) void {
-        _ = dt;
-        const t = &ctx.theme;
-        const m = t.metrics;
-
-        // The panel is the whole editor view for now: a real editor's dock
-        // layout is M5's job, and a panel that fills the window is the honest
-        // starting point for one that has to prove it works.
         const flags: u32 = cimgui.WindowFlags.NoDecoration |
             cimgui.WindowFlags.NoMove |
             cimgui.WindowFlags.NoSavedSettings |
@@ -585,6 +579,22 @@ pub const Pane = struct {
             return;
         }
         defer cimgui.ember_ui_end();
+        self.drawContents(ctx, dt);
+    }
+
+    /// The pane's body, drawn into the CURRENT window at the current cursor.
+    ///
+    /// Everything below measures from the cursor and the remaining content
+    /// area, so the same code fills a full screen and a 900×600 dock panel. The
+    /// caller owns the window (and its begin/end pair); this owns the chrome
+    /// and the document.
+    ///
+    /// `dt` is unused today and taken anyway, so adding an animation later does
+    /// not change every call site.
+    pub fn drawContents(self: *Pane, ctx: *ui.Context, dt: f32) void {
+        _ = dt;
+        const t = &ctx.theme;
+        const m = t.metrics;
 
         const list = ui.draw.List.window();
         const origin = ui.draw.cursorScreenPos();

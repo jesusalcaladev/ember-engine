@@ -32,9 +32,6 @@ const Context = @import("context.zig").Context;
 const button = @import("widgets/button.zig");
 
 pub const RowOptions = struct {
-    /// The gap between items. The theme's by default, because a row whose gap
-    /// is passed in by every caller is a row whose gap drifts.
-    gap: ?f32 = null,
     /// Where the first item starts, relative to the current cursor.
     offset_x: f32 = 0,
 };
@@ -42,9 +39,13 @@ pub const RowOptions = struct {
 /// Draws items left to right on one line. The body is a separate function
 /// because the cursor has to be put back afterwards, and "put it back" only
 /// works if the function that moved it is the one that restores it.
+///
+/// The body owns the `SameLine` calls BETWEEN its items; this function must not
+/// emit one at the end. It used to, and that was the bug that put every field
+/// after a row on the same line: `SameLine` overrides the Y the cursor was
+/// restored to, so "restore the row, then continue below it" turned into
+/// "continue beside it".
 pub fn row(ctx: *Context, opts: RowOptions, body: *const fn (ctx: *Context) void) void {
-    const m = &ctx.theme.metrics;
-    const item_gap = opts.gap orelse m.gap();
     const start = draw.cursorPos();
     draw.setCursorPos(.{ .x = start.x + opts.offset_x, .y = start.y });
     body(ctx);
@@ -53,7 +54,6 @@ pub fn row(ctx: *Context, opts: RowOptions, body: *const fn (ctx: *Context) void
     // leaving Y alone is what makes the next row sit below the tallest.
     const after = draw.cursorPos();
     draw.setCursorPos(.{ .x = start.x, .y = after.y });
-    cimgui.ember_ui_same_line(0, item_gap);
 }
 
 /// Draws `body` at an indented offset, without leaving the line. The
@@ -244,17 +244,32 @@ pub fn splitter(s: Splitter) bool {
 /// A full-screen editor window with no decoration, no moving and no resizing.
 /// The shape a workspace panel is: a region, a name, and nothing else.
 pub fn fullscreen(ctx: *Context, id: []const u8, body: *const fn (ctx: *Context) void) void {
-    _ = beginHost(ctx, id, 0);
-    body(ctx);
+    const w: f32 = @floatFromInt(ctx.window.fb_width);
+    const h: f32 = @floatFromInt(ctx.window.fb_height);
+    const visible = beginHost(ctx, id, .{
+        .x = 0,
+        .y = 0,
+        .w = w,
+        .h = h,
+        .resizable = false,
+        .fixed = true,
+        .flags = cimgui.WindowFlags.NoDecoration |
+            cimgui.WindowFlags.NoMove |
+            cimgui.WindowFlags.NoSavedSettings |
+            cimgui.WindowFlags.NoBringToFrontOnFocus,
+    });
+    if (visible) body(ctx);
+    // `End` is unconditional: ImGui requires the pair even on a collapsed
+    // window, and skipping it is what leaves the next window parented wrongly.
     cimgui.ember_ui_end();
 }
 
 /// A panel that floats: a real ImGui window, positioned by the caller, with a
 /// title bar. Used for the asset browser and the console when they are
-/// undocked.
+/// undocked, and for the editor dock when they are not.
 pub fn floating(ctx: *Context, id: []const u8, opts: FloatingOptions, body: *const fn (ctx: *Context) void) void {
-    _ = beginHost(ctx, id, opts);
-    body(ctx);
+    const visible = beginHost(ctx, id, opts);
+    if (visible) body(ctx);
     cimgui.ember_ui_end();
 }
 
@@ -268,16 +283,36 @@ pub const FloatingOptions = struct {
     first_use: bool = true,
     resizable: bool = true,
     menu_bar: bool = false,
+    /// Extra `WindowFlags`, OR'd on top of the ones derived above.
+    ///
+    /// This is where a docked-looking panel asks for `NoDecoration | NoMove`:
+    /// the shell pins it in place and draws its OWN header, so ImGui's title
+    /// bar would be a second, mismatched one. A fixed editor layout is a set of
+    /// windows that must NOT be draggable, and "not draggable" has to be
+    /// expressible without a fifth boolean per window flag.
+    flags: u32 = 0,
+    /// The position and size are the layout's, not the user's: they are applied
+    /// EVERY frame (`Cond.Always`), which is the only thing that makes a pinned
+    /// dock stay pinned. `first_use` alone would leave the window at whatever
+    /// ImGui remembered from last session — and with `NoSavedSettings` there is
+    /// nothing to remember, so it would sit at the origin.
+    fixed: bool = false,
 };
 
 fn beginHost(ctx: *Context, id: []const u8, opts: FloatingOptions) bool {
     _ = ctx;
-    var flags: u32 = 0;
+    var flags: u32 = opts.flags;
     if (opts.w <= 0 or opts.h <= 0) flags |= cimgui.WindowFlags.AlwaysAutoResize;
     if (!opts.resizable) flags |= cimgui.WindowFlags.NoResize;
     if (opts.menu_bar) flags |= cimgui.WindowFlags.MenuBar;
-    cimgui.ember_ui_set_next_window_pos(opts.x, opts.y, @intFromEnum(if (opts.first_use) cimgui.Cond.FirstUseEver else cimgui.Cond.None));
-    cimgui.ember_ui_set_next_window_size(opts.w, opts.h, @intFromEnum(if (opts.first_use) cimgui.Cond.FirstUseEver else cimgui.Cond.None));
+    const cond: cimgui.Cond = if (opts.fixed)
+        .Always
+    else if (opts.first_use)
+        .FirstUseEver
+    else
+        .None;
+    cimgui.ember_ui_set_next_window_pos(opts.x, opts.y, @intFromEnum(cond));
+    cimgui.ember_ui_set_next_window_size(opts.w, opts.h, @intFromEnum(cond));
     return cimgui.ember_ui_begin(cimgui.text(id), @bitCast(flags)) != 0;
 }
 

@@ -36,6 +36,8 @@ const physics = @import("physics");
 const session = @import("session");
 const code_pane = @import("code_pane.zig");
 const tilemap_panel = @import("tilemap_panel.zig");
+const editor_shell = @import("shell.zig");
+const editor_state = @import("editor_state.zig");
 
 const Model = session.model.Model;
 const log = core.log.scoped("editor");
@@ -72,10 +74,18 @@ const asset_budget_bytes: usize = 64 * 1024 * 1024;
 
 var frame_count: u64 = 0;
 
+/// The last frame's ImGui geometry: [draw lists, vertices, indices]. Written
+/// inside the overlay callback (the only moment ImGui's draw data is valid) and
+/// read by the `--frames` summary.
+var ui_stats: [3]i32 = .{ 0, 0, 0 };
+
 // ─── Arguments ───────────────────────────────────────────────────────────────
 
 const Args = struct {
     project_path: []const u8 = ".",
+    /// A scene document to open at boot. Empty means "keep the built-in demo
+    /// scene", which is what an editor with no arguments opens onto.
+    scene_path: []const u8 = "",
     headless: bool = false,
     vsync: bool = true,
     gpu_smoke: bool = false,
@@ -97,6 +107,8 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--project")) {
             if (it.next()) |p| args.project_path = p;
+        } else if (std.mem.eql(u8, arg, "--scene")) {
+            if (it.next()) |p| args.scene_path = p;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             args.headless = true;
         } else if (std.mem.eql(u8, arg, "--gpu-smoke")) {
@@ -130,12 +142,10 @@ fn sceneCamera(view: ?ecs.camera.View, width: u32, height: u32) render.Camera {
     return render.makeCameraCustom(v.viewProjection(), 0, 0, width, height);
 }
 
-/// The editor's camera. Fixed for now, but it is the same `ecs.camera.View` the
+/// The editor's camera lives in `Editor.viewport` (pan, zoom, persistence);
+/// main only asks for the view each frame — the same `ecs.camera.View` the
 /// runtime would read from a project, so switching to a real camera component
 /// later is a query, not a rewrite.
-fn editorView(w: f32, h: f32) ecs.camera.View {
-    return .{ .cx = 0, .cy = 0, .zoom = 1, .viewport_w = w, .viewport_h = h };
-}
 
 /// The world's environment, or a neutral one. A scene with no `Environment`
 /// component still has to light, or an unconfigured project renders black and
@@ -375,6 +385,44 @@ pub fn main(init: std.process.Init) !void {
     try world.reserve(.{ ecs.components.Transform, ecs.components.Sprite }, 10_000);
     try world.enableHierarchy();
 
+    // ── Editor ───────────────────────────────────────────────────────────────
+    // The editor owns the shell's state, not the tools: `main` keeps the tile
+    // panel and the code pane because their frame work (painting, lexing)
+    // happens outside the no-allocation guard, next to the world they edit.
+    var editor = editor_state.Editor.init(boot_alloc, &session_model);
+    defer editor.deinit();
+    editor.tilemap = &tilemap;
+    editor.pane = &pane;
+    // The asset browser's Owner pointer. It cannot be set inside `init`
+    // because an init returns a copy; the browser double-clicks back into this
+    // editor's queued Open act, and that act belongs to this address.
+    editor.assets.editor = &editor;
+    // Launched on a file: show the file. The Scene tab is the default for a
+    // project, and the Script tab is the only useful view for `--project x.lua`.
+    if (pane_owned != null) editor.workspace = .script;
+    // Launched on a scene: open it through the same deferred path the File menu
+    // uses, so boot and a menu click cannot diverge (and so the load happens
+    // outside the frame guard, where replacing a world is allowed).
+    if (args.scene_path.len > 0) {
+        editor.setSceneFile(args.scene_path);
+        editor.requestOpen();
+    }
+    // A paint stroke is an edit: the document is now different on screen from
+    // the one on disk, and the tab strip has to say so. The callback exists
+    // because the panel is a value in `main` and the dirty flag lives in the
+    // editor — and a global would be a second source of truth.
+    tilemap.on_edit = markTileEdit;
+    tilemap.edit_ctx = &editor;
+
+    // A recovery file newer than the scene is work a crash left behind. The
+    // editor says so at boot rather than silently taking it: the user may
+    // prefer the file on disk, and the difference is theirs to judge.
+    if (editor.autosave_recoverable) {
+        editor.log(.warn, "unsaved work was recovered from {s} — File → Recover to restore it", .{
+            editor.autosavePath(),
+        });
+    }
+
     // ── Input ───────────────────────────────────────────────────────────────
     var input_state = script.Input{};
     input_state.define("move_left");
@@ -391,6 +439,10 @@ pub fn main(init: std.process.Init) !void {
     defer behaviors.deinit();
     try behaviors.reserve(10_000);
     behaviors.lock();
+    // The Play bridge: beginPlay calls `startAll` so actor `start`s run the
+    // moment Play begins. Set here rather than in `Editor.init` because the
+    // behaviors did not exist yet — same reason as `editor.assets.editor`.
+    editor.behaviors = &behaviors;
 
     // ── Physics ─────────────────────────────────────────────────────────────
     var physics_sys = physics.System.init(boot_alloc, .box2d, .{}) catch |err| {
@@ -464,6 +516,13 @@ pub fn main(init: std.process.Init) !void {
     };
     defer assets_registry.deinit();
 
+    // The editor's render bridge: what turns a browser click into pixels.
+    // Created AFTER both of its owners exist; the addresses here (`renderer`,
+    // `assets_registry`) hold for the whole run, which is what a pointer the
+    // editor dereferences every spawn needs to be true.
+    var asset_bridge = editor_state.RenderBridge{ .renderer = &renderer, .assets = &assets_registry };
+    editor.bridge = &asset_bridge;
+
     // ── File watchers ───────────────────────────────────────────────────────
     // Polled OUTSIDE the frame guard: reloading decodes, and decoding blocks
     // and allocates. An editor that pays for an artist's save inside the loop it
@@ -471,14 +530,59 @@ pub fn main(init: std.process.Init) !void {
     var config_watcher: ?platform.FileWatcher = platform.watchFile(boot_alloc, project.config.default_path) catch null;
     defer if (config_watcher) |*w| w.deinit();
 
+    // The scene file's watcher, for the hot reload. It is re-armed when the
+    // open scene changes, so the path it watches is kept here next to it.
+    var scene_watcher: ?platform.FileWatcher = null;
+    defer if (scene_watcher) |*w| w.deinit();
+    var watched_scene_path: [256]u8 = undefined;
+    var watched_scene_path_len: usize = 0;
+
     // The parsed config the watcher keeps fresh. Null when there is no
     // `project.config` beside the editor yet, which is a normal way to start a
     // project — not an error.
     const project_config: ?*project.config.Config = project.config.load(boot_alloc, project.config.default_path) catch null;
     defer if (project_config) |c| c.destroy(boot_alloc);
 
+    // ── Global scripts from the config ───────────────────────────────────
+    // The `scripts { global "..." }` section, mounted before the first frame
+    // exactly like the runtime mounts them. Same one-file-one-try policy: a
+    // bad path is a logged skip, not a dead editor.
+    if (project_config) |c| {
+        for (c.scripts.global) |path| {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, boot_alloc, .limited(assets.script_asset.default_max_bytes)) catch {
+                log.warn("global script '{s}': file not found, skipping it", .{path});
+                continue;
+            };
+            defer boot_alloc.free(bytes);
+            const v = assets.script_asset.validate(bytes, assets.script_asset.default_max_bytes) catch |err| {
+                log.warn("global script '{s}' rejected ({s}), skipping it", .{ path, @errorName(err) });
+                continue;
+            };
+            const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
+            const id = behaviors.loadGlobal(name, v.source) catch |err| {
+                log.warn("global script '{s}' failed to compile ({s})", .{ path, @errorName(err) });
+                continue;
+            };
+            behaviors.attachGlobal(id) catch |err| {
+                log.warn("global script '{s}' failed to mount ({s})", .{ path, @errorName(err) });
+            };
+        }
+        // Idempotent: any already-started actors are skipped; the globals just
+        // mounted are the only ones whose `start` runs here.
+        behaviors.startAll();
+    }
+
     // ── Frame loop ──────────────────────────────────────────────────────────
     var loop = core.loop.FixedLoop.init(fixed_dt);
+    // The game clock: the global time scale, shared by the simulation, the
+    // scripts and the `time.*` bindings. The editor's own Play/Stop/Step is a
+    // SEPARATE switch — it decides whether the world runs at all — while the
+    // scale decides how fast it runs when it does. A script that calls
+    // `time.pause()` in Play mode therefore freezes the world without
+    // confusing the editor's own paused state.
+    var game_time = core.loop.GameTime.init(fixed_dt);
+    behaviors.ctx.time = &game_time;
     var limiter = core.loop.FrameLimiter.init(60, args.vsync);
     var view_w: f32 = @floatFromInt(window.fb_width);
     var view_h: f32 = @floatFromInt(window.fb_height);
@@ -495,10 +599,6 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var last_ns = core.time.monotonicNs();
-    // ImGui's command count for the last frame drawn. Read inside the loop
-    // because `drawCommands` needs a live ImGui frame — calling it in the
-    // summary below asserts inside ImGui, since the frame is long over.
-    var last_ui_cmds: usize = 0;
     // Tiles the TileMap panel pushed on the last frame.
     var tiles_pushed: usize = 0;
     while (true) {
@@ -539,6 +639,53 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // ── Scene hot-reload ────────────────────────────────────────────────
+        //
+        // The scene file is watched so a change made OUTSIDE the editor (a
+        // merge, a generator, a second instance) is noticed instead of being
+        // silently overwritten by the next save.
+        //
+        // The editor does not reload on the spot: a reload replaces the world,
+        // and the user may have unsaved work. The change is recorded, the
+        // console says so, and File → Reload takes it.
+        //
+        // The watcher is polled OUTSIDE the frame guard (a poll is a syscall,
+        // and the frame may not do work that blocks) and the reload itself is
+        // a queued act, because replacing a world allocates.
+        if (editor.hot_reload_enabled) {
+            // The watched path follows the open scene: opening another file
+            // means watching another file.
+            const watched = editor.scenePath();
+            if (!std.mem.eql(u8, watched, watched_scene_path[0..watched_scene_path_len])) {
+                if (scene_watcher) |*old| old.deinit();
+                scene_watcher = platform.watchFile(boot_alloc, watched) catch |err| blk: {
+                    log.warn("cannot watch {s}: {s}", .{ watched, @errorName(err) });
+                    break :blk null;
+                };
+                @memcpy(watched_scene_path[0..watched.len], watched);
+                watched_scene_path_len = watched.len;
+            }
+            if (scene_watcher) |*w| {
+                if (w.poll()) |changed| {
+                    if (changed) {
+                        // The editor's own save also trips the watcher. The
+                        // mtime check is what tells the two apart: the editor
+                        // records the mtime when it saves, and a change to a
+                        // DIFFERENT mtime is somebody else.
+                        const io = std.Io.Threaded.global_single_threaded.io();
+                        const st = std.Io.Dir.cwd().statFile(io, watched, .{}) catch {
+                            continue;
+                        };
+                        if (st.mtime.nanoseconds != editor.scene_mtime_ns) {
+                            editor.notifySceneChanged();
+                        }
+                    }
+                } else |err| {
+                    log.warn("scene watcher error: {s}", .{@errorName(err)});
+                }
+            }
+        }
+
         // The camera, and the lighting mask sized for it.
         //
         // BOTH of these allocate — the mask, the SDF, the EDT scratch — and both
@@ -547,7 +694,7 @@ pub fn main(init: std.process.Init) !void {
         // how the editor used to die on its second frame with a 4 MiB
         // allocation complaint that pointed at lighting rather than at the
         // ordering mistake that caused it.
-        const camera_view: ?ecs.camera.View = editorView(view_w, view_h);
+        const camera_view: ?ecs.camera.View = editor.viewport.cameraView(view_w, view_h);
         const fb_w: u32 = if (has_window) window.framebufferSize().w else @intFromFloat(view_w);
         const fb_h: u32 = if (has_window) window.framebufferSize().h else @intFromFloat(view_h);
         lighting.resize(lighting_driver.Driver.viewFor(camera_view, fb_w, fb_h)) catch |err| log.warn("lighting mask resize failed: {s}", .{@errorName(err)});
@@ -597,9 +744,13 @@ pub fn main(init: std.process.Init) !void {
         // ── TileMap brush, OUTSIDE the frame ───────────────────────────────
         //
         // Painting can create a chunk, and a chunk is an append — an
-        // allocation, which the guard below forbids. So the brush runs here and
-        // only the resulting quads are pushed inside the frame.
-        if (has_window and camera_view != null and !ui_ctx.wantsMouse()) {
+        // allocation, which the guard below forbids. So the brush runs here
+        // and only the resulting quads are pushed inside the frame. It owns
+        // left-click only while the Tiles tool is up: the cursor tool's
+        // picking and gizmos share the same button and must not paint.
+        if (has_window and camera_view != null and !ui_ctx.wantsMouse() and
+            editor.viewport.tool == .tile)
+        {
             const m = window.input.mouse;
             const inside = m.x >= 0 and m.y >= 0 and m.x < @as(f32, @floatFromInt(fb_w)) and m.y < @as(f32, @floatFromInt(fb_h));
             const world_pos = camera_view.?.screenToWorld(.{ .x = m.x, .y = m.y });
@@ -628,6 +779,39 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // ── Viewport interaction ───────────────────────────────────────────
+        //
+        // The cursor tool's picking and gizmo drags. Pointer reads here, and
+        // writes through the queued set — which preFrame below turns into
+        // world state the render this very frame will show. A drag that
+        // started in the scene follows the pointer even over the docks, so
+        // everything above stays the authority it claims to be.
+        if (has_window) {
+            editor.viewport.update(&editor, window.input.mouse, &ui_ctx, fb_w, fb_h);
+        }
+
+        // A completed gizmo drag moved collider hosts while the simulation was
+        // not stepping them: the physics overlay and the bodies must follow
+        // the transform, not trail it. Playing worlds step on their own.
+        // Same tool hygiene: the tile hover marker is a Tiles-tool thing.
+        if (editor.viewport.takeEdited() and editor.play == .stopped) physics_dirty = true;
+        if (editor.viewport.tool != .tile) tilemap.hover = null;
+
+        // ── Editor pre-frame (queued edits, asset refresh, scene replace) ─────
+        editor.preFrame();
+        if (editor.should_quit) break;
+        if (editor.takeSceneReplaced()) {
+            physics_dirty = true;
+        }
+
+        // ── Autosave ───────────────────────────────────────────────────────
+        //
+        // The TIMER runs here (it is a float, no allocation) and the WRITE is
+        // queued: encoding a world allocates megabytes, and the frame's
+        // allocation guard forbids that inside the frame. The queued act runs
+        // in the next `preFrame`, on the safe side.
+        _ = editor.tickAutosave(editor.frame_dt);
+
         // ── The allocation-guarded frame ───────────────────────────────────
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
@@ -640,18 +824,43 @@ pub fn main(init: std.process.Init) !void {
         const frame_ns = now_ns - last_ns;
         last_ns = now_ns;
         const real_dt: f32 = @as(f32, @floatFromInt(frame_ns)) / std.time.ns_per_s;
-        const steps = loop.addTime(real_dt);
+        // The status bar reads the same number the simulation does, so "60 fps"
+        // in the corner and the fixed-step accumulator cannot disagree.
+        editor.frame_dt = real_dt;
+        const steps = loop.addTime(game_time.beginFrame(real_dt));
 
-        // ── Editor overlay: input, then widgets, then the code pane ───────
+        // ── Editor overlay ─────────────────────────────────────────────────
+        // ONE call: the shell owns every panel, including the code pane and the
+        // tilemap tool. Drawing them here as well is what used to put two
+        // copies of each window on screen.
         ui_ctx.newFrame(real_dt);
-        drawEditorUi(&ui_ctx, &pane, camera_view.?);
-        tilemap.draw();
-        pane.draw(&ui_ctx, real_dt);
-        last_ui_cmds = ui_ctx.drawCommands();
+        editor_shell.draw(&editor, &ui_ctx, fb_w, fb_h);
+
+        // The viewport's tool pill: a floating window (it captures the
+        // pointer only over itself), placed after the shell's docks so it
+        // draws above them the way a tool strip should.
+        editor.viewport.drawToolbar(&ui_ctx, fb_w);
 
         // ── Fixed-step simulation ──────────────────────────────────────────
+        // The Play menu is not decoration: stopped means the world does not
+        // move, paused means exactly the steps the user asked for with Step.
+        // The accumulator's leftover time is kept either way, so resuming does
+        // not replay the pause as a burst.
+        var steps_to_run = steps;
+        switch (editor.play) {
+            .stopped => steps_to_run = 0,
+            .paused => steps_to_run = if (editor.takeStep()) 1 else 0,
+            .playing => {},
+        }
         var s: u32 = 0;
-        while (s < steps) : (s += 1) {
+        while (s < steps_to_run) : (s += 1) {
+            // The interpolation snapshot, first: `prev_*` is what the renderer
+            // blends from, so it must be captured before anything writes a
+            // transform this tick.
+            world.captureTransforms();
+            // The tweens, before the behaviors: a script reads the tweened
+            // value in the same tick it was written.
+            behaviors.tickTweens(fixed_dt);
             behaviors.fixedUpdate(fixed_dt);
             particles.fixedUpdate(world, fixed_dt);
             anim_system.update(world, fixed_dt, timer_bridge);
@@ -661,7 +870,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // ── Variable-step ──────────────────────────────────────────────────
-        behaviors.update(real_dt);
+        // The SCALED delta, the same one the accumulator got: a script must
+        // not move faster than the world it is in.
+        if (editor.simulationEnabled()) behaviors.update(game_time.delta);
         behaviors.sweepDestroyed();
         behaviors.vm.gcStep();
         particles.beginFrame();
@@ -676,6 +887,11 @@ pub fn main(init: std.process.Init) !void {
         // editor that skipped this compiled, ran, and showed a black window
         // with zero draw calls — no error anywhere to point at the omission.
         renderer.beginScene(target, sceneCamera(camera_view, fb_w, fb_h));
+
+        // The editor grid: layer 0, pushed FIRST — the batcher's stable sort
+        // keeps insertion order inside a layer, so the grid sits under every
+        // sprite drawn after it, on the same single-pass instance stream.
+        editor.viewport.pushUnderlay(&r2d);
 
         r2d.collectFiltered(
             world,
@@ -710,11 +926,27 @@ pub fn main(init: std.process.Init) !void {
 
         const tiles = tilemap.pushTiles(&r2d);
         tiles_pushed = tiles;
+
+        // Selection + gizmo quads, above the scene and below the physics
+        // overlay. Reads the pointer's hover state from `update` above.
+        editor.viewport.pushOverlay(&editor, &r2d);
+
         r2d.submit(renderer);
 
         // ── Lighting ───────────────────────────────────────────────────────
         const lighting_env = lighting_driver.Driver.environmentOf(world, defaultEnvironment());
         _ = lighting.render(world, &r2d, renderer, lighting_env, 0);
+
+        // Fader
+        fader.update(real_dt);
+
+        // Compose. `endScene` is what resolves the scene (SMAA included) into
+        // the swapchain, so everything that has to appear ON TOP of it must be
+        // drawn after this line. The overlay used to be submitted before it,
+        // and the UI was therefore painted over by the scene every frame: the
+        // draw data was real (thousands of vertices per frame) and nothing was
+        // on screen.
+        renderer.endScene(true, .Medium);
 
         // ── Editor overlay on top ──────────────────────────────────────────
         //
@@ -726,14 +958,13 @@ pub fn main(init: std.process.Init) !void {
             fn draw(ctx: ?*anyopaque, pass: ?*anyopaque) void {
                 const c: *ui.Context = @ptrCast(@alignCast(ctx.?));
                 c.render(pass);
+                // Measured HERE, because ImGui's draw data is only valid
+                // between Render() and the next NewFrame(). The summary reads
+                // what this frame actually submitted, not what was queued.
+                ui.cimgui.ember_ui_draw_stats(&ui_stats);
             }
         }.draw);
 
-        // Fader
-        fader.update(real_dt);
-
-        // Compose
-        renderer.endScene(true, .Medium);
         renderer.present();
 
         // Close the frame: the arena drains and the tracker's allocation guard
@@ -755,16 +986,38 @@ pub fn main(init: std.process.Init) !void {
     // cannot distinguish "worked" from "never started".
     if (args.frames != 0) {
         const st = renderer.stats();
-        log.info("{d} frames, {d} draw calls, physics overlay: {d} bodies ({d} sensors), tiles: {d}, ui: {d} cmds", .{
+        log.info("{d} frames, {d} entities, {d} draw calls, physics overlay: {d} bodies ({d} sensors), tiles: {d}, ui: {d} verts", .{
             frame_count,
+            world.entityCount(),
             st.draw_calls,
             physics_debug.stats.bodies_drawn,
             physics_debug.stats.sensors_drawn,
             tiles_pushed,
-            last_ui_cmds,
+            ui_stats[1],
         });
         log.info("tilemap panel drew {d} frames", .{tilemap_panel.Panel.draws});
     }
+}
+
+/// The tilemap panel's edit callback: mark the editor's document dirty.
+fn markTileEdit(ctx: ?*anyopaque) void {
+    const ed: *editor_state.Editor = @ptrCast(@alignCast(ctx.?));
+    ed.dirty = true;
+}
+
+// Pull the panels' `test` blocks into the tools' test binary. A test build's
+// root file must reference a file for its tests to be collected; these are
+// imported anyway by the real program, but the reference alone is not the
+// trigger — one comptime touch per file is.
+test {
+    _ = @import("editor_state.zig");
+    _ = @import("tilemap_panel.zig");
+    _ = @import("asset_browser.zig");
+    _ = @import("hierarchy.zig");
+    _ = @import("console.zig");
+    _ = @import("inspector.zig");
+    _ = @import("viewport.zig");
+    _ = @import("prefab.zig");
 }
 
 /// The reactive-store keys the editor's own UI keeps its state under.
@@ -775,41 +1028,8 @@ const ui_stores = struct {
     pub const physics_debug = "editor.physics_debug";
 };
 
-/// The editor's ImGui chrome.
-///
-/// Drawn with the engine's own `ui` module rather than raw ImGui calls, so a
-/// theme change lands here and in the code pane at once — and so the editor
-/// cannot drift into a look the rest of the tool does not share.
-///
-/// ## Why the store, and not `*Args`
-///
-/// The reactive store holds the editor's one piece of interactive state:
-/// whether the collision overlay is on. A checkbox writes it by name and the
-/// render path reads it by the same name, so the command line, the mouse and
-/// the frame all see one value. Handing the toolbar a pointer to the frame
-/// loop's args instead would be a second source of truth that drifts the first
-/// time someone adds a panel.
-fn drawEditorUi(ctx: *ui.Context, pane: *code_pane.Pane, view: ecs.camera.View) void {
-    _ = pane;
-    _ = view;
-
-    // No closure wraps this: Zig has none, so a widget drawn inside a layout
-    // body cannot reach a local of the caller's. The checkbox is drawn directly
-    // against the context — the layout helpers are for panels that genuinely
-    // need one, not for holding a variable the language cannot close over.
-    var on = ui.reactive.getBool(&ctx.store, ui_stores.physics_debug, true);
-    if (ui.toggle.checkbox(.{
-        .ctx = ctx,
-        .id = "editor.dbg",
-        .label = "Physics debug",
-        .value = &on,
-    })) {
-        ctx.store.set(ui_stores.physics_debug, bool, !on) catch {};
-    }
-}
-
-/// Whether the overlay is on THIS frame. The toolbar writes the store; this is
-/// the single read that decides it, which is what keeps the command line and
+/// Whether the overlay is on THIS frame. The View menu writes the store; this
+/// is the single read that decides it, which is what keeps the command line and
 /// the mouse from ever disagreeing.
 fn overlayOn(ctx: *ui.Context, initial: bool) bool {
     return ui.reactive.getBool(&ctx.store, ui_stores.physics_debug, initial);

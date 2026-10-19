@@ -129,6 +129,7 @@ void ember_ui_get_item_rect_max(float* out_xy);
 void ember_ui_dummy(float w, float h);
 void ember_ui_spacing(void);
 void ember_ui_same_line(float offset_from_start, float spacing);
+void ember_ui_set_scroll_here_y(float center_y_ratio);
 void ember_ui_indent(float width);
 void ember_ui_unindent(float width);
 void ember_ui_separator(void);
@@ -180,6 +181,12 @@ int ember_ui_begin_popup_modal(const char* id, int flags);
 int ember_ui_is_popup_open(const char* id, int flags);
 int ember_ui_begin_menu_bar(const char* name);
 void ember_ui_end_menu_bar(void);
+int ember_ui_begin_menu(const char* label, int enabled);
+void ember_ui_end_menu(void);
+int ember_ui_is_key_pressed(int key, int repeat);
+void ember_ui_draw_stats(int* out);
+int ember_ui_is_key_down(int key);
+int ember_ui_is_mouse_double_clicked(int button);
 int ember_ui_menu_item(const char* label, const char* shortcut, int* selected, int flags);
 int ember_ui_begin_tooltip(void);
 void ember_ui_end_tooltip(void);
@@ -191,6 +198,20 @@ int ember_ui_is_item_deactivated_after_edit(void);
 int ember_ui_is_item_focused(void);
 int ember_ui_is_window_focused(int flags);
 void ember_ui_set_window_focus(void);
+
+// ── Drag & drop ───────────────────────────────────────────────────────────
+// Signatures match the .cpp block: one ImGui call each, no state. The accept
+// call returns the payload's bytes and writes its size; the bytes are valid
+// only until the caller calls ember_ui_end_drag_drop_target, so a consumer
+// copies them out immediately.
+int ember_ui_is_mouse_dragging(int button, float lock_threshold);
+int ember_ui_is_drag_drop_active(void);
+int ember_ui_begin_drag_drop_source(int flags);
+int ember_ui_set_drag_drop_payload(const char* type, const void* data, unsigned int size);
+void ember_ui_end_drag_drop_source(void);
+int ember_ui_begin_drag_drop_target(void);
+const void* ember_ui_accept_drag_drop_payload(const char* type, int flags, unsigned int* out_size);
+void ember_ui_end_drag_drop_target(void);
 void ember_ui_text(const char* s);
 void ember_ui_text_colored(unsigned int col, const char* s);
 void ember_ui_text_wrapped(unsigned int col, const char* s);

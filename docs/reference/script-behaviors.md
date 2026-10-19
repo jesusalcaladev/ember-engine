@@ -22,6 +22,8 @@ A behavior script is a Lua chunk that returns a **prototype table** (its methods
 | `on_signal(name)` | When a signal this actor listens to drains | `function M:on_signal(name)` |
 | `on_destroy` | Once, before the actor's refs are released | `function M:on_destroy()` |
 
+A script can also be mounted as a **global** (no actor at all — the game manager, the score): same hooks, same lifecycle, no sweep, and reachable from any other script through `globals.get`. See [Global Scripts](global-scripts.md).
+
 ### `start`
 
 - **When**: Called once per instance, before the first `update`. Idempotent — a hot-reload does NOT re-run `start`; state survives and `start` is for one-time setup.
@@ -128,12 +130,13 @@ The engine calls the lifecycle hooks in a fixed order each frame:
 
 1. **State machine tick** — advance all attached machines (applies pending transitions, runs `enter`/`update`/`exit`).
 2. **Spatial grid rebuild** — bin entities into the uniform grid so `world.nearby` sees current positions.
-3. **`update(dt)`** — drive all instances from the Lua driver.
-4. **Signal drain** — fire typed Zig listeners, then `on_signal(name)` on Lua behaviors.
-5. **`fixedUpdate(dt)`** — drive all instances that define `fixed_update` (at 60 Hz).
-6. **Sweep** — run `on_destroy` and remove dead instances.
+3. **Global scripts' `update(dt)`** — drive the mounted globals (scripts with no actor: the game manager, the score). See [Global Scripts](global-scripts.md).
+4. **`update(dt)`** — drive all actor instances from the Lua driver.
+5. **Signal drain** — fire typed Zig listeners, then `on_signal(name)` on the globals first, then on Lua behaviors.
+6. **`fixedUpdate(dt)`** — drive the globals, then all instances that define `fixed_update` (at 60 Hz).
+7. **Sweep** — run `on_destroy` and remove dead instances (globals are never swept — they do not die with an entity, `on_destroy` fires only when they are detached).
 
-This ordering means a state's `update` may call `sm_fire` or `sm_set_state`, and a behavior's `update` (running later in the same frame) sees the state its machine just entered.
+This ordering means a state's `update` may call `sm_fire` or `sm_set_state`, and a behavior's `update` (running later in the same frame) sees the state its machine just entered. It also means a global's `update` prepares the shared state (score, phase, spawn budget) that a behavior's `update` reads **the same frame**.
 
 ## Hot-Reload Interaction
 

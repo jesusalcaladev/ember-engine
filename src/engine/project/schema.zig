@@ -108,6 +108,7 @@ pub const registry: []const Entry = &.{
     .{ .name = "physics", .T = config.Physics },
     .{ .name = "layers", .T = config.Layers },
     .{ .name = "audio", .T = config.Audio },
+    .{ .name = "scripts", .T = config.Scripts },
     .{ .name = "input_map", .T = void },
 };
 
@@ -191,6 +192,13 @@ pub const sections: []const Section = &.{
             .{ .name = "budget_bytes", .type = .int, .default = "33554432", .min = 1048576, .max = 268435456, .tooltip = "Decoded-PCM cache ceiling in bytes (spec §3.15). 32 MiB is about 90 seconds of stereo 48 kHz." },
             .{ .name = "master_volume", .type = .float, .default = "1", .min = 0, .max = 4, .tooltip = "Master gain (bus 0), applied after every bus sum." },
             .{ .name = "buses", .type = .string_list, .list_style = .bare, .default = "\"master\" \"music\" \"sfx\" \"ui\"", .max_items = config.max_audio_buses, .tooltip = "Bus names in id order; the first is master. Names are how scripts and the mixer panel address a bus." },
+        },
+    },
+    .{
+        .name = "scripts",
+        .tooltip = "The project's Lua global scripts: behavior chunks mounted with no actor (game manager, score, spawner).",
+        .fields = &.{
+            .{ .name = "global", .type = .string_list, .list_style = .bare, .max_items = config.max_global_scripts, .tooltip = "Script paths relative to the project root, in LOAD order: the first listed runs first each frame. Each mounts under its basename — \"scripts/globals/game.lua\" is `globals.get(\"game\")` from any script." },
         },
     },
     .{
@@ -285,6 +293,7 @@ pub fn validateDiag(cfg: *const Config, diag: ?*parser.Diagnostics) !void {
     try validateSection(diag, "physics", &cfg.physics);
     try validateSection(diag, "layers", &cfg.layers);
     try validateSection(diag, "audio", &cfg.audio);
+    try validateSection(diag, "scripts", &cfg.scripts);
 
     // The one cross-field rule: a default mask naming a layer that does not
     // exist is a body that collides with nothing, silently.
@@ -364,7 +373,11 @@ fn validateSection(diag: ?*parser.Diagnostics, comptime section: []const u8, val
 /// lookup walks, so both owe distinct, non-empty items.
 fn isNameList(comptime section: []const u8, comptime field: []const u8) bool {
     return isLayersList(section, field) or
-        (std.mem.eql(u8, section, "audio") and std.mem.eql(u8, field, "buses"));
+        (std.mem.eql(u8, section, "audio") and std.mem.eql(u8, field, "buses")) or
+        // `scripts.global` is a load ORDER, so a duplicate mounts one global and
+        // hides the other — an error at attach time (`GlobalsAlreadyMounted`)
+        // that validation can catch before anything is mounted.
+        (std.mem.eql(u8, section, "scripts") and std.mem.eql(u8, field, "global"));
 }
 
 fn isLayersList(comptime section: []const u8, comptime field: []const u8) bool {
@@ -594,6 +607,7 @@ const validated_sections = [_][]const u8{
     "physics",
     "layers",
     "audio",
+    "scripts",
 };
 
 test "schema: getMetadata answers for a real field, and says .unknown for the rest" {

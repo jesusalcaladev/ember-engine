@@ -235,7 +235,80 @@ function M:start()
 end
 ```
 
-## Step 6: Run It
+## Step 7: A HUD with text, a button and a bar
+
+The game is playable but silent about its own state. In the editor, you would
+add a small hierarchy of HUD actors — **one widget per actor**, because each
+`ui.*` setter addresses the widget on the actor it is given — and attach a HUD
+behavior to the root. The editor generates this hierarchy:
+
+```
+hud          (root)   UiCanvas
+├── hud_panel         UiPanel      a backdrop
+├── hud_score         Label        "Score: 0"
+├── hud_bar           UiProgressBar
+└── hud_pause         UiButton     "Pause"
+```
+
+and the following `hud.lua` on the root:
+
+```lua
+local M = {}
+
+function M:start()
+  self.score = 0
+  self.time_left = 30
+
+  -- Address the widgets by name (one actor each).
+  self.score_actor = actor.find_by_name(self, "hud_score")
+  self.bar_actor   = actor.find_by_name(self, "hud_bar")
+
+  -- A backdrop. The panel actor was authored with `interactive = false`
+  -- in the scene, so the HUD does not swallow clicks meant for the world.
+  local panel = actor.find_by_name(self, "hud_panel")
+  ui.set_color(panel, 0.05, 0.06, 0.09, 0.75)
+  ui.set_border(panel, 1, 1, 1, 0.15, 1)
+
+  ui.set_text(self.score_actor, "Score: 0")
+  ui.set_show_text(self.bar_actor, true)
+end
+
+function M:update(dt)
+  self.time_left = math.max(self.time_left - dt, 0)
+  ui.set_text(self.score_actor, "Score: " .. self.score)
+  ui.set_value(self.bar_actor, self.time_left / 30)
+  ui.set_text(self.bar_actor, string.format("%ds", math.ceil(self.time_left)))
+end
+
+function M:on_signal(name, payload)
+  if name == "ui_pressed" and payload.id == 1 then
+    log.info("pause pressed — dimming the canvas")
+    scene.tint(0.35, 0.35, 0.5, 0.6) -- dims world + UI together
+    scene.tint_mode("multiply")
+  elseif name == "collect" then
+    self.score = self.score + 1
+  end
+end
+
+return M
+```
+
+> **Update from Step 2:** the player's `on_signal` set `self.score`. Let the
+> HUD keep the score instead: have `coin.lua` emit `collect`, and this
+> `on_signal` receive it (add `collection` to the HUD's actor, or keep the
+> player's score and mirror it in `update`). What matters here is that the HUD
+> reads its own fields and writes its own widgets.
+
+Two things are doing real work:
+
+- **Anchoring.** The panel and label are pinned `top_left`; the pause button is
+  placed `top_right` with `pivot = {x = 1, y = 0}`, so it stays in the corner at
+  **any** window size. No branch in the script.
+- **Input capture.** `input.pointer_over_ui()` is `true` while the pointer is
+  over the button, so world input is untouched — the UI never consumes the
+  world's input.
+
+## Step 8: Run It
 
 In the editor, you would press Play. From the command line:
 
@@ -247,7 +320,8 @@ You should see:
 - A blue square (player) that moves with arrow keys
 - Yellow squares (coins) that spawn randomly
 - Coins disappear when you touch them
-- Score increases in the log
+- A **HUD**: a "Score: 0" label and a countdown bar in the top-left, a
+  **Pause** button in the top-right that dims the whole canvas when clicked
 - Game ends after 30 seconds
 
 ## What You Learned
@@ -260,10 +334,15 @@ You should see:
 - **Signals**: `actor.emit` for communication between actors
 - **Spawning**: `actor.spawn` and `actor.add_component` at runtime
 - **Determinism**: `rand.float` for reproducible randomness
+- **Game UI**: `Label`/`UiButton`/`UiPanel`/`UiProgressBar` + anchors, the
+  `ui.*` setters and queries, `ui_pressed`, `input.pointer_over_ui()` and
+  `scene.tint` — see [Game UI](game-ui.md) for the full surface
 
 ## Next Steps
 
 - [Learning Lua](learning-lua.md) — Deepen your Lua knowledge
+- [Game UI](../reference/game-ui.md) — HUD, menus and the full `ui.*` surface
 - [Lua API Reference](../reference/script-lua-api.md) — Every function available
+- [Global Scripts](../reference/global-scripts.md) — Move the score into a manager with no actor
 - [State Machines](../reference/script-state-machines.md) — Add idle/run/jump states
 - [Steering Behaviors](../reference/script-lua-api.md#steer) — Add enemy AI

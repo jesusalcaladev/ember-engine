@@ -31,7 +31,9 @@ const core_log = core.log.scoped("behavior");
 const vm_mod = @import("vm.zig");
 const scripts_mod = @import("scripts.zig");
 const bindings = @import("bindings.zig");
+const context = @import("context.zig");
 const statemachine_mod = @import("statemachine.zig");
+const tween_mod = @import("tween.zig");
 const spatial_mod = @import("spatial.zig");
 const steer_mod = @import("steer.zig");
 const build_options = @import("options");
@@ -82,6 +84,41 @@ const Instance = struct {
     started: bool = false,
     /// Flipped false when the entity died; swept on the next update.
     alive: bool = true,
+};
+
+/// One mounted GLOBAL script: the same lifecycle as a behavior, with no actor.
+///
+/// A global exists for everything gameplay that is not "one actor's logic" — a
+/// game manager, the score, the spawn director, the game flow. It is a single
+/// `self` table per script (one per name, the singleton rule), driven by the
+/// same hooks (`start`, `update(dt)`, `fixed_update(dt)`,
+/// `on_signal(name, payload)`) plus `on_destroy` when it is detached — never
+/// swept, because nothing it belongs to can die.
+///
+/// It has no entity and stamps no `__entity` handle: `actor.*` on a global's
+/// `self` is a caller mistake and fails the way "no entity" always fails, while
+/// the world-level surfaces (`world.*`, `input.*`, `scene.*`, `globals.get`)
+/// are exactly what a global is FOR. Behaviors reach its state through
+/// `globals.get("name")`, which is the Lua singleton pattern.
+const GlobalInstance = struct {
+    /// The script this global serves. One global per script id — a second
+    /// `attachGlobal` of the same id is an error, not a second instance.
+    script_id: scripts_mod.ScriptId,
+    /// Registry ref to this global's `self` table (never stamped with an
+    /// entity — see the struct comment).
+    self_ref: i32,
+    /// 1-based index in the Lua side of the dense table the driver walks for
+    /// globals (`globals[1..n]`), kept in step with the Zig array exactly like
+    /// `Instance.lua_slot` is with `instances`.
+    lua_slot: u32 = 0,
+    /// Cached method refs (same set and shape as `Instance`'s; `no_ref` when
+    /// the script does not define the hook).
+    update_ref: i32 = no_ref,
+    fixed_update_ref: i32 = no_ref,
+    on_signal_ref: i32 = no_ref,
+    on_destroy_ref: i32 = no_ref,
+    /// True once `start` has run (idempotent, like a behavior's).
+    started: bool = false,
 };
 
 /// The driver: a small Lua chunk that loops over every instance table and
@@ -137,11 +174,41 @@ pub const Behaviors = struct {
     /// runtime because it holds Lua refs into `self.vm`: the registry must be
     /// destroyed before the VM, and this struct already owns that ordering.
     machines: statemachine_mod.Registry,
+    /// The tween pool (M4.5 follow-up). Owned here for the same reason as
+    /// `machines`: it holds Lua refs into `self.vm` (the completion callback)
+    /// and it must be destroyed before the VM.
+    ///
+    /// It is a MANAGER and not a component because a tween is transient: it
+    /// runs, it ends, it is gone. A component is the opposite — the document,
+    /// serialized, surviving a save. A tween in a `.zson` file would be a
+    /// tween that has already finished.
+    tweens: tween_mod.Manager,
     /// The spatial grid behind `world.nearby` (ROADMAP M4.5), plus the steering
     /// module. Owned here for the same reason as `machines`.
     grid: spatial_mod.Grid,
     /// Registry ref of the steering module's `for` constructor.
     steer_ref: i32 = no_ref,
+    /// The mounted GLOBAL scripts (see `GlobalInstance`). Kept in a second
+    /// dense array rather than mixed into `instances` on purpose: an actor
+    /// lifecycle question (`world.isAlive`, the sweep) has a definite answer
+    /// for a global — "always alive" — and folding that special case into the
+    /// hot arrays would put a branch in every actor pass to serve at most a few
+    /// dozen globals. The driver walks this array from its own Lua table, so
+    /// the JIT-compiled loop pays nothing extra.
+    globals: std.ArrayListUnmanaged(GlobalInstance) = .empty,
+    /// Registry ref to the dense globals table the driver's second call
+    /// iterates. Same lifetime discipline as `insts_table_ref`.
+    globals_table_ref: i32 = no_ref,
+    /// Storage for the hook vtable `ctx.globals` points at. A field and not an
+    /// inline literal in `init` on purpose: `&self.globals_hooks` stays valid
+    /// for the struct's lifetime (the rule `init`'s doc comment states), while
+    /// a stack temporary would die at the end of `init` and hand the bindings
+    /// a dangling context. Filled once in `init`, never again.
+    globals_hooks: context.GlobalsHooks = .{
+        .ctx = null,
+        .push_self = pushGlobalSelf,
+        .exists = globalExistsHook,
+    },
     /// Per-frame counters for the acceptance report (M3 criteria).
     updates: u32 = 0,
     errors: u32 = 0,
@@ -151,7 +218,7 @@ pub const Behaviors = struct {
     insts_table_ref: i32 = no_ref,
     driver_ref: i32 = no_ref,
 
-    pub const Error = error{ OutOfMemory, StateCreationFailed, DriverCompilationFailed, SteerCompilationFailed } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
+    pub const Error = error{ OutOfMemory, StateCreationFailed, DriverCompilationFailed, SteerCompilationFailed, GlobalAlreadyMounted } || vm_mod.Vm.Error || scripts_mod.Scripts.Error;
 
     /// Wires this Behaviors system in place: creates the VM (sandboxed Lua heap
     /// owner), binds the engine API against `world` + `input`, and prepares the
@@ -170,13 +237,18 @@ pub const Behaviors = struct {
         world: *World,
         input_snap: *const input.Input,
     ) Error!void {
-        self.* = Behaviors{ .vm = undefined, .scripts = undefined, .ctx = undefined, .allocator = allocator, .machines = undefined, .grid = undefined, .steer_ref = no_ref };
+        self.* = Behaviors{ .vm = undefined, .scripts = undefined, .ctx = undefined, .allocator = allocator, .machines = undefined, .tweens = undefined, .grid = undefined, .steer_ref = no_ref };
         self.vm = try vm_mod.Vm.init(allocator);
         errdefer self.vm.deinit();
         self.vm.sandbox();
         // Before `ctx`: the context hands the machine registry to the `sm.*`
         // bindings as its upvalue, and the registry outlives both.
         self.machines = statemachine_mod.Registry.init(allocator, &self.vm);
+        // The tween pool, same discipline: it holds Lua refs into the VM and
+        // it writes into the world, so it is set up before the context points
+        // the `tween.*` bindings at it.
+        self.tweens = tween_mod.Manager.init(allocator, &self.vm);
+        self.tweens.setWorld(world);
         // Sized from the world the caller already reserved, so the grid never
         // allocates while it is being filled (spec §10).
         self.grid = spatial_mod.Grid.init(allocator, spatial_mod.default_cell_size, spatial_mod.default_extent, world.slotCount()) catch {
@@ -186,7 +258,13 @@ pub const Behaviors = struct {
         };
         self.ctx = bindings.Context.init(world, input_snap);
         self.ctx.machines = &self.machines;
+        self.ctx.tweens = &self.tweens;
         self.ctx.spatial = &self.grid;
+        // The `globals.*` bindings reach the mounted globals through this
+        // vtable, stored IN the struct (see the field's comment) and pointed at
+        // the Behaviors the bindings' shared upvalue already reaches.
+        self.globals_hooks.ctx = self;
+        self.ctx.globals = &self.globals_hooks;
         bindings.registerAll(self.vm.state(), &self.ctx);
         if (build_options.steering) {
             self.buildSteer() catch |e| {
@@ -250,6 +328,12 @@ pub const Behaviors = struct {
         _ = lua.lua_createtable(L, 0, 0); // [insts]
         self.insts_table_ref = self.vm.refTop(); // ref + pop
 
+        // The globals' side of the driver: a second dense table, exactly the
+        // same walk. Empty at init (globals mount after the driver is built —
+        // a project's scripts are read from disk once the runtime is up).
+        _ = lua.lua_createtable(L, 0, 0); // [globs]
+        self.globals_table_ref = self.vm.refTop(); // ref + pop
+
         // Compile and keep the driver module's `drive` function.
         // The source is a comptime string: `loadbuffer` avoids the null-terminator copy.
         if (lua.luaL_loadbuffer(L, driver_src, driver_src.len, "@behavior_driver") != 0)
@@ -270,8 +354,20 @@ pub const Behaviors = struct {
             self.vm.unref(inst.on_destroy_ref);
         }
         self.instances.deinit(self.allocator);
+        // Globals: release every ref the same way, drop the dense table, and
+        // free the array. There is no sweep for a global — `on_destroy` fires
+        // from `detachGlobal` while the instance can still call out.
+        for (self.globals.items) |*g| {
+            self.vm.unref(g.self_ref);
+            self.vm.unref(g.update_ref);
+            self.vm.unref(g.fixed_update_ref);
+            self.vm.unref(g.on_signal_ref);
+            self.vm.unref(g.on_destroy_ref);
+        }
+        self.globals.deinit(self.allocator);
         if (self.driver_ref != no_ref) self.vm.unref(self.driver_ref);
         if (self.insts_table_ref != no_ref) self.vm.unref(self.insts_table_ref);
+        if (self.globals_table_ref != no_ref) self.vm.unref(self.globals_table_ref);
         // The spatial grid is allocated by `init` (a cell table plus the
         // self-ref array) and was never freed here: every `Behaviors` that was
         // torn down leaked its grid, which the test runner reports as one leak
@@ -307,12 +403,176 @@ pub const Behaviors = struct {
             if (inst.script_id != id) continue;
             self.cacheMethods(inst);
         }
+        // A mounted global of the same script reloads with it too: the cache is
+        // shared (a `.lua` file may serve an actor AND a global), so one reload
+        // re-resolves both kinds of consumers.
+        for (self.globals.items) |*g| {
+            if (g.script_id != id) continue;
+            self.cacheGlobalMethods(g);
+        }
     }
 
     /// Hot-reloads a script by name, preserving every live instance's state.
     pub fn reload(self: *Behaviors, name: []const u8, source: []const u8) Error!void {
         const id = try self.scripts.reload(name, source);
         self.recacheInstancesOf(id);
+    }
+
+    // ── Global scripts (no actor) ────────────────────────────────────────────
+
+    /// The number of mounted globals (diagnostics).
+    pub fn globalCount(self: *const Behaviors) usize {
+        return self.globals.items.len;
+    }
+    /// Loads a script as a GLOBAL: same shared cache as `load` (so one `.lua`
+    /// file can serve actors and a global at once, and reloading the name
+    /// updates every consumer), but does not mount anything — mount with
+    /// `attachGlobal`. One global per script: `attachGlobal` rejects an id
+    /// that is already mounted, and a second `loadGlobal` of the same name is
+    /// simply a hot-reload like everywhere else in the cache.
+    ///
+    /// File reading and `.lua` validation are deliberately NOT here: `script`
+    /// is its own build module and cannot import `assets` (the module graph
+    /// refuses a file in two modules — the same wall the render/lighting
+    /// comments document). The runtime and the editor read the file, validate
+    /// it with `assets.script_asset.validate` and call this; the name they
+    /// pass is the basename, so the Lua-side handle stays location-free.
+    pub fn loadGlobal(self: *Behaviors, name: []const u8, source: []const u8) Error!scripts_mod.ScriptId {
+        return self.load(name, source);
+    }
+
+    /// Mounts a global: one `self` table (no entity stamped), cached method
+    /// refs, appended to the dense globals array and mirrors into the Lua-side
+    /// table the driver walks. Load/spawn-time only (it allocates). Rejects an
+    /// id that is already mounted — the singleton rule is enforced here, not
+    /// left to the caller's discipline. NOT gated on `lock` on purpose: globals
+    /// mount after the actor array is frozen (the config is read later than the
+    /// sprites are reserved), and a few dozen globals are noise next to the
+    /// ten-thousand array the lock exists to size.
+    pub fn attachGlobal(self: *Behaviors, script_id: scripts_mod.ScriptId) Error!void {
+        if (script_id >= self.scripts.entries.items.len) return error.LoadFailed;
+        if (self.indexOfGlobal(script_id) != null) return error.GlobalAlreadyMounted;
+
+        const L = self.vm.state().?;
+
+        // 1. Fresh `self` with the shared metatable — and NO entity handle.
+        //    That is the whole difference from a behavior: `actor.*` on this
+        //    table resolves the same "absent handle" path as a self whose
+        //    entity just died, which is the right failure for a global (it
+        //    should be talking to `world.*`, not to an actor that does not
+        //    belong to it).
+        self.scripts.instantiate(script_id); // leaves `self` on top
+        const self_ref = self.vm.refTop(); // ref + pop `self`
+
+        // 2. Record the instance and resolve its cached method refs. From the
+        //    first ref on, an OOM anywhere below must release all of them —
+        //    the refs are the only resource here (the Lua mirror below cannot
+        //    fail: `rawseti` never allocates).
+        var g = GlobalInstance{
+            .script_id = script_id,
+            .self_ref = self_ref,
+        };
+        self.cacheGlobalMethods(&g);
+        const slot: u32 = @intCast(self.globals.items.len + 1);
+        g.lua_slot = slot;
+        errdefer {
+            self.vm.unref(g.update_ref);
+            self.vm.unref(g.fixed_update_ref);
+            self.vm.unref(g.on_signal_ref);
+            self.vm.unref(g.on_destroy_ref);
+            self.vm.unref(self_ref);
+        }
+        try self.globals.append(self.allocator, g);
+
+        // Keep the Lua-side dense table in step: globals[slot] = self. Exactly
+        // the mirror `attach` maintains for actors, so removeGlobalAt's
+        // swap-fix has the same invariant to protect.
+        self.vm.pushRef(self.globals_table_ref); // [globs]
+        self.vm.pushRef(self_ref); // [globs, self]
+        lua.lua_rawseti(L, -2, @intCast(slot)); // globs[slot] = self (pops self)
+        lua.pop(L, 1); // []
+    }
+
+    /// Detaches the global named `name`: runs `on_destroy` if the script
+    /// defines it (once, while the `self` table is still fully reachable),
+    /// then releases every ref and removes it from both stores. Returns false
+    /// when no global with that name is mounted — a no-op, the same silent
+    /// contract `detach` has for actors.
+    pub fn detachGlobal(self: *Behaviors, name: []const u8) bool {
+        const id = self.scripts.idOf(name) orelse return false;
+        const i = self.indexOfGlobal(id) orelse return false;
+        const g = &self.globals.items[i];
+        if (g.on_destroy_ref != no_ref) {
+            self.vm.pushRef(g.on_destroy_ref); // [fn]
+            self.vm.pushRef(g.self_ref); // [fn, self]
+            self.callGlobalMethod(g, 1); // pcall(1): fn(self)
+        }
+        self.removeGlobalAt(i);
+        return true;
+    }
+
+    /// The index in `globals` of the global bound to `script_id`, or null.
+    /// Linear on purpose: a project mounts at most a few dozen globals, and a
+    /// map would buy nothing but a second invariant to keep in step with a
+    /// swap-remove (the exact bug class `removeInstanceAt` exists to close).
+    fn indexOfGlobal(self: *const Behaviors, script_id: scripts_mod.ScriptId) ?usize {
+        for (self.globals.items, 0..) |g, i| {
+            if (g.script_id == script_id) return i;
+        }
+        return null;
+    }
+
+    /// Resolves and caches a global's lifecycle method refs off the shared
+    /// prototype. Identical discipline to `cacheMethods` — same method names,
+    /// same "never cache ONTO self" rule (an instance field would shadow the
+    /// next reload) — over a GlobalInstance.
+    fn cacheGlobalMethods(self: *Behaviors, g: *GlobalInstance) void {
+        const L = self.vm.state().?;
+        self.vm.pushRef(g.self_ref); // push self
+        g.update_ref = self.refMethod(L, "update");
+        g.fixed_update_ref = self.refMethod(L, "fixed_update");
+        g.on_signal_ref = self.refMethod(L, "on_signal");
+        g.on_destroy_ref = self.refMethod(L, "on_destroy");
+        lua.pop(L, 1); // pop self
+    }
+
+    /// Removes the global at `i` and fixes BOTH stores — the Zig array
+    /// (swap-remove) and the Lua dense table (move the last into the hole,
+    /// clear the tail) — the mirrors of `removeInstanceAt`'s invariants, one
+    /// desync of which silently drops or double-runs a global.
+    fn removeGlobalAt(self: *Behaviors, i: usize) void {
+        const g = self.globals.items[i];
+        self.vm.unref(g.self_ref);
+        self.vm.unref(g.update_ref);
+        self.vm.unref(g.fixed_update_ref);
+        self.vm.unref(g.on_signal_ref);
+        self.vm.unref(g.on_destroy_ref);
+
+        const L = self.vm.state().?;
+        const last = self.globals.items.len;
+        if (i + 1 != last) {
+            const moved = &self.globals.items[last - 1];
+            moved.lua_slot = g.lua_slot;
+            self.vm.pushRef(self.globals_table_ref); // [globs]
+            self.vm.pushRef(moved.self_ref); // [globs, self]
+            lua.lua_rawseti(L, -2, @intCast(g.lua_slot)); // globs[hole] = last
+            lua.pop(L, 1); // []
+        }
+        // Clear the tail so the driver's `#globs` shrinks with the array.
+        self.vm.pushRef(self.globals_table_ref); // [globs]
+        lua.pushNil(L); // [globs, nil]
+        lua.lua_rawseti(L, -2, @intCast(last)); // globs[last] = nil
+        lua.pop(L, 1); // []
+
+        _ = self.globals.swapRemove(i);
+    }
+
+    /// The registry ref of a mounted global's `self` table (tests read state
+    /// through it; the Lua surface reaches the same table via `globals.get`).
+    pub fn globalSelfRef(self: *Behaviors, name: []const u8) ?i32 {
+        const id = self.scripts.idOf(name) orelse return null;
+        const i = self.indexOfGlobal(id) orelse return null;
+        return self.globals.items[i].self_ref;
     }
 
     /// Pre-allocates the instance array. Call at load time; `lock` freezes it.
@@ -413,8 +673,27 @@ pub const Behaviors = struct {
     /// calls this before the first `update`. Idempotent: an instance that has
     /// started is skipped, and a hot-reload does NOT re-run `start` (state
     /// survives; `start` is for one-time setup).
+    ///
+    /// Globals run FIRST: a global is higher-level state (the manager, the
+    /// score) and a behavior's `start` may legitimately read
+    /// `globals.get("game")` in the same call.
     pub fn startAll(self: *Behaviors) void {
         const L = self.vm.state().?;
+        for (self.globals.items) |*g| {
+            if (g.started) continue;
+            g.started = true;
+            // Resolved on demand, once per global — same choice `start` makes
+            // for behaviors (it is not in the cached hot-path set).
+            self.vm.pushRef(g.self_ref); // [self]
+            lua.getField(L, -1, "start"); // [self, fn_or_nil]
+            if (lua.isFunction(L, -1)) {
+                self.vm.pushRef(g.self_ref); // [self, fn, self]
+                self.callGlobalMethod(g, 1); // pcall(1): fn(self) -> [self]
+            } else {
+                lua.pop(L, 1); // [self]
+            }
+            lua.pop(L, 1); // []
+        }
         for (self.instances.items) |*inst| {
             if (inst.started) continue;
             if (!self.ctx.world.isAlive(inst.entity)) continue; // sweep finalizes it
@@ -454,20 +733,39 @@ pub const Behaviors = struct {
         // those actors query this same frame, or the flock lags a frame behind.
         if (build_options.steering) self.rebuildGrid();
         const n = self.instances.items.len;
-        if (n == 0 or self.driver_ref == no_ref) return;
-        const state = self.vm.state().?;
+        const gn = self.globals.items.len;
+        if ((n == 0 and gn == 0) or self.driver_ref == no_ref) {
+            self.updates = @intCast(n + gn);
+            return;
+        }
 
+        // Globals run FIRST on the same driver: a global's `update` sets the
+        // shared state (score, spawn budget, game phase) that a behavior's
+        // `update` may read one line later in the same frame. Two drive calls,
+        // six C calls per frame — the per-instance cost is unchanged.
+        if (gn != 0) self.driveTable(self.globals_table_ref, dt);
         // THREE C calls per FRAME instead of four per instance: push the
         // driver, push the dense `self` table, push dt — then one pcall. The
         // per-instance loop (and its own pcall) runs inside LuaJIT, where the
         // tracing JIT can compile it. See `driver_src` for the measurement that
         // justifies it.
+        if (n != 0) self.driveTable(self.insts_table_ref, dt);
+        self.updates = @intCast(n + gn);
+    }
+
+    /// Drives one dense table (`insts_table_ref` or `globals_table_ref`)
+    /// through the Lua driver: push the driver, push the table, push dt, one
+    /// pcall. The driver pcall-protects each instance inside the loop and
+    /// returns its error count, which lands in `errors` exactly like a
+    /// Zig-driven call's would. The driver failing ITSELF is an engine bug
+    /// (its own errors are caught per instance inside), so it is reported
+    /// loudly and the caller's pass simply ends.
+    fn driveTable(self: *Behaviors, table_ref: i32, dt: f32) void {
+        const state = self.vm.state() orelse return;
         self.vm.pushRef(self.driver_ref); // [drive]
-        self.vm.pushRef(self.insts_table_ref); // [drive, insts]
+        self.vm.pushRef(table_ref); // [drive, insts]
         lua.pushF32(state, dt); // [drive, insts, dt]
         if (lua.lua_pcall(state, 2, 1, 0) != 0) {
-            // The driver itself failing is an engine bug (its own errors are
-            // caught per instance inside), so report it loudly.
             self.errors += 1;
             var buf: [256]u8 = undefined;
             if (self.vm.readError(&buf)) |msg| {
@@ -482,7 +780,6 @@ pub const Behaviors = struct {
             if (reported > 0) self.errors += @intCast(reported);
         }
         lua.pop(state, 1); // []
-        self.updates = @intCast(n);
     }
 
     /// `__behavior_error(self, msg)`: published as a global at init and called by
@@ -526,11 +823,35 @@ pub const Behaviors = struct {
         _ = self.instances.swapRemove(i);
     }
 
+    /// Advances every live tween by `dt`.
+    ///
+    /// Called from the FIXED step, before the behaviors run, and that order is
+    /// the contract: a script reads the tweened value in the same tick it was
+    /// written, and a script that writes the property itself has the last word
+    /// in that tick (the tween's next tick overwrites it).
+    ///
+    /// The fixed step and not the frame: a tween that ran on the variable dt
+    /// would land on a different value every frame, and a game that replays
+    /// would not replay the same animation.
+    pub fn tickTweens(self: *Behaviors, dt: f32) void {
+        self.tweens.tick(dt);
+    }
+
     /// Runs `fixed_update(dt)` on every live instance, once per fixed 60 Hz tick.
     /// Same shape as `update`; kept separate so the runtime drives them from
     /// different points in the loop (spec §3.3: fixed sim, decoupled render).
+    /// Globals run first, for the same reason `update` runs them first: the
+    /// manager's decision this tick should be visible to every behavior that
+    /// ticks after it.
     pub fn fixedUpdate(self: *Behaviors, dt: f32) void {
         const L = self.vm.state().?;
+        for (self.globals.items) |*g| {
+            if (g.fixed_update_ref == no_ref) continue;
+            self.vm.pushRef(g.fixed_update_ref);
+            self.vm.pushRef(g.self_ref);
+            lua.pushF32(L, dt);
+            self.callGlobalMethod(g, 2); // fn(self, dt)
+        }
         for (self.instances.items) |*inst| {
             if (!inst.alive) continue;
             if (!self.ctx.world.isAlive(inst.entity)) continue; // sweep finalizes it
@@ -575,6 +896,29 @@ pub const Behaviors = struct {
     /// gets them. The table is built on the Lua stack and never escapes the call.
     pub fn dispatchSignalPayload(self: *Behaviors, name: []const u8, payload: []const PayloadField) void {
         const L = self.vm.state().?;
+        // Globals first: the manager hears the event before the actors do, the
+        // same "higher level first" order `start`/`update`/`fixedUpdate` use.
+        for (self.globals.items) |*g| {
+            if (g.on_signal_ref == no_ref) continue;
+            self.vm.pushRef(g.on_signal_ref); // [fn]
+            self.vm.pushRef(g.self_ref); // [fn, self]
+            lua.pushSlice(L, name); // [fn, self, name]
+            if (payload.len == 0) {
+                lua.pushNil(L); // [fn, self, name, nil]
+            } else {
+                lua.lua_createtable(L, 0, @intCast(payload.len));
+                for (payload) |field| {
+                    switch (field.value) {
+                        .number => |v| lua.lua_pushnumber(L, v),
+                        .integer => |v| lua.lua_pushinteger(L, v),
+                        .boolean => |v| lua.lua_pushboolean(L, @intFromBool(v)),
+                        .string => |v| lua.pushSlice(L, v),
+                    }
+                    lua.setField(L, -2, field.name); // pops the value
+                }
+            }
+            self.callGlobalMethod(g, 3); // fn(self, name, payload)
+        }
         for (self.instances.items) |*inst| {
             if (!inst.alive) continue;
             if (!self.ctx.world.isAlive(inst.entity)) continue;
@@ -665,6 +1009,21 @@ pub const Behaviors = struct {
         }
     }
 
+    /// `callMethod` for a GLOBAL: pcall-protected like everything else (a
+    /// broken script is a logged line, never a dead frame), logged without an
+    /// entity index because there is no entity — the name outlives the call
+    /// site, which is what matters when someone greps the console.
+    fn callGlobalMethod(self: *Behaviors, g: *GlobalInstance, nargs: c_int) void {
+        const L = self.vm.state().?;
+        if (lua.lua_pcall(L, nargs, 0, 0) != 0) {
+            self.errors += 1;
+            var buf: [256]u8 = undefined;
+            if (self.vm.readError(&buf)) |msg| {
+                core_log.err("global script {s}: {s}", .{ self.scripts.entries.items[g.script_id].name, msg });
+            }
+        }
+    }
+
     /// Sweeps dead instances: for each whose entity died, runs `on_destroy`
     /// (once), releases its Lua refs, and swap-removes it from the array. The
     /// runtime calls this once per frame after the update passes. Swap-remove
@@ -705,6 +1064,30 @@ pub const Behaviors = struct {
         }
     }
 };
+
+// ── Globals hooks (the `globals.*` vtable) ──────────────────────────────────
+// File-level because a function WITH an `anyopaque`-erased callback cannot be a
+// struct method with a `*Behaviors` receiver without casting anyway — these
+// cast once, immediately, and reach the rest through the real type.
+
+/// `GlobalsHooks.push_self`: pushes the named global's `self` table; false (and
+/// nothing pushed) when it is not mounted.
+fn pushGlobalSelf(ctx: ?*anyopaque, L: ?*lua_State, name: []const u8) bool {
+    const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return false));
+    _ = L;
+    const id = b.scripts.idOf(name) orelse return false;
+    const i = b.indexOfGlobal(id) orelse return false;
+    b.vm.pushRef(b.globals.items[i].self_ref);
+    return true;
+}
+
+/// `GlobalsHooks.exists`: a name counts only when its global is MOUNTED —
+/// `globals.exists` answers "can I call this", not "does the file exist".
+fn globalExistsHook(ctx: ?*anyopaque, name: []const u8) bool {
+    const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return false));
+    const id = b.scripts.idOf(name) orelse return false;
+    return b.indexOfGlobal(id) != null;
+}
 
 // ── End-to-end tests ─────────────────────────────────────────────────────────
 // These drive the REAL stack: a World, a sandBoxed VM, the registered C
@@ -949,11 +1332,216 @@ test "actor.translate binding works from Zig" {
     try std.testing.expectEqual(@as(f32, 5), h.world.get(e, components.Transform).?.position.x);
 }
 
-/// lives in the test frame, so the self-referential interior pointers stay valid.
+// ── Global scripts (no actor, singleton access) ─────────────────────────────
+
+const manager_src =
+    \\local M = {}
+    \\M.phase = "menu"
+    \\function M:start()
+    \\  self.score = 0
+    \\  self.ticks = 0
+    \\end
+    \\function M:update(dt)
+    \\  self.ticks = self.ticks + 1
+    \\  changed = self.phase  -- a global the tests read (survives the call)
+    \\end
+    \\function M:fixed_update(dt)
+    \\  self.fixed_ticks = (self.fixed_ticks or 0) + 1
+    \\end
+    \\function M:on_signal(name, payload)
+    \\  self.last_signal = name
+    \\  if payload then self.slot = payload.slot end
+    \\end
+    \\function M:on_destroy()
+    \\  destroy_count = (destroy_count or 0) + 1
+    \\end
+    \\return M
+;
+
+test "a global script runs start/update/fixed_update with no entity" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    h.b.startAll();
+
+    // The self table exists, carries NO entity handle, and start seeded it.
+    const self_ref = h.b.globalSelfRef("manager.lua").?;
+    try std.testing.expectEqual(@as(f64, 0), readSelfNumber(&h.b, self_ref, "score").?);
+
+    h.b.fixedUpdate(1.0 / 60.0);
+    h.b.update(1.0 / 60.0);
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, self_ref, "ticks").?);
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, self_ref, "fixed_ticks").?);
+    // Counts: one global, no behaviors.
+    try std.testing.expectEqual(@as(usize, 1), h.b.globalCount());
+    try std.testing.expectEqual(@as(u32, 1), h.b.updates);
+    try std.testing.expectEqual(@as(usize, 0), h.b.instanceCount());
+}
+
+test "a global's update runs before behaviors: visible the same frame" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const gid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(gid);
+
+    const sid = try h.b.load("read_global.lua",
+        \\local M = {}
+        \\function M:update(dt)
+        \\  local g = globals.get("manager.lua")
+        \\  if g then self.seen = g.ticks or 0 end
+        \\end
+        \\return M
+    );
+    const e = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e, sid);
+    h.b.startAll();
+
+    // One update: the global's `update` ran FIRST (ticks 0 -> 1) and the actor
+    // saw the post-global value, not the one the global started the frame with.
+    h.b.update(1.0 / 60.0);
+    const g_self = h.b.globalSelfRef("manager.lua").?;
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, g_self, "ticks").?);
+    const a_self = h.b.instances.items[0].self_ref;
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, a_self, "seen").?);
+}
+
+test "hot-reload of a global preserves self state and swaps methods" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    h.b.startAll();
+    h.b.update(1.0 / 60.0); // ticks = 1
+    const self_ref = h.b.globalSelfRef("manager.lua").?;
+
+    // Reload: same name through the SHARED cache (a .lua can serve an actor and
+    // a global), new body. The old `changed` global stays untouched — the new
+    // update only renames the counter.
+    const sid2 = try h.b.loadGlobal("manager.lua",
+        \\local M = {}
+        \\function M:update(dt)
+        \\  self.ticks = self.ticks + 10
+        \\end
+        \\return M
+    );
+    try std.testing.expectEqual(sid, sid2);
+
+    h.b.update(1.0 / 60.0); // ticks = 1 + 10 (state survived, method swapped)
+    try std.testing.expectEqual(@as(f64, 11), readSelfNumber(&h.b, self_ref, "ticks").?);
+}
+
+test "signals reach a global's on_signal, payload included" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    h.b.startAll();
+
+    h.b.dispatchSignal("hit");
+    const self_ref = h.b.globalSelfRef("manager.lua").?;
+    try std.testing.expectEqualStrings("hit", readSelfString(&h.b, self_ref, "last_signal").?);
+    try std.testing.expect(readSelfNumber(&h.b, self_ref, "slot") == null); // nil payload
+
+    const fields = [_]Behaviors.PayloadField{
+        .{ .name = "slot", .value = .{ .integer = 7 } },
+    };
+    h.b.dispatchSignalPayload("level_cleared", &fields);
+    try std.testing.expectEqualStrings("level_cleared", readSelfString(&h.b, self_ref, "last_signal").?);
+    try std.testing.expectEqual(@as(f64, 7), readSelfNumber(&h.b, self_ref, "slot").?);
+}
+
+test "one global per script: re-attach is an error, re-load is a hot-reload" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    // The singleton rule is enforced: a second mount of the SAME id is an
+    // error, not a second hidden instance whose update would double-run.
+    try std.testing.expectError(error.GlobalAlreadyMounted, h.b.attachGlobal(sid));
+    // A second loadGlobal of the same name is the usual hot-reload path.
+    const sid2 = try h.b.loadGlobal("manager.lua", manager_src);
+    try std.testing.expectEqual(sid, sid2);
+    try std.testing.expectEqual(@as(usize, 1), h.b.globalCount());
+}
+
+test "detachGlobal fires on_destroy once and removes the global" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    h.b.startAll();
+    try std.testing.expect(readGlobalNumber(&h.b, "destroy_count") == null);
+
+    try std.testing.expect(h.b.detachGlobal("manager.lua"));
+    try std.testing.expectEqual(@as(f64, 1), readGlobalNumber(&h.b, "destroy_count"));
+    try std.testing.expectEqual(@as(usize, 0), h.b.globalCount());
+    try std.testing.expect(h.b.globalSelfRef("manager.lua") == null);
+
+    // Detaching twice is a silent no-op (and on_destroy did not re-fire).
+    try std.testing.expect(!h.b.detachGlobal("manager.lua"));
+    try std.testing.expectEqual(@as(f64, 1), readGlobalNumber(&h.b, "destroy_count"));
+}
+
+test "globals.get/exist bindings reach a global from Lua; unknown names return nil/false" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.loadGlobal("manager.lua", manager_src);
+    try h.b.attachGlobal(sid);
+    h.b.startAll();
+
+    // From real Lua, through the real bindings: read a field, call a method on
+    // the global's self, and check the negative paths for an unknown name.
+    const ok = runChunkBool(&h.b,
+        \\local g = globals.get("manager.lua")
+        \\if not g or g.score ~= 0 then return false end
+        \\g.score = 99
+        \\if globals.get("nope.lua") ~= nil then return false end
+        \\if globals.exists("nope.lua") then return false end
+        \\return globals.exists("manager.lua") and globals.get("manager.lua").score == 99
+    );
+    try std.testing.expect(ok);
+}
+
+/// Runs a Lua chunk in the harness VM and returns its truthiness. The
+/// globals-binding probe compiles real Lua through the real sandbox, so the
+/// test exercises the registered C functions, not a Zig-side stand-in.
+fn runChunkBool(b: *Behaviors, comptime src: []const u8) bool {
+    const L = b.vm.state() orelse return false;
+    b.vm.loadBuffer(src, "@globals_probe") catch |e| {
+        std.debug.print("  globals probe loadBuffer failed: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) {
+        var buf: [256]u8 = undefined;
+        if (b.vm.readError(&buf)) |msg| std.debug.print("  globals probe lua error: {s}\n", .{msg});
+        lua.pop(L, 1); // drop the error message, the stack starts clean again
+        return false;
+    }
+    const ok = lua.toBool(L, -1);
+    lua.pop(L, 1);
+    return ok;
+}
+
 const Harness = struct {
     world: World,
     input: script_Input,
     b: Behaviors,
+
     fn init(self: *Harness, a: std.mem.Allocator) !void {
         self.world = World.init(a);
         errdefer self.world.deinit();

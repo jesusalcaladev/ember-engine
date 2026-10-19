@@ -16,10 +16,16 @@ pub const light_mod = @import("light.zig");
 pub const batcher = @import("batcher.zig");
 pub const atlas = @import("atlas.zig");
 pub const render2d = @import("2d.zig");
+/// M14: text — TrueType rasterizing, metrics and string layout.
+pub const font = @import("font.zig");
+/// M14: game-UI instance emission — panels, buttons, bars and glyphs.
+pub const ui_draw = @import("ui_draw.zig");
 /// M9: the CPU particle system (the GPU simulator is `particles_gpu`).
 pub const particles = @import("particles.zig");
 /// M9: scene transitions — the fade.
 pub const fade = @import("fade.zig");
+/// M14: CanvasModulate — the full-screen tint.
+pub const tint = @import("tint.zig");
 pub const light = @import("light.zig");
 pub const lighting_driver = @import("lighting_driver.zig");
 /// M15 PARKED: TileMap chunked rendering is unfinished; re-enable with the rest
@@ -235,6 +241,21 @@ pub const SceneEnvironment = struct {
     /// composite shader reads, published by whoever owns the transition. The
     /// `Fader` in `fade.zig` computes the amount; this is where it lands.
     fade_color: [4]f32 = .{ 0, 0, 0, 0 },
+
+    /// M14: CanvasModulate — a full-screen tint over the finished image (world
+    /// AND game UI, because the UI is drawn into the scene target). rgb + the
+    /// strength in alpha, the same convention `fade_color` uses; a zero strength
+    /// is a no-op and `postActive` skips the whole composite for it.
+    ///
+    /// It rides on the Environment beside the fade for the identical reason: it
+    /// is a per-frame value the composite shader reads, published by whoever
+    /// owns the tint. The `Tint` in `tint.zig` holds the state; this is where it
+    /// lands.
+    tint_color: [4]f32 = .{ 1, 1, 1, 0 },
+    /// How the tint mixes: 0 off, 1 multiply, 2 add, 3 alpha (`tint.Mode`).
+    /// A `u8` and not the enum because these PODs cross module boundaries as
+    /// plain data; the enum's wire codes are pinned in `tint.zig`.
+    tint_mode: u8 = 0,
 };
 
 pub const Renderer = struct {

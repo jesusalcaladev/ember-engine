@@ -33,6 +33,7 @@ const light_mod = @import("light.zig");
 const sound_emitter_mod = @import("sound_emitter.zig");
 const particle_mod = @import("particle.zig");
 const animation_mod = @import("animation.zig");
+const ui_mod = @import("ui.zig");
 // M15 PARKED: the tilemap subsystem is unfinished; re-enable this import with
 // the component_list entry and the exports in components.zig.
 // const tilemap_mod = @import("tilemap.zig");
@@ -65,6 +66,19 @@ pub const AnimationPlayer = animation_mod.AnimationPlayer;
 pub const anim_clip_loop = animation_mod.clip_loop;
 pub const anim_clip_ping_pong = animation_mod.clip_ping_pong;
 pub const anim_clip_root_motion = animation_mod.clip_root_motion;
+// ── M14: the game UI components (plain data) ────────────────────────────────
+pub const InlineText = ui_mod.InlineText;
+pub const UiAnchor = ui_mod.UiAnchor;
+pub const UiScaleMode = ui_mod.UiScaleMode;
+pub const TextAlign = ui_mod.TextAlign;
+pub const UiButtonState = ui_mod.UiButtonState;
+/// Placement is a field of every widget, not a component of its own.
+pub const UiLayout = ui_mod.UiLayout;
+pub const UiCanvas = ui_mod.UiCanvas;
+pub const Label = ui_mod.Label;
+pub const UiButton = ui_mod.UiButton;
+pub const UiPanel = ui_mod.UiPanel;
+pub const UiProgressBar = ui_mod.UiProgressBar;
 pub const RigidBody2D = physics_mod.RigidBody2D;
 pub const Collider2D = physics_mod.Collider2D;
 pub const CollisionLayers = physics_mod.CollisionLayers;
@@ -94,8 +108,12 @@ pub const max_components = 256;
 pub const Mask = std.StaticBitSet(max_components);
 
 /// Buffer size generous enough to hold any registered component while
-/// decoding a document (130 bytes covers a 60-byte Transform with slack).
-pub const max_stride = 128;
+/// decoding a document. It grew from 128 to 512 for M14: a `UiButton` carries
+/// its 68-byte layout, four RGBA colours and a 129-byte inline label, which does
+/// not fit the old bound. The buffer is a stack local in the `.zson` decoder and
+/// a field in the editor's pending-edit state; the extra 384 bytes are nothing
+/// next to the correctness of "the biggest component fits".
+pub const max_stride = 512;
 
 // ── Registry ─────────────────────────────────────────────────────────────────
 
@@ -165,6 +183,12 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "ParticleEmitter2D", .type = ParticleEmitter2D },
     // -- M13 -- appended, never inserted
     .{ .name = "AnimationPlayer", .type = AnimationPlayer },
+    // -- M14 -- appended, never inserted
+    .{ .name = "UiCanvas", .type = UiCanvas },
+    .{ .name = "Label", .type = Label },
+    .{ .name = "UiButton", .type = UiButton },
+    .{ .name = "UiPanel", .type = UiPanel },
+    .{ .name = "UiProgressBar", .type = UiProgressBar },
     // -- M15 PARKED: appended at id 23 once the tilemap subsystem is finished.
     // .{ .name = "TileMapLayer", .type = tilemap_mod.TileMapLayer },
 };
@@ -338,7 +362,13 @@ test "the components were APPENDED, not inserted" {
     try testing.expectEqual(@as(ComponentId, 22), componentId(AnimationPlayer));
     // M15 PARKED: the tilemap layer would be id 23; disabled for now.
     // try testing.expectEqual(@as(ComponentId, 23), componentId(tilemap_mod.TileMapLayer));
-    try testing.expectEqual(@as(usize, 23), entries.len);
+    // M14 appended five UI components after animation: ids 23..27.
+    try testing.expectEqual(@as(ComponentId, 23), componentId(UiCanvas));
+    try testing.expectEqual(@as(ComponentId, 24), componentId(Label));
+    try testing.expectEqual(@as(ComponentId, 25), componentId(UiButton));
+    try testing.expectEqual(@as(ComponentId, 26), componentId(UiPanel));
+    try testing.expectEqual(@as(ComponentId, 27), componentId(UiProgressBar));
+    try testing.expectEqual(@as(usize, 28), entries.len);
 }
 
 test "default baseline bytes match a default value" {

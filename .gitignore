@@ -25,3 +25,11 @@ libs/fonts/
 
 # Bench output (the sample lives in samples/scene.zson)
 /scene.zson
+
+# The editor's per-scene bookkeeping: the prefab overrides sidecar and the
+# crash-recovery copy. Both are DERIVED from the scene — they record what the
+# user changed on top of it, and what was unsaved when the editor died — and
+# neither belongs in the repository.
+*.overrides
+*.autosave
+*.autosave.tmp

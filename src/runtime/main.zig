@@ -21,6 +21,8 @@ const render2d = engine.render2d;
 const lighting_driver = engine.lighting_driver;
 /// M9: the scene-transition fader.
 const fader_mod = engine.fade;
+/// M14: CanvasModulate — the full-screen tint.
+const tint_mod = engine.tint;
 /// M9: the CPU particle system.
 const particles_mod = engine.particles;
 const batcher_mod = engine.batcher;
@@ -75,6 +77,184 @@ const image_watch_capacity = 16;
 /// budget — and it is the SAME 2048 the Lua binding uses, on purpose: the binding
 /// and the reload sink must hand images to one atlas, not two.
 const atlas_side: u32 = 2048;
+
+/// M14: the default UI font, loaded at boot when present. It is the vendored
+/// test typeface (`libs/fonts.commit` pins it); a project that wants its own
+/// default calls `ui.font_load` and `ui.set_font`. A missing file is NOT an
+/// error — a UI with no glyphs is still a UI, and the log says so.
+const default_font_path = "libs/fonts/Inter-Regular.ttf";
+/// Pixel height the default font rasterizes at. 20 reads comfortably at 720p
+/// and matches every UI test in the render suite.
+const default_font_px: f32 = 20;
+
+/// M14: the runtime's owner for the game UI — the font cache and the frame's
+/// resolved `ui_system.State`.
+///
+/// One owner serves both vtables that need UI state: `ui_draw.FontSource`
+/// (which font a widget's id resolves to) and `script.context.UiHooks`
+/// (`measure`/`font_load` and the hover/press queries). They must see the SAME
+/// cache and the SAME frame, so they point at one `UiRuntime`. It is
+/// module-scope so its hook functions can name its type; the runtime builds
+/// exactly one instance.
+const UiRuntime = struct {
+    allocator: std.mem.Allocator,
+    /// Kept so a font loaded later can attach its own glyph atlas. By value
+    /// because `Renderer` is a vtable-plus-pointer handle, like `Context.renderer`.
+    renderer: render.Renderer,
+    entries: [max_fonts]?Entry = [_]?Entry{null} ** max_fonts,
+    /// Number of id slots in use. Id 0 is RESERVED for the default font even
+    /// when it failed to load, so `ui.font_load` ids never collide with "the
+    /// default".
+    count: usize = 0,
+    /// The frame's resolved widgets, hover and press state. Written by
+    /// `ui_system.update`, read by `ui_draw` and the query hooks.
+    state: ecs.ui_system.State = .{},
+
+    /// 16 faces/sizes is more than a HUD needs and keeps the table tiny.
+    const max_fonts = 16;
+    /// Longest path remembered for `ui.font_load` de-duplication.
+    const max_path = 192;
+    /// Each font's glyph page. 1024² RGBA8 is 4 MB; the sprite atlas is 2048².
+    const font_atlas_side = 1024;
+
+    const Entry = struct {
+        handle: *render.font.Font,
+        pixel_height: f32,
+        path_len: u16 = 0,
+        path: [max_path]u8 = [_]u8{0} ** max_path,
+
+        fn sameRequest(self: *const Entry, path: []const u8, px: f32) bool {
+            if (self.pixel_height != px) return false;
+            const n = @min(path.len, max_path);
+            if (self.path_len != n) return false;
+            return std.mem.eql(u8, self.path[0..n], path[0..n]);
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator, renderer: render.Renderer) UiRuntime {
+        return .{ .allocator = allocator, .renderer = renderer };
+    }
+
+    fn deinit(self: *UiRuntime) void {
+        for (self.entries[0..self.count]) |e| {
+            const entry = e orelse continue;
+            entry.handle.deinit();
+            self.allocator.destroy(entry.handle);
+        }
+        self.count = 0;
+    }
+
+    /// The `Font` for a widget's `font` id, or null. Ids are their index in
+    /// `entries`, so 0 is the default font when it loaded and null when it did
+    /// not (drawing then falls back to nothing rather than to garbage).
+    fn fontFor(self: *UiRuntime, id: u32) ?*render.font.Font {
+        if (id >= self.count) return null;
+        const entry = self.entries[id] orelse return null;
+        return entry.handle;
+    }
+
+    /// Builds a `Font` from `bytes`, attaches its glyph atlas, and stores it.
+    /// Returns the new id (its index) or null when the table is full or the
+    /// bytes are not a font.
+    fn add(self: *UiRuntime, path: []const u8, bytes: []const u8, px: f32) ?u32 {
+        if (self.count >= max_fonts) return null;
+        const handle = self.allocator.create(render.font.Font) catch return null;
+        handle.* = render.font.Font.init(self.allocator, bytes, px) catch {
+            self.allocator.destroy(handle);
+            return null;
+        };
+        // A headless backend has no atlas; `attachAtlas` declines and the font
+        // keeps its CPU metrics, so `measure` still works and drawing does not.
+        handle.attachAtlas(self.renderer, font_atlas_side) catch {};
+
+        const idx = self.count;
+        var entry = Entry{ .handle = handle, .pixel_height = px };
+        const n = @min(path.len, max_path);
+        @memcpy(entry.path[0..n], path[0..n]);
+        entry.path_len = @intCast(n);
+        self.entries[idx] = entry;
+        self.count += 1;
+        return @intCast(idx);
+    }
+
+    /// Reads a `.ttf` and adds it, or returns an existing id for the same
+    /// (path, pixel_height). Reads a file, so this is a load-time call, not a
+    /// per-frame one.
+    fn fontLoad(self: *UiRuntime, path: []const u8, px: f32) ?u32 {
+        if (px <= 0 or path.len == 0) return null;
+        for (self.entries[0..self.count], 0..) |e, i| {
+            const entry = e orelse continue;
+            if (entry.sameRequest(path, px)) return @intCast(i);
+        }
+        const bytes = readFileAlloc(self.allocator, path) catch return null;
+        defer self.allocator.free(bytes);
+        return self.add(path, bytes, px);
+    }
+
+    /// The engine default: `path` at `px`, if it exists. Id 0 either way, so a
+    /// widget's default `font = 0` stays meaningful and `ui.font_load` hands out
+    /// ids from 1.
+    fn loadDefault(self: *UiRuntime, path: []const u8, px: f32) void {
+        const bytes = readFileAlloc(self.allocator, path) catch |err| {
+            log.info("no default UI font ({s} at '{s}'); ui.font_load can still add one", .{ @errorName(err), path });
+            self.count = @max(self.count, 1);
+            return;
+        };
+        defer self.allocator.free(bytes);
+        if (self.add(path, bytes, px) == null) {
+            log.warn("default UI font '{s}' could not be built", .{path});
+            self.count = @max(self.count, 1);
+        }
+    }
+
+    // ── The `UiHooks` function pointers (see `script.context.UiHooks`) ────────
+
+    fn hookMeasure(ctx: ?*anyopaque, font_id: u32, text: []const u8, out: *[2]f32) bool {
+        const self: *UiRuntime = @ptrCast(@alignCast(ctx.?));
+        const font = self.fontFor(font_id) orelse return false;
+        out[0] = font.measure(text);
+        out[1] = font.lineHeight();
+        return true;
+    }
+
+    fn hookFontLoad(ctx: ?*anyopaque, path: []const u8, px: f32) u32 {
+        const self: *UiRuntime = @ptrCast(@alignCast(ctx.?));
+        return self.fontLoad(path, px) orelse 0;
+    }
+
+    fn hookHovered(ctx: ?*anyopaque, entity_bits: u64) bool {
+        const self: *UiRuntime = @ptrCast(@alignCast(ctx.?));
+        const hot = self.state.hot orelse return false;
+        return hot.bits() == entity_bits;
+    }
+
+    fn hookPressed(ctx: ?*anyopaque, entity_bits: u64) bool {
+        const self: *UiRuntime = @ptrCast(@alignCast(ctx.?));
+        const active = self.state.active orelse return false;
+        return active.bits() == entity_bits;
+    }
+
+    /// The `ui_draw.FontSource` that resolves a widget's font id against this
+    /// cache.
+    fn fontSource(self: *UiRuntime) render.ui_draw.FontSource {
+        return .{
+            .ctx = self,
+            .get = struct {
+                fn get(ctx: ?*anyopaque, id: u32) ?*render.font.Font {
+                    const runtime: *UiRuntime = @ptrCast(@alignCast(ctx.?));
+                    return runtime.fontFor(id);
+                }
+            }.get,
+        };
+    }
+};
+
+/// Reads a whole file, with the 8 MiB limit the font tests use: a `.ttf` bigger
+/// than that is not a font anyone wants rasterized at runtime.
+fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 << 20));
+}
 
 const Args = struct {
     frames: u64 = 0, // 0 = infinite
@@ -340,6 +520,55 @@ fn applyInputMap(_: *anyopaque, actions: []const project.config.InputAction) voi
     _ = actions;
 }
 
+// ── Global scripts ───────────────────────────────────────────────────────
+// The `scripts { global "..." }` section of `project.config`: Lua scripts
+// mounted with NO actor (the game manager, the score, the spawner). One
+// mount per listed path, in file order — file order is start order, so list
+// the manager before the scripts that read it.
+
+/// Reads, compiles and mounts every global script in the section. Each path
+/// is relative to the project root (the same paths as `audio.play_file`),
+/// validated like every other script the engine loads (BOM strip included),
+/// and mounted under its file's BASENAME: `scripts/globals/game.lua` is
+/// `globals.get("game")` from any script, with no path in the Lua surface.
+///
+/// A failure is logged and skipped, one script at a time: a typo in one file
+/// costs that one manager this session, not the boot. This matches how a
+/// behavior's compile error is a logged line, never a dead frame.
+fn mountGlobalScripts(
+    behaviors: *script.Behaviors,
+    cfg: *const project.config.Config,
+    alloc: std.mem.Allocator,
+) void {
+    for (cfg.scripts.global) |path| {
+        // One async-io handle for the whole section: boot-time file reads,
+        // where the threaded engine costs nothing this early.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(assets.script_asset.default_max_bytes)) catch {
+            log.warn("global script '{s}': file not found, skipping it", .{path});
+            continue;
+        };
+        defer alloc.free(bytes);
+        const v = assets.script_asset.validate(bytes, assets.script_asset.default_max_bytes) catch |err| {
+            log.warn("global script '{s}' rejected ({s}), skipping it", .{ path, @errorName(err) });
+            continue;
+        };
+        // The basename resolves the mount name: no '/'. survives into Lua.
+        const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[slash + 1 ..] else path;
+        const id = behaviors.loadGlobal(name, v.source) catch |err| {
+            log.warn("global script '{s}' failed to compile ({s})", .{ path, @errorName(err) });
+            continue;
+        };
+        behaviors.attachGlobal(id) catch |err| {
+            log.warn("global script '{s}' failed to mount ({s})", .{ path, @errorName(err) });
+        };
+    }
+    // `startAll` is idempotent — the actors already started; this runs `start`
+    // for exactly the globals that mounted above. Called here instead of
+    // inside the loop so a global's first call is never half..scheduled.
+    behaviors.startAll();
+}
+
 /// M9: the payload a finished scene transition carries on the world bus.
 ///
 /// The signal is what a Lua `on_signal("scene_faded")` handler and a Zig
@@ -443,6 +672,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer behaviors.deinit();
     try behaviors.reserve(args.sprites);
     behaviors.lock();
+
+    // ── The game clock: the global time scale, and the `time.*` surface ──────
+    //
+    // The ONE owner of the scale. The simulation, the scripts and the Lua
+    // bindings all read it from here, so they cannot disagree about how fast
+    // the game is running. The clock is a local of `main` and outlives every
+    // frame, so the pointer the context holds stays valid for the whole run.
+    var game_time = core.loop.GameTime.init(fixed_dt);
+    behaviors.ctx.time = &game_time;
+
+    // ── M14: the game UI. The runtime owns one `UiRuntime` — the font cache and
+    // the frame's resolved widget/hover/press state — and publishes it to Lua
+    // through `Context.ui`. The default font is loaded here (outside the frame
+    // guard: `ui.font_load` is a load-time call by contract), so text works with
+    // no project setup at all.
+    var ui_runtime = UiRuntime.init(boot_alloc, renderer);
+    defer ui_runtime.deinit();
+    ui_runtime.loadDefault(default_font_path, default_font_px);
+    var ui_hooks = script.context.UiHooks{
+        .ctx = &ui_runtime,
+        .measure = UiRuntime.hookMeasure,
+        .font_load = UiRuntime.hookFontLoad,
+        .hovered = UiRuntime.hookHovered,
+        .pressed = UiRuntime.hookPressed,
+    };
+    behaviors.ctx.ui = &ui_hooks;
 
     // A script that drives the actor's transform: this is the M3 acceptance
     // path (Lua -> binding -> ECS), attached to the first sprite so the grid
@@ -598,6 +853,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // behavior's `start()` sees the real system rather than null.
     behaviors.ctx.audio = audio_system;
 
+    // ── Global scripts, mounted before the first frame ───────────────────
+    // AFTER the audio publish above (a global's `start` deserves the same
+    // full binding surface a behavior's gets), and skipped in headless mode
+    // for the same reason every other config section is: headless runs the
+    // defaults, so `zig build run -- --headless` measures the empty world.
+    if (!args.headless) mountGlobalScripts(&behaviors, &project_config, boot_alloc);
+
     // ── M9: the scene-transition fader. Owned by the runtime like the camera:
     // it is engine state that outlives a script, and the `scene.*` bindings
     // reach it through the hook struct below. A transition advances on REAL
@@ -698,6 +960,49 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }.fading_fn,
     };
     behaviors.ctx.scene = &scene_hooks;
+
+    // ── M14: CanvasModulate (the full-screen tint). Owned by the runtime beside
+    // the fader, for the same reason: engine state that outlives a script, fed
+    // into `SceneEnvironment` every frame and reached from Lua through the hook
+    // struct below. It does not advance on its own — a script sets a colour and
+    // a mode, and the post pass applies them.
+    var tint_state = tint_mod.Tint{};
+    var tint_hooks = script.context.TintHooks{
+        .ctx = &tint_state,
+        .set = struct {
+            fn set_fn(ctx: ?*anyopaque, r: f32, g: f32, b: f32, a: f32) void {
+                const t: *tint_mod.Tint = @ptrCast(@alignCast(ctx.?));
+                t.set(r, g, b, a);
+            }
+        }.set_fn,
+        .set_mode = struct {
+            fn set_mode_fn(ctx: ?*anyopaque, mode: u8) void {
+                const t: *tint_mod.Tint = @ptrCast(@alignCast(ctx.?));
+                // The wire code is the wire code: anything the runtime does not
+                // recognise falls back to `off` rather than being trusted into
+                // an invalid enum.
+                t.setMode(switch (mode) {
+                    1 => .multiply,
+                    2 => .add,
+                    3 => .alpha,
+                    else => .off,
+                });
+            }
+        }.set_mode_fn,
+        .clear = struct {
+            fn clear_fn(ctx: ?*anyopaque) void {
+                const t: *tint_mod.Tint = @ptrCast(@alignCast(ctx.?));
+                t.clear();
+            }
+        }.clear_fn,
+        .amount = struct {
+            fn amount_fn(ctx: ?*anyopaque) f32 {
+                const t: *tint_mod.Tint = @ptrCast(@alignCast(ctx.?));
+                return t.amount();
+            }
+        }.amount_fn,
+    };
+    behaviors.ctx.tint = &tint_hooks;
 
     // ── M9: the particle pool hooks ──────────────────────────────────────────
     var particles_hooks = script.context.ParticleHooks{
@@ -833,6 +1138,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.warn("could not reserve the 'scene_faded' signal: {s}", .{@errorName(err)});
     };
 
+    // M14: the UI button signal, interned for the same reason: the button fires
+    // it from inside the frame, where `emit` must never allocate.
+    world.signals.preintern(ecs.ui_system.pressed_signal) catch |err| {
+        log.warn("could not reserve the '{s}' signal: {s}", .{ ecs.ui_system.pressed_signal, @errorName(err) });
+    };
+
     const AudioSignals = struct {
         world: *ecs.World,
         behaviors: *script.Behaviors,
@@ -894,6 +1205,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // `null` means the scene has no enabled Camera2D, and that is not an error:
     // the culler then draws everything, exactly as it did before M4.5.
     var camera_view: ?ecs.camera.View = null;
+
+    // ── M14: the UI button → Lua signal sink.
+    // A completed click reaches Lua as `on_signal("ui_pressed", { id, entity })`
+    // through this erased callback, for the same reason the timer bridge exists:
+    // the ECS must not import the script layer. The typed bus still carries the
+    // event for Zig listeners (inside `ui_system`), so both see one press.
+    const ui_press_sink = ecs.ui_system.PressSink{
+        .ctx = &behaviors,
+        .fire = struct {
+            fn fire(ctx: ?*anyopaque, id: u32, entity: u64) void {
+                const b: *script.Behaviors = @ptrCast(@alignCast(ctx.?));
+                const fields = [_]script.Behaviors.PayloadField{
+                    .{ .name = "id", .value = .{ .integer = @intCast(id) } },
+                    .{ .name = "entity", .value = .{ .integer = @bitCast(entity) } },
+                };
+                b.dispatchSignalPayload(ecs.ui_system.pressed_signal, &fields);
+            }
+        }.fire,
+    };
 
     while (true) {
         // ── Frame limiter (Godot-style). Runs BEFORE the frame so the pacing
@@ -1050,9 +1380,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         last_ns = now_ns;
         const real_dt: f32 = @as(f32, @floatFromInt(frame_ns)) / std.time.ns_per_s;
         var z_sim = prof.zone("fixed_update");
-        const steps = loop.addTime(real_dt);
+        // The clock owns the hitch clamp AND the global time scale, and hands
+        // back the SCALED delta. The accumulator and the scripts both advance
+        // by that same number: a slow-motion game runs the same simulation,
+        // less often, and a script can never move at a different speed than
+        // the world it is in.
+        const dt = game_time.beginFrame(real_dt);
+        const steps = loop.addTime(dt);
         var s: u32 = 0;
         while (s < steps) : (s += 1) {
+            // ── The interpolation snapshot, FIRST.
+            //
+            // `prev_*` is what the renderer blends from, and it must be the
+            // position the renderer last SAW — so it is captured before
+            // anything writes a transform this tick. Without this the
+            // renderer interpolates from the spawn position, and every moving
+            // actor (and every tween) drags a line back to where it was born.
+            // world.captureTransforms(); // TEMP: measuring
             // ── M4.5: the Timer system, BEFORE the behaviors run.
             // That order is the contract a scripted timer depends on: a
             // behavior's `fixed_update` observes exactly the signals its own
@@ -1061,6 +1405,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // typed bus cannot reach by itself.
             ecs.timer.tick(&world, fixed_dt, timer_bridge);
             anim_system.update(&world, fixed_dt, timer_bridge);
+            // ── The tweens, BEFORE the behaviors run.
+            //
+            // Same contract as the timers, and the same reason: a script that
+            // reads a tweened property in `fixed_update` sees the value the
+            // tween just wrote, and a script that writes the property itself
+            // has the last word in this tick.
+            behaviors.tickTweens(fixed_dt);
             // M3: behaviors run at the fixed 60 Hz tick. `startAll` already ran,
             // so this is the gameplay itself: Lua -> actor.* bindings -> ECS.
             behaviors.fixedUpdate(fixed_dt);
@@ -1091,7 +1442,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // step at ≤ 0.4 ms/frame; `vm.gcStep()` measures nothing, so the frame
         // cost lands in `script_update` where the budget gate can see it.
         var z_script = prof.zone("script_update");
-        behaviors.update(real_dt);
+        behaviors.update(dt);
         behaviors.sweepDestroyed();
         behaviors.vm.gcStep();
 
@@ -1140,6 +1491,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
             ) else null,
             null,
         );
+
+        // ── M14: the game UI. Resolve the canvas, lay out and hit-test every
+        // widget, advance the button state machine and fire `ui_pressed`, then
+        // emit the UI instances into the SAME buffer the world just filled — so
+        // they draw on top without a second pass. Runs after `collectFiltered`
+        // and before `submit` on purpose: emission order IS the UI's z-order.
+        //
+        // The framebuffer the canvas maps onto is the OFFSCREEN TARGET
+        // (`view_w`/`view_h`), not the window: the UI lives inside the game's
+        // own render, and the editor composites that later (plan §9.6).
+        const ui_pointer: ecs.ui_system.PointerState = if (has_window) .{
+            .x = window.input.mouse.x,
+            .y = window.input.mouse.y,
+            .down = window.input.mouse.down(0),
+            .pressed = window.input.mouse.justPressed(0),
+            .inside = window.input.mouse.inside,
+        } else .{ .inside = false };
+        ecs.ui_system.update(
+            &ui_runtime.state,
+            &world,
+            .{ .x = @floatFromInt(view_w), .y = @floatFromInt(view_h) },
+            ui_pointer,
+            ui_press_sink,
+        );
+        // Publish the capture flag BEFORE the next `behaviors.update` so a
+        // world script asking `input.pointer_over_ui()` this frame sees the
+        // widget the pointer was over in the frame just laid out.
+        input_state.setPointerOverUi(ui_runtime.state.pointer_over_ui);
+        _ = render.ui_draw.emit(&r2d, &world, &ui_runtime.state, .{
+            .view = camera_view,
+            .fonts = UiRuntime.fontSource(&ui_runtime),
+        });
         z_batch.end();
 
         // ── M9: advance the scene transition, then fold it into the
@@ -1175,6 +1558,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Environment component: a `environment.new` actor still gets its fog
         // and bloom, and a fade does not need a component to exist.
         lighting_env.fade_color = fader.rgba();
+        // M14: the CanvasModulate tint. Merged here for the same reason as the
+        // fade: it is a full-screen effect the runtime owns, not a value on the
+        // scene's Environment component, so a scene with no `environment.new`
+        // can still be tinted.
+        lighting_env.tint_color = tint_state.rgba();
+        lighting_env.tint_mode = @intFromEnum(tint_state.mode);
 
         // The mask is already sized by `sync_lighting_buffers` above, OUTSIDE
         // the tracker guard, because `resize` allocates and `Lighting.resize`

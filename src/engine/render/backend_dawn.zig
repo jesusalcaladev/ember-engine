@@ -433,8 +433,9 @@ pub const Backend = struct {
     /// SMAA `EdgeUniforms`: 2 x vec2f = 24 bytes.
     const SmaaUniformBytes: u64 = 24;
     /// `PostParams`: texel(8) + inv(8) + bloom_texel(8) + exposure(4) +
-    /// fog(8) + fog_color(16) + flags(16) + focus(8) + pad(8) = 96 bytes.
-    const PostUniformBytes: u64 = 112; // 28 floats: PostParams incl. M9's fade
+    /// fog(8) + fog_color(16) + flags(16) + focus(8) + pad(8) + fade(16) =
+    /// 112 bytes, then M14's tint(16) + tint_mode(16) = 144.
+    const PostUniformBytes: u64 = 144; // 36 floats: PostParams incl. fade + tint
 
     const vtable = render.Renderer.VTable{
         .beginFrame = beginFrame,
@@ -2152,7 +2153,7 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         // INTERNAL consistency and never sees the CPU's buffer, so nothing
         // caught it. These offsets are the shader's real ones; the `fade` vec4
         // at byte 96 is M9's.
-        var p: [28]f32 = undefined;
+        var p: [36]f32 = undefined;
         p[0] = 1.0 / fw;
         p[1] = 1.0 / fh;
         p[2] = fw;
@@ -2195,6 +2196,17 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         p[25] = env.fade_color[1];
         p[26] = env.fade_color[2];
         p[27] = env.fade_color[3];
+        // tint: vec4f @ 112 — M14's CanvasModulate, rgb + strength in alpha.
+        p[28] = env.tint_color[0];
+        p[29] = env.tint_color[1];
+        p[30] = env.tint_color[2];
+        p[31] = env.tint_color[3];
+        // tint_mode: vec4f @ 128 — x is the mix (0 off, 1 multiply, 2 add,
+        // 3 alpha); yzw spare, present so the struct stays 16-aligned.
+        p[32] = @floatFromInt(env.tint_mode);
+        p[33] = 0;
+        p[34] = 0;
+        p[35] = 0;
         wgpu.wgpuQueueWriteBuffer(self.queue, self.post_uniform_buf, 0, &p, PostUniformBytes);
         self.stats_data.upload_bytes += PostUniformBytes;
     }
@@ -2207,7 +2219,8 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
     /// per pixel.
     fn postActive(self: *const Backend) bool {
         const e = self.environment;
-        return e.tonemap or e.bloom_intensity > 0 or e.fog[1] > e.fog[0] or e.fade_color[3] > 0;
+        return e.tonemap or e.bloom_intensity > 0 or e.fog[1] > e.fog[0] or
+            e.fade_color[3] > 0 or (e.tint_mode != 0 and e.tint_color[3] > 0);
     }
 
     /// Writes the light pass's `Globals`. 128 bytes, fixed, every `beginScene`.

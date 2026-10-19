@@ -275,13 +275,23 @@ pub const Panel = struct {
         }
     }
 
-    /// Draws the whole panel. `body` is a free function over the context because
-    /// `ui.floating` takes one and Zig has no closures: the panel instance is
-    /// published in `current` for the duration of the call.
+    /// Draws the panel as its own floating window. Kept for a standalone run;
+    /// the editor shell calls `drawContents` inside the window IT owns, so the
+    /// panel is a dock like every other one.
     pub fn draw(self: *Panel) void {
         current = self;
+        defer current = null;
         ui.floating(host_ctx.?, "TileMap", .{ .x = 16, .y = 16, .w = 268, .h = 440 }, drawBody);
-        current = null;
+    }
+
+    /// The panel's body, drawn into the CURRENT window. `ctx` is also stashed in
+    /// `host_ctx` because the widgets below take it directly (the body itself is
+    /// a plain function pointer and cannot reach it any other way).
+    pub fn drawContents(self: *Panel, ctx: *ui.Context) void {
+        host_ctx = ctx;
+        current = self;
+        defer current = null;
+        drawBody(ctx);
     }
 
     /// The shell sets this before `draw`; it is the context the window opens on.
@@ -333,7 +343,7 @@ pub const Panel = struct {
     }
 
     fn drawPalette(self: *Panel) void {
-        _ = c.ember_ui_text(c.text("Palette"));
+        ui.text.subtitle(host_ctx.?, "Palette");
         const list = ui.draw.windowList();
         const cols: usize = self.cols;
         var idx: u16 = 0;
@@ -370,7 +380,7 @@ pub const Panel = struct {
 
     fn drawLayers(self: *Panel) void {
         _ = c.ember_ui_separator();
-        _ = c.ember_ui_text(c.text("Layers"));
+        ui.text.subtitle(host_ctx.?, "Layers");
         var i: usize = 0;
         while (i < self.layer_visible.len) : (i += 1) {
             var label_buf: [24]u8 = undefined;

@@ -28,6 +28,7 @@ const lua = @import("luajit.zig");
 // `script_mod.addImport("api_meta", ...)`.
 const metadata = @import("api_meta");
 const context_mod = @import("context.zig");
+const tween_mod = @import("tween.zig");
 const assets_mod = @import("assets");
 const ecs = @import("ecs");
 
@@ -498,6 +499,15 @@ fn lua_get_axis(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// `pointer_over_ui() -> boolean` — true while the pointer is over an
+/// interactive game-UI widget. Gameplay checks this so a click on a button
+/// cannot also be a world action (spec M14: "the UI never leaks input to the
+/// world"). Filled each frame by the runtime from the UI system.
+fn lua_input_pointer_over_ui(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    return pushBool(L, ctx.input.pointerOverUi());
+}
+
 // ── Log bindings (the whitelisted sink) ──────────────────────────────────────
 
 /// `log.info(message)` — writes to the engine log at info level.
@@ -515,6 +525,45 @@ fn lua_log_warn(L: ?*lua_State) callconv(.c) c_int {
     core_log.warn("{s}", .{msg});
     return 0;
 }
+
+// ── globals: the mounted global scripts (singleton access) ──────────────────
+// A global script (one mounted with no actor — the game manager, the score,
+// the spawner) is the one piece of Lua game state every OTHER script should be
+// able to reach, the way Godot's autoloads work. The surface is two reads:
+// `get` hands back the global's `self` table (method calls and field writes
+// go straight through it) and `exists` answers "is this one mounted" without
+// pushing anything. There is no reflection API on purpose: a global is not a
+// service locator, it is one instance per script, resolved by name.
+
+/// `globals.get(name) -> self_table | nil`.
+fn lua_globals_get(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const name = lua.toString(L, 1);
+    if (ctx.globals) |hooks| {
+        if (hooks.push_self(hooks.ctx, L, name)) return 1;
+    }
+    // Not mounted (no globals wired, or no global with this name): nil, not an
+    // error. Time is a perfectly good answer for "flow hasn't bootstrapped it
+    // yet" — a behavior can write `local game = globals.get("game")` and take
+    // the nil branch once, at startup.
+    lua.pushNil(L);
+    return 1;
+}
+
+/// `globals.exists(name) -> boolean`.
+fn lua_globals_exists(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const name = lua.toString(L, 1);
+    const mounted = if (ctx.globals) |hooks| hooks.exists(hooks.ctx, name) else false;
+    lua.lua_pushboolean(L, @intFromBool(mounted));
+    return 1;
+}
+
+const globals_regs = [_]luaL_Reg{
+    .{ .name = "get", .func = lua_globals_get },
+    .{ .name = "exists", .func = lua_globals_exists },
+    .{ .name = null, .func = null },
+};
 
 // ── world.nearby: the spatial query primitive (M4.5) ──────────────────────────
 // One primitive, not one per AI behaviour. Flocking, obstacle avoidance, "the
@@ -1621,6 +1670,23 @@ fn lua_actor_add_component(L: ?*lua_State) callconv(.c) c_int {
         // one from the inspector is safe and needs no system call.
         if (ctx.world.get(e, SoundEmitter2D) != null) return pushFalse(L);
         _ = ctx.world.add(e, SoundEmitter2D{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "UiCanvas")) {
+        // M14: the UI widgets are plain data too. Adding one starts from the
+        // component defaults (a 100x30 top-left box), which `ui.*` then styles.
+        if (ctx.world.get(e, components.UiCanvas) != null) return pushFalse(L);
+        _ = ctx.world.add(e, components.UiCanvas{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "Label")) {
+        if (ctx.world.get(e, components.Label) != null) return pushFalse(L);
+        _ = ctx.world.add(e, components.Label{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "UiButton")) {
+        if (ctx.world.get(e, components.UiButton) != null) return pushFalse(L);
+        _ = ctx.world.add(e, components.UiButton{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "UiPanel")) {
+        if (ctx.world.get(e, components.UiPanel) != null) return pushFalse(L);
+        _ = ctx.world.add(e, components.UiPanel{}) catch return pushFalse(L);
+    } else if (std.mem.eql(u8, name, "UiProgressBar")) {
+        if (ctx.world.get(e, components.UiProgressBar) != null) return pushFalse(L);
+        _ = ctx.world.add(e, components.UiProgressBar{}) catch return pushFalse(L);
     } else {
         // An unknown name is a reportable error, not a silent no-op: a tool that
         // asks for a component that does not exist has a bug, and hiding it here
@@ -1647,6 +1713,16 @@ fn lua_actor_has_component(L: ?*lua_State) callconv(.c) c_int {
         ctx.world.get(e, context_mod.components.Name) != null
     else if (std.mem.eql(u8, name, "SoundEmitter2D"))
         ctx.world.get(e, SoundEmitter2D) != null
+    else if (std.mem.eql(u8, name, "UiCanvas"))
+        ctx.world.get(e, components.UiCanvas) != null
+    else if (std.mem.eql(u8, name, "Label"))
+        ctx.world.get(e, components.Label) != null
+    else if (std.mem.eql(u8, name, "UiButton"))
+        ctx.world.get(e, components.UiButton) != null
+    else if (std.mem.eql(u8, name, "UiPanel"))
+        ctx.world.get(e, components.UiPanel) != null
+    else if (std.mem.eql(u8, name, "UiProgressBar"))
+        ctx.world.get(e, components.UiProgressBar) != null
     else
         false;
     return pushBool(L, present);
@@ -1671,6 +1747,16 @@ fn lua_actor_remove_component(L: ?*lua_State) callconv(.c) c_int {
         ctx.world.remove(e, Collider2D)
     else if (std.mem.eql(u8, name, "SoundEmitter2D"))
         ctx.world.remove(e, SoundEmitter2D)
+    else if (std.mem.eql(u8, name, "UiCanvas"))
+        ctx.world.remove(e, components.UiCanvas)
+    else if (std.mem.eql(u8, name, "Label"))
+        ctx.world.remove(e, components.Label)
+    else if (std.mem.eql(u8, name, "UiButton"))
+        ctx.world.remove(e, components.UiButton)
+    else if (std.mem.eql(u8, name, "UiPanel"))
+        ctx.world.remove(e, components.UiPanel)
+    else if (std.mem.eql(u8, name, "UiProgressBar"))
+        ctx.world.remove(e, components.UiProgressBar)
     else
         false;
     return pushBool(L, removed);
@@ -1868,6 +1954,326 @@ fn pushTrue(L: ?*lua_State) c_int {
 }
 fn pushFalse(L: ?*lua_State) c_int {
     return pushBool(L, false);
+}
+
+// ── Game UI (M14) ────────────────────────────────────────────────────────────
+//
+// `ui.*` styles an actor's WIDGET component. It is a setter API over plain-data
+// components, the same shape as `sprite.*` and `sound.*`: `ui.set_text` writes
+// the label's bytes, `ui.set_anchor` writes the layout, and the per-frame
+// system — which runs in Zig, never in Lua — turns those fields into quads. No
+// node tree, no allocation, and nothing here touches the GPU.
+//
+// The one thing that is NOT a component write is the query half (`measure`,
+// `font_load`, `hovered`, `pressed`): those need the glyph rasterizer and the
+// frame's resolved state, which live in the runtime, so they cross through the
+// `Context.ui` vtable (see `context.UiHooks`).
+
+/// The widget layout of the entity in argument 1, whichever widget kind it
+/// carries, or null when the actor has no widget component. Precedence matches
+/// `ui_system.gather` (button, panel, bar, label) so a malformed entity lays out
+/// and draws the same way.
+fn uiLayoutOf(L: ?*lua_State) ?*components.UiLayout {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return null;
+    if (ctx.world.get(e, components.UiButton)) |b| return &b.layout;
+    if (ctx.world.get(e, components.UiPanel)) |p| return &p.layout;
+    if (ctx.world.get(e, components.UiProgressBar)) |p| return &p.layout;
+    if (ctx.world.get(e, components.Label)) |l| return &l.layout;
+    return null;
+}
+
+/// The font id of a widget, 0 when it has none. Only the three text-bearing
+/// widgets carry one.
+fn uiFontOf(ctx: *Context, e: context_mod.Entity) u32 {
+    if (ctx.world.get(e, components.UiButton)) |b| return b.font;
+    if (ctx.world.get(e, components.UiProgressBar)) |p| return p.font;
+    if (ctx.world.get(e, components.Label)) |l| return l.font;
+    return 0;
+}
+
+/// Reads a `{ r, g, b, a }` ARRAY at `idx` into `out`. `a` defaults to 1 when
+/// the array has only three entries, and every component is clamped to 0..1.
+/// False (and `out` untouched) when `idx` is not a table, so a nil colour
+/// argument is a no-op rather than a black flash.
+fn readColor(L: ?*lua_State, idx: c_int, out: *[4]f32) bool {
+    if (!lua.isTable(L, idx)) return false;
+    var c: [4]f32 = .{ 0, 0, 0, 1 };
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        lua.lua_rawgeti(L, idx, @intCast(i + 1));
+        // A missing 4th entry reads as nil; `toF32` would call it 0, so the
+        // "alpha omitted means opaque" case is handled explicitly.
+        if (!(i == 3 and lua.isNil(L, -1))) c[i] = lua.toF32(L, -1);
+        lua.pop(L, 1);
+    }
+    out.* = .{
+        std.math.clamp(c[0], 0, 1),
+        std.math.clamp(c[1], 0, 1),
+        std.math.clamp(c[2], 0, 1),
+        std.math.clamp(c[3], 0, 1),
+    };
+    return true;
+}
+
+/// `ui.set_anchor(self, anchor)` — one of the twelve preset names: top_left,
+/// top_center, top_right, middle_left, center, middle_right, bottom_left,
+/// bottom_center, bottom_right, stretch_h, stretch_v, full_rect.
+fn lua_ui_set_anchor(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    layout.anchor = std.meta.stringToEnum(components.UiAnchor, name) orelse return 0;
+    return 0;
+}
+
+/// `ui.set_offset(self, x, y)` — displacement from the resolved anchor point.
+fn lua_ui_set_offset(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.offset = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    return 0;
+}
+
+/// `ui.set_size(self, w, h)` — widget size in canvas pixels (ignored by the
+/// axis a stretch preset fills).
+fn lua_ui_set_size(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.size = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    return 0;
+}
+
+/// `ui.set_pivot(self, x, y)` — 0,0 puts the widget's top-left on the anchor,
+/// 0.5,0.5 centres it.
+fn lua_ui_set_pivot(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.pivot = .{ .x = lua.toF32(L, 2), .y = lua.toF32(L, 3) };
+    return 0;
+}
+
+/// `ui.set_margin(self, top, right, bottom, left)` — the insets the stretch
+/// presets use. Ignored by the nine point presets.
+fn lua_ui_set_margin(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.margin = .{
+        lua.toF32(L, 2),
+        lua.toF32(L, 3),
+        lua.toF32(L, 4),
+        lua.toF32(L, 5),
+    };
+    return 0;
+}
+
+/// `ui.set_order(self, order)` — the paint and hit-test tie-break. Higher draws
+/// later and wins a click.
+fn lua_ui_set_order(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.order = @intFromFloat(lua.toF32(L, 2));
+    return 0;
+}
+
+/// `ui.set_visible(self, visible)` — whether the widget is drawn.
+fn lua_ui_set_visible(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.visible = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `ui.set_interactive(self, interactive)` — whether the widget blocks world
+/// input and can be hovered/clicked. Labels and bars never capture regardless.
+fn lua_ui_set_interactive(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    layout.interactive = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `ui.set_text(self, text)` — the widget's string (label, button caption, bar
+/// text). Truncated silently at 128 bytes, like every inline text here.
+fn lua_ui_set_text(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const text = lua.toSlice(L, 2) orelse return 0;
+    if (ctx.world.get(e, components.UiButton)) |b| {
+        b.text.set(text);
+        return 0;
+    }
+    if (ctx.world.get(e, components.UiProgressBar)) |p| {
+        p.text.set(text);
+        return 0;
+    }
+    if (ctx.world.get(e, components.Label)) |l| {
+        l.text.set(text);
+        return 0;
+    }
+    return 0;
+}
+
+/// `ui.set_font(self, id)` — which font the text uses; 0 is the engine default,
+/// any other id comes from `ui.font_load`.
+fn lua_ui_set_font(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const id: u32 = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    if (ctx.world.get(e, components.UiButton)) |b| {
+        b.font = id;
+        return 0;
+    }
+    if (ctx.world.get(e, components.UiProgressBar)) |p| {
+        p.font = id;
+        return 0;
+    }
+    if (ctx.world.get(e, components.Label)) |l| {
+        l.font = id;
+        return 0;
+    }
+    return 0;
+}
+
+/// `ui.set_color(self, r, g, b, a)` — the widget's primary colour: a label's
+/// text, a panel's fill, a button's caption, a bar's fill.
+fn lua_ui_set_color(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const rgba = [4]f32{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    if (ctx.world.get(e, components.Label)) |l| {
+        l.color = rgba;
+        return 0;
+    }
+    if (ctx.world.get(e, components.UiPanel)) |p| {
+        p.color = rgba;
+        return 0;
+    }
+    if (ctx.world.get(e, components.UiButton)) |b| {
+        b.text_color = rgba;
+        return 0;
+    }
+    if (ctx.world.get(e, components.UiProgressBar)) |p| {
+        p.fill_color = rgba;
+        return 0;
+    }
+    return 0;
+}
+
+/// `ui.set_colors(self, normal, hover, pressed, text)` — a button's four
+/// colours, each a `{r, g, b, a}` table. A nil table leaves that colour alone.
+fn lua_ui_set_colors(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const b = ctx.world.get(e, components.UiButton) orelse return 0;
+    var c: [4]f32 = undefined;
+    if (readColor(L, 2, &c)) b.color_normal = c;
+    if (readColor(L, 3, &c)) b.color_hover = c;
+    if (readColor(L, 4, &c)) b.color_pressed = c;
+    if (readColor(L, 5, &c)) b.text_color = c;
+    return 0;
+}
+
+/// `ui.set_border(self, r, g, b, a, width)` — a panel's outline. Zero width (or
+/// zero alpha) draws none.
+fn lua_ui_set_border(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.UiPanel) orelse return 0;
+    p.border_color = .{ lua.toF32(L, 2), lua.toF32(L, 3), lua.toF32(L, 4), lua.toF32(L, 5) };
+    p.border_width = @max(lua.toF32(L, 6), 0);
+    return 0;
+}
+
+/// `ui.set_show_text(self, show)` — whether a progress bar draws its text.
+fn lua_ui_set_show_text(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.UiProgressBar) orelse return 0;
+    p.show_text = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `ui.set_value(self, value)` — a progress bar's fill, clamped to 0..1.
+fn lua_ui_set_value(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const p = ctx.world.get(e, components.UiProgressBar) orelse return 0;
+    p.value = std.math.clamp(lua.toF32(L, 2), 0, 1);
+    return 0;
+}
+
+/// `ui.set_align(self, align)` — a label's horizontal alignment: "left",
+/// "center" or "right".
+fn lua_ui_set_align(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const l = ctx.world.get(e, components.Label) orelse return 0;
+    const name = lua.toSlice(L, 2) orelse return 0;
+    l.alignment = std.meta.stringToEnum(components.TextAlign, name) orelse return 0;
+    return 0;
+}
+
+/// `ui.set_enabled(self, enabled)` — a button's enabled flag. A disabled button
+/// is inert: no hover, no click, and no pointer capture.
+fn lua_ui_set_enabled(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const b = ctx.world.get(e, components.UiButton) orelse return 0;
+    b.enabled = lua.toBool(L, 2);
+    return 0;
+}
+
+/// `ui.measure(self, text) -> w, h` — the pixel size `text` would occupy in this
+/// widget's font. Returns nil when no UI system is wired (a headless tool).
+fn lua_ui_measure(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const hooks = ctx.ui orelse return 0;
+    const e = entityOf(L, 1) orelse return 0;
+    const text = lua.toSlice(L, 2) orelse "";
+    var out = [2]f32{ 0, 0 };
+    if (!hooks.measure(hooks.ctx, uiFontOf(ctx, e), text, &out)) return 0;
+    lua.pushF32(L, out[0]);
+    lua.pushF32(L, out[1]);
+    return 2;
+}
+
+/// `ui.rect(self) -> x, y, w, h` — the screen-pixel rect the UI system resolved
+/// this frame (the previous frame's, if called before the first layout).
+fn lua_ui_rect(L: ?*lua_State) callconv(.c) c_int {
+    const layout = uiLayoutOf(L) orelse return 0;
+    const r = layout.resolved;
+    lua.pushF32(L, r.position.x);
+    lua.pushF32(L, r.position.y);
+    lua.pushF32(L, r.size.x);
+    lua.pushF32(L, r.size.y);
+    return 4;
+}
+
+/// `ui.hovered(self) -> boolean` — true while the pointer is over this widget.
+fn lua_ui_hovered(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const hooks = ctx.ui orelse return pushFalse(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    return pushBool(L, hooks.hovered(hooks.ctx, e.bits()));
+}
+
+/// `ui.pressed(self) -> boolean` — true while this button is being held down.
+fn lua_ui_pressed(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const hooks = ctx.ui orelse return pushFalse(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    return pushBool(L, hooks.pressed(hooks.ctx, e.bits()));
+}
+
+/// `ui.font_load(path, px) -> id` — loads (or returns a cached) TTF at `px`
+/// pixels and returns its id for `ui.set_font`. 0 when the file cannot be read.
+/// Reads a file, so call it at load time, not per frame.
+fn lua_ui_font_load(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const hooks = ctx.ui orelse {
+        lua.lua_pushinteger(L, 0);
+        return 1;
+    };
+    const path = lua.toSlice(L, 1) orelse {
+        lua.lua_pushinteger(L, 0);
+        return 1;
+    };
+    const id = hooks.font_load(hooks.ctx, path, lua.toF32(L, 2));
+    lua.lua_pushinteger(L, @intCast(id));
+    return 1;
 }
 
 // ── Shader materials ─────────────────────────────────────────────────────────
@@ -2606,6 +3012,64 @@ fn lua_scene_fading(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+// ── M14: CanvasModulate (the full-screen tint) ────────────────────────────────
+
+/// Maps a `scene.tint_mode` name to its wire code: 0 off, 1 multiply, 2 add,
+/// 3 alpha. Unknown names are ignored (return null), so a typo does not pick a
+/// mode by accident — the call simply does nothing.
+fn tintModeFromName(name: []const u8) ?u8 {
+    if (std.mem.eql(u8, name, "off")) return 0;
+    if (std.mem.eql(u8, name, "multiply")) return 1;
+    if (std.mem.eql(u8, name, "add")) return 2;
+    if (std.mem.eql(u8, name, "alpha")) return 3;
+    return null;
+}
+
+/// `scene.tint(r, g, b, a)` — lays a colour over the whole canvas (world AND
+/// game UI). Multiply by default; follow with `scene.tint_mode` to flash or
+/// veil instead. `a` is the strength, 0..1, and 0 is a no-op.
+fn lua_scene_tint(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.tint orelse return 0;
+    const r = @min(@max(lua.toF32(L, 1), 0), 1);
+    const g = @min(@max(lua.toF32(L, 2), 0), 1);
+    const b = @min(@max(lua.toF32(L, 3), 0), 1);
+    const a = @min(@max(lua.toF32(L, 4), 0), 1);
+    h.set(h.ctx, r, g, b, a);
+    return 0;
+}
+
+/// `scene.tint_mode(name)` — how the tint mixes: "multiply" (the default),
+/// "add" (a flash), "alpha" (a flat veil) or "off" (disables it). An unknown
+/// name is ignored.
+fn lua_scene_tint_mode(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.tint orelse return 0;
+    const mode = tintModeFromName(lua.toString(L, 1)) orelse return 0;
+    h.set_mode(h.ctx, mode);
+    return 0;
+}
+
+/// `scene.tint_clear()` — disables the tint and forgets its colour.
+fn lua_scene_tint_clear(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.tint orelse return 0;
+    h.clear(h.ctx);
+    return 0;
+}
+
+/// `scene.tint_amount() -> 0..1` — the current strength. The value a script
+/// animates a flash back down to zero against.
+fn lua_scene_tint_amount(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const h = ctx.tint orelse {
+        lua.pushF32(L, 0);
+        return 1;
+    };
+    lua.pushF32(L, h.amount(h.ctx));
+    return 1;
+}
+
 // ── M9: particles (the CPU pool) ──────────────────────────────────────────────
 
 /// `particles.burst(self, count)` — emits `count` particles NOW, from the
@@ -2907,6 +3371,11 @@ const scene_regs = [_]luaL_Reg{
     .{ .name = "fade_clear", .func = lua_scene_fade_clear },
     .{ .name = "fade_amount", .func = lua_scene_fade_amount },
     .{ .name = "fading", .func = lua_scene_fading },
+    // M14: CanvasModulate (the full-screen tint).
+    .{ .name = "tint", .func = lua_scene_tint },
+    .{ .name = "tint_mode", .func = lua_scene_tint_mode },
+    .{ .name = "tint_clear", .func = lua_scene_tint_clear },
+    .{ .name = "tint_amount", .func = lua_scene_tint_amount },
     .{ .name = null, .func = null },
 };
 
@@ -3257,8 +3726,12 @@ fn lua_timer_set_signals(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
-/// `timer.start(self, loops)` — 0 loops means forever. Autostart is a field on
-/// the component, so a timer declared in a scene file runs without any script.
+/// `timer.start(self, loops)` — 0 loops means forever.
+///
+/// There is no `autostart` field: a timer in the world ticks from the moment it
+/// exists, so a timer declared in a scene file runs without any script. What
+/// `start` does is put it back to zero (a timer that already fired is
+/// `finished`, and the tick skips those) and set how many cycles it runs.
 fn lua_timer_start(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
@@ -3303,6 +3776,118 @@ fn lua_timer_progress(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// `timer.restart(self)` — puts the timer back to zero and runs it again.
+///
+/// The configuration survives: the duration, the kind, the loop count and the
+/// signals are all still there. Only the progress is reset — the elapsed time,
+/// the cycle counter and the finished flag.
+fn lua_timer_restart(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    t.restart();
+    t.paused = false;
+    return 0;
+}
+
+/// `timer.set_duration(self, seconds)` — how long one cycle takes.
+fn lua_timer_set_duration(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    t.duration = @max(lua.toF32(L, 2), 0);
+    return 0;
+}
+
+/// `timer.get_duration(self) -> seconds`.
+fn lua_timer_get_duration(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    lua.pushF32(L, t.duration);
+    return 1;
+}
+
+/// `timer.get_elapsed(self) -> seconds` — how far into the current cycle it is.
+fn lua_timer_get_elapsed(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    lua.pushF32(L, t.elapsed);
+    return 1;
+}
+
+/// `timer.get_loops(self) -> count, current` — how many cycles it will run and
+/// how many it has run.
+fn lua_timer_get_loops(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    lua.lua_pushinteger(L, @intCast(t.loop_count));
+    lua.lua_pushinteger(L, @intCast(t.current_loop));
+    return 2;
+}
+
+/// `timer.set_kind(self, kind)` — 0 once, 1 loop, 2 during.
+///
+/// Changing the kind does not restart the timer: the elapsed time and the
+/// cycle counter are still where they were.
+fn lua_timer_set_kind(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    const kind: u32 = @intFromFloat(@max(lua.toF32(L, 2), 0));
+    t.kind = switch (kind) {
+        1 => .loop,
+        2 => .during,
+        else => .once,
+    };
+    return 0;
+}
+
+/// `timer.set_time_scale(self, scale)` — this timer's own speed.
+///
+/// 1 is normal, 0.5 is half as fast, 0 stops the timer where it is. It
+/// multiplies with the GLOBAL scale (`time.scale`): a slow-motion game slows
+/// every timer, and a timer slower than the game is slower still.
+fn lua_timer_set_time_scale(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    const s = lua.toF32(L, 2);
+    if (std.math.isNan(s)) return 0;
+    t.time_scale = std.math.clamp(s, 0.0, 100.0);
+    return 0;
+}
+
+/// `timer.is_finished(self) -> boolean` — true once the timer has done its job.
+fn lua_timer_is_finished(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    return pushBool(L, t.finished);
+}
+
+/// `timer.is_paused(self) -> boolean` — true while the timer is stopped.
+fn lua_timer_is_paused(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    return pushBool(L, t.paused);
+}
+
+/// `timer.get_dropped(self) -> count` — the cycles this timer could not run.
+///
+/// Zero in a healthy game. A number that grows says the timer is running late
+/// because one tick asked for more cycles than the engine runs at once.
+fn lua_timer_get_dropped(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const t = ctx.world.get(e, components.Timer) orelse return 0;
+    lua.lua_pushinteger(L, @intCast(t.dropped_cycles));
+    return 1;
+}
+
 const timer_regs = [_]luaL_Reg{
     .{ .name = "new", .func = lua_timer_new },
     .{ .name = "set_signals", .func = lua_timer_set_signals },
@@ -3310,6 +3895,430 @@ const timer_regs = [_]luaL_Reg{
     .{ .name = "stop", .func = lua_timer_stop },
     .{ .name = "kill", .func = lua_timer_kill },
     .{ .name = "progress", .func = lua_timer_progress },
+    .{ .name = "restart", .func = lua_timer_restart },
+    .{ .name = "set_duration", .func = lua_timer_set_duration },
+    .{ .name = "get_duration", .func = lua_timer_get_duration },
+    .{ .name = "get_elapsed", .func = lua_timer_get_elapsed },
+    .{ .name = "get_loops", .func = lua_timer_get_loops },
+    .{ .name = "set_kind", .func = lua_timer_set_kind },
+    .{ .name = "set_time_scale", .func = lua_timer_set_time_scale },
+    .{ .name = "is_finished", .func = lua_timer_is_finished },
+    .{ .name = "is_paused", .func = lua_timer_is_paused },
+    .{ .name = "get_dropped", .func = lua_timer_get_dropped },
+    .{ .name = null, .func = null },
+};
+
+// ── time: the game clock and the global time scale ───────────────────────────
+//
+// The clock GAMEPLAY reads, and the engine's one time dial. Every number here
+// comes from the same `GameTime` the simulation runs on, so a script can never
+// see a delta that disagrees with the world it is moving in.
+//
+// The scale is GLOBAL: 0 is paused, 0.5 is slow motion, 2 is double speed. It
+// slows the SIMULATION — physics, timers, animation, particles — and the `dt`
+// the scripts are handed. It does NOT stop the frame loop: a pause menu has to
+// keep reading the input and keep drawing, and a paused game that freezes its
+// own UI is a worse pause.
+//
+// The one thing the scale does not touch is PRESENTATION: a scene fade runs on
+// real time, because a transition that takes 0.5 s of game time would take 5 s
+// of real time in slow motion, which is nobody's idea of a fade.
+
+/// `time.delta() -> seconds` — the last frame's SCALED delta.
+///
+/// The same number the simulation advanced by, so `self.x = self.x + v * dt`
+/// moves at the speed the world moves. It is 0 while the game is paused.
+fn lua_time_delta(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    // No clock wired (a headless tool, a test): a zero delta, not a crash.
+    // Zero is the SAFE answer — a script that multiplies by it gets a still
+    // frame instead of a segfault.
+    lua.pushF32(L, if (ctx.time) |t| t.delta else 0);
+    return 1;
+}
+
+/// `time.unscaled_delta() -> seconds` — the last frame's REAL delta.
+///
+/// The wall clock, unaffected by the scale. A UI that has to keep moving while
+/// the game is paused (a loading spinner) reads this one.
+fn lua_time_unscaled_delta(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.pushF32(L, if (ctx.time) |t| t.unscaled_delta else 0);
+    return 1;
+}
+
+/// `time.elapsed() -> seconds` — scaled game time since boot.
+///
+/// What a gameplay timer counts: it slows down with the game, so "10 seconds
+/// into the level" means ten seconds of PLAY, not ten seconds of wall clock.
+fn lua_time_elapsed(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.pushF32(L, if (ctx.time) |t| t.elapsed else 0);
+    return 1;
+}
+
+/// `time.unscaled_elapsed() -> seconds` — real time since boot.
+fn lua_time_unscaled_elapsed(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.pushF32(L, if (ctx.time) |t| t.unscaled_elapsed else 0);
+    return 1;
+}
+
+/// `time.frame() -> number` — the frame counter.
+fn lua_time_frame(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const frame: isize = if (ctx.time) |t| @intCast(t.frame) else 0;
+    lua.lua_pushinteger(L, frame);
+    return 1;
+}
+
+/// `time.physics_delta() -> seconds` — the fixed simulation step (1/60).
+///
+/// The step the SOLVER uses, not the frame's delta: it is the number to
+/// integrate against when the answer must not depend on the frame rate.
+fn lua_time_physics_delta(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.pushF32(L, if (ctx.time) |t| t.physicsDelta() else 0);
+    return 1;
+}
+
+/// `time.scale() -> number` — the global time scale. 1 is normal.
+fn lua_time_scale(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    lua.pushF32(L, if (ctx.time) |t| t.scale else 1);
+    return 1;
+}
+
+/// `time.set_scale(s)` — sets the global time scale.
+///
+/// 0 pauses, 0.5 is slow motion, 2 is double speed. Clamped to
+/// `[0, 100]`: a negative scale would run the simulation backwards, which
+/// nothing supports. A NaN is ignored rather than applied.
+fn lua_time_set_scale(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const t = ctx.time orelse return 0;
+    t.setScale(lua.toF32(L, 1));
+    return 0;
+}
+
+/// `time.pause()` — pauses the simulation.
+///
+/// The scale goes to 0 and the scale in force is remembered, so `resume`
+/// brings back slow motion if that is what was running.
+fn lua_time_pause(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    if (ctx.time) |t| t.pause();
+    return 0;
+}
+
+/// `time.resume()` — unpauses, restoring the scale that was in force.
+fn lua_time_resume(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    if (ctx.time) |t| t.unpause();
+    return 0;
+}
+
+/// `time.is_paused() -> boolean`.
+fn lua_time_is_paused(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    return pushBool(L, if (ctx.time) |t| t.isPaused() else false);
+}
+
+const time_regs = [_]luaL_Reg{
+    .{ .name = "delta", .func = lua_time_delta },
+    .{ .name = "unscaled_delta", .func = lua_time_unscaled_delta },
+    .{ .name = "elapsed", .func = lua_time_elapsed },
+    .{ .name = "unscaled_elapsed", .func = lua_time_unscaled_elapsed },
+    .{ .name = "frame", .func = lua_time_frame },
+    .{ .name = "physics_delta", .func = lua_time_physics_delta },
+    .{ .name = "scale", .func = lua_time_scale },
+    .{ .name = "set_scale", .func = lua_time_set_scale },
+    .{ .name = "pause", .func = lua_time_pause },
+    .{ .name = "resume", .func = lua_time_resume },
+    .{ .name = "is_paused", .func = lua_time_is_paused },
+    .{ .name = null, .func = null },
+};
+
+// ── tween: a value that moves to another value over time ─────────────────────
+//
+// The answer to "slide the panel in", "fade the sprite out" and "punch the
+// player back", without a frame counter in the script.
+//
+// A tween drives a COMPONENT of an actor — the real `Transform`, the real
+// `Sprite.tint` — so the renderer draws the result. It is not a number in a
+// Lua table that happens to look like a position.
+//
+// Every tween returns a HANDLE: a small integer that identifies it until it
+// finishes. The handle is what `tween.kill` and `tween.chain` take.
+
+/// The properties a tween can drive, in the order the doc lists them.
+const tween_property_names = [_][]const u8{
+    "position",   "position.x", "position.y",
+    "rotation",
+    "scale",      "scale.x",    "scale.y",
+    "tint",       "tint.r",     "tint.g",     "tint.b",     "tint.a",
+    "color",      "color.r",    "color.g",    "color.b",    "color.a",
+    "energy",
+    "radius",
+    "value",
+    "duration",
+};
+
+/// Reads a Lua argument into a tween value, shaped by the property it drives.
+///
+/// The SHAPE comes from the property, not from the argument: "position" is a
+/// vector, "tint" is a colour, "rotation" is a number. A number given for a
+/// vector is a uniform one (`{x = 5, y = 5}`), which is what a designer means
+/// by "scale it by five".
+fn tweenValueFromLua(L: ?*lua_State, idx: c_int, field: tween_mod.Field, part: tween_mod.Part) ?tween_mod.Value {
+    // A sub-field ("position.x") is always a number.
+    if (part != .whole) {
+        if (!lua.isNumber(L, idx)) return null;
+        return .{ .scalar = lua.toF32(L, idx) };
+    }
+    switch (field) {
+        .position, .scale => {
+            if (lua.isTable(L, idx)) {
+                var v = components.Vec2{};
+                lua.getField(L, idx, "x");
+                if (lua.isNumber(L, -1)) v.x = lua.toF32(L, -1);
+                lua.pop(L, 1);
+                lua.getField(L, idx, "y");
+                if (lua.isNumber(L, -1)) v.y = lua.toF32(L, -1);
+                lua.pop(L, 1);
+                return .{ .vec2 = v };
+            }
+            if (lua.isNumber(L, idx)) {
+                const s = lua.toF32(L, idx);
+                return .{ .vec2 = .{ .x = s, .y = s } };
+            }
+            return null;
+        },
+        .tint, .color => {
+            if (lua.isTable(L, idx)) {
+                // A missing channel keeps its DEFAULT, and the default alpha is
+                // 1: a colour written without an alpha is opaque, not
+                // invisible.
+                var c = [4]f32{ 1, 1, 1, 1 };
+                const names = [_][*:0]const u8{ "r", "g", "b", "a" };
+                for (names, 0..) |name, i| {
+                    lua.getField(L, idx, name);
+                    if (lua.isNumber(L, -1)) c[i] = lua.toF32(L, -1);
+                    lua.pop(L, 1);
+                }
+                return .{ .color = c };
+            }
+            if (lua.isNumber(L, idx)) {
+                const s = lua.toF32(L, idx);
+                return .{ .color = .{ s, s, s, s } };
+            }
+            return null;
+        },
+        else => {
+            if (!lua.isNumber(L, idx)) return null;
+            return .{ .scalar = lua.toF32(L, idx) };
+        },
+    }
+}
+
+/// Reads the tween options table: `{ easing, delay, repeat, yoyo, hold, on_complete }`.
+fn tweenOptionsFromLua(L: ?*lua_State, idx: c_int, pool: *tween_mod.Manager) tween_mod.Options {
+    var opts = tween_mod.Options{};
+    if (!lua.isTable(L, idx)) return opts;
+
+    lua.getField(L, idx, "easing");
+    if (lua.isString(L, -1)) {
+        // An unknown curve is IGNORED, and the tween runs linear. The
+        // alternative — refusing the tween — would leave the property where it
+        // is, which looks like a broken tween rather than a typo.
+        if (core_math.Easing.fromName(lua.toString(L, -1))) |e| opts.easing = e;
+    }
+    lua.pop(L, 1);
+
+    lua.getField(L, idx, "delay");
+    if (lua.isNumber(L, -1)) opts.delay = lua.toF32(L, -1);
+    lua.pop(L, 1);
+
+    lua.getField(L, idx, "repeat");
+    if (lua.isNumber(L, -1)) opts.repeat = @intFromFloat(lua.toF32(L, -1));
+    lua.pop(L, 1);
+
+    lua.getField(L, idx, "yoyo");
+    opts.yoyo = lua.toBool(L, -1);
+    lua.pop(L, 1);
+
+    lua.getField(L, idx, "hold");
+    opts.hold = lua.toBool(L, -1);
+    lua.pop(L, 1);
+
+    // The completion callback: a Lua function, kept alive by a registry ref
+    // the pool owns and releases when the tween ends.
+    lua.getField(L, idx, "on_complete");
+    if (lua.isFunction(L, -1)) {
+        if (pool.vm) |vm| {
+            opts.on_complete = vm.refTop(); // pops
+        } else {
+            lua.pop(L, 1);
+        }
+    } else {
+        lua.pop(L, 1);
+    }
+    return opts;
+}
+
+/// `tween.to(self, property, value, duration, opts) -> handle`.
+///
+/// Starts a tween that drives `property` on this actor towards `value` over
+/// `duration` seconds. The handle identifies it until it finishes.
+///
+/// `property` is a component field, optionally with a sub-field:
+/// `"position"`, `"position.x"`, `"rotation"`, `"scale"`, `"tint"`, `"tint.a"`,
+/// `"color"`, `"energy"`, `"radius"`, `"value"`, `"duration"`.
+///
+/// `opts` is optional: `{ easing = "out_back", delay = 0.2, repeat = 2,
+/// yoyo = true, hold = true, on_complete = function(self) end }`.
+fn lua_tween_to(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const e = entityOf(L, 1) orelse return 0;
+    const property = lua.toString(L, 2);
+
+    // "position.x" is the field "position" and the part "x".
+    var field_name = property;
+    var part_name: []const u8 = "";
+    if (std.mem.lastIndexOfScalar(u8, property, '.')) |dot| {
+        field_name = property[0..dot];
+        part_name = property[dot + 1 ..];
+    }
+    const field = tween_mod.Field.fromName(field_name) orelse return 0;
+    const part = tween_mod.Part.fromName(part_name);
+    const to = tweenValueFromLua(L, 3, field, part) orelse return 0;
+    const duration = lua.toF32(L, 4);
+
+    var opts = tween_mod.Options{};
+    if (lua.isTable(L, 5)) {
+        opts = tweenOptionsFromLua(L, 5, pool);
+        // The callback is called with the actor's `self`, the same shape every
+        // other hook in the engine uses.
+        if (opts.on_complete != tween_mod.no_ref) opts.self_ref = refTableAt(L, 1);
+    }
+
+    const handle = pool.create(e, field, part, to, duration, opts) catch return 0;
+    lua.lua_pushinteger(L, @intCast(handle));
+    return 1;
+}
+
+/// `tween.chain(parent, child) -> boolean`.
+///
+/// The child tween starts when the parent finishes. The child is parked and
+/// reset, so chain it before it runs (or create it with `hold = true`) to
+/// avoid a visible jump back to its start value.
+fn lua_tween_chain(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const parent: u32 = @intCast(@max(lua.toInteger(L, 1), 0));
+    const child: u32 = @intCast(@max(lua.toInteger(L, 2), 0));
+    const ok = pool.chain(parent, child) catch return 0;
+    return pushBool(L, ok);
+}
+
+/// `tween.start(handle) -> boolean` — releases a parked tween.
+fn lua_tween_start(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const handle: u32 = @intCast(@max(lua.toInteger(L, 1), 0));
+    return pushBool(L, pool.release(handle));
+}
+
+/// `tween.kill(handle) -> boolean` — stops a tween where it is.
+fn lua_tween_kill(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const handle: u32 = @intCast(@max(lua.toInteger(L, 1), 0));
+    return pushBool(L, pool.kill(handle));
+}
+
+/// `tween.kill_entity(self) -> count` — stops every tween on this actor.
+fn lua_tween_kill_entity(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const e = entityOf(L, 1) orelse return 0;
+    lua.lua_pushinteger(L, @intCast(pool.killEntity(e)));
+    return 1;
+}
+
+/// `tween.kill_all() -> count` — stops every tween in the game.
+fn lua_tween_kill_all(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    pool.killAll();
+    lua.lua_pushinteger(L, @intCast(pool.liveCount()));
+    return 1;
+}
+
+/// `tween.is_alive(handle) -> boolean`.
+fn lua_tween_is_alive(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    const handle: u32 = @intCast(@max(lua.toInteger(L, 1), 0));
+    return pushBool(L, pool.isAlive(handle));
+}
+
+/// `tween.count() -> number` — how many tweens are running.
+fn lua_tween_count(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse {
+        lua.lua_pushinteger(L, 0);
+        return 1;
+    };
+    lua.lua_pushinteger(L, @intCast(pool.liveCount()));
+    return 1;
+}
+
+/// `tween.time_scale() -> number` — the global tween speed.
+fn lua_tween_time_scale(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse {
+        lua.pushF32(L, 1);
+        return 1;
+    };
+    lua.pushF32(L, pool.time_scale);
+    return 1;
+}
+
+/// `tween.set_time_scale(s)` — the global tween speed. 0 freezes every tween.
+fn lua_tween_set_time_scale(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const pool = ctx.tweens orelse return 0;
+    pool.setTimeScale(lua.toF32(L, 1));
+    return 0;
+}
+
+/// `tween.properties() -> table` — every property a tween can drive.
+///
+/// The list is here so a script (and the editor's autocomplete) can discover
+/// what is tweenable without the documentation being the only source.
+fn lua_tween_properties(L: ?*lua_State) callconv(.c) c_int {
+    lua.lua_createtable(L, 0, @intCast(tween_property_names.len));
+    for (tween_property_names, 0..) |name, i| {
+        lua.pushSlice(L, name);
+        lua.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+const tween_regs = [_]luaL_Reg{
+    .{ .name = "to", .func = lua_tween_to },
+    .{ .name = "chain", .func = lua_tween_chain },
+    .{ .name = "start", .func = lua_tween_start },
+    .{ .name = "kill", .func = lua_tween_kill },
+    .{ .name = "kill_entity", .func = lua_tween_kill_entity },
+    .{ .name = "kill_all", .func = lua_tween_kill_all },
+    .{ .name = "is_alive", .func = lua_tween_is_alive },
+    .{ .name = "count", .func = lua_tween_count },
+    .{ .name = "time_scale", .func = lua_tween_time_scale },
+    .{ .name = "set_time_scale", .func = lua_tween_set_time_scale },
+    .{ .name = "properties", .func = lua_tween_properties },
     .{ .name = null, .func = null },
 };
 
@@ -3385,6 +4394,36 @@ const input_regs = [_]luaL_Reg{
     .{ .name = "is_action_pressed", .func = lua_is_action_pressed },
     .{ .name = "is_action_down", .func = lua_is_action_down },
     .{ .name = "get_axis", .func = lua_get_axis },
+    .{ .name = "pointer_over_ui", .func = lua_input_pointer_over_ui },
+    .{ .name = null, .func = null },
+};
+
+/// Game UI (M14): style an actor's widget component, plus the two queries that
+/// need the runtime (`measure`, `font_load`) and the two that read the frame
+/// (`hovered`, `pressed`).
+const ui_regs = [_]luaL_Reg{
+    .{ .name = "set_anchor", .func = lua_ui_set_anchor },
+    .{ .name = "set_offset", .func = lua_ui_set_offset },
+    .{ .name = "set_size", .func = lua_ui_set_size },
+    .{ .name = "set_pivot", .func = lua_ui_set_pivot },
+    .{ .name = "set_margin", .func = lua_ui_set_margin },
+    .{ .name = "set_order", .func = lua_ui_set_order },
+    .{ .name = "set_visible", .func = lua_ui_set_visible },
+    .{ .name = "set_interactive", .func = lua_ui_set_interactive },
+    .{ .name = "set_text", .func = lua_ui_set_text },
+    .{ .name = "set_font", .func = lua_ui_set_font },
+    .{ .name = "set_color", .func = lua_ui_set_color },
+    .{ .name = "set_colors", .func = lua_ui_set_colors },
+    .{ .name = "set_border", .func = lua_ui_set_border },
+    .{ .name = "set_show_text", .func = lua_ui_set_show_text },
+    .{ .name = "set_value", .func = lua_ui_set_value },
+    .{ .name = "set_align", .func = lua_ui_set_align },
+    .{ .name = "set_enabled", .func = lua_ui_set_enabled },
+    .{ .name = "measure", .func = lua_ui_measure },
+    .{ .name = "rect", .func = lua_ui_rect },
+    .{ .name = "hovered", .func = lua_ui_hovered },
+    .{ .name = "pressed", .func = lua_ui_pressed },
+    .{ .name = "font_load", .func = lua_ui_font_load },
     .{ .name = null, .func = null },
 };
 
@@ -3455,8 +4494,41 @@ const math_regs = [_]luaL_Reg{
     .{ .name = "deg_to_rad", .func = scalar1(m.degToRad) },
     .{ .name = "rad_to_deg", .func = scalar1(m.radToDeg) },
     .{ .name = "is_close", .func = lua_math_is_close },
+    .{ .name = "ease", .func = lua_math_ease },
+    .{ .name = "easings", .func = lua_math_easings },
     .{ .name = null, .func = null },
 };
+
+/// `math.ease(name, t) -> number` — the easing curve, `t` in `[0,1]`.
+///
+/// The same curves the tween uses: `"linear"`, `"in_quad"`, `"out_cubic"`,
+/// `"in_out_back"`, `"out_elastic"`, `"out_bounce"`… A curve starts at 0 and
+/// ends at 1, and the SHAPE between them is the point.
+///
+/// Nil for an unknown name: a typo is a reported failure, not a silent linear
+/// that looks like the easing was ignored.
+fn lua_math_ease(L: ?*lua_State) callconv(.c) c_int {
+    const name = lua.toString(L, 1);
+    const t = lua.toF32(L, 2);
+    const v = core_math.easeByName(name, t) orelse {
+        lua.pushNil(L);
+        return 1;
+    };
+    lua.pushF32(L, v);
+    return 1;
+}
+
+/// `math.easings() -> table` — every easing name, so a script (or the
+/// editor's autocomplete) can discover them without the docs.
+fn lua_math_easings(L: ?*lua_State) callconv(.c) c_int {
+    const names = core_math.easing_names;
+    lua.lua_createtable(L, 0, @intCast(names.len));
+    for (names, 0..) |name, i| {
+        lua.pushSlice(L, name);
+        lua.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    return 1;
+}
 
 /// Factories returning a C function that reads N numbers, calls one core
 /// function and pushes one result. Zig forbids a `comptime` parameter on a
@@ -4695,6 +5767,7 @@ pub const registered_names = [_][]const u8{
     "math.damp",                 "math.wrap",
     "math.pingpong",             "math.deg_to_rad",
     "math.rad_to_deg",           "math.is_close",
+    "math.ease",                 "math.easings",
     // vec2
     "vec2.new",                  "vec2.to_vec",
     "vec2.dist",                 "vec2.dist_sq",
@@ -4709,7 +5782,10 @@ pub const registered_names = [_][]const u8{
     // input / log
               "input.is_action_pressed",
     "input.is_action_down",      "input.get_axis",
+    "input.pointer_over_ui",
     "log.info",                  "log.warn",
+    // globals: mounted global scripts (the Lua singleton surface)
+    "globals.get",               "globals.exists",
     // rand / noise (M4.5)
     "rand.seed",                 "rand.float",
     "rand.range",                "rand.int",
@@ -4798,6 +5874,11 @@ pub const registered_names = [_][]const u8{
     "scene.fade_clear",
     "scene.fade_amount",
     "scene.fading",
+    // M14: CanvasModulate (the full-screen tint)
+    "scene.tint",
+    "scene.tint_mode",
+    "scene.tint_clear",
+    "scene.tint_amount",
     // M9: particles (the CPU pool)
     "particles.burst",
     "particles.stats",
@@ -4897,6 +5978,40 @@ pub const registered_names = [_][]const u8{
     "timer.stop",
     "timer.kill",
     "timer.progress",
+    "timer.restart",
+    "timer.set_duration",
+    "timer.get_duration",
+    "timer.get_elapsed",
+    "timer.get_loops",
+    "timer.set_kind",
+    "timer.set_time_scale",
+    "timer.is_finished",
+    "timer.is_paused",
+    "timer.get_dropped",
+    // time: the game clock and the global time scale
+    "time.delta",
+    "time.unscaled_delta",
+    "time.elapsed",
+    "time.unscaled_elapsed",
+    "time.frame",
+    "time.physics_delta",
+    "time.scale",
+    "time.set_scale",
+    "time.pause",
+    "time.resume",
+    "time.is_paused",
+    // tween: animating a value over time
+    "tween.to",
+    "tween.chain",
+    "tween.start",
+    "tween.kill",
+    "tween.kill_entity",
+    "tween.kill_all",
+    "tween.is_alive",
+    "tween.count",
+    "tween.time_scale",
+    "tween.set_time_scale",
+    "tween.properties",
     // M13: the per-actor AnimationPlayer surface. Same rule as above: every
     // name here must have a metadata entry, or `assertAllDocumented` fails.
     "anim.new",
@@ -4913,6 +6028,30 @@ pub const registered_names = [_][]const u8{
     "anim.time",
     "anim.length",
     "anim.is_playing",
+    // M14: the game UI. Same rule as everything above — every name here needs a
+    // `metadata.bindings` entry or `assertAllDocumented` fails to compile.
+    "ui.set_anchor",
+    "ui.set_offset",
+    "ui.set_size",
+    "ui.set_pivot",
+    "ui.set_margin",
+    "ui.set_order",
+    "ui.set_visible",
+    "ui.set_interactive",
+    "ui.set_text",
+    "ui.set_font",
+    "ui.set_color",
+    "ui.set_colors",
+    "ui.set_border",
+    "ui.set_show_text",
+    "ui.set_value",
+    "ui.set_align",
+    "ui.set_enabled",
+    "ui.measure",
+    "ui.rect",
+    "ui.hovered",
+    "ui.pressed",
+    "ui.font_load",
 };
 
 pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
@@ -4927,6 +6066,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "vec2", &vec2_regs);
     installModule(L, ctx, "input", &input_regs);
     installModule(L, ctx, "log", &log_regs);
+    installModule(L, ctx, "globals", &globals_regs);
     installModule(L, ctx, "rand", &rand_regs);
     installModule(L, ctx, "noise", &noise_regs);
     installModule(L, ctx, "sm", &sm_regs);
@@ -4954,7 +6094,11 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     // call per frame — the fixed step advances them.
     installModule(L, ctx, "camera", &camera_regs);
     installModule(L, ctx, "timer", &timer_regs);
+    installModule(L, ctx, "time", &time_regs);
+    installModule(L, ctx, "tween", &tween_regs);
     installModule(L, ctx, "anim", &anim_regs);
+    // M14: the game UI (Label/Button/Panel/ProgressBar + layout + queries).
+    installModule(L, ctx, "ui", &ui_regs);
     // M8: the per-actor emitter. Beside `sprite` and `timer` because it is the
     // same kind of surface — methods on `self` over a plain-data component.
     installModule(L, ctx, "sound", &sound_regs);

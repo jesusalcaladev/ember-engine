@@ -1627,6 +1627,62 @@ pub const bindings = [_]Binding{
         \\if scene.fading() then return end
         ,
     },
+    // ── M14: CanvasModulate (the full-screen tint) ────────────────────────────
+    .{
+        .name = "scene.tint",
+        .module = "scene",
+        .signature = "scene.tint(r, g, b, a)",
+        .summary = "Lays a colour over the whole canvas (world and game UI). Multiply by default; `a` is the strength 0..1, and 0 is a no-op.",
+        .params = &.{
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "strength 0..1; 0 turns the tint off" },
+        },
+        .returns = &.{},
+        .example =
+        \\-- a washed-out dusk, then a red damage flash
+        \\scene.tint(0.6, 0.5, 0.75, 0.8)
+        ,
+    },
+    .{
+        .name = "scene.tint_mode",
+        .module = "scene",
+        .signature = "scene.tint_mode(name)",
+        .summary = "Sets how the tint mixes: \"multiply\" (default), \"add\" (a flash), \"alpha\" (a flat veil) or \"off\". Unknown names are ignored.",
+        .params = &.{
+            .{ .name = "name", .kind = .string, .doc = "\"multiply\", \"add\", \"alpha\" or \"off\"" },
+        },
+        .returns = &.{},
+        .example =
+        \\scene.tint(1, 0.2, 0.2, 0.7)
+        \\scene.tint_mode("add") -- a muzzle flash rather than a grade
+        ,
+    },
+    .{
+        .name = "scene.tint_clear",
+        .module = "scene",
+        .signature = "scene.tint_clear()",
+        .summary = "Disables the tint and forgets its colour.",
+        .params = &.{},
+        .returns = &.{},
+        .example =
+        \\scene.tint_clear()
+        ,
+    },
+    .{
+        .name = "scene.tint_amount",
+        .module = "scene",
+        .signature = "scene.tint_amount() -> 0..1",
+        .summary = "The tint's current strength. The value a script animates a flash back down to zero against.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "strength 0..1" },
+        },
+        .example =
+        \\local a = scene.tint_amount()
+        ,
+    },
     // ── M9: particles (the CPU pool) ──────────────────────────────────────────
     .{
         .name = "particles.burst",
@@ -2377,6 +2433,472 @@ pub const bindings = [_]Binding{
         },
         .example =
         \\sprite.set_size(self, 40 * timer.progress(self), 8)
+        ,
+    },
+    .{
+        .name = "timer.restart",
+        .module = "timer",
+        .signature = "timer.restart(self)",
+        .summary = "Puts the timer back to zero and runs it again. The configuration survives — the duration, the kind, the loop count and the signals are all still there; only the progress is reset.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{},
+        .example =
+        \\timer.restart(self)   -- the wave spawns again
+        ,
+    },
+    .{
+        .name = "timer.set_duration",
+        .module = "timer",
+        .signature = "timer.set_duration(self, seconds)",
+        .summary = "How long one cycle takes.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "seconds", .kind = .number, .doc = "the cycle length" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.set_duration(self, 2.5)
+        ,
+    },
+    .{
+        .name = "timer.get_duration",
+        .module = "timer",
+        .signature = "timer.get_duration(self) -> number",
+        .summary = "How long one cycle takes, in seconds.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the cycle length in seconds" },
+        },
+        .example =
+        \\if timer.get_duration(self) > 5 then print("long timer") end
+        ,
+    },
+    .{
+        .name = "timer.get_elapsed",
+        .module = "timer",
+        .signature = "timer.get_elapsed(self) -> number",
+        .summary = "How far into the current cycle the timer is, in seconds.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "seconds into the current cycle" },
+        },
+        .example =
+        \\local left = timer.get_duration(self) - timer.get_elapsed(self)
+        ,
+    },
+    .{
+        .name = "timer.get_loops",
+        .module = "timer",
+        .signature = "timer.get_loops(self) -> count, current",
+        .summary = "How many cycles the timer will run, and how many it has run. A count of 0 means it runs forever.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the total cycle count (0 = forever)" },
+            .{ .kind = .number, .doc = "the cycles completed so far" },
+        },
+        .example =
+        \\local total, done = timer.get_loops(self)
+        ,
+    },
+    .{
+        .name = "timer.set_kind",
+        .module = "timer",
+        .signature = "timer.set_kind(self, kind)",
+        .summary = "The kind of timer: 0 once, 1 loop, 2 during. Changing the kind does not restart the timer — the elapsed time and the cycle counter stay where they were.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "kind", .kind = .number, .doc = "0 once, 1 loop, 2 during" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.set_kind(self, 1)   -- make the one-shot a loop
+        ,
+    },
+    .{
+        .name = "timer.set_time_scale",
+        .module = "timer",
+        .signature = "timer.set_time_scale(self, scale)",
+        .summary = "This timer's own speed. 1 is normal, 0.5 is half as fast, 0 stops the timer where it is. It multiplies with the GLOBAL scale (`time.scale`): a slow-motion game slows every timer, and a timer slower than the game is slower still.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "scale", .kind = .number, .doc = "0 stops the timer, 0.5 halves it, 2 doubles it" },
+        },
+        .returns = &.{},
+        .example =
+        \\timer.set_time_scale(self, 0.5)   -- a slow debuff timer
+        ,
+    },
+    .{
+        .name = "timer.is_finished",
+        .module = "timer",
+        .signature = "timer.is_finished(self) -> boolean",
+        .summary = "True once the timer has done its job: a `once` that fired, or a `loop` that exhausted its cycle count.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the timer is done" },
+        },
+        .example =
+        \\if timer.is_finished(self) then actor.set_visible(self, false) end
+        ,
+    },
+    .{
+        .name = "timer.is_paused",
+        .module = "timer",
+        .signature = "timer.is_paused(self) -> boolean",
+        .summary = "True while the timer is stopped. A stopped timer keeps its elapsed time, so starting it again resumes where it was.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true while the timer is stopped" },
+        },
+        .example =
+        \\if timer.is_paused(self) then timer.start(self, 3) end
+        ,
+    },
+    .{
+        .name = "timer.get_dropped",
+        .module = "timer",
+        .signature = "timer.get_dropped(self) -> number",
+        .summary = "The cycles this timer could not run, because one tick asked for more than the engine runs at once. Zero in a healthy game; a number that grows says the timer is running late.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the dropped cycle count" },
+        },
+        .example =
+        \\if timer.get_dropped(self) > 0 then print("the timer is running late") end
+        ,
+    },
+    .{
+        .name = "time.delta",
+        .module = "time",
+        .signature = "time.delta() -> number",
+        .summary = "The last frame's delta in seconds, scaled by the global time scale. It is the same number the simulation advanced by, so a script can never move at a different speed than the world it is in.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "seconds; 0 while the game is paused" },
+        },
+        .example =
+        \\self.x = self.x + 100 * time.delta()
+        ,
+    },
+    .{
+        .name = "time.unscaled_delta",
+        .module = "time",
+        .signature = "time.unscaled_delta() -> number",
+        .summary = "The last frame's REAL delta in seconds, unaffected by the time scale. A UI that has to keep moving while the game is paused reads this one.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "seconds of wall clock" },
+        },
+        .example =
+        \\spinner.rotation = spinner.rotation + 3 * time.unscaled_delta()
+        ,
+    },
+    .{
+        .name = "time.elapsed",
+        .module = "time",
+        .signature = "time.elapsed() -> number",
+        .summary = "Scaled game time since boot. It slows down with the game, so it counts PLAY time, not wall-clock time.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "seconds of game time" },
+        },
+        .example =
+        \\if time.elapsed() > 60 then globals.get("game").over = true end
+        ,
+    },
+    .{
+        .name = "time.unscaled_elapsed",
+        .module = "time",
+        .signature = "time.unscaled_elapsed() -> number",
+        .summary = "Real time since boot, unaffected by the time scale.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "seconds of wall clock" },
+        },
+        .example =
+        \\local load = time.unscaled_elapsed() - started_at
+        ,
+    },
+    .{
+        .name = "time.frame",
+        .module = "time",
+        .signature = "time.frame() -> number",
+        .summary = "The frame counter, incremented once per frame since boot.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "frames since boot" },
+        },
+        .example =
+        \\if time.frame() % 30 == 0 then actor.emit(self, "tick") end
+        ,
+    },
+    .{
+        .name = "time.physics_delta",
+        .module = "time",
+        .signature = "time.physics_delta() -> number",
+        .summary = "The fixed simulation step (1/60 s) — the step the solver uses. Integrate against this when the answer must not depend on the frame rate.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the fixed step in seconds" },
+        },
+        .example =
+        \\self.hp = self.hp - 10 * time.physics_delta()
+        ,
+    },
+    .{
+        .name = "time.scale",
+        .module = "time",
+        .signature = "time.scale() -> number",
+        .summary = "The global time scale. 1 is normal, 0.5 is slow motion, 0 is paused.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the global scale" },
+        },
+        .example =
+        \\time.set_scale(0.5)   -- slow motion
+        \\time.set_scale(1.0)   -- back to normal
+        ,
+    },
+    .{
+        .name = "time.set_scale",
+        .module = "time",
+        .signature = "time.set_scale(s)",
+        .summary = "Sets the global time scale. It slows the simulation — physics, timers, animation, particles — and the delta the scripts are handed. Clamped to [0, 100]: a negative scale would run the world backwards.",
+        .params = &.{
+            .{ .name = "s", .kind = .number, .doc = "0 pauses, 0.5 is slow motion, 2 is double speed" },
+        },
+        .returns = &.{},
+        .example =
+        \\time.set_scale(0.25)   -- a dramatic slow-motion moment
+        ,
+    },
+    .{
+        .name = "time.pause",
+        .module = "time",
+        .signature = "time.pause()",
+        .summary = "Pauses the simulation. The scale goes to 0 and the scale in force is remembered, so `resume` restores it. The frame loop keeps running: the UI and the input keep working.",
+        .params = &.{},
+        .returns = &.{},
+        .example =
+        \\time.pause()
+        \\globals.get("game").state = "paused"
+        ,
+    },
+    .{
+        .name = "time.resume",
+        .module = "time",
+        .signature = "time.resume()",
+        .summary = "Unpauses the simulation, restoring the scale that was in force before the pause. A no-op when the game is not paused: a scale set by hand while paused is not stomped by a resume the game did not need.",
+        .params = &.{},
+        .returns = &.{},
+        .example =
+        \\time.resume()
+        ,
+    },
+    .{
+        .name = "time.is_paused",
+        .module = "time",
+        .signature = "time.is_paused() -> boolean",
+        .summary = "True while the game is paused.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true while the scale is 0" },
+        },
+        .example =
+        \\if time.is_paused() then sprite.set_visible(self, false) end
+        ,
+    },
+    .{
+        .name = "math.ease",
+        .module = "math",
+        .signature = "math.ease(name, t) -> number",
+        .summary = "An easing curve: the SHAPE of a movement over time. `t` goes from 0 to 1 and the result is how far along the movement is. The same curves the tween uses, so a value eased by hand and a value eased by a tween look the same.",
+        .params = &.{
+            .{ .name = "name", .kind = .string, .doc = "\"linear\", \"in_quad\", \"out_cubic\", \"in_out_back\", \"out_elastic\", \"out_bounce\"…" },
+            .{ .name = "t", .kind = .number, .doc = "0 at the start, 1 at the end" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "the eased value; nil for an unknown curve" },
+        },
+        .example =
+        \\local p = math.ease("out_back", 0.5)   -- past the halfway mark
+        ,
+    },
+    .{
+        .name = "math.easings",
+        .module = "math",
+        .signature = "math.easings() -> table",
+        .summary = "Every easing name, so a script can discover what exists without the documentation being the only source.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .table, .doc = "the list of easing names" },
+        },
+        .example =
+        \\for _, name in ipairs(math.easings()) do print(name) end
+        ,
+    },
+    .{
+        .name = "tween.to",
+        .module = "tween",
+        .signature = "tween.to(self, property, value, duration, opts) -> number",
+        .summary = "Animates a component property of this actor towards a value. Returns a handle: a number that identifies the tween until it finishes. The property is a component field, optionally with a sub-field: \"position\", \"position.x\", \"rotation\", \"scale\", \"tint\", \"tint.a\", \"color\", \"energy\", \"radius\", \"value\", \"duration\".",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "property", .kind = .string, .doc = "the property to drive, e.g. \"position.x\"" },
+            .{ .name = "value", .kind = .any, .doc = "the target: a number, or a table for a vector or a colour" },
+            .{ .name = "duration", .kind = .number, .doc = "seconds" },
+            .{ .name = "opts", .kind = .table, .doc = "optional: easing, delay, repeat, yoyo, hold, on_complete" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "the tween handle; 0 when it could not be created" },
+        },
+        .example =
+        \\tween.to(self, "position.x", 100, 0.5, { easing = "out_back" })
+        \\tween.to(self, "tint.a", 0, 0.3, { on_complete = function(self) actor.set_visible(self, false) end })
+        ,
+    },
+    .{
+        .name = "tween.chain",
+        .module = "tween",
+        .signature = "tween.chain(parent, child) -> boolean",
+        .summary = "The child tween starts when the parent finishes. The child is parked and reset to its start value, so chain it before it runs (or create it with `hold = true`) to avoid a visible jump.",
+        .params = &.{
+            .{ .name = "parent", .kind = .number, .doc = "the tween handle that runs first" },
+            .{ .name = "child", .kind = .number, .doc = "the tween handle that waits" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the chain was made" },
+        },
+        .example =
+        \\local move = tween.to(self, "position.x", 100, 1.0)
+        \\local fade = tween.to(self, "tint.a", 0, 0.5, { hold = true })
+        \\tween.chain(move, fade)
+        ,
+    },
+    .{
+        .name = "tween.start",
+        .module = "tween",
+        .signature = "tween.start(handle) -> boolean",
+        .summary = "Releases a parked tween: it starts now. A tween created with `hold = true` waits until it is released or chained.",
+        .params = &.{
+            .{ .name = "handle", .kind = .number, .doc = "the tween handle" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the tween was released" },
+        },
+        .example =
+        \\local h = tween.to(self, "alpha", 0, 0.5, { hold = true })
+        \\tween.start(h)
+        ,
+    },
+    .{
+        .name = "tween.kill",
+        .module = "tween",
+        .signature = "tween.kill(handle) -> boolean",
+        .summary = "Stops a tween where it is. The property keeps the value it had, and the completion callback does NOT run: a killed tween was cancelled, not finished.",
+        .params = &.{
+            .{ .name = "handle", .kind = .number, .doc = "the tween handle" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when a tween was stopped" },
+        },
+        .example =
+        \\tween.kill(self.tween_handle)
+        ,
+    },
+    .{
+        .name = "tween.kill_entity",
+        .module = "tween",
+        .signature = "tween.kill_entity(self) -> number",
+        .summary = "Stops every tween driving this actor. The count of stopped tweens comes back.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "how many tweens were stopped" },
+        },
+        .example =
+        \\tween.kill_entity(self)   -- the actor is being despawned
+        ,
+    },
+    .{
+        .name = "tween.kill_all",
+        .module = "tween",
+        .signature = "tween.kill_all() -> number",
+        .summary = "Stops every tween in the game. The count of tweens still running comes back.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "how many tweens are still running" },
+        },
+        .example =
+        \\tween.kill_all()   -- changing level
+        ,
+    },
+    .{
+        .name = "tween.is_alive",
+        .module = "tween",
+        .signature = "tween.is_alive(handle) -> boolean",
+        .summary = "True while the tween is running. False once it finished, was killed, or never existed.",
+        .params = &.{
+            .{ .name = "handle", .kind = .number, .doc = "the tween handle" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true while the tween runs" },
+        },
+        .example =
+        \\if tween.is_alive(self.h) then tween.kill(self.h) end
+        ,
+    },
+    .{
+        .name = "tween.count",
+        .module = "tween",
+        .signature = "tween.count() -> number",
+        .summary = "How many tweens are running right now.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the number of live tweens" },
+        },
+        .example =
+        \\if tween.count() > 50 then print("too many tweens") end
+        ,
+    },
+    .{
+        .name = "tween.time_scale",
+        .module = "tween",
+        .signature = "tween.time_scale() -> number",
+        .summary = "The global tween speed. 1 is normal, 0 freezes every tween. It moves the ANIMATIONS, not the world: the world's speed is `time.scale`.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the global tween scale" },
+        },
+        .example =
+        \\tween.set_time_scale(0.25)   -- everything animates in slow motion
+        ,
+    },
+    .{
+        .name = "tween.set_time_scale",
+        .module = "tween",
+        .signature = "tween.set_time_scale(s)",
+        .summary = "Sets the global tween speed. Clamped to [0, 100]; a negative speed would run the animations backwards.",
+        .params = &.{
+            .{ .name = "s", .kind = .number, .doc = "0 freezes the tweens, 0.5 halves them, 2 doubles them" },
+        },
+        .returns = &.{},
+        .example =
+        \\tween.set_time_scale(0.5)
+        ,
+    },
+    .{
+        .name = "tween.properties",
+        .module = "tween",
+        .signature = "tween.properties() -> table",
+        .summary = "Every property a tween can drive, as an array of names. The list is here so a script can discover what is tweenable without the documentation being the only source.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .table, .doc = "the list of tweenable property names" },
+        },
+        .example =
+        \\for _, name in ipairs(tween.properties()) do print(name) end
         ,
     },
     .{
@@ -3487,6 +4009,19 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "input.pointer_over_ui",
+        .module = "input",
+        .signature = "input.pointer_over_ui() -> boolean",
+        .summary = "True while the pointer is over an interactive game-UI widget, so a click on a button is not also a world action.",
+        .params = &.{},
+        .returns = &.{.{ .kind = .boolean, .doc = "true when an interactive UI widget captures the pointer this frame" }},
+        .example =
+        \\if input.is_action_pressed("jump") and not input.pointer_over_ui() then
+        \\  actor.set_linear_velocity(self, 0, -400)
+        \\end
+        ,
+    },
+    .{
         .name = "log.info",
         .module = "log",
         .signature = "log.info(message)",
@@ -3506,6 +4041,33 @@ pub const bindings = [_]Binding{
         .returns = &.{},
         .example =
         \\log.warn("out of ammo")
+        ,
+    },
+
+    // ── globals: the mounted global scripts (singleton access) ────────────
+    .{
+        .name = "globals.get",
+        .module = "globals",
+        .signature = "globals.get(name) -> Actor",
+        .summary = "The mounted global script's `self` table, or nil.",
+        .params = &.{.{ .name = "name", .kind = .string, .doc = "the global script's cache name (e.g. \"game\")" }},
+        .returns = &.{
+            .{ .kind = .actor, .doc = "the global's `self` table — call its methods (game:pause()) or read/write its fields; nil when no global by that name is mounted" },
+        },
+        .example =
+        \\local game = globals.get("game")
+        \\if game then game.score = game.score + 100 end
+        ,
+    },
+    .{
+        .name = "globals.exists",
+        .module = "globals",
+        .signature = "globals.exists(name) -> boolean",
+        .summary = "True when a global script with this name is mounted.",
+        .params = &.{.{ .name = "name", .kind = .string, .doc = "the global script's cache name (e.g. \"flow\")" }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true while the global is mounted (a detached global returns false the moment it is gone)" }},
+        .example =
+        \\if globals.exists("flow") then globals.get("flow"):resume() end
         ,
     },
     // ── M15: TileMap (chunked tile layers) ─────────────────────────────────────
@@ -3866,6 +4428,339 @@ pub const bindings = [_]Binding{
         .returns = &.{.{ .kind = .boolean, .doc = "true when playing" }},
         .example =
         \\if anim.is_playing(self) then anim.play(self, 2) end
+        ,
+    },
+
+    // ── ui: the game UI (M14). The setter half styles an actor's widget
+    // component; the query half reads the runtime's font cache and the frame's
+    // resolved hover/press state. ─────────────────────────────────────────────
+    .{
+        .name = "ui.set_anchor",
+        .module = "ui",
+        .signature = "ui.set_anchor(self, anchor)",
+        .summary = "Places the widget at an anchor preset: top_left … bottom_right, stretch_h, stretch_v or full_rect.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "anchor", .kind = .string, .doc = "\"top_left\" | \"top_center\" | \"top_right\" | \"middle_left\" | \"center\" | \"middle_right\" | \"bottom_left\" | \"bottom_center\" | \"bottom_right\" | \"stretch_h\" | \"stretch_v\" | \"full_rect\"" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_anchor(self, "bottom_right")
+        ,
+    },
+    .{
+        .name = "ui.set_offset",
+        .module = "ui",
+        .signature = "ui.set_offset(self, x, y)",
+        .summary = "Displacement from the resolved anchor point, in canvas pixels.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x", .kind = .number, .doc = "horizontal offset" },
+            .{ .name = "y", .kind = .number, .doc = "vertical offset, positive down" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_offset(self, -16, -16)  -- 16px in from the corner
+        ,
+    },
+    .{
+        .name = "ui.set_size",
+        .module = "ui",
+        .signature = "ui.set_size(self, w, h)",
+        .summary = "Widget size in canvas pixels (ignored by `full_rect` and by the axis a stretch preset fills).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "w", .kind = .number, .doc = "width in canvas pixels" },
+            .{ .name = "h", .kind = .number, .doc = "height in canvas pixels" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_size(self, 220, 48)
+        ,
+    },
+    .{
+        .name = "ui.set_pivot",
+        .module = "ui",
+        .signature = "ui.set_pivot(self, x, y)",
+        .summary = "Where the anchor point sits on the widget: 0,0 is its top-left, 0.5,0.5 centres it.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "x", .kind = .number, .doc = "0..1 across the width" },
+            .{ .name = "y", .kind = .number, .doc = "0..1 down the height" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_pivot(self, 0.5, 0.5)  -- centre the box on its anchor
+        ,
+    },
+    .{
+        .name = "ui.set_margin",
+        .module = "ui",
+        .signature = "ui.set_margin(self, top, right, bottom, left)",
+        .summary = "The insets the stretch presets use. Ignored by the nine point anchors.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "top", .kind = .number },
+            .{ .name = "right", .kind = .number },
+            .{ .name = "bottom", .kind = .number },
+            .{ .name = "left", .kind = .number },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_anchor(self, "full_rect")
+        \\ui.set_margin(self, 8, 8, 8, 8)  -- 8px border around the whole canvas
+        ,
+    },
+    .{
+        .name = "ui.set_order",
+        .module = "ui",
+        .signature = "ui.set_order(self, order)",
+        .summary = "Paint and hit-test tie-break: a higher order draws later and wins a click. Equal orders fall back to spawn order.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "order", .kind = .integer, .doc = "any integer; additive across widgets" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_order(self, 10)  -- a pause menu over the HUD
+        ,
+    },
+    .{
+        .name = "ui.set_visible",
+        .module = "ui",
+        .signature = "ui.set_visible(self, visible)",
+        .summary = "Whether the widget is drawn this frame.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "visible", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_visible(self, game.paused)
+        ,
+    },
+    .{
+        .name = "ui.set_interactive",
+        .module = "ui",
+        .signature = "ui.set_interactive(self, interactive)",
+        .summary = "Whether the widget blocks world input and can be hovered/clicked. Labels and bars never capture regardless.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "interactive", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_interactive(self, false)  -- a decorative panel, click-through
+        ,
+    },
+    .{
+        .name = "ui.set_text",
+        .module = "ui",
+        .signature = "ui.set_text(self, text)",
+        .summary = "The widget's string: a label's body, a button's caption or a bar's text. Truncated at 128 bytes.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "text", .kind = .string, .doc = "the text to draw (max 128 bytes, silently truncated)" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_text(self, "Score: " .. game.score)
+        ,
+    },
+    .{
+        .name = "ui.set_font",
+        .module = "ui",
+        .signature = "ui.set_font(self, id)",
+        .summary = "Which font the text uses: 0 is the engine default, any other id comes from `ui.font_load`.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "id", .kind = .integer, .doc = "font id from ui.font_load, or 0 for the default" },
+        },
+        .returns = &.{},
+        .example =
+        \\local title = ui.font_load("assets/fonts/Title.ttf", 48)
+        \\ui.set_font(self, title)
+        ,
+    },
+    .{
+        .name = "ui.set_color",
+        .module = "ui",
+        .signature = "ui.set_color(self, r, g, b, a)",
+        .summary = "The widget's primary colour: a label's text, a panel's fill, a button's caption or a bar's fill.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "alpha 0..1" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_color(self, 1, 0.85, 0.2, 1)  -- HUD gold
+        ,
+    },
+    .{
+        .name = "ui.set_colors",
+        .module = "ui",
+        .signature = "ui.set_colors(self, normal, hover, pressed, text)",
+        .summary = "A button's four colours, each a `{ r, g, b, a }` array (alpha optional). A nil table leaves that colour unchanged.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "normal", .kind = .table, .doc = "{ r, g, b, a } when idle" },
+            .{ .name = "hover", .kind = .table, .doc = "{ r, g, b, a } under the pointer" },
+            .{ .name = "pressed", .kind = .table, .doc = "{ r, g, b, a } while held" },
+            .{ .name = "text", .kind = .table, .doc = "{ r, g, b, a } for the caption" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_colors(self,
+        \\  { 0.2, 0.2, 0.25, 1 },
+        \\  { 0.3, 0.3, 0.38, 1 },
+        \\  { 0.1, 0.1, 0.15, 1 },
+        \\  { 1, 1, 1, 1 })
+        ,
+    },
+    .{
+        .name = "ui.set_border",
+        .module = "ui",
+        .signature = "ui.set_border(self, r, g, b, a, width)",
+        .summary = "A panel's outline. Zero width or zero alpha draws none.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "r", .kind = .number, .doc = "red 0..1" },
+            .{ .name = "g", .kind = .number, .doc = "green 0..1" },
+            .{ .name = "b", .kind = .number, .doc = "blue 0..1" },
+            .{ .name = "a", .kind = .number, .doc = "alpha 0..1" },
+            .{ .name = "width", .kind = .number, .doc = "border thickness in pixels" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_border(self, 1, 1, 1, 0.6, 2)
+        ,
+    },
+    .{
+        .name = "ui.set_show_text",
+        .module = "ui",
+        .signature = "ui.set_show_text(self, show)",
+        .summary = "Whether a progress bar draws its text (e.g. \"7 / 10\") over the fill.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "show", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_show_text(self, true)
+        ,
+    },
+    .{
+        .name = "ui.set_value",
+        .module = "ui",
+        .signature = "ui.set_value(self, value)",
+        .summary = "A progress bar's fill, clamped to 0..1.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "value", .kind = .number, .doc = "0..1 fraction filled" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_value(self, self.hp / self.max_hp)
+        ,
+    },
+    .{
+        .name = "ui.set_align",
+        .module = "ui",
+        .signature = "ui.set_align(self, align)",
+        .summary = "A label's horizontal alignment inside its rect: \"left\", \"center\" or \"right\".",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "align", .kind = .string, .doc = "\"left\" | \"center\" | \"right\"" },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_align(self, "center")
+        ,
+    },
+    .{
+        .name = "ui.set_enabled",
+        .module = "ui",
+        .signature = "ui.set_enabled(self, enabled)",
+        .summary = "A button's enabled flag. A disabled button is inert: no hover, no click, no pointer capture.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "enabled", .kind = .boolean },
+        },
+        .returns = &.{},
+        .example =
+        \\ui.set_enabled(self, game.can_resume)
+        ,
+    },
+    .{
+        .name = "ui.measure",
+        .module = "ui",
+        .signature = "ui.measure(self, text) -> number, number",
+        .summary = "The pixel size `text` would occupy in this widget's font. Nil when no UI system is wired.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "text", .kind = .string, .doc = "the string to measure" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "width in pixels" },
+            .{ .kind = .number, .doc = "height in pixels (the line box)" },
+        },
+        .example =
+        \\local w, h = ui.measure(self, "Game Over")
+        ,
+    },
+    .{
+        .name = "ui.rect",
+        .module = "ui",
+        .signature = "ui.rect(self) -> number, number, number, number",
+        .summary = "The screen-pixel rect the UI system resolved this frame: x, y, width, height.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "x of the top-left corner" },
+            .{ .kind = .number, .doc = "y of the top-left corner" },
+            .{ .kind = .number, .doc = "width in pixels" },
+            .{ .kind = .number, .doc = "height in pixels" },
+        },
+        .example =
+        \\local x, y, w, h = ui.rect(self)
+        ,
+    },
+    .{
+        .name = "ui.hovered",
+        .module = "ui",
+        .signature = "ui.hovered(self) -> boolean",
+        .summary = "True while the pointer is over this widget.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true when the pointer is over the widget" }},
+        .example =
+        \\if ui.hovered(self) then ui.set_color(self, 1, 1, 1, 1) end
+        ,
+    },
+    .{
+        .name = "ui.pressed",
+        .module = "ui",
+        .signature = "ui.pressed(self) -> boolean",
+        .summary = "True while this button is being held down.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{.{ .kind = .boolean, .doc = "true while held" }},
+        .example =
+        \\if ui.pressed(self) then log.info("charging") end
+        ,
+    },
+    .{
+        .name = "ui.font_load",
+        .module = "ui",
+        .signature = "ui.font_load(path, px) -> integer",
+        .summary = "Loads (or returns a cached) TTF at `px` pixels and returns its id for `ui.set_font`. 0 when unreadable.",
+        .params = &.{
+            .{ .name = "path", .kind = .string, .doc = "TTF path, relative to the project root" },
+            .{ .name = "px", .kind = .number, .doc = "pixel height to rasterize at" },
+        },
+        .returns = &.{.{ .kind = .integer, .doc = "font id for ui.set_font; 0 when the file could not be read" }},
+        .example =
+        \\self.title_font = ui.font_load("assets/fonts/Title.ttf", 48)
         ,
     },
 };

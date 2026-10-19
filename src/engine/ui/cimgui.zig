@@ -107,6 +107,7 @@ pub extern fn ember_ui_get_item_rect_max(out_xy: [*]f32) void;
 pub extern fn ember_ui_dummy(w: f32, h: f32) void;
 pub extern fn ember_ui_spacing() void;
 pub extern fn ember_ui_same_line(offset_from_start: f32, spacing: f32) void;
+pub extern fn ember_ui_set_scroll_here_y(center_y_ratio: f32) void;
 pub extern fn ember_ui_indent(width: f32) void;
 pub extern fn ember_ui_unindent(width: f32) void;
 pub extern fn ember_ui_separator() void;
@@ -156,6 +157,16 @@ pub extern fn ember_ui_begin_popup_modal(id: [*:0]const u8, flags: c_int) c_int;
 pub extern fn ember_ui_is_popup_open(id: [*:0]const u8, flags: c_int) c_int;
 pub extern fn ember_ui_begin_menu_bar(name: [*:0]const u8) c_int;
 pub extern fn ember_ui_end_menu_bar() void;
+pub extern fn ember_ui_begin_menu(label: [*:0]const u8, enabled: c_int) c_int;
+pub extern fn ember_ui_end_menu() void;
+/// Keyboard, by `keys.Key` value. `repeat` = fire on auto-repeat.
+pub extern fn ember_ui_is_key_pressed(key: c_int, repeat: c_int) c_int;
+/// `out`: [command lists, vertices, indices] of the frame just rendered. This is
+/// the number that proves the UI submitted geometry, which "draw commands" does
+/// not: a window can report a command with zero vertices in it.
+pub extern fn ember_ui_draw_stats(out: [*]i32) void;
+pub extern fn ember_ui_is_key_down(key: c_int) c_int;
+pub extern fn ember_ui_is_mouse_double_clicked(button: c_int) c_int;
 pub extern fn ember_ui_menu_item(label: [*:0]const u8, shortcut: ?[*:0]const u8, selected: ?*c_int, flags: c_int) c_int;
 pub extern fn ember_ui_begin_tooltip() c_int;
 pub extern fn ember_ui_end_tooltip() void;
@@ -163,6 +174,19 @@ pub extern fn ember_ui_set_tooltip(text: [*:0]const u8) void;
 pub extern fn ember_ui_is_item_hovered(flags: c_int) c_int;
 pub extern fn ember_ui_is_item_clicked(button: c_int) c_int;
 pub extern fn ember_ui_is_item_active() c_int;
+pub extern fn ember_ui_is_mouse_dragging(button: c_int, lock_threshold: f32) c_int;
+
+// ── Drag & drop ──────────────────────────────────────────────────────────────
+// See the shim's .cpp for the lifetimes the C side guarantees. The payload
+// kinds are NUL-terminated usz strings ("ember/entity", "ember/file"); the
+// accepted bytes are valid ONLY until `end_drag_drop_target`.
+pub extern fn ember_ui_is_drag_drop_active() c_int;
+pub extern fn ember_ui_begin_drag_drop_source(flags: c_int) c_int;
+pub extern fn ember_ui_set_drag_drop_payload(kind: [*:0]const u8, data: *const anyopaque, size: c_uint) c_int;
+pub extern fn ember_ui_end_drag_drop_source() void;
+pub extern fn ember_ui_begin_drag_drop_target() c_int;
+pub extern fn ember_ui_accept_drag_drop_payload(kind: [*:0]const u8, flags: c_int, out_size: ?*c_uint) ?*const anyopaque;
+pub extern fn ember_ui_end_drag_drop_target() void;
 pub extern fn ember_ui_is_item_deactivated_after_edit() c_int;
 pub extern fn ember_ui_is_item_focused() c_int;
 pub extern fn ember_ui_is_window_focused(flags: c_int) c_int;
@@ -346,6 +370,12 @@ pub const HoveredFlags = struct {
     pub const DelayShort: u32 = (1 << @as(u32,14));
     pub const DelayNormal: u32 = (1 << @as(u32,15));
     pub const NoTooltip: u32 = (1 << @as(u32,20));
+};
+
+/// MenuItemFlags — for `MenuItem`.
+pub const MenuItemFlags = struct {
+    pub const @"None": u32 = 0;
+    pub const Disabled: u32 = (1 << @as(u32,0));
 };
 
 /// SelectableFlags — ImGui takes these as ONE integer, so they are integers here.
@@ -584,14 +614,23 @@ pub const ComboFlags = struct {
 /// near-overflow label is still correct.
 pub const label_buf: usize = 256;
 
-/// The scratch buffer `Cstr` copies into, one per THREAD.
+/// The scratch buffers `Cstr` copies into, one per THREAD, in a RING.
 ///
 /// Per thread rather than shared, because "the string the C ABI is reading"
 /// is per-call state and two threads in the same frame (a loader and the draw
 /// thread) would otherwise overwrite each other's labels. The size is the
 /// label budget: a label longer than the budget is truncated, and a UI whose
 /// labels are 256 bytes of text has a different problem.
-threadlocal var label_scratch: [label_buf]u8 = undefined;
+///
+/// A ring and not one buffer, because a SINGLE call can take two strings:
+/// `ember_ui_menu_item(label, shortcut)` is the menu bar's whole API. With one
+/// scratch buffer both arguments pointed at the same bytes, so every shortcut
+/// replaced its label and the menu showed "Ctrl+S" twice. Eight slots is far
+/// more than any one call needs; a pointer is only used for the duration of the
+/// call that produced it.
+const label_slots = 8;
+threadlocal var label_scratch: [label_slots][label_buf]u8 = undefined;
+threadlocal var label_next: usize = 0;
 
 /// Turns a Zig slice into the NUL-terminated slice the C ABI wants.
 ///
@@ -609,15 +648,17 @@ pub fn CstrLit(comptime s: [:0]const u8) [*:0]const u8 {
 }
 
 pub fn Cstr(s: []const u8) [*:0]const u8 {
+    const slot = &label_scratch[label_next];
+    label_next = (label_next + 1) % label_slots;
     const n: usize = if (s.len >= label_buf) label_buf - 1 else s.len;
     // The buffer is written and its length is FIXED before the slice is taken,
     // which is what lets Zig accept `[0..n :0]` on a runtime `n`: the sentinel
-    // is a byte at `label_scratch[n]`, and `n < label_buf` is the invariant the
-    // branch above maintains.
+    // is a byte at `slot[n]`, and `n < label_buf` is the invariant the branch
+    // above maintains.
     var i: usize = 0;
-    while (i < n) : (i += 1) label_scratch[i] = s[i];
-    label_scratch[n] = 0;
-    return @as([*:0]const u8, @ptrCast(&label_scratch));
+    while (i < n) : (i += 1) slot[i] = s[i];
+    slot[n] = 0;
+    return @as([*:0]const u8, @ptrCast(slot));
 }
 
 /// The common case: a label, with the framework's own limit.

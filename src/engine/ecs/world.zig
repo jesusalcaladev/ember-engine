@@ -338,6 +338,39 @@ pub const World = struct {
         return self.get(e, T) != null;
     }
 
+    /// Captures the current transform of every entity as the "previous"
+    /// snapshot the renderer interpolates from (spec §3.3).
+    ///
+    /// Called at the START of each fixed step, BEFORE anything writes a
+    /// transform. The order is the whole point: `prev` must be the position
+    /// the renderer LAST SAW and `current` the one the simulation just
+    /// produced, and the renderer blends between them with the interpolation
+    /// factor.
+    ///
+    /// Without this call the renderer interpolates from the position the
+    /// entity was SPAWNED at — `prev` is seeded once, at spawn, and never
+    /// updated — so every moving actor drags a line back to its birth point,
+    /// and a tween on it renders as a slide from the spawn point rather than
+    /// as the tween.
+    ///
+    /// Only the entities that MOVED are written. A static sprite's `prev` is
+    /// already its `current`, and 50 000 pointless writes per tick is 72 MB/s
+    /// of memory traffic for nothing.
+    pub fn captureTransforms(self: *Self) void {
+        var q = self.query(.{components.Transform});
+        while (q.nextBatch()) |batch| {
+            const transforms = batch.slice(components.Transform);
+            for (transforms) |*t| {
+                if (t.position.x == t.prev_position.x and
+                    t.position.y == t.prev_position.y and
+                    t.rotation == t.prev_rotation and
+                    t.scale.x == t.prev_scale.x and
+                    t.scale.y == t.prev_scale.y) continue;
+                t.capturePrevious();
+            }
+        }
+    }
+
     // ── Queries ─────────────────────────────────────────────────────────────
 
     /// Iterates every entity that has all of `with` (a tuple of component

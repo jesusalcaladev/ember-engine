@@ -40,6 +40,8 @@ Not sure which pattern you need? Start here. Find the mechanic you're building, 
 | A power-up lasts 5 seconds | Simple Timer | [State Management](#state-management) |
 | A sword swing has a 0.5s recovery | Cooldown | [State Management](#state-management) |
 | An enemy has idle / chase / attack modes | State Machine | [State Management](#state-management) |
+| The player pauses the game | Pause | [Pause and slow motion](#pause-and-slow-motion) |
+| A death blow lands in slow motion | Slow motion | [Pause and slow motion](#pause-and-slow-motion) |
 | Taking damage, firing events, UI updates | Signals | [Signals](#signals) |
 | A character plays a walk cycle | Sprite Cycling | [Animation](#animation) |
 
@@ -1034,6 +1036,87 @@ The `sm_is_in` function lets the behavior-level `update` read the current state 
 > - Add a "patrol" state: the enemy walks back and forth until it sees the player.
 > - Add a "hurt" state: when the enemy takes damage, it briefly flashes and becomes invulnerable.
 > - Add a "dead" state: when HP reaches zero, the enemy plays a death animation and then is destroyed.
+
+---
+
+## Pause and slow motion
+
+### The problem
+
+The player hits Escape. Everything should stop: the enemies, the projectiles, the timers, the animation. And separately, a boss's death blow should land in slow motion for two seconds — but the pause menu must keep running, because the player has to un-pause it.
+
+### The solution
+
+The engine has ONE global time scale, and it is the same one the simulation runs on. `time.pause()` sets it to zero; `time.set_scale(0.25)` sets it to a quarter speed.
+
+```lua
+-- scripts/globals/game.lua — the game manager
+local M = {}
+
+function M:start()
+  self.state = "playing"
+  self.slow_until = nil
+end
+
+function M:update(dt)
+  if input.is_action_pressed("pause") then
+    if self.state == "playing" then
+      self:pause()
+    else
+      self:resume()
+    end
+  end
+
+  -- the slow motion has to end on its own
+  if self.slow_until and time.elapsed() >= self.slow_until then
+    time.set_scale(1)
+    self.slow_until = nil
+  end
+end
+
+function M:pause()
+  self.state = "paused"
+  time.pause()
+end
+
+function M:resume()
+  self.state = "playing"
+  time.resume()
+end
+
+function M:slow_motion(seconds)
+  time.set_scale(0.25)
+  self.slow_until = time.elapsed() + seconds
+end
+
+return M
+```
+
+### Why it works
+
+The scale is owned in ONE place (`core/loop.zig`'s `GameTime`), and the simulation, the scripts and the `time.*` bindings all read it from there. That is the whole trick: a script can never move at a different speed than the world it is in, because there is only one number that could be wrong.
+
+What the scale touches:
+
+- The **simulation** — physics, `timer.*`, animation, particles. They run on the fixed step, and a smaller scale means FEWER steps per second, not a different step. The physics step stays 1/60 s, so the simulation stays deterministic.
+- The **`dt` the scripts are handed** — the same scaled number, so `self.x = self.x + v * dt` keeps up with the world.
+
+What it does NOT touch:
+
+- The **frame loop**. A paused game still gets its `update` calls, with `dt == 0`, so the pause menu keeps reading the input and keeps drawing. What pauses is the simulation.
+- **Presentation**. A scene fade runs on real time; a fade that took 0.5 s of game time would take 5 s of real time in slow motion, which is nobody's idea of a fade.
+- **Audio**. A sound plays at its own rate, like in every other engine.
+
+> **When to use this:** pause menus, slow-motion moments, hit-stop, "the world slows down while the UI explains what just happened".
+
+> **Common mistakes:**
+> - **Using `time.delta()` inside `fixed_update`.** `fixed_update` gets the fixed step (1/60 s) as its `dt`; `time.delta()` is the FRAME's delta. Inside `fixed_update`, integrate against the `dt` argument, or `time.physics_delta()`.
+> - **Assuming a pause stops the scripts.** It stops the simulation, not the callbacks. A script that counts frames (`self.frames = self.frames + 1`) keeps counting while paused.
+> - **Forgetting that `resume` restores the scale that was in force.** If the game was in slow motion when it was paused, `time.resume()` brings back the slow motion, not normal speed. That is deliberate: a resume that reset the scale to 1 would silently cancel the slow-motion moment the game was in. If you want normal speed, call `time.set_scale(1)` yourself. (`resume` on a game that is not paused does nothing, so a scale you set by hand while paused is not stomped.)
+
+> **Try this:**
+> - Add hit-stop: `time.set_scale(0)` for 0.05 s of real time when the player takes a hit, then back to 1.
+> - Add a debug key that cycles the scale: 0.1, 0.25, 0.5, 1, 2.
 
 ---
 

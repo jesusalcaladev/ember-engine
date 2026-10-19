@@ -247,6 +247,196 @@ pub fn isClose(a: f32, b: f32, tolerance: f32) bool {
     return @abs(a - b) <= tolerance;
 }
 
+// ── Easing ───────────────────────────────────────────────────────────────────
+//
+// The shape of a movement over time. `t` goes from 0 to 1 and the result is
+// how far along the movement is: 0 at the start, 1 at the end, and the CURVE
+// between them is what makes a tween feel like a snap, a slide or a bounce.
+//
+// These live in `core` and not in the tween system for one reason: the same
+// curve is useful in three places — a tween, a camera spring and a UI
+// transition — and three copies of `out_back` is three places to fix the
+// wobble in.
+//
+// The names are the Godot/Unity ones (`out_back`, `in_out_cubic`) because
+// that is what a game designer searching the web for "easing" will find.
+
+/// The easing curves. Every one of them maps `t ∈ [0,1]` to a value that
+/// starts at 0 and ends at 1 (the `in_*` ones may overshoot below 0 or above
+/// 1 in the middle — that IS the character of the curve).
+pub const Easing = enum(u8) {
+    linear = 0,
+    in_quad,
+    out_quad,
+    in_out_quad,
+    in_cubic,
+    out_cubic,
+    in_out_cubic,
+    in_quart,
+    out_quart,
+    in_out_quart,
+    in_sine,
+    out_sine,
+    in_out_sine,
+    in_expo,
+    out_expo,
+    in_out_expo,
+    in_circ,
+    out_circ,
+    in_out_circ,
+    in_back,
+    out_back,
+    in_out_back,
+    in_elastic,
+    out_elastic,
+    in_out_elastic,
+    in_bounce,
+    out_bounce,
+    in_out_bounce,
+
+    /// The name a script uses: `"out_back"`, `"in_out_cubic"`, …
+    pub fn label(self: Easing) []const u8 {
+        return @tagName(self);
+    }
+
+    /// Resolves a name to a curve. Null for an unknown name, so a typo is a
+    /// reported failure and not a silent "linear" that looks like the tween
+    /// simply ignored the option.
+    pub fn fromName(name: []const u8) ?Easing {
+        inline for (@typeInfo(Easing).@"enum".fields) |f| {
+            if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// The easing curve, `t` in `[0,1]`.
+///
+/// Values outside `[0,1]` are allowed and extrapolate: a tween that is one
+/// frame past its end asks for `t = 1.02`, and a curve that clamps there would
+/// make the last frame of every tween look like it stalled.
+pub fn ease(kind: Easing, t: f32) f32 {
+    return switch (kind) {
+        .linear => t,
+        .in_quad => t * t,
+        .out_quad => 1 - (1 - t) * (1 - t),
+        .in_out_quad => if (t < 0.5) 2 * t * t else 1 - pow(-2 * t + 2, 2) / 2,
+        .in_cubic => t * t * t,
+        .out_cubic => 1 - pow(1 - t, 3),
+        .in_out_cubic => if (t < 0.5) 4 * t * t * t else 1 - pow(-2 * t + 2, 3) / 2,
+        .in_quart => t * t * t * t,
+        .out_quart => 1 - pow(1 - t, 4),
+        .in_out_quart => if (t < 0.5) 8 * t * t * t * t else 1 - pow(-2 * t + 2, 4) / 2,
+        .in_sine => 1 - std.math.cos(t * pi / 2),
+        .out_sine => std.math.sin(t * pi / 2),
+        .in_out_sine => -(std.math.cos(pi * t) - 1) / 2,
+        .in_expo => if (t == 0) 0 else pow(2, 10 * t - 10),
+        .out_expo => if (t == 1) 1 else 1 - pow(2, -10 * t),
+        .in_out_expo => if (t == 0)
+            0
+        else if (t == 1)
+            1
+        else if (t < 0.5)
+            pow(2, 20 * t - 10) / 2
+        else
+            (2 - pow(2, -20 * t + 10)) / 2,
+        .in_circ => 1 - std.math.sqrt(1 - t * t),
+        .out_circ => std.math.sqrt(1 - pow(t - 1, 2)),
+        .in_out_circ => if (t < 0.5)
+            (1 - std.math.sqrt(1 - pow(2 * t, 2))) / 2
+        else
+            (std.math.sqrt(1 - pow(-2 * t + 2, 2)) + 1) / 2,
+        .in_back => back_c3 * t * t * t - back_c1 * t * t,
+        .out_back => 1 + back_c3 * pow(t - 1, 3) + back_c1 * pow(t - 1, 2),
+        .in_out_back => if (t < 0.5)
+            (pow(2 * t, 2) * ((back_c2 + 1) * 2 * t - back_c2)) / 2
+        else
+            (pow(2 * t - 2, 2) * ((back_c2 + 1) * (t * 2 - 2) + back_c2) + 2) / 2,
+        .in_elastic => elasticIn(t),
+        .out_elastic => elasticOut(t),
+        .in_out_elastic => elasticInOut(t),
+        .in_bounce => 1 - bounceOut(1 - t),
+        .out_bounce => bounceOut(t),
+        .in_out_bounce => if (t < 0.5)
+            (1 - bounceOut(1 - 2 * t)) / 2
+        else
+            (1 + bounceOut(2 * t - 1)) / 2,
+    };
+}
+
+/// The overshoot constant of the `back` curves. Above 1 makes the curve
+/// overshoot its target and come back — that is the "back" in the name.
+const back_c1: f32 = 1.70158;
+const back_c2: f32 = back_c1 * 1.525;
+const back_c3: f32 = back_c1 + 1;
+
+/// The period of the `elastic` curves: a full oscillation over the tween.
+const elastic_c4: f32 = 2.0 * pi / 3.0;
+const elastic_c5: f32 = 2.0 * pi / 4.5;
+
+/// The `in` elastic: a decaying oscillation that starts at rest and ends at
+/// the target.
+///
+/// The ENDPOINTS ARE FORCED. The closed form of an elastic curve does not
+/// evaluate to exactly 0 at t=0 or exactly 1 at t=1 — it misses by a fraction
+/// of a percent — and a tween that ends a hundredth short of its target
+/// leaves the property permanently off. Every engine that ships an elastic
+/// curve snaps the ends, and so does this one.
+fn elasticIn(t: f32) f32 {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return -pow(2, 10 * t - 10) * std.math.sin((t * 10 - 10.75) * elastic_c4);
+}
+
+/// The `out` elastic: the same oscillation, ending at rest on the target.
+fn elasticOut(t: f32) f32 {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return pow(2, -10 * t) * std.math.sin((t * 10 - 0.75) * elastic_c4) + 1;
+}
+
+/// The `in_out` elastic: one oscillation in, one out, mirrored.
+fn elasticInOut(t: f32) f32 {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    if (t < 0.5) return -(pow(2, 20 * t - 10) * std.math.sin((20 * t - 11.125) * elastic_c5)) / 2;
+    return (pow(2, -20 * t + 10) * std.math.sin((20 * t - 11.125) * elastic_c5)) / 2 + 1;
+}
+
+/// The four-piece bounce: a parabolic fall, a bounce, a smaller bounce, and a
+/// settle. Piecewise rather than a formula because a bounce IS piecewise.
+fn bounceOut(t: f32) f32 {
+    const n1: f32 = 7.5625;
+    const d1: f32 = 2.75;
+    if (t < 1 / d1) return n1 * t * t;
+    if (t < 2 / d1) {
+        const u = t - 1.5 / d1;
+        return n1 * u * u + 0.75;
+    }
+    if (t < 2.5 / d1) {
+        const u = t - 2.25 / d1;
+        return n1 * u * u + 0.9375;
+    }
+    const u = t - 2.625 / d1;
+    return n1 * u * u + 0.984375;
+}
+
+/// Eases by NAME, the way a script asks for it. Null for an unknown name.
+pub fn easeByName(name: []const u8, t: f32) ?f32 {
+    const kind = Easing.fromName(name) orelse return null;
+    return ease(kind, t);
+}
+
+/// Every easing name, in the order `Easing` declares them. The list a script
+/// reads to discover what exists.
+pub const easing_names = blk: {
+    var names: [@typeInfo(Easing).@"enum".fields.len][]const u8 = undefined;
+    for (@typeInfo(Easing).@"enum".fields, 0..) |f, i| {
+        names[i] = f.name;
+    }
+    break :blk names;
+};
+
 pub const Mat4 = struct {
     /// Column-major: m[col * 4 + row]
     m: [16]f32,
@@ -591,4 +781,62 @@ test "Rect2 fromCenter places the box around a point" {
     try std.testing.expectEqual(Vec2{ .x = 80, .y = 90 }, r.position);
     try std.testing.expectEqual(Vec2{ .x = 40, .y = 20 }, r.size);
     try std.testing.expectEqual(Vec2{ .x = 100, .y = 100 }, r.center());
+}
+
+// ── Easing tests ─────────────────────────────────────────────────────────────
+
+test "every easing starts at 0 and ends at 1" {
+    inline for (@typeInfo(Easing).@"enum".fields) |f| {
+        const kind: Easing = @enumFromInt(f.value);
+        const at0 = ease(kind, 0);
+        const at1 = ease(kind, 1);
+        try std.testing.expectApproxEqAbs(@as(f32, 0), at0, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), at1, 0.0001);
+    }
+}
+
+test "the curves have the shape their names promise" {
+    // An `in` curve is BELOW the straight line in the first half; an `out`
+    // curve is ABOVE it. That difference is the whole character.
+    try std.testing.expect(ease(.in_quad, 0.25) < 0.25);
+    try std.testing.expect(ease(.out_quad, 0.25) > 0.25);
+    try std.testing.expect(ease(.in_cubic, 0.25) < ease(.in_quad, 0.25));
+
+    // `out_back` overshoots past 1 and comes back: that is the bounce.
+    var peak: f32 = 0;
+    var i: usize = 0;
+    while (i <= 100) : (i += 1) {
+        const v = ease(.out_back, @as(f32, @floatFromInt(i)) / 100);
+        peak = @max(peak, v);
+    }
+    try std.testing.expect(peak > 1.0);
+    try std.testing.expect(peak < 1.2); // and not wildly so
+
+    // `out_elastic` oscillates: it crosses 1 more than once.
+    var crossings: u32 = 0;
+    var prev = ease(.out_elastic, 0);
+    i = 1;
+    while (i <= 200) : (i += 1) {
+        const v = ease(.out_elastic, @as(f32, @floatFromInt(i)) / 200);
+        if ((v > 1) != (prev > 1)) crossings += 1;
+        prev = v;
+    }
+    try std.testing.expect(crossings >= 2);
+
+    // `out_bounce` never goes below 0 and does not overshoot.
+    i = 0;
+    while (i <= 100) : (i += 1) {
+        const v = ease(.out_bounce, @as(f32, @floatFromInt(i)) / 100);
+        try std.testing.expect(v >= -0.0001);
+        try std.testing.expect(v <= 1.0001);
+    }
+}
+
+test "an easing resolves by the name a script writes" {
+    try std.testing.expect(easeByName("out_back", 0.5) != null);
+    try std.testing.expect(easeByName("in_out_cubic", 0.5) != null);
+    try std.testing.expect(easeByName("linear", 0.5) != null);
+    // A typo is a null, never a silent linear.
+    try std.testing.expect(easeByName("out_bak", 0.5) == null);
+    try std.testing.expectApproxEqAbs(ease(.out_back, 0.25), easeByName("out_back", 0.25).?, 0.0001);
 }

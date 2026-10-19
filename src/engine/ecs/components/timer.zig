@@ -42,6 +42,21 @@ pub const Timer = struct {
     /// Stopped timers keep their component so the inspector can show them; the
     /// tick skips anything finished.
     finished: bool = false,
+    /// The timer's OWN speed. 1 is normal, 0.5 is half as fast, 0 stops it.
+    ///
+    /// It multiplies with the GLOBAL scale (`time.scale`): a slow-motion game
+    /// slows every timer, and a timer that is slower than the game is slower
+    /// still. A buff that lasts 10 seconds of game time lasts 20 in a
+    /// half-speed game, and 5 in a double-speed one.
+    time_scale: f32 = 1.0,
+    /// The cycles this timer COULD NOT run, because one tick asked for more
+    /// than `max_cycles_per_tick`.
+    ///
+    /// Zero in a healthy game. A number that grows says the timer is running
+    /// slower than it was asked to, which is otherwise invisible: the timer
+    /// still fires, just late, and "late" is the kind of bug nobody reports
+    /// until it is a firefight.
+    dropped_cycles: u32 = 0,
     /// Signal fired every tick while `kind == .during`. Empty = none.
     tick_signal: Name = .{},
     /// Signal fired when a cycle completes. Empty = none.

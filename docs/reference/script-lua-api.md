@@ -9,6 +9,10 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`actor`](#actor) | Per-actor transform, rotation, name, signals, and spatial queries between actors |
 | [`input`](#input) | Action-based input queries (pressed, down, axis) |
 | [`log`](#log) | The whitelisted logging sink (`info`, `warn`) |
+| [`globals`](#globals) | The mounted global scripts — the Lua singleton surface (`get`, `exists`) |
+| [`time`](#time) | The game clock and the global time scale (slow motion, pause) |
+| [`timer`](#timer) | The gameplay clock: "in N seconds, fire this signal" |
+| [`tween`](#tween) | A value that travels to another value over time |
 | [`math`](#math) | Scalar math: clamping, interpolation, easing, rounding, trigonometry |
 | [`vec2`](#vec2) | 2D vector math: distance, length, normalization, dot/cross, rotation |
 | [`rand`](#rand) | Deterministic random numbers (floats, ints, chance, gauss, shuffle, choice) |
@@ -354,6 +358,417 @@ log.info("hp: " .. self.hp)
 
 ```lua
 log.warn("out of ammo")
+```
+
+## `globals`
+
+The mounted **global scripts** — Lua behavior scripts with no actor: the game manager, the score, the spawner, the flow. Declared in `project.config` under `scripts { global "..." }`; each mounts under its file's basename (see [Global Scripts](global-scripts.md)). One instance per script, resolved by name — the Lua side of the singleton rule.
+
+> A global's `self` carries **no entity handle**, so `actor.*` called on a
+> global's table fails the same way a dead self's does. A global talks to the
+> world (`world.*`, `input.*`, `scene.*`, `audio.*`), and reaches the actors
+> that talk to *it*.
+
+### `globals.get(name)`
+
+| | |
+|---|---|
+| **Signature** | `globals.get(name) -> Actor` |
+| **Parameters** | `name` — `string` — the global script's cache name (e.g. `"game"`) |
+| **Returns** | `Actor` — the global's `self` table — call its methods (`game:pause()`) or read/write its fields; nil when no global by that name is mounted |
+| **Description** | Returns the mounted global script's `self` table, or `nil`. Method calls and field writes go straight through it, so a behavior can read the score, bump it, or invoke the manager's flow methods in the same frame. |
+
+```lua
+local game = globals.get("game")
+if game then game.score = game.score + 100 end
+```
+
+### `globals.exists(name)`
+
+| | |
+|---|---|
+| **Signature** | `globals.exists(name) -> boolean` |
+| **Parameters** | `name` — `string` — the global script's cache name (e.g. `"flow"`) |
+| **Returns** | `boolean` — true while the global is mounted (a detached global returns false the moment it is gone) |
+| **Description** | True when a global script with this name is mounted. Answers "can I call this", not "does the file exist" — `globals.get` on an unknown name is `nil`, so most scripts only ever need `get`. |
+
+```lua
+if globals.exists("flow") then globals.get("flow"):resume() end
+```
+
+---
+
+## `time`
+
+The **game clock** — the time gameplay sees — and the engine's **one time dial**.
+
+Every number here comes from the same clock the simulation runs on, so a script can never see a delta that disagrees with the world it is moving in.
+
+> The scale is **global**. It slows the *simulation* — physics, timers, animation, particles — and the `dt` the scripts are handed. It does **not** stop the frame loop: a pause menu has to keep reading the input and keep drawing, and a paused game that freezes its own UI is a worse pause. Presentation (a scene fade) runs on real time.
+
+### `time.delta()`
+
+| | |
+|---|---|
+| **Signature** | `time.delta() -> number` |
+| **Returns** | `number` — seconds; `0` while the game is paused |
+| **Description** | The last frame's delta, scaled by the global time scale. It is the same number the simulation advanced by, so `self.x = self.x + v * time.delta()` moves at the speed the world moves. |
+
+```lua
+self.x = self.x + 100 * time.delta()
+```
+
+### `time.unscaled_delta()`
+
+| | |
+|---|---|
+| **Signature** | `time.unscaled_delta() -> number` |
+| **Returns** | `number` — seconds of wall clock |
+| **Description** | The last frame's **real** delta, unaffected by the time scale. A UI that has to keep moving while the game is paused (a loading spinner) reads this one. |
+
+```lua
+spinner.rotation = spinner.rotation + 3 * time.unscaled_delta()
+```
+
+### `time.elapsed()`
+
+| | |
+|---|---|
+| **Signature** | `time.elapsed() -> number` |
+| **Returns** | `number` — seconds of game time |
+| **Description** | Scaled game time since boot. It slows down with the game, so it counts **play** time, not wall-clock time. |
+
+```lua
+if time.elapsed() > 60 then globals.get("game").over = true end
+```
+
+### `time.unscaled_elapsed()`
+
+| | |
+|---|---|
+| **Signature** | `time.unscaled_elapsed() -> number` |
+| **Returns** | `number` — seconds of wall clock |
+| **Description** | Real time since boot, unaffected by the time scale. |
+
+```lua
+local load = time.unscaled_elapsed() - started_at
+```
+
+### `time.frame()`
+
+| | |
+|---|---|
+| **Signature** | `time.frame() -> number` |
+| **Returns** | `number` — frames since boot |
+| **Description** | The frame counter, incremented once per frame. |
+
+```lua
+if time.frame() % 30 == 0 then actor.emit(self, "tick") end
+```
+
+### `time.physics_delta()`
+
+| | |
+|---|---|
+| **Signature** | `time.physics_delta() -> number` |
+| **Returns** | `number` — the fixed step in seconds (1/60) |
+| **Description** | The fixed simulation step — the step the **solver** uses, not the frame's delta. Integrate against this when the answer must not depend on the frame rate. |
+
+```lua
+self.hp = self.hp - 10 * time.physics_delta()
+```
+
+### `time.scale()`
+
+| | |
+|---|---|
+| **Signature** | `time.scale() -> number` |
+| **Returns** | `number` — the global scale |
+| **Description** | The global time scale. `1` is normal, `0.5` is slow motion, `0` is paused. |
+
+```lua
+time.set_scale(0.5)   -- slow motion
+time.set_scale(1.0)   -- back to normal
+```
+
+### `time.set_scale(s)`
+
+| | |
+|---|---|
+| **Signature** | `time.set_scale(s)` |
+| **Parameters** | `s` — `number` — `0` pauses, `0.5` is slow motion, `2` is double speed |
+| **Description** | Sets the global time scale. It slows the simulation and the delta the scripts are handed. Clamped to `[0, 100]`: a **negative** scale would run the world backwards, which nothing supports. A `NaN` is ignored rather than applied. |
+
+```lua
+time.set_scale(0.25)   -- a dramatic slow-motion moment
+```
+
+### `time.pause()`
+
+| | |
+|---|---|
+| **Signature** | `time.pause()` |
+| **Description** | Pauses the simulation. The scale goes to `0` and the scale in force is remembered, so `time.resume()` restores it — slow motion stays slow motion. The frame loop keeps running: the UI and the input keep working. |
+
+```lua
+time.pause()
+globals.get("game").state = "paused"
+```
+
+### `time.resume()`
+
+| | |
+|---|---|
+| **Signature** | `time.resume()` |
+| **Description** | Unpauses the simulation, restoring the scale that was in force before the pause. A no-op when the game is not paused: a scale set by hand while paused is not stomped by a `resume` the game did not need. |
+
+```lua
+time.resume()
+```
+
+### `time.is_paused()`
+
+| | |
+|---|---|
+| **Signature** | `time.is_paused() -> boolean` |
+| **Returns** | `boolean` — true while the scale is `0` |
+| **Description** | True while the game is paused. |
+
+```lua
+if time.is_paused() then sprite.set_visible(self, false) end
+```
+
+---
+
+## `timer`
+
+The gameplay clock. It fires **named signals** instead of calling back, so the same timer works for a Lua `on_signal` handler and for a Zig listener, and it survives a save.
+
+See [Tweens and Timers](tween-and-timer.md) for the whole picture.
+
+### `timer.new(self, seconds, kind)`
+
+| | |
+|---|---|
+| **Signature** | `timer.new(self, seconds, kind)` |
+| **Parameters** | `self` — `Actor`; `seconds` — `number` — the cycle length; `kind` — `number` — `0` once, `1` loop, `2` during |
+| **Description** | Creates the `Timer` component (or reuses the one the actor already has) and returns it. A `during` timer also fires its tick signal every tick, so a telegraph bar can redraw without a second clock. |
+
+```lua
+timer.new(self, 2.0, 1)          -- every 2 seconds, forever
+timer.set_signals(self, "", "wave_spawned")
+```
+
+### `timer.set_signals(self, on_tick, on_done)`
+
+| | |
+|---|---|
+| **Signature** | `timer.set_signals(self, on_tick, on_done)` |
+| **Parameters** | `self` — `Actor`; `on_tick` — `string` — fired every tick while the kind is `during`; `on_done` — `string` — fired when a cycle completes |
+| **Description** | The signal **names** this timer fires. An empty name fires nothing. The handler is `on_signal(name)` on the behaviour. |
+
+```lua
+function M:on_signal(name)
+  if name == "wave_spawned" then self.spawn_wave() end
+end
+```
+
+### `timer.start(self, loops)`
+
+| | |
+|---|---|
+| **Signature** | `timer.start(self, loops)` |
+| **Parameters** | `self` — `Actor`; `loops` — `number` — how many cycles; `0` means forever |
+| **Description** | Puts the timer back to zero and sets how many cycles it runs. It does not unpause a timer that already finished — use `timer.restart` for that. |
+
+### `timer.stop(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.stop(self)` |
+| **Description** | Pauses the timer **keeping** its elapsed time, so starting it again resumes where it was. |
+
+### `timer.kill(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.kill(self)` |
+| **Description** | Finishes the timer for good. The done signal does **not** fire. |
+
+### `timer.restart(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.restart(self)` |
+| **Description** | Back to zero, running again, with the configuration intact: the duration, the kind, the loop count and the signals all survive. |
+
+### `timer.progress(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.progress(self) -> number` |
+| **Returns** | `number` — `0` at the start of the cycle, `1` at the end |
+| **Description** | How far through the current cycle it is — what a cooldown bar draws. |
+
+```lua
+ui.set_value(self.bar, timer.progress(self))
+```
+
+### `timer.set_duration(self, seconds)` · `timer.get_duration(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.set_duration(self, seconds)` / `timer.get_duration(self) -> number` |
+| **Description** | The length of one cycle. |
+
+### `timer.get_elapsed(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.get_elapsed(self) -> number` |
+| **Returns** | `number` — seconds into the current cycle |
+| **Description** | How far into the cycle it is. The remaining time is `get_duration - get_elapsed`. |
+
+### `timer.get_loops(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.get_loops(self) -> count, current` |
+| **Returns** | `number` — the total cycle count (`0` = forever); `number` — the cycles completed |
+| **Description** | How many cycles it will run and how many it has run. |
+
+### `timer.set_kind(self, kind)`
+
+| | |
+|---|---|
+| **Signature** | `timer.set_kind(self, kind)` |
+| **Parameters** | `self` — `Actor`; `kind` — `number` — `0` once, `1` loop, `2` during |
+| **Description** | Changes the kind **without** restarting: the elapsed time and the cycle counter stay where they were. |
+
+### `timer.set_time_scale(self, scale)`
+
+| | |
+|---|---|
+| **Signature** | `timer.set_time_scale(self, scale)` |
+| **Parameters** | `self` — `Actor`; `scale` — `number` — `0` stops the timer, `0.5` halves it, `2` doubles it |
+| **Description** | This timer's **own** speed. It multiplies with the global scale (`time.scale`): a slow-motion game slows every timer, and a timer slower than the game is slower still. |
+
+### `timer.is_finished(self)` · `timer.is_paused(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.is_finished(self) -> boolean` / `timer.is_paused(self) -> boolean` |
+| **Description** | Whether the timer has done its job, and whether it is stopped. |
+
+### `timer.get_dropped(self)`
+
+| | |
+|---|---|
+| **Signature** | `timer.get_dropped(self) -> number` |
+| **Returns** | `number` — the cycles the timer could not run |
+| **Description** | The engine runs at most 16 cycles of one timer per tick, and the ones it refuses are **counted** instead of dropped in silence. Zero in a healthy game; a number that grows says the timer is running **late**. |
+
+```lua
+if timer.get_dropped(self) > 0 then print("the timer is running late") end
+```
+
+---
+
+## `tween`
+
+A value that **travels** to another value over time — the answer to "slide the panel in", "fade the sprite out" and "punch the player back", without a frame counter in the script.
+
+A tween drives a **component** of an actor, so the renderer draws the result. See [Tweens and Timers](tween-and-timer.md) for the full guide.
+
+### `tween.to(self, property, value, duration, opts)`
+
+| | |
+|---|---|
+| **Signature** | `tween.to(self, property, value, duration, opts) -> number` |
+| **Parameters** | `self` — `Actor`; `property` — `string` — the component field to drive; `value` — `any` — the target; `duration` — `number` — seconds; `opts` — `table` — optional |
+| **Returns** | `number` — the tween handle, or `0` when it could not be created |
+| **Description** | Starts a tween and returns its handle. The property is a component field, optionally with a sub-field: `"position"`, `"position.x"`, `"rotation"`, `"scale"`, `"tint"`, `"tint.a"`, `"color"`, `"energy"`, `"radius"`, `"value"`, `"duration"`. The value's shape comes from the property: a vector for `"position"`, a colour for `"tint"`, a number for the rest. `opts` may carry `easing`, `delay`, `repeat`, `yoyo`, `hold` and `on_complete`. |
+
+```lua
+tween.to(self, "position.x", 200, 0.5, { easing = "out_back" })
+tween.to(self, "tint.a", 0, 0.3, { on_complete = function(self) actor.set_visible(self, false) end })
+```
+
+### `tween.chain(parent, child)`
+
+| | |
+|---|---|
+| **Signature** | `tween.chain(parent, child) -> boolean` |
+| **Parameters** | `parent` — `number` — the handle that runs first; `child` — `number` — the handle that waits |
+| **Returns** | `boolean` — true when the chain was made |
+| **Description** | The child tween starts when the parent finishes. The child is parked and reset to its start value, so create it with `hold = true` (or chain it before it runs) to avoid a visible jump. |
+
+```lua
+local move = tween.to(self, "position.x", 100, 1.0)
+local fade = tween.to(self, "tint.a", 0, 0.5, { hold = true })
+tween.chain(move, fade)
+```
+
+### `tween.start(handle)`
+
+| | |
+|---|---|
+| **Signature** | `tween.start(handle) -> boolean` |
+| **Description** | Releases a parked tween: it starts now. |
+
+### `tween.kill(handle)`
+
+| | |
+|---|---|
+| **Signature** | `tween.kill(handle) -> boolean` |
+| **Description** | Stops the tween where it is. The property keeps the value it had, and the completion callback does **not** run: a killed tween was cancelled, not finished. |
+
+### `tween.kill_entity(self)`
+
+| | |
+|---|---|
+| **Signature** | `tween.kill_entity(self) -> number` |
+| **Returns** | `number` — how many tweens were stopped |
+| **Description** | Stops every tween driving this actor. The thing to call when the actor is despawned. |
+
+### `tween.kill_all()`
+
+| | |
+|---|---|
+| **Signature** | `tween.kill_all() -> number` |
+| **Description** | Stops every tween in the game. The thing to call when the level changes. |
+
+### `tween.is_alive(handle)`
+
+| | |
+|---|---|
+| **Signature** | `tween.is_alive(handle) -> boolean` |
+| **Description** | True while the tween is running. False once it finished, was killed, or never existed. |
+
+### `tween.count()`
+
+| | |
+|---|---|
+| **Signature** | `tween.count() -> number` |
+| **Description** | How many tweens are running right now. |
+
+### `tween.time_scale()` · `tween.set_time_scale(s)`
+
+| | |
+|---|---|
+| **Signature** | `tween.time_scale() -> number` / `tween.set_time_scale(s)` |
+| **Description** | The **tween** speed: it moves the **animations**, not the world. The world's speed is `time.scale`. A slow-motion game wants the world slowed and the tweens slowed with it. |
+
+### `tween.properties()`
+
+| | |
+|---|---|
+| **Signature** | `tween.properties() -> table` |
+| **Returns** | `table` — the list of tweenable property names |
+| **Description** | Every property a tween can drive, so a script can discover what exists without the documentation being the only source. |
+
+```lua
+for _, name in ipairs(tween.properties()) do print(name) end
 ```
 
 ---
@@ -727,6 +1142,31 @@ log.info("heading: " .. math.rad_to_deg(actor.get_rotation(self)))
 
 ```lua
 if math.is_close(self.x, self.target_x, 0.01) then self.x = self.target_x end
+```
+
+### `math.ease(name, t)`
+
+| | |
+|---|---|
+| **Signature** | `math.ease(name, t) -> number` |
+| **Parameters** | `name` — `string` — the curve; `t` — `number` — `0` at the start, `1` at the end |
+| **Returns** | `number` — the eased value, or `nil` for an unknown curve |
+| **Description** | An easing curve: the **shape** of a movement over time. The same curves the tween uses, so a value eased by hand and a value eased by a tween look the same. The names are `"linear"` and then `in_*`, `out_*` and `in_out_*` of `quad`, `cubic`, `quart`, `sine`, `expo`, `circ`, `back`, `elastic`, `bounce`. |
+
+```lua
+local p = math.ease("out_back", 0.5)   -- past the halfway mark
+```
+
+### `math.easings()`
+
+| | |
+|---|---|
+| **Signature** | `math.easings() -> table` |
+| **Returns** | `table` — the list of easing names |
+| **Description** | Every easing name, so a script can discover what exists without the documentation being the only source. |
+
+```lua
+for _, name in ipairs(math.easings()) do print(name) end
 ```
 
 ---

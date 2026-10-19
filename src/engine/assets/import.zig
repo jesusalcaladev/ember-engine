@@ -26,6 +26,7 @@ const registry = @import("registry.zig");
 const image_mod = @import("image.zig");
 const audio = @import("audio_asset.zig");
 const script = @import("script_asset.zig");
+const font_asset = @import("font_asset.zig");
 const pack = @import("pack.zig");
 const Image = @import("asset_types.zig").Image;
 const AssetGUID = registry.AssetGUID;
@@ -38,10 +39,11 @@ pub const ImportError = error{
     /// An image container was recognised but could not be decoded.
     InvalidImage,
     EmptyFile,
-} || audio.AudioError || script.ScriptError;
+} || audio.AudioError || script.ScriptError || font_asset.FontError;
 
 /// A recognised container. `lua` is a text fallback: it is chosen by extension
-/// once the bytes are proven to be UTF-8 text.
+/// once the bytes are proven to be UTF-8 text. `ttf` is content-detected only
+/// (the sfnt magic), so it covers `.otf` and `.ttc` as well as `.ttf`.
 pub const Format = enum {
     png,
     jpeg,
@@ -49,12 +51,14 @@ pub const Format = enum {
     wav,
     ogg,
     lua,
+    ttf,
 
     pub fn kind(self: Format) Kind {
         return switch (self) {
             .png, .jpeg, .webp => .image,
             .wav, .ogg => .audio,
             .lua => .script,
+            .ttf => .font,
         };
     }
 
@@ -66,12 +70,13 @@ pub const Format = enum {
             .wav => "wav",
             .ogg => "ogg",
             .lua => "lua",
+            .ttf => "ttf",
         };
     }
 };
 
 /// The registry's coarse asset classes.
-pub const Kind = enum { image, audio, script };
+pub const Kind = enum { image, audio, script, font };
 
 /// One file handed to the importer.
 pub const Source = struct {
@@ -95,6 +100,8 @@ pub const ImportedAsset = struct {
     audio: ?audio.AudioInfo = null,
     /// Validation result, present only for scripts.
     script: ?script.Validated = null,
+    /// Validation result, present only for fonts.
+    font: ?font_asset.Validated = null,
 
     pub fn deinit(self: *ImportedAsset, allocator: std.mem.Allocator) void {
         if (self.image) |*img| allocator.free(img.pixels);
@@ -108,6 +115,7 @@ pub fn detect(path: []const u8, bytes: []const u8) ?Format {
     if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return .png;
     if (bytes.len >= 3 and bytes[0] == 0xFF and bytes[1] == 0xD8 and bytes[2] == 0xFF) return .jpeg;
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return .webp;
+    if (font_asset.looksLikeFont(bytes)) return .ttf;
     if (audio.sniff(bytes)) |f| return switch (f) {
         .wav => .wav,
         .ogg => .ogg,
@@ -140,6 +148,7 @@ pub fn importOne(
         },
         .wav, .ogg => asset.audio = try audio.probe(allocator, bytes),
         .lua => asset.script = try script.validate(bytes, script.default_max_bytes),
+        .ttf => asset.font = try font_asset.validate(bytes),
     }
 
     return asset;
@@ -271,6 +280,32 @@ test "a .lua file is validated as text; a renamed binary is not Lua" {
 test "an empty file and unknown bytes are refused" {
     try testing.expectError(error.EmptyFile, importOne(testing.allocator, "empty.png", ""));
     try testing.expectError(error.UnknownFormat, importOne(testing.allocator, "x.bin", "not an asset"));
+}
+
+test "a .ttf is detected by magic and validated as a font" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // The bootstrap-downloaded typeface is not committed; skip when absent.
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "libs/fonts/Inter-Regular.ttf", testing.allocator, .limited(8 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer testing.allocator.free(bytes);
+
+    // A `.otf` name is fine: detection follows the sfnt magic, not the suffix.
+    var asset = try importOne(testing.allocator, "ui/Inter-Regular.ttf", bytes);
+    defer asset.deinit(testing.allocator);
+    try testing.expectEqual(Format.ttf, asset.format);
+    try testing.expectEqual(Kind.font, asset.kind);
+    try testing.expectEqual(@as(u32, 0), asset.font.?.fontstart);
+    try testing.expect(!asset.font.?.is_cff);
+}
+
+test "a TTF magic on garbage bytes is refused rather than trusted" {
+    // The magic is recognised as a font, so it is not UnknownFormat — it is the
+    // validator that refuses it, which is exactly the point.
+    try testing.expectEqual(Format.ttf, detect("x.ttf", "ttcf....").?);
+    try testing.expectError(error.Truncated, importOne(testing.allocator, "x.ttf", "OTTO" ++ "x" ** 40));
+    try testing.expectError(error.UnknownFormat, importOne(testing.allocator, "x.ttf", "not a font"));
 }
 
 test "importBatch frees a partial manifest on failure" {

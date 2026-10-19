@@ -45,11 +45,20 @@ const Action = struct {
 pub const Input = struct {
     actions: [max_actions]Action = [_]Action{Action{}} ** max_actions,
     count: u8 = 0,
+    /// True while the pointer is over an interactive game-UI widget this frame.
+    /// Filled by the runtime from `ecs.ui_system` and read by gameplay so a click
+    /// on a button cannot also be a world action (spec M14: "the UI never leaks
+    /// input to the world"). Distinct from the action table on purpose: it is a
+    /// single boolean about the whole UI, not a named action.
+    pointer_over_ui: bool = false,
 
     /// Clears per-frame edge state. Call once at the start of building the
     /// snapshot (pressed flags are recomputed from the platform edge each frame).
     pub fn beginFrame(self: *Input) void {
         for (self.actions[0..self.count]) |*a| a.pressed = false;
+        // Recomputed every frame by the UI system; a stale `true` would wedge
+        // world input off after the pointer left the widget.
+        self.pointer_over_ui = false;
     }
 
     /// Interns an action name so it can be driven each frame. Idempotent:
@@ -95,6 +104,18 @@ pub const Input = struct {
         const pos = self.down(positive);
         if (neg == pos) return 0; // neither, or the contradictory both
         return if (pos) 1 else -1;
+    }
+
+    /// Sets the UI capture flag for this frame. The runtime owns the call; the
+    /// engine's UI system produces the value.
+    pub fn setPointerOverUi(self: *Input, over: bool) void {
+        self.pointer_over_ui = over;
+    }
+
+    /// True while the pointer sits over an interactive game-UI widget. Gameplay
+    /// checks this before acting on a click so the UI consumes it first.
+    pub fn pointerOverUi(self: *const Input) bool {
+        return self.pointer_over_ui;
     }
 
     fn find(self: *const Input, name: []const u8) ?*const Action {
@@ -153,4 +174,14 @@ test "unknown actions are inert, not crashes" {
     try std.testing.expect(!input.down("nope"));
     try std.testing.expect(!input.pressed("nope"));
     try std.testing.expectEqual(@as(f32, 0), input.axis("a", "b"));
+}
+
+test "pointer_over_ui is set per frame and cleared by beginFrame" {
+    var input = Input{};
+    try std.testing.expect(!input.pointerOverUi());
+    input.setPointerOverUi(true);
+    try std.testing.expect(input.pointerOverUi());
+    // The next frame recomputes it; a stale true must not survive.
+    input.beginFrame();
+    try std.testing.expect(!input.pointerOverUi());
 }

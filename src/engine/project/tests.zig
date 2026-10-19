@@ -523,6 +523,65 @@ test "project.config: string lists accept both spellings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "names \"world\" \"player\"") != null);
 }
 
+// ── Globals scripts (`scripts` section) ─────────────────────────────────────
+
+test "project.config: the scripts section parses global scripts in load order" {
+    var cfg = try parser.parse(std.testing.allocator,
+        \\scripts {
+        \\  global "scripts/globals/game.lua" "scripts/globals/flow.lua"
+        \\}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.scripts.global.len);
+    try std.testing.expectEqualStrings("scripts/globals/game.lua", cfg.scripts.global[0]);
+    try std.testing.expectEqualStrings("scripts/globals/flow.lua", cfg.scripts.global[1]);
+
+    // The canonical encoding is a bare list on one `global` line (the same
+    // style `layers.names` uses), and parsing it back lands on the same paths
+    // in the same order — file order IS start order.
+    const encoded = try parser.encodeToString(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "global \"scripts/globals/game.lua\" \"scripts/globals/flow.lua\"") != null);
+    // And a single-path project keeps that one path alone.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "scripts") != null);
+}
+
+test "project.config: a section absent is an EMPTY global list, not an error" {
+    var cfg = try parser.parse(std.testing.allocator, "project \"X\"\n");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cfg.scripts.global.len);
+    // And validation is happy: zero globals is the default state of a project.
+    try schema.validate(&cfg);
+}
+
+test "project.config: validation rejects an empty or duplicated global path" {
+    var empty = try parser.parse(std.testing.allocator,
+        \\scripts {
+        \\  global ""
+        \\}
+    );
+    defer empty.deinit();
+
+    var diag = parser.Diagnostics{};
+    try std.testing.expectError(error.EmptyItem, schema.validateDiag(&empty, &diag));
+
+    var dup = try parser.parse(std.testing.allocator,
+        \\scripts {
+        \\  global "game.lua" "game.lua"
+        \\}
+    );
+    defer dup.deinit();
+    try std.testing.expectError(error.DuplicateItem, schema.validateDiag(&dup, null));}
+
+test "project.config: an unknown SCRIPTS field says so, like every other section" {
+    try expectParseError(
+        \\scripts {
+        \\  autoload "game.lua"
+        \\}
+    , error.UnknownField, 2, "scripts");
+}
+
+
 test "project.config: escapes round-trip through the canonical encoding" {
     var cfg = try parser.parse(std.testing.allocator, "project \"a\\\"b\\\\c\"\n");
     defer cfg.deinit();

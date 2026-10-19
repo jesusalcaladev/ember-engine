@@ -226,8 +226,14 @@ pub fn collapse(c: Collapse) bool {
 /// The counterpart of `collapse`: closes what it opened. Separate on purpose,
 /// because an unbalanced pair is a nesting bug that shows up as a panel whose
 /// contents are indented for the rest of the session.
-pub fn collapseEnd() void {
-    cimgui.ember_ui_unindent(0);
+///
+/// It needs the context for the same reason `collapse` did: the indent width is
+/// a theme metric, and the only way to undo exactly what was done is to ask the
+/// same metric for the same number. The previous version passed `0`, which
+/// ImGui treats as "unindent nothing" — so every open section left the rest of
+/// the panel shifted right.
+pub fn collapseEnd(ctx: *Context) void {
+    cimgui.ember_ui_unindent(ctx.theme.metrics.space(2));
 }
 
 test "ui card: a card's content width is the panel's width minus twice the pad" {

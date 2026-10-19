@@ -27,6 +27,8 @@ pub const timer = @import("timer.zig");
 pub const camera = @import("camera.zig");
 pub const animation = @import("animation.zig");
 pub const actor = @import("actor.zig");
+/// M14: the game-UI system (canvas, layout, hit-testing, button signals).
+pub const ui_system = @import("ui_system.zig");
 
 // Short names for what the runtime and the actor code import constantly.
 pub const World = world.World;
@@ -50,4 +52,5 @@ test {
     _ = @import("timer.zig");
     _ = @import("camera.zig");
     _ = @import("animation.zig");
+    _ = @import("ui_system.zig");
 }

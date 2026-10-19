@@ -25,6 +25,8 @@ pub const render2d = render.render2d;
 pub const particles = render.particles;
 /// M9: scene transitions — the fade.
 pub const fade = render.fade;
+/// M14: CanvasModulate — the full-screen tint.
+pub const tint = render.tint;
 /// M7: 2D lighting. Lights, occluders, 1D shadow maps and the GI field.
 pub const light = render.light;
 /// M7: the lighting DRIVER — the owner that ties the above to the renderer.

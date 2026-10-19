@@ -51,6 +51,13 @@ struct PostParams {
     /// screen it covers. Applied LAST, after tonemap, because it is a curtain
     /// hung over the finished image and not part of the image.
     fade: vec4f,
+    /// M14: CanvasModulate — rgb and, in alpha, the strength. Applied after
+    /// tonemap and BEFORE the fade, so a transition curtain is never tinted.
+    tint: vec4f,
+    /// x = the mix (0 off, 1 multiply, 2 add, 3 alpha), yzw spare. A vec4 rather
+    /// than an f32 so it lands on a 16-byte boundary, which a uniform struct
+    /// requires after the `tint` vec4.
+    tint_mode: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> params: PostParams;
@@ -176,6 +183,25 @@ fn fs_composite(in: VSOut) -> @location(0) vec4f {
 
     if (params.flags.x > 0.0) {
         c = tonemap(c);
+    }
+
+    // M14: CanvasModulate. A full-screen tint over the finished (tonemapped)
+    // image, world and UI alike. Before the fade on purpose: the curtain is
+    // hung over the tinted image, and a fade-to-black must reach black whatever
+    // the scene is tinted. A zero strength or mode 0 is a no-op.
+    if (params.tint_mode.x > 0.0 && params.tint.a > 0.0) {
+        let amt = clamp(params.tint.a, 0.0, 1.0);
+        if (params.tint_mode.x < 1.5) {
+            // multiply: toward black for a dark ambience, toward the colour for
+            // a grade. mix(1, rgb, amt) keeps amt = 1 an exact multiply.
+            c = c * mix(vec3f(1.0), params.tint.rgb, amt);
+        } else if (params.tint_mode.x < 2.5) {
+            // add: a flash. Scaled by amt so the strength ramps the flash in.
+            c = c + params.tint.rgb * amt;
+        } else {
+            // alpha: a flat veil over the image.
+            c = mix(c, params.tint.rgb, amt);
+        }
     }
 
     // The fade, last. A transition is a CURTAIN over the finished frame, so

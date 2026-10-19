@@ -457,6 +457,10 @@ pub fn backgroundList() List {
 /// The shape every "draw this text in that face" call takes. A function plus a
 /// tuple of its arguments, which is what ImGui's own API does NOT have and why
 /// a `withFont` callback has to be a template.
-pub fn drawInFont(ctx: *Context, face: Context.Font, comptime body: anytype, args: anytype) void {
+/// `Context` here is the MODULE (see the import above), so the struct and its
+/// nested face enum are reached through it. Naming only the module is what made
+/// this signature "*context has no member named Font" — a compile error that
+/// stayed invisible until something called `text.title`.
+pub fn drawInFont(ctx: *Context.Context, face: Context.Context.Font, comptime body: anytype, args: anytype) void {
     ctx.withFont(face, body, args);
 }

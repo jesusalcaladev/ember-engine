@@ -83,6 +83,7 @@ Quality rules: **spec.md is law** — no milestone closes by breaking a budget.
 **Goal**: gameplay exists and is enjoyable.
 
 - Embed LuaJIT; behaviors with a `start / update / fixed_update / on_signal / on_destroy` lifecycle. **DONE**.
+- **Global scripts** (Lua with no actor — managers, game flow, score, spawner) declared in `project.config` under `scripts { global "..." }`, mounted in file order, one global per script, and reachable from any script through `globals.get(name)` / `globals.exists(name)`. They run BEFORE the actors each frame, so a manager's decision is visible to every behavior that same frame. **DONE** (see `docs/reference/global-scripts.md`).
 - Script hot-reload < 100 ms **without losing state** (migrate the `self` table). **DONE**: reload swaps only the cached method refs; the `self` table — all gameplay state — is untouched. Loading a name that already has live instances re-caches them, so "edit and reload" just works.
 - Sandbox for the editor (library whitelist); action-based Input API for Lua. **DONE** (`vm.sandbox` + the `input` module).
 - Signals: `emit`/`on`, stable order by spawn; drained once per frame. **DONE**.
@@ -220,8 +221,9 @@ Placed here on purpose: every item below depends only on what already exists (sc
 | `noise` (seed/value/perlin/simplex/fbm/ridged) | **done** — `core/noise.zig`, stateless per call so terrain and weather can use different fields |
 | State machine component (`sm.*`) | **done** — `script/statemachine.zig` + the `StateMachine` component (a `u32` handle, forced by the plain-data rule) |
 | `Camera2D` | **done** — `ecs/components/camera.zig` (the component) + `ecs/camera.zig` (the fixed-step system) + the `camera.*` bindings, and the runtime now feeds its `View` into BOTH the culler and the draw camera |
-| `Timer` | **done** — `ecs/components/timer.zig` + `ecs/timer.zig` (fixed step, callbacks as signals) + the `timer.*` bindings |
-| Tweens (`tween.to`, `chain`, `kill`, `time_scale`) | **not built** — a `Timer` covers "fire N times" and a `Camera2D` spring covers "ease a value", so a tween is the composition of both. Deferred rather than dropped: nothing in M5–M17 needs one that those two do not already answer. |
+| `Timer` | **done** — `ecs/components/timer.zig` + `ecs/timer.zig` (fixed step, callbacks as signals) + the `timer.*` bindings, and since the M4.5 follow-up: `restart`, `set_duration`, `get_duration`, `get_elapsed`, `get_loops`, `set_kind`, a per-timer `time_scale`, `is_finished`, `is_paused`, and `get_dropped` (the cycles the catch-up cap refused, counted instead of dropped in silence). |
+| Time scale + the `time.*` clock | **done** — `core/loop.zig` (`GameTime`): ONE owner of the global scale (0 = paused, 0.5 = slow motion, 2 = double speed) and the clock the scripts read (`time.delta`, `time.elapsed`, `time.scale`, `time.pause`…). The simulation, the scripts and the bindings all read the same clock, so a script can never move at a different speed than the world it is in. |
+| Tweens (`tween.to`, `chain`, `kill`, `time_scale`) | **done** — `script/tween.zig` (the pool) + the `tween.*` bindings. A tween drives a COMPONENT of an actor (the real `Transform`, the real `Sprite.tint`), so the renderer draws the result. 28 easing curves in `core/math.zig` (`math.ease`), shared with the tweens. |
 | Coroutines (`async`/`await`, `wait(seconds)`) | **not built** — the same reasoning: a state machine plus a `Timer` sequences without one, and the FSM is the documented answer to "sequence without hand-rolled frame counters". |
 | AI steering + `line_of_sight` + `pathfind` | steering is **written and tested** but still behind `-Dsteering` (off), because `world.nearby` measures ~16 µs per call — about 100x the spatial grid's budget — and the cause is unknown. Shipping it on would put a known-wrong number inside the frame. `line_of_sight` and `pathfind` still need the M4 physics queries and remain open. |
 
@@ -239,6 +241,30 @@ Two things the M4.5 close found and fixed rather than papered over:
 - ImGuizmo for transforms; undo/redo on top of serialization; crash-safe autosave.
 
 **Criteria**: Play runs inside the same window and UI; Stop restores an identical hash; editor overlay cost ≤ 2 ms extra; editing a component during Play reflects instantly.
+
+**Status: in progress — the Play/Stop criterion is now real, not a promise.**
+
+- **Play/Stop with the bit-exact snapshot is wired into the editor**
+  (`src/tools/editor/editor_state.zig`, over the headless machine of
+  `session/play.zig`). Entering Play captures a zson document of the world and
+  hashes it; Stop restores that document IN PLACE through the same
+  `zson.replace` the Open path uses — so no cached `*World` moves — clears the
+  play-time undo journal (acts naming played-world entities would edit
+  entities that no longer exist), and verifies the hash, reporting the result to
+  the console rather than asserting on it. What Stop restores is the world AND
+  the editor state that belongs to it: the selection comes back and the dirty
+  flag returns to what it was when Play began.
+- Begin/Stop are queued acts applied in `preFrame`, outside the frame's
+  allocation guard — encode and decode allocate, and a click inside the frame
+  records an intent, the same rule every other editor act follows.
+- Behaviors survive the transaction by the rules of the swap: Stop's world
+  replace kills every instance the played world held and the per-frame
+  `sweepDestroyed` dispatches their `on_destroy`; a fresh Play warms
+  `Behaviors.startAll` (idempotent) after the snapshot is taken, so everything
+  `start` does is gameplay — part of what Stop throws away.
+
+Still open for M5: crash-safe autosave, the written rules for editing during
+Play, and a measured overlay-cost number against the ≤ 2 ms budget.
 
 ### M5.5 — Code editor + integrated documentation (Godot-style)
 **Goal**: comfortable Lua writing inside the engine and the whole API one Ctrl+Click away.
@@ -277,11 +303,59 @@ Docks shared by both tabs: actor hierarchy, component inspector, console, asset 
 **Still missing before that v1 editor is honest** (from [docs/EDITOR-SURFACE.md](docs/EDITOR-SURFACE.md)):
 
 - [ ] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state).
-- [ ] **Undo/redo** — an engine-side command journal on top of bit-exact serialization (M1). The single biggest gap.
+- [x] **Undo/redo** — an engine-side command journal on top of bit-exact serialization (M1). The single biggest gap. **Done**: `session/model.zig` journals every act; the editor drives it and never keeps a second stack.
 - [ ] **Project file + file dialogs** — open/save `.zson`, no ad-hoc paths.
-- [ ] **Flat prefab authoring** — create from selection, instantiate, overrides visible and revertable. Storage exists since M1; the UI does not.
-- [ ] **Save/load UI + crash-safe autosave** (M5 bullet, still open).
-- [ ] **Hot reload** of scenes and assets while a tab is open (M6).
+- [x] **Flat prefab authoring** — create from selection, instantiate, overrides visible and revertable. Storage exists since M1; the UI does not. **Done**: see below.
+- [x] **Save/load UI + crash-safe autosave** (M5 bullet, still open). **Done**: see below.
+- [x] **Hot reload** of scenes and assets while a tab is open (M6). **Done**: see below.
+
+#### Autosave, hot reload and flat prefabs
+
+**Autosave is a recovery file, not a save.** The editor writes the world to
+`<scene>.autosave` every 60 seconds while the document is dirty, and the write
+goes through a temporary name and a rename — so a crash mid-write leaves the
+PREVIOUS recovery file whole rather than a half-written one. At boot, a
+recovery file newer than the scene is reported in the console, and File →
+Recover takes it. The recovered document is marked unsaved: recovering is not
+saving, and the user decides when the work becomes the file.
+
+The interval is a field rather than a constant, so a preference can move it
+into `project.config` without touching the frame loop. The timer runs on the
+frame loop's clock and the WRITE is a queued act: encoding a world allocates
+megabytes, and a frame may not (spec §3.1).
+
+**Hot reload watches the file, not the buffer.** The scene file is watched
+while it is open, and a change made outside the editor (a merge, a generator,
+a second instance) is noticed. The editor does NOT reload on the spot: a
+reload replaces the world, and the user may have unsaved work. The change is
+recorded, the console says so, and File → Reload takes it. The editor's own
+save is told apart from somebody else's by the mtime it recorded when it
+saved.
+
+**Flat prefabs are `.zson` files, and the overrides live in a sidecar.**
+
+- A prefab is a **document**, written by `zson.encodeToStringEntities` — the
+  same grammar as a scene, so there is no second format and no second parser
+  to keep in sync with the component registry.
+- **Create from selection** writes the selected entity AND its children to
+  `prefabs/<name>.zson`. The children come along because a prefab of a
+  "turret" that leaves the barrel behind is not what anyone means.
+- **Instantiate** spawns the document at fresh identities
+  (`zson.instantiateInto`), with the names made unique in the world
+  (`enemy`, `enemy_2`) so two instances coexist. The instance is recorded in
+  a **sidecar** — `<scene>.overrides`, a text file beside the scene.
+- **The sidecar is where the overrides live**, and that is a decision worth
+  stating: the overrides are per-COMPONENT, and a component cannot hold that
+  without a registry entry — and the registry is append-only, so a
+  `SpriteOverrides` component would be a permanent, load-bearing addition to
+  the engine's data model to serve a purely editorial feature. The world is
+  the SCENE; what the game loads must not carry editor bookkeeping. The
+  sidecar is written by the editor only, and losing it loses the ability to
+  revert — never the scene.
+- **Revert to Prefab** writes the prefab's value back over the overridden
+  component, through the same encoder and decoder a `.zson` file goes
+  through. A revert that restored a merely-parsable value would be a lie, so
+  the round trip is the contract and it is tested.
 
 **The long tail** — one workspace per subsystem, in subsystem order, none before v1.0 and none before the thing it edits exists:
 
@@ -499,6 +573,16 @@ Ahora **M13 depende solo de**:
 - Closes the "the editor has ImGui but the game has no UI" gap.
 
 **Criteria**: a HUD with a health bar and score renders at 3 resolutions with correct anchoring; 200 labels in 1 draw call; a button fires a Lua callback.
+
+**Status: runtime delivered — text rendering + the game UI are wired end to end.**
+
+- **Text pipeline**: `stb_truetype` vendored; `render/font.zig` rasterizes glyphs on demand into the existing atlas, with metrics and `measure`/`positionOf`. Glyphs batch through the sprite pipeline, so no new GPU pass exists.
+- **UI components**: `UiCanvas`, `Label`, `UiButton`, `UiPanel`, `UiProgressBar` (`ecs/components/ui.zig`), all POD, serialized to `.zson` (inline text encodes as a quoted string) and editable in the inspector.
+- **The system** (`ecs/ui_system.zig`): canvas resolution (`pixel`/`fit`/`stretch`), Godot-style anchors, per-frame layout into each widget's `resolved` rect, hit-testing that only `UiButton`/`UiPanel` participate in, and the `ui_pressed` signal.
+- **Lua surface**: the `ui.*` module (setters + `measure`/`rect`/`hovered`/`pressed`/`font_load`), `input.pointer_over_ui()`, and `scene.tint*` for CanvasModulate.
+- **No input leak**: the world asks `input.pointer_over_ui()`; the action-input API is unchanged.
+
+See [Game UI](docs/reference/game-ui.md) and [`samples/ui-hud/`](samples/ui-hud/). Deferred (unchanged from the plan): containers, focus navigation, rich text, and per-layer tint.
 
 ### M15 — Tilemap
 **Goal**: levels, not sprite soup.

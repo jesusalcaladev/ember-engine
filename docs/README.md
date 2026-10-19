@@ -40,6 +40,7 @@ New to Ember? Follow this path. Each step builds on the previous one.
 ### Level 2.5 — I want to know how a subsystem is built
 
 - [Code Editor core](internals/code-editor.md) — Buffer, cursor, highlighter, find
+- [Editor recovery & prefabs](reference/editor-recovery-prefabs.md) — Autosave, hot reload, flat prefabs
 - [Asset pipeline](reference/asset-pipeline.md) — Import, `.pak`, VFS, hot reload
 - [Benchmarks](internals/benchmarks.md) — What is measured and what it costs
 - [Build system](internals/build-system.md) — Modules, steps, tests
@@ -47,13 +48,18 @@ New to Ember? Follow this path. Each step builds on the previous one.
 ### Level 3 — I want the full API reference
 
 - [Lua API Reference](reference/script-lua-api.md) — Every binding, with examples
+- [Component Catalog](reference/component-catalog.md) — All 28 components: what they are, what drives them, how they connect
+- [Tweens and Timers](reference/tween-and-timer.md) — The sequencing toolkit: the clock, the timer, the tween
 - [Core Math](reference/core-math.md) — Vec2, Mat4, Rect2, scalar functions
+- [Core Loop](reference/core-loop.md) — The fixed step, the game clock, the global time scale
 - [Random](reference/core-random.md) — Deterministic PRNG
 - [Noise](reference/core-noise.md) — Procedural noise
 - [ECS](reference/ecs-entities.md) — Entities, components, actors, queries
 - [Animation clips](reference/ecs-animation.md) — The `.anim` format, GUID identity, root motion, the method track
 - [Rendering](reference/render-pipeline.md) — Pipeline, batching, atlas
+- [Game UI](reference/game-ui.md) — Text, HUD, menus: `Label`/`UiButton`/`UiPanel`/`UiProgressBar`, anchors, `ui.*`, `ui_pressed` and `scene.tint`
 - [Scripting](reference/script-behaviors.md) — Behaviors, state machines, hot-reload
+- [Global scripts](reference/global-scripts.md) — Lua sin actor: managers, game flow, score; `globals.get` y la sección `scripts` de `project.config`
 - [Physics](reference/physics-overview.md) — Port, bodies, shapes, the sync contract
 - [Audio: the mixer](reference/audio-system.md) — The two threads, the port, voices, the bank, latency
 - [Audio: buses](reference/audio-buses.md) — Sixteen named gains, solo, sends, the mixer-panel API
@@ -62,9 +68,11 @@ New to Ember? Follow this path. Each step builds on the previous one.
 
 ### Level 4 — I want to build real games
 
-- [Common Patterns](guides/common-patterns.md) — Movement, camera, collision, spawning
+- [Common Patterns](guides/common-patterns.md) — Movement, camera, collision, spawning, pause and slow motion
 - [First Game](guides/first-game.md) — A complete collector game tutorial
 - [State Machines](reference/script-state-machines.md) — Declarative state management
+- [Tweens and Timers](reference/tween-and-timer.md) — Sequencing without a frame counter
+- [Component Catalog](reference/component-catalog.md) — Which component do I need?
 - [Steering Behaviors](reference/script-lua-api.md#steer) — AI movement
 - [Collision Layers](reference/ecs-collision-layers.md) — What hits what, by name
 - [Open World Physics](reference/physics-open-world.md) — 200k bodies at 60 Hz
@@ -79,7 +87,9 @@ New to Ember? Follow this path. Each step builds on the previous one.
 | Physics: port, bodies, sync | [physics-overview](reference/physics-overview.md) |
 | Physics: activity tiers, open world | [physics-open-world](reference/physics-open-world.md) |
 | Collision layers & tuning | [ecs-collision-layers](reference/ecs-collision-layers.md) |
-| Components (all 10) | [ecs-components](reference/ecs-components.md) |
+| Components (the registry) | [ecs-components](reference/ecs-components.md) |
+| Components (all 28, and how they connect) | [component-catalog](reference/component-catalog.md) |
+| The clock, the timer, the tween | [tween-and-timer](reference/tween-and-timer.md) |
 | Entities, actors, queries, signals, hierarchy, serialization | [ecs-entities](reference/ecs-entities.md) and siblings |
 | Animation clips, tracks, root motion | [ecs-animation](reference/ecs-animation.md) |
 | Math, random, noise, time | `core-*` |

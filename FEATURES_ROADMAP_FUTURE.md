@@ -6,6 +6,7 @@
 - [x] **Sprite Batcher** - Ordenado por atlas + draw-call agrupado, 1 draw call por (atlas, blend)
 - [x] **Atlas Packer** - Shelf packing, multi-page, padding, trim, decontaminación alfa.
 - [x] **LuaJIT Bindings** - Actor API, Math, Vec2, Spatial, Input, Time, Signals
+      - `time.*` = el reloj de juego (delta, elapsed) + la escala global (slow-mo, pausa)
 - [x] **Physics** - Box2D wrapper, collision layers simétricas, raycast, signals
 - [x] **Camera2D** - Follow, zoom, shake, shake decay, deadzone, lerp
 - [x] **Timer System** - Fixed-step, one-shot, repeating, signals
@@ -14,10 +15,14 @@
 
 ### ✅ M4-M5 GAMEPLAY - FUNCIONAL
 - [x] **Behavior System** - LuaJIT, hot-reload, lifecycle (init/update/destroy), signals
+- [x] **Tweens** - `tween.to`, `chain`, `kill`, `time_scale`; 28 curvas de easing (`math.ease`)
+- [x] **Reloj de juego** - `time.*` + escala global (pausa, slow-mo) + `Timer` completo (por-timer `time_scale`, `restart`, getters, ciclos descartados contados)
 - [x] **Steering** - Seek, flee, arrive, pursue, evade, wander, flock, obstacle avoidance
-- [x] **Pathfinding** - A* grid, navigation mesh (básico), dynamic obstacles
+      - ⚠️ **escrito y probado, pero detrás de `-Dsteering` (off)**: `world.nearby` mide ~16 µs por llamada
+- [ ] **Pathfinding** - **NO EXISTE.** No hay A*, ni navmesh, ni navegación. `line_of_sight` sí (`physics.line_of_sight`).
+      - La versión anterior de este doc lo marcaba como hecho: mentía.
 - [x] **Input System** - Keyboard, mouse, gamepad, action mapping, action buffer
-- [x] **UI System (Básico)** - Layout, widgets, focus, navegación, temas
+- [x] **UI System** - El del editor (ImGui) **y** el de juego (M14: Label, Button, Panel, ProgressBar, fuentes TTF)
 
 ### ✅ M7 ILUMINACIÓN 2D - COMPLETO
 - [x] **4 Tipos Luz** - Point, Spot, Directional, Ambient (LightBase compartido)
@@ -420,10 +425,12 @@ recolectaban nunca (el mismo fallo, en pequeño):
 
 ---
 
-## ❌ M9 FX / PARTÍCULAS - NO INICIADO
-- [ ] **GPU Particles** - Compute shader, 100k particles ≤ 1ms GPU
-- [ ] **Soft Bloom** - For lights
-- [ ] **Scene Transitions** - Fades
+## 🟡 M9 FX / PARTÍCULAS - PARCIAL
+- [ ] **GPU Particles** - Compute shader, 100k particles ≤ 1ms GPU — **NO EXISTE.**
+      Las partículas actuales son de CPU (`ParticleEmitter2D` con backend `.cpu`).
+- [x] **Soft Bloom** - For lights (`render/light.zig`, medido)
+- [x] **Scene Transitions** - Fades (`render/fade.zig` + `scene.fade_*`)
+- [x] **Fog / Tonemap** - En el pase de post (`render/shaders/post.wgsl`)
 
 ---
 
@@ -449,25 +456,29 @@ recolectaban nunca (el mismo fallo, en pequeño):
 
 ---
 
-## ❌ M13 ANIMATION - NO INICIADO (Gap más grande)
-- [ ] **AnimationClip** - Tracks: value, sprite, method
-- [ ] **AnimationPlayer** - play/stop/pause/seek/speed/queue
-- [ ] **AnimationTree** - BlendSpace1D, OneShot, StateMachine, BlendTree
-- [ ] **Root Motion** - Per-clip transform drive
+## ✅ M13 ANIMATION - HECHO (falta el árbol de blend)
+- [x] **AnimationClip** - Tracks: value, sprite, method
+- [x] **AnimationPlayer** - play/stop/pause/seek/speed/queue (`anim.*`, 14 funciones)
+- [x] **Root Motion** - Per-clip transform drive (`applyRootMotion`)
+- [ ] **AnimationTree** - BlendSpace1D, OneShot, StateMachine, BlendTree — **NO EXISTE**
 
 ---
 
-## ❌ M14 TEXT + UI - NO INICIADO
-- [ ] **Font Atlas** - TTF → SDF/bitmap, glyph metrics
-- [ ] **Text Pipeline** - Batch on sprite renderer
-- [ ] **UI Scene Graph** - Canvas, Control, Label, Button, ProgressBar
-- [ ] **HUD** - Bars, counters, anchored to screen size
+## ✅ M14 TEXT + UI - HECHO
+- [x] **Font Atlas** - TTF → atlas de glifos (stb_truetype), métricas por glifo
+- [x] **Text Pipeline** - Batch sobre el renderer de sprites
+- [x] **UI Scene Graph** - Canvas, Label, Button, Panel, ProgressBar (`ui.*`)
+- [x] **HUD** - Bars, counters, anclados al tamaño de pantalla
+- [ ] **Rich text / markup** - bold, color spans, wrapping (backlog, M19)
 
 ---
 
-## ❌ M15 TILEMAP - NO INICIADO
+## ❌ M15 TILEMAP - NO INICIADO (aparcado)
 - [ ] **TileSet** - Atlas regions, physics layers, autotiling (16/47-blob/Wang)
 - [ ] **TileMapLayer** - Chunked storage, dirty-chunk upload, viewport culling
+      - Los TIPOS existen (`components/tilemap.zig`, `render/tilemap.zig`, `physics/tilemap.zig`),
+        pero el componente **no está registrado** (`registry.zig`: "M15 PARKED") y el módulo
+        `tilemap.*` de Lua **no está instalado** (`bindings.zig`). Documentado pero inalcanzable.
 - [ ] **Tile Collision** - Per-tile collision, nav cost, triggers
 
 ---
@@ -489,7 +500,7 @@ recolectaban nunca (el mismo fallo, en pequeño):
 | Gap | Nota | Home propuesto |
 |---|---|---|
 | **Shaders / Material System** | M2 dice "simple materials"; no user shader path | M18 |
-| **Navmesh** | M4.5 grid A* done; navmesh baking unplaced | M18 |
+| **Navmesh** | M4.5 **NO** trae grid A* (no existe A* todavía); el navmesh bake queda sin sitio | M18 |
 | **Skeletal Animation / IK** | M13 is sprite/transform only; 2D rig unplaced | M18/M19 |
 | **Save slots & settings** | Bit-exact serialize exists; no user-facing slots | M19 |
 | **Input remapping** | Action mapping in M3; rebinding at runtime unplaced | M19 |
