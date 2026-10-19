@@ -211,7 +211,15 @@ fn scrollBody(ctx: *ui.Context) void {
             shown += 1;
             continue;
         }
-        if (r.clicked) ed.select(e);
+        if (r.clicked) {
+            // Ctrl+click ADDS to the selection: the same gesture the viewport
+            // uses, so the two panels speak one language.
+            if (ctrlHeld()) {
+                ed.selectAdd(e);
+            } else {
+                ed.select(e);
+            }
+        }
         if (r.activated) ed.beginRename(e);
 
         // Fold chevron for parents, laid OVER the row's own icon cell: the row
@@ -249,6 +257,14 @@ fn scrollBody(ctx: *ui.Context) void {
 /// hierarchy does not show is a multi-selection the user cannot see.
 fn isSelected(ed: *Editor, e: Entity) bool {
     return ed.isSelected(e);
+}
+
+/// Is a modifier held? ImGui owns the keyboard state (the window feeds it),
+/// so the panel asks ImGui rather than the platform layer — one input path,
+/// and the one that knows whether a text field is focused.
+fn ctrlHeld() bool {
+    return ui.cimgui.ember_ui_is_key_down(@intFromEnum(ui.keys.Key.LeftCtrl)) != 0 or
+        ui.cimgui.ember_ui_is_key_down(@intFromEnum(ui.keys.Key.RightCtrl)) != 0;
 }
 
 /// The kinds a hierarchy row accepts, declared once — the row's `drop` needs a

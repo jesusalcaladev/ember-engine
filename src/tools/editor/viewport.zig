@@ -1410,6 +1410,8 @@ test "viewport: the marquee catches what it touches" {
     // A box that reaches the second one catches both.
     const two = entitiesInRect(&world, -15, 115, -15, 15, out[0..]);
     try testing.expectEqual(@as(usize, 2), two);
+    try testing.expectEqual(a.index, out[0].index);
+    try testing.expectEqual(b.index, out[1].index);
 
     // An INVISIBLE sprite is not caught: a selection of something the user
     // cannot see is a selection they cannot make.
@@ -1418,8 +1420,14 @@ test "viewport: the marquee catches what it touches" {
     try testing.expectEqual(@as(usize, 2), vis);
 
     // A box that touches an entity's EDGE catches it: "did the box touch it"
-    // is the question, not "did the box swallow it".
+    // is the question, not "did the box swallow it". The first sprite spans
+    // x ∈ [-10, 10], so a box from 9 catches it.
     const edge = entitiesInRect(&world, 9, 12, -2, 2, out[0..]);
     try testing.expectEqual(@as(usize, 1), edge);
-    try testing.expectEqual(b.index, out[0].index);
+    try testing.expectEqual(a.index, out[0].index);
+
+    // And the second one, which is a hundred units away, is not caught by it.
+    const far = entitiesInRect(&world, 9, 12, -2, 2, out[0..]);
+    try testing.expectEqual(@as(usize, 1), far);
+    try testing.expectEqual(a.index, out[0].index);
 }

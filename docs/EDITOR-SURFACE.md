@@ -201,7 +201,7 @@ Build against this list as things to request, not things to use.
 | **Prefab / scene instantiation** | `SceneId` exists on the ECS side; there is no binding to instantiate one from another. **Done**: flat prefabs with a sidecar (M5.7). |
 | **File dialogs / paths** | None. The editor will need an IO binding that does not exist. **Still open**: the editor writes paths it is given. |
 | **Docking / panels / tabs** | No UI, so no answer, and the generic component API is the only lever. **Done in the editor's own right**: fixed docks, draggable seams, one workspace tab bar (M5.7). |
-| **Selection state** | There is `physics.overlap_rect` for picking, but no engine-side selection model, no multi-select, no a "current object" the inspector binds to. **Partly done**: the current object, its gizmo and the inspector's binding are here (M5.8); the multi-select and the marquee are not. |
+| **Selection state** | There is `physics.overlap_rect` for picking, but no engine-side selection model, no multi-select, no a "current object" the inspector binds to. **Done**: the session model holds the selection SET (`model.selected()`), the editor keeps the current object for the inspector, and the viewport's marquee fills the set. The gizmo still edits the current object alone. |
 | **Gizmos / handles** | No. `physics.reshape` is the primitive they would drive, but drawing and hitting them is editor work. **Done**: move / rotate / scale handles over the selection (M5.8). The handles over `physics.reshape` and `occluder.set_polygon` are still open. |
 | **Rich text** | M14. `sprite.texture` is the only text you can draw today. |
 

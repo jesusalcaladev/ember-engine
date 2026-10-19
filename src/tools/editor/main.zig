@@ -461,6 +461,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer physics_sys.deinit();
 
+    // The collision signal reaches LUA. The physics publishes contacts on the
+    // world's typed bus, which only the Zig listeners see — so without this
+    // bridge a script could not react to being touched, which in a 2D game is
+    // the same as saying a script cannot play the game.
+    behaviors.bridgeCollisions(world) catch |err| {
+        log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
+    };
+
     // Collision overlay. Collected OUTSIDE the frame's allocation guard because
     // its buffer grows with the body count; the reservation below is the only
     // place it is allowed to allocate. See the push loop in the render section

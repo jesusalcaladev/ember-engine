@@ -120,6 +120,37 @@ what is under the pointer. Priority is the sprite's render layer, then its
 stable `order`, then slot order: what you see on top is what you pick. The
 current selection's handles beat everything else within a few pixels.
 
+## The selection is a set, and the current object is one of them
+
+Two things, because they are two different things:
+
+- **the SET** — what is selected. It lives in the session model
+  (`model.selected()`), which has had one since M1; the editor was keeping a
+  second, single-entity selection of its own, which is worse than no
+  multi-select at all.
+- **the CURRENT object** — the one the inspector binds to. It is the editor's
+  `selection`, and it is always one of the set (or nothing).
+
+| Gesture | What it does |
+|---|---|
+| Click an entity | Replaces the selection; the entity becomes current |
+| Ctrl+click an entity | Adds to the selection; the entity becomes current |
+| Drag on empty space | The marquee: it catches everything the box TOUCHES and replaces the selection |
+| Click on empty space | Clears the selection |
+
+The marquee clears the selection on the RELEASE, not on the press: a press
+that turns into a drag must not have cleared the selection on the way, or a
+drag to select four things would deselect first and reselect second, and the
+undo would show it.
+
+The box TOUCHES an entity rather than containing it — a marquee that only
+caught the entities it fully swallowed would be useless on small sprites.
+
+The gizmo edits the CURRENT object alone. A group transform (one gizmo
+moving the whole selection) is the next piece, and it is not done: pretending
+it is would mean dragging one object out of a selection of four and
+watching the other three stay behind.
+
 ## The camera's own maths
 
 `ecs.camera.View` also knows how to place itself inside a render target:

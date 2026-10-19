@@ -1944,8 +1944,48 @@ test "layer names: defaults and set" {
     try testing.expectEqualStrings("Layer 4", ed.layerName(3));
 }
 
-test "describeMask: the three cases a mask can be in" {
+test "the selection is a SET, and the current object is one of them" {
     var model = try Model.init(testing.allocator, ecs.World.init(testing.allocator));
+    defer model.deinit();
+    var ed = Editor.init(testing.allocator, &model);
+    defer ed.deinit();
+
+    const world = ed.world();
+    const a = try world.spawn(.{ecs.components.Transform{}});
+    const b = try world.spawn(.{ecs.components.Transform{}});
+
+    // A plain click REPLACES the selection.
+    ed.select(a);
+    ed.preFrame();
+    try testing.expectEqual(@as(usize, 1), ed.selectedCount());
+    try testing.expect(ed.isSelected(a));
+    try testing.expect(!ed.isSelected(b));
+    try testing.expectEqual(a.index, ed.selection.?.index);
+
+    // Ctrl+click ADDS to it, and the new one becomes the current object.
+    ed.selectAdd(b);
+    ed.preFrame();
+    try testing.expectEqual(@as(usize, 2), ed.selectedCount());
+    try testing.expect(ed.isSelected(a));
+    try testing.expect(ed.isSelected(b));
+    try testing.expectEqual(b.index, ed.selection.?.index);
+
+    // Adding the same one twice does not add it twice.
+    ed.selectAdd(b);
+    ed.preFrame();
+    try testing.expectEqual(@as(usize, 2), ed.selectedCount());
+
+    // And clearing empties BOTH: the current object and the set. Clearing
+    // one and not the other leaves an editor that says "nothing is selected"
+    // and "two things are selected" at the same time.
+    ed.clearSelection();
+    ed.preFrame();
+    try testing.expectEqual(@as(usize, 0), ed.selectedCount());
+    try testing.expect(ed.selection == null);
+    try testing.expect(!ed.isSelected(a));
+}
+
+test "describeMask: the three cases a mask can be in" {    var model = try Model.init(testing.allocator, ecs.World.init(testing.allocator));
     defer model.deinit();
     var ed = Editor.init(testing.allocator, &model);
     defer ed.deinit();

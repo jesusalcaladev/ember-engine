@@ -304,7 +304,7 @@ Docks shared by both tabs: actor hierarchy, component inspector, console, asset 
 
 **Still missing before that v1 editor is honest** (from [docs/EDITOR-SURFACE.md](docs/EDITOR-SURFACE.md)):
 
-- [ ] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state). **Partly done**: the current object and its gizmo are here (M5.8); the MULTI-select and the drag-select marquee are not.
+- [x] **Selection model** — multi-select + a current object the inspector binds to (`physics.contains_point` picks; nothing holds the state). **Done**: the session model has held a selection SET since M1 and the editor was not using it; the editor now keeps the CURRENT object (the one the inspector binds to) and the model holds the set, and the viewport's marquee fills it. The gizmo still edits the current object alone — the group transform is the next piece.
 - [x] **Undo/redo** — an engine-side command journal on top of bit-exact serialization (M1). The single biggest gap. **Done**: `session/model.zig` journals every act; the editor drives it and never keeps a second stack.
 - [ ] **Project file + file dialogs** — open/save `.zson`, no ad-hoc paths.
 - [x] **Flat prefab authoring** — create from selection, instantiate, overrides visible and revertable. Storage exists since M1; the UI does not. **Done**: see below.
