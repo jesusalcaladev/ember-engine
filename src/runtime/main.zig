@@ -1396,7 +1396,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // anything writes a transform this tick. Without this the
             // renderer interpolates from the spawn position, and every moving
             // actor (and every tween) drags a line back to where it was born.
-            // world.captureTransforms(); // TEMP: measuring
+            world.captureTransforms();
             // ── M4.5: the Timer system, BEFORE the behaviors run.
             // That order is the contract a scripted timer depends on: a
             // behavior's `fixed_update` observes exactly the signals its own

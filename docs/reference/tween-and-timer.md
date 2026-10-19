@@ -144,6 +144,8 @@ return M
 
 A tween drives a **component** of an actor — the real `Transform`, the real `Sprite.tint` — so the renderer draws the result. It is not a number in a Lua table that happens to look like a position.
 
+> **A tween needs an actor.** It drives a component of one, so it is started from a behaviour (which has an entity). A **global script** has no entity and therefore cannot start one: `tween.to` returns `0` there. The game manager starts the tween *through* the actor that owns it.
+
 Every tween returns a **handle**: a small integer that identifies it until it finishes. The handle is what `tween.kill` and `tween.chain` take.
 
 ### The properties

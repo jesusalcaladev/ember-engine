@@ -160,8 +160,15 @@ pub fn main() !void {
 fn benchBoot(allocator: std.mem.Allocator) !void {
     // Warm the allocator once so the first measurement is not an outlier of
     // first-touch page faults.
+    //
+    // The warm-up gets a REAL world and a real input: `Behaviors.init` reads
+    // the world's slot count to size the spatial grid, so an `undefined` world
+    // is a segfault, not a warm-up.
+    var warm_world = try initWorld(allocator, 4);
+    defer warm_world.deinit();
+    var warm_input = script.Input{};
     var throw_away: script.Behaviors = undefined;
-    try throw_away.init(allocator, undefined, undefined);
+    try throw_away.init(allocator, &warm_world, &warm_input);
     throw_away.deinit();
 
     var world = try initWorld(allocator, 4);

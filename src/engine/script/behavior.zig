@@ -1161,6 +1161,27 @@ const reloaded_src =
     \\return M
 ;
 
+test "the tween pool is wired to the world and to the bindings" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // The pool the `tween.*` bindings reach IS the behaviors' own pool, and
+    // it writes into the behaviors' own world. A tween that drove a
+    // different world would move nothing the renderer draws.
+    const pool = h.b.ctx.tweens orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, @intFromPtr(&h.b.tweens)), @as(usize, @intFromPtr(pool)));
+
+    const e = try h.world.spawn(.{components.Transform{ .position = .{ .x = 0, .y = 0 } }});
+    const handle = pool.create(e, .position, .x, .{ .scalar = 100 }, 1.0, .{}) catch
+        return error.TestUnexpectedResult;
+    pool.tick(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), h.world.get(e, components.Transform).?.position.x, 0.001);
+    pool.tick(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), h.world.get(e, components.Transform).?.position.x, 0.001);
+    try std.testing.expect(!pool.isAlive(handle));
+}
+
 test "behavior lifecycle: start, update drives the ECS, signal dispatch" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);

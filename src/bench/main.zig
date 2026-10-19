@@ -107,12 +107,15 @@ pub fn main(init: std.process.Init) !void {
     core.log.info("budget reference: spec.md §2 and ROADMAP M1", .{});
 
     const transforms = try benchTransforms(bench_alloc);
+    const capture = try benchCapture(bench_alloc);
     const hierarchy = try benchHierarchy(bench_alloc);
     const hash_ok = try benchSaveLoad(bench_alloc);
     try benchStructural(bench_alloc);
 
     report(.{ .name = "100k transforms p50", .measured_ms = transforms.p50, .limit_ms = 2.0 });
     reportSpike(.{ .name = "100k transforms p99", .measured_ms = transforms.p99, .limit_ms = spike_limit_ms });
+    report(.{ .name = "100k interpolation snapshot p50", .measured_ms = capture.p50, .limit_ms = 2.0 });
+    reportSpike(.{ .name = "100k interpolation snapshot p99", .measured_ms = capture.p99, .limit_ms = spike_limit_ms });
     report(.{ .name = "10k hierarchy p50", .measured_ms = hierarchy.p50, .limit_ms = 2.0 });
     reportSpike(.{ .name = "10k hierarchy p99", .measured_ms = hierarchy.p99, .limit_ms = spike_limit_ms });
     report(.{ .name = "save/load hash", .measured_ms = if (hash_ok) 0 else 1, .limit_ms = 0 });
@@ -185,7 +188,61 @@ fn transform_query_checksum(world: *World) u64 {
     return sum;
 }
 
-/// 2. 10k entities in a parent/child tree, resolved flat every frame.
+/// 2. The interpolation snapshot: the walk that records where every actor
+///    was, so the renderer can draw it BETWEEN two simulation ticks.
+///
+/// It is a per-tick cost the frame pays for EVERY actor, moved or not, so it
+/// has to be measured on its own: 100k actors, half of them moving, which is
+/// a busy scene. The movers are the ones that cost (the snapshot is a write);
+/// the still ones cost a read and a compare.
+fn benchCapture(allocator: std.mem.Allocator) !FrameTimes {
+    var world = World.init(allocator);
+    defer world.deinit();
+
+    try world.reserveEntities(transforms_count);
+    try world.reserve(.{ components.Transform, components.Velocity }, transforms_count);
+
+    var i: usize = 0;
+    while (i < transforms_count) : (i += 1) {
+        _ = try world.spawn(.{
+            components.Transform{ .position = .{ .x = @floatFromInt(i % 1000), .y = 0 } },
+            components.Velocity{ .linear = .{ .x = 1.5, .y = -0.75 }, .angular = 0.1 },
+        });
+    }
+
+    var samples = try Sample.init(allocator, iterations);
+    defer samples.deinit();
+
+    world.lockAllocs(); // from here on, allocating is a bug (spec §3.1)
+    for (0..iterations) |frame| {
+        // Half the world moves, the way a real scene does: a static
+        // background and a busy foreground.
+        {
+            var q = world.query(.{ components.Transform, components.Velocity });
+            while (q.nextBatch()) |batch| {
+                const transforms = batch.slice(components.Transform);
+                const velocities = batch.slice(components.Velocity);
+                var row: usize = 0;
+                for (transforms, velocities) |*transform, velocity| {
+                    if (row % 2 == 0) {
+                        transform.position.x += velocity.linear.x * dt;
+                        transform.position.y += velocity.linear.y * dt;
+                    }
+                    row += 1;
+                }
+            }
+        }
+        const t0 = core.time.monotonicNs();
+        world.captureTransforms();
+        const elapsed = core.time.monotonicNs() - t0;
+        if (frame >= warmup) samples.record(elapsed);
+        std.mem.doNotOptimizeAway(transform_query_checksum(&world));
+    }
+    world.unlockAllocs();
+    return .{ .p50 = samples.percentile(0.50), .p99 = samples.percentile(0.99) };
+}
+
+/// 3. 10k entities in a parent/child tree, resolved flat every frame.
 fn benchHierarchy(allocator: std.mem.Allocator) !FrameTimes {
     var world = World.init(allocator);
     defer world.deinit();

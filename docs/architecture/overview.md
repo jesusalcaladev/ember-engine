@@ -222,9 +222,18 @@ Frame
 │
 ├─ 4. Input                        zone("input")
 ├─ 5. Fixed-timestep simulation    zone("fixed_update")
-│      loop.addTime(real_dt) → N steps
-│      behaviors.fixedUpdate(fixed_dt)  × N
+│      loop.addTime(scaled_dt) → N steps
+│      per step:
+│        world.captureTransforms()   ← the interpolation snapshot, FIRST
+│        ecs.timer.tick(...)         ← the timers fire their signals
+│        anim_system.update(...)     ← the clips advance
+│        behaviors.tickTweens(...)   ← the tweens move their properties
+│        behaviors.fixedUpdate(...)  × N
+│        particles.fixedUpdate(...)  ← the particles simulate
+│        anim_system.applyRootMotion(...) ← LAST
 ├─ 6. Script update + GC step      zone("script_update")
+│      behaviors.update(scaled_dt)   ← the SCALED delta: a script never
+│                                        moves faster than the world
 ├─ 7. ECS → GPU instances          zone("batch")
 │      r2d.collect(&world, loop.alpha())
 ├─ 8. Render                       zone("render")
@@ -234,6 +243,19 @@ Frame
        prof.endFrame()
        tracker.endFrame()
 ```
+
+The order **inside** the fixed step is a contract, not an accident:
+
+- The **interpolation snapshot comes first**, because `prev_*` must be the
+  position the renderer last saw, before anything writes a transform this
+  tick. Without it, everything renders interpolated from the spawn point.
+- The **timers fire before the scripts run**, so a script's `fixed_update`
+  observes exactly the signals its own timers fired this tick.
+- The **tweens run before the scripts**, for the same reason: a script reads
+  the tweened value in the same tick it was written, and a script that
+  writes the property itself has the last word.
+- The **root motion runs last**, so a solver (or a script) that wrote the
+  transform does not overwrite the clip's baked displacement.
 
 The pipeline (spec §7):
 

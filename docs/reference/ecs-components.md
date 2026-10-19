@@ -2,6 +2,11 @@
 
 **Source:** `src/engine/ecs/components.zig`
 
+> **Looking for a component to use?** The [Component Catalog](component-catalog.md)
+> is the per-component reference: what each one is for, which system drives it,
+> which Lua bindings touch it, and how they connect. This document is the other
+> half — **how** components are registered, stored and serialized.
+
 ## Overview
 
 The component registry is the single comptime source of truth for the ECS. Every
