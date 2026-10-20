@@ -78,11 +78,10 @@ pub fn textField(f: TextField) bool {
     // ImGui: the second one edits the first one's buffer.
     cimgui.ember_ui_push_id_str(cimgui.text(f.id));
 
-    // ImGui draws its own frame, so ImGui's frame is turned OFF and the field
-    // is drawn below. `FrameBg` alpha 0 is the switch: one push, one pop, and
-    // every other control in the window keeps its background.
-    cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.FrameBg), 0, 0, 0, 0);
-    cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.Border), 0, 0, 0, 0);
+    // ImGui draws the field's own frame, so the theme's frame IS the frame —
+    // and, more importantly, the value ImGui draws is not painted over by a
+    // background drawn afterwards. The custom frame used to be painted here,
+    // which meant a text field showed its PLACEHOLDER and never its value.
     cimgui.ember_ui_set_next_item_width(w);
 
     var flags: u32 = cimgui.InputTextFlags.None;
@@ -95,7 +94,6 @@ pub fn textField(f: TextField) bool {
         cimgui.ember_ui_input_text_multiline(hidden_label, f.buf, f.capacity, &size, @bitCast(flags))
     else
         cimgui.ember_ui_input_text(hidden_label, f.buf, f.capacity, @bitCast(flags));
-    cimgui.ember_ui_pop_style_color(2);
     changed = raw != 0;
 
     const r = draw.itemRect();
@@ -103,8 +101,11 @@ pub fn textField(f: TextField) bool {
     const focused = cimgui.ember_ui_is_item_focused() != 0;
     cimgui.ember_ui_pop_id();
 
-    const state: theme.State = if (focused) .active else if (hovered) .hover else .idle;
-    paintField(t, r, state, focused);
+    // The focus ring, on top of the value: the one thing that may be drawn
+    // over it.
+    if (focused) {
+        draw.itemList().rectOutline(r, t.colors.border_focus, m.radius_sm(), 1.5);
+    }
 
     // The placeholder. Drawn only when the buffer is empty, which is the
     // condition: drawing it on a non-empty buffer is how a field ends up with
@@ -294,8 +295,12 @@ pub fn numberField(n: NumberField) bool {
         widget.labelSlot(t, n.label, n.label_slot, h);
     }
     cimgui.ember_ui_push_id_str(cimgui.text(n.id));
-    cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.FrameBg), 0, 0, 0, 0);
-    cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.Border), 0, 0, 0, 0);
+    // ImGui draws the field's own frame AND its own text. A custom-painted
+    // background would have to be drawn BEFORE the widget — and the widget's
+    // rect is not known until after it ran — so the frame is ImGui's and the
+    // theme styles it. Painting it afterwards (which is what this used to do)
+    // covered the value with the background: every number field in the
+    // editor showed its unit and nothing else.
     cimgui.ember_ui_set_next_item_width(w);
     changed = cimgui.ember_ui_drag_float(
         hidden_label,
@@ -306,15 +311,19 @@ pub fn numberField(n: NumberField) bool {
         cimgui.text(n.format),
         @bitCast(cimgui.SliderFlags.AlwaysClamp),
     ) != 0;
-    cimgui.ember_ui_pop_style_color(2);
 
     const r = draw.itemRect();
     cimgui.ember_ui_pop_id();
     const list = draw.itemList();
     const hovered = cimgui.ember_ui_is_item_hovered(cimgui.HoveredFlags.None) != 0;
     const active = cimgui.ember_ui_is_item_active() != 0;
+    const focused = cimgui.ember_ui_is_item_focused() != 0;
     const state: theme.State = if (n.disabled) .disabled else if (active) .active else if (hovered) .hover else .idle;
-    paintField(t, r, state, false);
+    // The focus ring, and only the focus ring: it goes ON TOP of the value,
+    // which is the one thing that may be drawn over it.
+    if (focused) {
+        list.rectOutline(r, t.colors.border_focus, t.metrics.radius_sm(), 1.5);
+    }
 
     if (unit_w > 0) {
         list.text(

@@ -1364,8 +1364,12 @@ test "viewport: wrapPi unwraps a rotation so 359°→1° spins the short way" {
 }
 
 test "viewport: grid cell widens as the camera zooms out" {
+    // Zoomed IN, the cell HALVES: a 32-unit cell at zoom 4 is 128 px apart on
+    // screen, which is not a grid but three lonely lines. The cell adapts in
+    // both directions, and this is the direction that matters.
     const vp = Viewport{ .cam = .{ .zoom = 4 } };
-    try testing.expectEqual(grid_base, vp.gridCell());
+    try testing.expectEqual(grid_base / 2, vp.gridCell());
+    try testing.expect(vp.gridCell() * vp.cam.zoom <= grid_max_px);
     // Zoomed far out, lines every 32 world units would be sub-pixel soup:
     // the cell must double until it clears the minimum screen spacing.
     var vp_out = Viewport{ .cam = .{ .zoom = 0.3 } };
