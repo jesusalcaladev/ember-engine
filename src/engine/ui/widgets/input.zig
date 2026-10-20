@@ -286,7 +286,13 @@ pub fn numberField(n: NumberField) bool {
     const w = if (n.width > 0) n.width else draw.contentAvail().x - n.label_slot - m.gap();
 
     var changed = false;
-    widget.labelSlot(t, n.label, n.label_slot, h);
+    // A field with NO label takes no slot: `labelSlot` places what follows at
+    // an ABSOLUTE offset from the line's start, so a field that reserved one
+    // would jump back to the column it never left. That is how a row of two
+    // X/Y fields ended up drawn on top of the row's own label.
+    if (n.label.len != 0) {
+        widget.labelSlot(t, n.label, n.label_slot, h);
+    }
     cimgui.ember_ui_push_id_str(cimgui.text(n.id));
     cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.FrameBg), 0, 0, 0, 0);
     cimgui.ember_ui_push_style_color4(@intFromEnum(cimgui.Col.Border), 0, 0, 0, 0);

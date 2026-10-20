@@ -219,10 +219,14 @@ pub const Editor = struct {
     /// Last frame's wall time. The status bar reports it, and it is measured by
     /// the frame loop (the one place that already owns the clock), not by the
     /// UI: a second clock is a second definition of "frame".
-
+    frame_dt: f32 = 0,
+    /// Last frame's GPU time, in nanoseconds. Reported next to the frame's
+    /// own cost, because a frame that is 40 ms long with 5 ms of CPU in it is
+    /// a frame that is WAITING — and the two look identical on a status bar
+    /// that only shows one of them.
+    frame_gpu_ns: u64 = 0,
     /// The scene the Save menu writes and the Open menu reads. A buffer and not
     /// a slice: the toolbar edits it in place, and an editor owns its own path.
-    frame_dt: f32 = 0,
     scene_path: [256]u8 = undefined,
     scene_path_len: usize = 0,
     open_path: [256]u8 = undefined,

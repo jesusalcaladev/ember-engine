@@ -76,6 +76,39 @@ local in_attack = self:sm_is_in("attack")  -- true / false
 self:sm_set_state("attack")
 ```
 
+## Hierarchies
+
+A state can have **children**. A state with a child is **compound**: entering it
+enters the child's initial state, and the live state becomes a **path**.
+
+```lua
+-- Three states, where flat they would be five.
+sm.add_state(self, "idle", { ... })
+sm.add_state(self, "moving", { ... })        -- compound
+sm.add_child_state(self, "moving", "walk", { ... })
+sm.add_child_state(self, "moving", "run", { ... })
+sm.add_state(self, "dead", { ... })
+
+sm.add_transition(self, "moving", "stop", "idle")
+```
+
+Three things fall out of that:
+
+- **`sm.path(self)`** is the path: `"moving/walk"`, or just `"idle"` for a flat
+  machine.
+- **`sm.is_in(self, "moving")`** is true while the actor is in
+  `"moving/walk"`. The PATH decides, not the leaf — "is the actor running?" is
+  the question a hierarchy exists to answer.
+- **A transition is looked up from the deepest active state UP to the root.** A
+  child handles the events it knows, and its parent still handles the ones its
+  children ignore. So `"moving"` can react to `"stop"` while `"moving/run"`
+  reacts to `"tired"` first.
+
+The nesting is eight levels deep at most. A hierarchy deeper than that is not
+a state machine, it is a spreadsheet.
+
+---
+
 ## Callback Signatures
 
 All state callbacks receive `self` as their first argument:

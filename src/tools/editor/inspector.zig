@@ -445,19 +445,31 @@ fn drawVec2(ctx: *ui.Context, label: []const u8, v: *ecs.components.Vec2, speed:
     const gap = ctx.theme.metrics.gap();
     var changed = false;
     ui.widget.labelSlot(&ctx.theme, label, label_w, ctx.theme.metrics.row_h());
-    // Half the remaining width each, so the pair fills the row whatever the
-    // panel is wide and never spills past the inspector's edge.
-    const avail = @max(ui.draw.contentAvail().x - gap, 40);
-    const w = @max(avail * 0.5, 36);
+
+    // The two mini-labels are drawn HERE, not by the field.
+    //
+    // A field's own label slot is an ABSOLUTE offset from the line's start,
+    // and this row has already spent that column on "Position": the field
+    // would place itself at the line's start + 16 and draw its box on top of
+    // the row's label. Which is exactly what it did — the position values
+    // were unreadable because the box was sitting on the label.
+    const slot: f32 = 13;
+    // Two mini-labels and two fields have to fit in what is left of the row.
+    const avail = @max(ui.draw.contentAvail().x, 40);
+    const w = @max((avail - 2.0 * (slot + gap) - gap) * 0.5, 26);
+
     // `label` is a runtime slice (it comes from the caller's field list), so
     // the ids are assembled here instead of with `++`, which is comptime-only.
     var id_buf: [64]u8 = undefined;
     const id_x = std.fmt.bufPrint(&id_buf, "{s}.x", .{label}) catch label;
-    changed |= ui.input.numberField(.{ .ctx = ctx, .id = id_x, .label = "X", .label_slot = 16, .value = &v.x, .speed = speed, .unit = unit, .width = w });
+    ui.widget.labelSlotRelative(&ctx.theme, "X", slot, ctx.theme.metrics.row_h());
+    changed |= ui.input.numberField(.{ .ctx = ctx, .id = id_x, .value = &v.x, .speed = speed, .unit = unit, .width = w });
+
     ui.cimgui.ember_ui_same_line(0, gap);
     var id_buf2: [64]u8 = undefined;
     const id_y = std.fmt.bufPrint(&id_buf2, "{s}.y", .{label}) catch label;
-    changed |= ui.input.numberField(.{ .ctx = ctx, .id = id_y, .label = "Y", .label_slot = 16, .value = &v.y, .speed = speed, .unit = unit, .width = w });
+    ui.widget.labelSlotRelative(&ctx.theme, "Y", slot, ctx.theme.metrics.row_h());
+    changed |= ui.input.numberField(.{ .ctx = ctx, .id = id_y, .value = &v.y, .speed = speed, .unit = unit, .width = w });
     return changed;
 }
 

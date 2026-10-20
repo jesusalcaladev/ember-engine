@@ -25,6 +25,7 @@ const core_random = @import("core").random;
 const core_loop = @import("core").loop;
 const statemachine = @import("statemachine.zig");
 const tween_mod = @import("tween.zig");
+const nav_mod = @import("nav.zig");
 const spatial = @import("spatial.zig");
 const physics_mod = @import("physics");
 const assets = @import("assets");
@@ -340,6 +341,12 @@ pub const Context = struct {
     /// pointer. A zero delta is the SAFE answer — a script that multiplies by
     /// `time.delta()` gets a still frame instead of a crash.
     time: ?*core_loop.GameTime = null,
+
+    /// The navigation grid, behind the `ai.*` bindings. Null when the runtime
+    /// has not built one: a project with no colliders has nothing to
+    /// navigate, and a grid that answers from an empty world would send an
+    /// actor through a wall.
+    nav: ?*nav_mod.Grid = null,
 
     /// The hooks behind `actor.spawn` and `actor.destroy`. Null in a harness
     /// that has no behaviors wired: the two bindings then report failure

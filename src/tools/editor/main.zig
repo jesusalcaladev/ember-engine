@@ -98,6 +98,11 @@ const Args = struct {
     /// Skip the built-in scene. Useful for measuring an empty editor's own
     /// cost, which is the number the frame budget is written against.
     empty_scene: bool = false,
+    /// SMAA in the viewport. OFF by default in the editor: the scene being
+    /// edited is flat 2D art, and SMAA is three full-screen passes — the most
+    /// expensive thing in the frame on a weak GPU, spent on edges the editor
+    /// does not draw. The GAME keeps it.
+    smaa: bool = false,
 };
 
 fn parseArgs(init: std.process.Init.Minimal) Args {
@@ -121,6 +126,8 @@ fn parseArgs(init: std.process.Init.Minimal) Args {
             if (it.next()) |v| args.frames = std.fmt.parseInt(u64, v, 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--empty-scene")) {
             args.empty_scene = true;
+        } else if (std.mem.eql(u8, arg, "--smaa")) {
+            args.smaa = onOff(arg, false);
         }
     }
     return args;
@@ -306,7 +313,7 @@ pub fn main(init: std.process.Init) !void {
         window.nativeHandle(),
         window.fb_width,
         window.fb_height,
-        .{ .max_sprites = 50_000 },
+        .{ .max_sprites = 50_000, .vsync = args.vsync, .smaa = args.smaa },
     );
     var renderer = dawn.renderer();
     defer renderer.deinit();
@@ -612,7 +619,7 @@ pub fn main(init: std.process.Init) !void {
     // confusing the editor's own paused state.
     var game_time = core.loop.GameTime.init(fixed_dt);
     behaviors.ctx.time = &game_time;
-    var limiter = core.loop.FrameLimiter.init(60, args.vsync);
+    var limiter = core.loop.FrameLimiter.init(60, false);
     var view_w: f32 = @floatFromInt(window.fb_width);
     var view_h: f32 = @floatFromInt(window.fb_height);
 
@@ -632,11 +639,8 @@ pub fn main(init: std.process.Init) !void {
     var tiles_pushed: usize = 0;
     while (true) {
         // Frame limiter
-        const t_loop0 = core.time.monotonicNs();
         const pacing = limiter.wait(core.time.monotonicNs());
         limiter.sleep(pacing.wait_ns);
-        const t_after_limit = core.time.monotonicNs();
-
         if (has_window) {
             window.poll();
             if (window.shouldClose()) break;
@@ -776,14 +780,12 @@ pub fn main(init: std.process.Init) !void {
         // guard, and the `draw` inside the frame only reads the cache this
         // warmed. Re-lexing inside the guard is how the editor died on its
         // first keystroke with "allocation of 132 bytes outside the frame".
-        const t_a = core.time.monotonicNs();
         if (has_window) {
             pane.handleInput(&window.input);
             pane.handleText(&window.input);
         }
         pane.applyRequests();
         _ = pane.tokens() catch {};
-        const t_b = core.time.monotonicNs();
 
         // ── TileMap brush, OUTSIDE the frame ───────────────────────────────
         //
@@ -843,10 +845,8 @@ pub fn main(init: std.process.Init) !void {
         if (editor.viewport.takeEdited() and editor.play == .stopped) physics_dirty = true;
         if (editor.viewport.tool != .tile) tilemap.hover = null;
 
-        const t_c = core.time.monotonicNs();
         // ── Editor pre-frame (queued edits, asset refresh, scene replace) ─────
         editor.preFrame();
-        const t_d = core.time.monotonicNs();
         if (editor.should_quit) break;
         if (editor.takeSceneReplaced()) {
             physics_dirty = true;
@@ -864,7 +864,6 @@ pub fn main(init: std.process.Init) !void {
         // in the next `preFrame`, on the safe side.
         _ = editor.tickAutosave(editor.frame_dt);
 
-        const t_preframe = core.time.monotonicNs();
         // ── The allocation-guarded frame ───────────────────────────────────
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
@@ -886,11 +885,8 @@ pub fn main(init: std.process.Init) !void {
         // ONE call: the shell owns every panel, including the code pane and the
         // tilemap tool. Drawing them here as well is what used to put two
         // copies of each window on screen.
-        const t_nf = core.time.monotonicNs();
         ui_ctx.newFrame(real_dt);
-        const t_nf1 = core.time.monotonicNs();
         editor_shell.draw(&editor, &ui_ctx, fb_w, geom);
-        const t_shell = core.time.monotonicNs();
 
         // The viewport's gizmo: the selection, the handles and the hover
         // ghost. Drawn on ImGui's BACKGROUND list, so it is over the scene
@@ -901,13 +897,15 @@ pub fn main(init: std.process.Init) !void {
             // The marquee is drawn on the same list: it is the selection that
             // does not exist yet.
             editor.viewport.drawMarquee(&ui_ctx);
+            // The readouts live in the region's corner, not in the toolbar:
+            // a toolbar is for controls.
+            editor.viewport.drawReadout(&ui_ctx);
         }
 
         // The viewport's HUD: the tools, the gizmo modes, the toggles and the
         // readouts. It lives INSIDE the viewport region, so it never covers a
         // dock.
         editor.viewport.drawHud(&ui_ctx);
-        const t_hud = core.time.monotonicNs();
 
         // ── Fixed-step simulation ──────────────────────────────────────────
         // The Play menu is not decoration: stopped means the world does not
@@ -954,7 +952,6 @@ pub fn main(init: std.process.Init) !void {
         // backend's sprite emitter returns early when no scene is active, so an
         // editor that skipped this compiled, ran, and showed a black window
         // with zero draw calls — no error anywhere to point at the omission.
-        const t_scene0 = core.time.monotonicNs();
         renderer.beginScene(target, sceneCamera(camera_view, fb_w, fb_h));
 
         // The editor grid: layer 0, pushed FIRST — the batcher's stable sort
@@ -998,12 +995,10 @@ pub fn main(init: std.process.Init) !void {
 
         r2d.submit(renderer);
 
-        const t_scene1 = core.time.monotonicNs();
 
         // ── Lighting ───────────────────────────────────────────────────────
         const lighting_env = lighting_driver.Driver.environmentOf(world, defaultEnvironment());
         _ = lighting.render(world, &r2d, renderer, lighting_env, 0);
-        const t_light = core.time.monotonicNs();
 
         // Fader
         fader.update(real_dt);
@@ -1014,8 +1009,7 @@ pub fn main(init: std.process.Init) !void {
         // and the UI was therefore painted over by the scene every frame: the
         // draw data was real (thousands of vertices per frame) and nothing was
         // on screen.
-        renderer.endScene(false, .Medium);
-        const t_compose = core.time.monotonicNs();
+        renderer.endScene(args.smaa, .Medium);
 
         // ── Editor overlay on top ──────────────────────────────────────────
         //
@@ -1035,34 +1029,11 @@ pub fn main(init: std.process.Init) !void {
         }.draw);
 
         renderer.present();
-        const t_present = core.time.monotonicNs();
-        if (frame_count % 60 == 0) {
-            const ms = struct {
-                fn f(a: u64, b: u64) f64 {
-                    return @as(f64, @floatFromInt(b - a)) / 1e6;
-                }
-            }.f;
-            log.info("PHASE limit {d:.2} pre {d:.2} imgui {d:.2} scene {d:.2} light {d:.2} compose {d:.2} present {d:.2} | pane {d:.2} brush {d:.2} preframe {d:.2} ms | ui lists {d} verts {d} | newframe {d:.2} shell {d:.2} gizmo {d:.2} | gpu {d:.2} ms passes {d} post {d}", .{
-                ms(t_loop0, t_after_limit),
-                ms(t_after_limit, t_preframe),
-                ms(t_preframe, t_scene0),
-                ms(t_scene0, t_scene1),
-                ms(t_scene1, t_light),
-                ms(t_light, t_compose),
-                ms(t_compose, t_present),
-                ms(t_a, t_b),
-                ms(t_b, t_c),
-                ms(t_c, t_d),
-                ui_stats[0],
-                ui_stats[1],
-                ms(t_nf, t_nf1),
-                ms(t_nf1, t_shell),
-                ms(t_shell, t_hud),
-                @as(f64, @floatFromInt(renderer.stats().gpu_ns)) / 1e6,
-                renderer.stats().render_passes,
-                renderer.stats().post_passes,
-            });
-        }
+        // The frame's GPU cost, for the status bar. The editor's own CPU cost
+        // is the frame time; the GPU's is the GPU's, and the two together are
+        // what the frame is made of. Reporting one without the other is how
+        // a display-bound editor looks like a CPU problem.
+        editor.frame_gpu_ns = renderer.stats().gpu_ns;
 
         // Close the frame: the arena drains and the tracker's allocation guard
         // is disarmed. Without `endFrame` the guard stays armed from the first

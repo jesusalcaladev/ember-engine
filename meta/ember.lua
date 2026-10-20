@@ -1312,6 +1312,85 @@ function flow.is_in(self, name) end
 function flow.stack(self) end
 
 
+-- ── sm ──
+---Declares a state as a CHILD of `parent`, which makes the parent COMPOUND: entering it enters the child's initial state, and the live state becomes a PATH — "running/walk". This is what turns sixteen flat states into three: "idle", "moving" (with "walk" and "run" under it) and "dead" are three states with a hierarchy, where flat they would be sixteen.
+---@param self Actor 
+---@param parent string the state to nest under
+---@param name string the child state's name
+---@param hooks table optional: enter, update, exit
+---@return boolean true when the state was declared
+function sm.add_child_state(self, parent, name, hooks) end
+
+---The live state path, joined with "/". "running/walk" for a compound state with an active child, and just "idle" for a flat one.
+---@param self Actor 
+---@return string the state path
+function sm.path(self) end
+
+---Declares a state with optional `enter`/`update`/`exit` callbacks.
+---@param self Actor 
+---@param name string state name, unique within the machine
+---@param hooks any? #{}# table with optional enter/update/exit functions
+---@return boolean true when the state was declared
+function sm.add_state(self, name, hooks) end
+
+---Moves from one state to another when an event is fired.
+---@param self Actor 
+---@param from string state the transition starts in
+---@param event string event name that triggers it
+---@param to string state to enter
+function sm.add_transition(self, from, event, to) end
+
+---Sets the state entered when the machine starts.
+---@param self Actor 
+---@param name string state to start in
+function sm.set_initial(self, name) end
+
+---Requests a transition; applied before the next update.
+---@param self Actor 
+---@param event string event name
+function sm.fire(self, event) end
+
+---Jumps to a state immediately, running exit then enter.
+---@param self Actor 
+---@param name string state to enter now
+function sm.set_state(self, name) end
+
+---The active state's name; empty before the first update.
+---@param self Actor 
+---@return string the current state name
+function sm.state(self) end
+
+---True when the machine is currently in that state.
+---@param self Actor 
+---@param name string state name to test
+---@return boolean true when the active state is `name`
+function sm.is_in(self, name) end
+
+
+-- ── ai ──
+---A path across the level, as waypoints. The waypoints are the navigation grid's CELL CENTRES, so a walker that steers towards them stays on walkable ground. The path excludes the start and includes the goal; an empty table means "no path". The grid is a uniform one rastered from the level's colliders, so the path knows about walls — and not about ledges, or gaps narrower than a cell.
+---@param x1 number the start x
+---@param y1 number the start y
+---@param x2 number the goal x
+---@param y2 number the goal y
+---@return table the waypoints, each a table with x and y
+function ai.pathfind(x1, y1, x2, y2) end
+
+---Whether an actor can stand at that position, according to the navigation grid.
+---@param x number the position x
+---@param y number the position y
+---@return boolean true when the cell is walkable
+function ai.is_walkable(x, y) end
+
+---Rasterizes the navigation grid again. The grid is a snapshot of the level, so a level that changed — a door opened, a wall fell — needs a new one. It is a LOAD-TIME operation: it allocates, and the frame does not.
+---@return boolean true when the grid was rebuilt
+function ai.rebuild() end
+
+---The navigation grid's cell size, in world units. A cell should be about the size of an actor: smaller and the grid gets huge, bigger and the paths get ragged.
+---@return number the cell size in world units
+function ai.cell_size() end
+
+
 -- ── tween ──
 ---Animates a component property of this actor towards a value. Returns a handle: a number that identifies the tween until it finishes. The property is a component field, optionally with a sub-field: "position", "position.x", "rotation", "scale", "tint", "tint.a", "color", "energy", "radius", "value", "duration".
 ---@param self Actor 
@@ -1573,48 +1652,6 @@ function noise.fbm(x, y, octaves, basis) end
 ---@param basis string? #"perlin"# "value", "perlin" or "simplex"
 ---@return number ridge height in [0, 1]
 function noise.ridged(x, y, octaves, basis) end
-
-
--- ── sm ──
----Declares a state with optional `enter`/`update`/`exit` callbacks.
----@param self Actor 
----@param name string state name, unique within the machine
----@param hooks any? #{}# table with optional enter/update/exit functions
----@return boolean true when the state was declared
-function sm.add_state(self, name, hooks) end
-
----Moves from one state to another when an event is fired.
----@param self Actor 
----@param from string state the transition starts in
----@param event string event name that triggers it
----@param to string state to enter
-function sm.add_transition(self, from, event, to) end
-
----Sets the state entered when the machine starts.
----@param self Actor 
----@param name string state to start in
-function sm.set_initial(self, name) end
-
----Requests a transition; applied before the next update.
----@param self Actor 
----@param event string event name
-function sm.fire(self, event) end
-
----Jumps to a state immediately, running exit then enter.
----@param self Actor 
----@param name string state to enter now
-function sm.set_state(self, name) end
-
----The active state's name; empty before the first update.
----@param self Actor 
----@return string the current state name
-function sm.state(self) end
-
----True when the machine is currently in that state.
----@param self Actor 
----@param name string state name to test
----@return boolean true when the active state is `name`
-function sm.is_in(self, name) end
 
 
 -- ── world ──

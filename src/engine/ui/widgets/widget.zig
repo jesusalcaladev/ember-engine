@@ -91,6 +91,30 @@ pub fn labelSlot(t: *const theme.Theme, label: []const u8, slot_w: f32, h: f32) 
     cimgui.ember_ui_same_line(slot_w, t.metrics.gap());
 }
 
+/// A label in a fixed-width slot, RELATIVE to where the cursor is.
+///
+/// `labelSlot` is absolute: it places what follows at `slot_w` from the LINE's
+/// start, which is what a table wants and what a row inside a row cannot use.
+/// The second label of a row (the "X" of an X/Y pair) would jump back to the
+/// column it never left — and, in the inspector, land on top of the row's own
+/// label.
+///
+/// The slot is still FIXED, so the things after it line up: the label is
+/// padded to the slot's width, and what follows starts at the same x every
+/// time.
+pub fn labelSlotRelative(t: *const theme.Theme, label: []const u8, slot_w: f32, h: f32) void {
+    if (label.len != 0) {
+        cimgui.ember_ui_text_colored(t.colors.text_dim.pack(), cimgui.text(label));
+        // Stay on this line, right after the text.
+        cimgui.ember_ui_same_line(0, 0);
+        const pad = slot_w - draw.textSize(label).x;
+        if (pad > 0) cimgui.ember_ui_dummy(pad, h);
+    } else {
+        cimgui.ember_ui_dummy(slot_w, h);
+    }
+    cimgui.ember_ui_same_line(0, t.metrics.gap());
+}
+
 /// Draws a text item with an explicit colour, without the push/pop ceremony at
 /// every call site. `TextUnformatted` has no colour overload in 1.92 and
 /// `TextColored` takes a FORMAT string, which turns a `%` in a user-visible

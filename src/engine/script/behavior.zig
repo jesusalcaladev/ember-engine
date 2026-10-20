@@ -35,6 +35,7 @@ const context = @import("context.zig");
 const statemachine_mod = @import("statemachine.zig");
 const physics_mod = @import("physics");
 const tween_mod = @import("tween.zig");
+const nav_mod = @import("nav.zig");
 const spatial_mod = @import("spatial.zig");
 const steer_mod = @import("steer.zig");
 const build_options = @import("options");
@@ -1418,6 +1419,148 @@ fn globalRefOfSelfHook(ctx: ?*anyopaque, L: ?*lua_State, idx: c_int) i32 {
         if (got != null and got == want) return g.self_ref;
     }
     return statemachine_mod.no_ref;
+}
+
+// ── The hierarchical state machine ───────────────────────────────────────────
+
+const hierarchy_script_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.log = {}
+    \\  sm.add_state(self, "idle", { enter = function(self) table.insert(self.log, "idle") end })
+    \\  sm.add_state(self, "moving", { enter = function(self) table.insert(self.log, "moving") end })
+    \\  sm.add_child_state(self, "moving", "walk", { enter = function(self) table.insert(self.log, "walk") end })
+    \\  sm.add_child_state(self, "moving", "run", { enter = function(self) table.insert(self.log, "run") end })
+    \\  sm.add_transition(self, "idle", "go", "moving")
+    \\  sm.add_transition(self, "moving", "stop", "idle")
+    \\  sm.set_initial(self, "idle")
+    \\end
+    \\function M:update(dt)
+    \\  if self.fire_now then
+    \\    self.fire_now = false
+    \\    sm.fire(self, self.fire_now_event or "go")
+    \\  end
+    \\end
+    \\return M
+;
+
+test "a hierarchical machine nests a child under a compound state" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("hierarchy.lua", hierarchy_script_src);
+    const e = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e, sid);
+    h.b.startAll();
+
+    // The machine enters its initial state on its first tick, so the path is
+    // empty until then.
+    h.b.update(1.0 / 60.0);
+
+    const L = h.b.vm.state().?;
+    // The actor's `self`, published as a global for the test chunk.
+    lua.lua_createtable(L, 0, 1); // [T]
+    lua.lua_createtable(L, 0, 1); // [T, self]
+    bindings.stampEntityForTest(L, e);
+    lua.setField(L, -2, "__actor_self");
+    lua.setGlobal(L, "T");
+
+    const script =
+        \\local self = T.__actor_self
+        \\if sm.path(self) ~= "idle" then return 1 end
+        \\sm.fire(self, "go")
+        \\if sm.path(self) ~= "idle" then return 2 end
+        \\return 0
+    ;
+    h.b.vm.loadBuffer(script, "hierarchy_test") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.TestUnexpectedResult;
+    const step = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    if (step != 0) std.debug.print("hierarchy test stopped at step {d}\n", .{step});
+    try std.testing.expectEqual(@as(f32, 0), step);
+
+    // The transition applies on the NEXT tick (deferred, like every `sm.fire`).
+    h.b.update(1.0 / 60.0);
+    var path_buf: [statemachine_mod.max_depth * (statemachine_mod.max_name_len + 1)]u8 = undefined;
+    const path = readSelfPath(&h.b, e, &path_buf);
+    // Entering the compound "moving" enters its child "walk": the path is
+    // "moving/walk".
+    try std.testing.expectEqualStrings("moving/walk", path);
+    // And the compound counts as "in" while its child is active — that is the
+    // question a hierarchy exists to answer.
+    try std.testing.expect(isInState(&h.b, e, "moving"));
+    try std.testing.expect(isInState(&h.b, e, "walk"));
+    try std.testing.expect(!isInState(&h.b, e, "idle"));
+}
+
+/// The live state path of the behavior attached to an entity, written into the
+/// caller's buffer.
+///
+/// The buffer is the caller's because the path is BUILT into it: returning a
+/// slice of a local would be a dangling pointer, and a test that reads one
+/// would compare against garbage.
+fn readSelfPath(b: *Behaviors, entity: Entity, out: []u8) []const u8 {
+    const reg = b.ctx.machines orelse return "";
+    const bi = reg.bindingFor(entity.index) orelse return "";
+    return reg.pathName(bi, out);
+}
+
+/// Whether the behavior attached to an entity is in `name` (or under it).
+fn isInState(b: *Behaviors, entity: Entity, name: []const u8) bool {
+    const reg = b.ctx.machines orelse return false;
+    const bi = reg.bindingFor(entity.index) orelse return false;
+    return reg.pathContains(bi, name);
+}
+
+// ── The navigation grid ─────────────────────────────────────────────────────
+
+test "the navigation grid finds a path AROUND a wall" {
+    var world = ecs.World.init(std.testing.allocator);
+    defer world.deinit();
+
+    // A wall in two pieces, with a GAP between them: the lower piece reaches
+    // y = 0 and the upper one starts at y = 50.
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 100, .y = -50 } },
+        components.Collider2D{ .kind = 0, .size = .{ .x = 12, .y = 50 } },
+    });
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 100, .y = 100 } },
+        components.Collider2D{ .kind = 0, .size = .{ .x = 12, .y = 50 } },
+    });
+
+    var grid = try nav_mod.Grid.build(std.testing.allocator, &world, 24);
+    defer grid.deinit();
+
+    // The wall is not walkable; the ground beside it is.
+    try std.testing.expect(!grid.isWalkable(.{ .x = 100, .y = -50 }));
+    try std.testing.expect(grid.isWalkable(.{ .x = 50, .y = 0 }));
+
+    var path: [nav_mod.max_waypoints]components.Vec2 = undefined;
+    const n = grid.pathfind(.{ .x = 50, .y = 0 }, .{ .x = 150, .y = 0 }, &path);
+    try std.testing.expect(n > 0);
+
+    // The path goes THROUGH THE GAP: it climbs above the lower wall's top.
+    var went_up = false;
+    for (path[0..n]) |p| {
+        if (p.y > 10) went_up = true;
+    }
+    try std.testing.expect(went_up);
+}
+
+test "a sensor is walkable: a trigger is something you walk through" {
+    var world = ecs.World.init(std.testing.allocator);
+    defer world.deinit();
+    _ = try world.spawn(.{
+        components.Transform{ .position = .{ .x = 0, .y = 0 } },
+        components.Collider2D{ .kind = 0, .size = .{ .x = 40, .y = 40 }, .is_sensor = true },
+    });
+
+    var grid = try nav_mod.Grid.build(std.testing.allocator, &world, 24);
+    defer grid.deinit();
+    // The whole level is the trigger, and the whole level is walkable.
+    try std.testing.expect(grid.isWalkable(.{ .x = 0, .y = 0 }));
 }
 
 // ── Spawn, find and destroy ─────────────────────────────────────────────────

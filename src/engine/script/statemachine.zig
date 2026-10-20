@@ -39,6 +39,9 @@ pub const max_machines = 64;
 /// How many states a flow's stack holds. A game's phases nest a couple of
 /// levels deep: playing → paused → a confirmation dialog on top of that.
 pub const max_stack = 16;
+/// How many levels a state path may nest. A hierarchy of eight is already
+/// deeper than a game's state machine has any business being.
+pub const max_depth = 8;
 /// How many entities can be attached to machines at once. Sized for a full
 /// enemy roster; the tick walks this array, so it is the number that decides the
 /// frame cost of the whole subsystem.
@@ -73,6 +76,16 @@ pub const State = struct {
     enter_ref: i32 = no_ref,
     update_ref: i32 = no_ref,
     exit_ref: i32 = no_ref,
+    /// The CHILD MACHINE of this state; 0 for a leaf.
+    ///
+    /// A state with a child is COMPOUND: entering it enters the child's
+    /// initial state, and the live state is the PATH — the compound and the
+    /// leaf below it.
+    ///
+    /// This is what turns sixteen flat states into three: "idle", "moving"
+    /// (with "walk" and "run" under it) and "dead" are three STATES with a
+    /// hierarchy, where flat they would be sixteen.
+    child: u32 = 0,
 };
 
 /// `event` moves the machine from `from` to `to` when fired. States are stored
@@ -103,7 +116,14 @@ pub const Binding = struct {
     machine: u32 = 0,
     /// The behavior's `self` table, passed as `self` to every callback.
     self_ref: i32 = no_ref,
-    /// Index of the active state; `no_state` before the first tick.
+    /// The active state PATH, outermost first.
+    ///
+    /// `path[0]` is the root machine's state and `path[depth - 1]` the leaf.
+    /// A flat machine is a path of one.
+    path: [max_depth]u8 = undefined,
+    /// How deep the path is. 0 = not started.
+    depth: u8 = 0,
+    /// The deepest state of the path — the one whose `update` runs.
     current: u8 = no_state,
     /// A transition requested by `sm_fire` earlier this frame, applied at the
     /// top of the next tick. Deferred rather than immediate so a callback that
@@ -112,6 +132,9 @@ pub const Binding = struct {
 
     pub const no_state = 255;
 };
+
+/// Where a child state landed: the machine that holds it and its index there.
+pub const ChildRef = struct { machine: u32, state: u8 };
 
 pub const Error = error{
     OutOfMemory,
@@ -199,6 +222,78 @@ pub const Registry = struct {
         m.states[idx].name.set(name);
         m.state_count += 1;
         return idx;
+    }
+
+    /// Adds a state as a CHILD of `parent`, and returns its index in the
+    /// CHILD machine.
+    ///
+    /// The parent becomes compound: entering it enters the child's initial
+    /// state, and the live state is the path — "running/walk".
+    ///
+    /// The child lives in its own machine, in the same registry: a machine is
+    /// a set of states and transitions, and a hierarchy of them is a tree of
+    /// them.
+    pub fn addChildState(
+        self: *Registry,
+        machine_id: u32,
+        parent: []const u8,
+        name: []const u8,
+    ) Error!ChildRef {
+        if (machine_id == 0 or machine_id >= self.machine_count) return error.NoSuchMachine;
+        const m = &self.machines[machine_id];
+        const p = self.findState(m, parent) orelse return error.NoSuchState;
+        var child_id = m.states[p].child;
+        if (child_id == 0) {
+            child_id = self.createMachine();
+            if (child_id == 0) return error.MachineLimitReached;
+            m.states[p].child = child_id;
+        }
+        const idx = try self.addState(child_id, name);
+        return .{ .machine = child_id, .state = idx };
+    }
+
+    /// The path of the live state, joined with "/".
+    ///
+    /// "running/walk" for a compound state with an active child, and just
+    /// "idle" for a flat one. The buffer is the caller's: the path is built
+    /// once per query, not once per frame.
+    pub fn pathName(self: *const Registry, binding_index: usize, out: []u8) []const u8 {
+        if (binding_index >= self.binding_count) return "";
+        const b = &self.bindings[binding_index];
+        var len: usize = 0;
+        var level: u8 = 0;
+        while (level < b.depth) : (level += 1) {
+            const m = self.machineAtLevel(b, level) orelse break;
+            const idx = b.path[level];
+            if (idx >= m.state_count) break;
+            const name = m.states[idx].name.slice();
+            if (len + name.len + 1 > out.len) break;
+            if (level != 0) {
+                out[len] = '/';
+                len += 1;
+            }
+            @memcpy(out[len .. len + name.len], name);
+            len += name.len;
+        }
+        return out[0..len];
+    }
+
+    /// Whether the live path CONTAINS `name` — the state itself or any of
+    /// its ancestors.
+    ///
+    /// "is the actor running?" is true while it is in "running/walk", and
+    /// that is the question a hierarchy exists to answer.
+    pub fn pathContains(self: *const Registry, binding_index: usize, name: []const u8) bool {
+        if (binding_index >= self.binding_count) return false;
+        const b = &self.bindings[binding_index];
+        var level: u8 = 0;
+        while (level < b.depth) : (level += 1) {
+            const m = self.machineAtLevel(b, level) orelse continue;
+            const idx = b.path[level];
+            if (idx >= m.state_count) continue;
+            if (m.states[idx].name.eql(name)) return true;
+        }
+        return false;
     }
 
     pub fn setInitial(self: *Registry, machine_id: u32, name: []const u8) Error!void {
@@ -318,22 +413,36 @@ pub const Registry = struct {
             if (b.machine == 0 or b.machine >= self.machine_count) continue;
             const m = &self.machines[b.machine];
 
-            if (b.current == Binding.no_state) {
+            if (b.depth == 0) {
+                b.depth = 0;
+                b.path[0] = m.initial;
+                b.depth = 1;
                 b.current = m.initial;
-                self.callState(m, b, b.current, .enter);
+                self.callState(m, b, m.initial, .enter);
+                // A compound root enters its child.
+                const root = &m.states[m.initial];
+                if (root.child != 0 and root.child < self.machine_count) {
+                    const cm = &self.machines[root.child];
+                    self.enterState(cm, b, cm.initial);
+                }
             }
 
             // A transition requested by `fire` during the previous frame's
             // `update`, applied before this frame's `update` so the new state's
             // update runs the same frame it was entered.
             if (b.pending.len != 0) {
-                if (self.applyTransition(m, b)) {
-                    self.callState(m, b, b.current, .enter);
-                }
+                _ = self.applyTransition(b);
                 b.pending.len = 0;
             }
 
-            self.callState(m, b, b.current, .update);
+            // The UPDATE runs on the deepest state — the leaf — because that is
+            // the state the actor is really in.
+            if (b.depth > 0) {
+                const leaf_level = b.depth - 1;
+                if (self.machineAtLevel(b, leaf_level)) |lm| {
+                    self.callState(lm, b, b.path[leaf_level], .update);
+                }
+            }
         }
         // The flow, after the per-entity machines: the game's phase is the
         // slowest thing in the game, and a state that reads the world reads
@@ -346,21 +455,94 @@ pub const Registry = struct {
     /// `exit` runs on the state being LEFT, before `current` moves — that order
     /// is what lets an `exit` clean up what its `enter` set up, and it is why
     /// the caller only has to fire `enter` afterwards.
-    fn applyTransition(self: *Registry, m: *Machine, b: *Binding) bool {
-        for (m.transitions[0..m.transition_count]) |t| {
-            if (t.from != b.current) continue;
-            if (!t.event.eql(b.pending.slice())) continue;
-            if (t.to == b.current) return false; // self-transition: nothing to do
-            self.callState(m, b, b.current, .exit);
-            b.current = t.to;
-            return true;
+    // ── The state path ──────────────────────────────────────────────────────
+
+    /// The machine that owns the state at `level` of the path.
+    ///
+    /// Walks DOWN from the root, following each state's child machine. The
+    /// root is the binding's own machine; every level below is the child of
+    /// the state above it.
+    fn machineAtLevel(self: *const Registry, b: *const Binding, level: u8) ?*const Machine {
+        if (level >= b.depth) return null;
+        var m: *const Machine = &self.machines[b.machine];
+        var i: u8 = 0;
+        while (i < level) : (i += 1) {
+            const st = &m.states[b.path[i]];
+            if (st.child == 0 or st.child >= self.machine_count) return null;
+            m = &self.machines[st.child];
+        }
+        return m;
+    }
+
+    /// Enters a state and, if it is compound, its child's initial state.
+    ///
+    /// The path GROWS: a compound state pushes itself and then its child
+    /// pushes the leaf under it. The depth is bounded by `max_depth`, and a
+    /// path that would go deeper is stopped rather than overflowing.
+    fn enterState(self: *Registry, m: *const Machine, b: *Binding, state_index: u8) void {
+        if (b.depth >= max_depth) return;
+        if (state_index >= m.state_count) return;
+        b.path[b.depth] = state_index;
+        b.depth += 1;
+        b.current = state_index;
+        self.callState(m, b, state_index, .enter);
+        // A compound state enters its child: the child's INITIAL state, and
+        // the child's own children under it.
+        const st = &m.states[state_index];
+        if (st.child != 0 and st.child < self.machine_count) {
+            const cm = &self.machines[st.child];
+            self.enterState(cm, b, cm.initial);
+        }
+    }
+
+    /// Exits the path from the deepest level up to (and including) `level`.
+    ///
+    /// The order is deepest first — a child's `exit` runs before its parent's
+    /// — so a parent can still read the child's state while it cleans up.
+    fn exitToLevel(self: *Registry, b: *Binding, level: u8) void {
+        while (b.depth > level) {
+            const depth = b.depth;
+            const idx = b.path[depth - 1];
+            // The machine that owns the state being exited, looked up with the
+            // path still INTACT. The path shrinks as we go, and a lookup after
+            // the shrink finds the WRONG machine (or none) — which is how the
+            // exit hook stopped running at all.
+            if (self.machineAtLevel(b, depth - 1)) |m| {
+                if (idx < m.state_count) self.callState(m, b, idx, .exit);
+            }
+            b.depth -= 1;
+        }
+        b.current = if (b.depth > 0) b.path[b.depth - 1] else Binding.no_state;
+    }
+
+    /// Applies the pending event, looking for a transition from the DEEPEST
+    /// active state up to the root.
+    ///
+    /// The leaf first is what makes a hierarchy useful: a child state can
+    /// handle an event its parent does not care about, and a parent can still
+    /// handle the events its children ignore. The first match wins, so the
+    /// deepest state that knows the event decides.
+    fn applyTransition(self: *Registry, b: *Binding) bool {
+        var level = b.depth;
+        while (level > 0) {
+            level -= 1;
+            const m = self.machineAtLevel(b, level) orelse continue;
+            for (m.transitions[0..m.transition_count]) |t| {
+                if (t.from != b.path[level]) continue;
+                if (!t.event.eql(b.pending.slice())) continue;
+                if (t.to == b.path[level]) return false; // self-transition
+                // Out of the states below this level, then into the target.
+                self.exitToLevel(b, level);
+                self.enterState(m, b, t.to);
+                return true;
+            }
         }
         return false;
     }
 
     const Hook = enum { enter, update, exit };
 
-    fn callState(self: *Registry, m: *Machine, b: *Binding, state_index: u8, hook: Hook) void {
+    fn callState(self: *Registry, m: *const Machine, b: *Binding, state_index: u8, hook: Hook) void {
         if (state_index >= m.state_count) return;
         const ref = switch (hook) {
             .enter => m.states[state_index].enter_ref,

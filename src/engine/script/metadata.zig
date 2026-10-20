@@ -3032,6 +3032,102 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "sm.add_child_state",
+        .module = "sm",
+        .signature = "sm.add_child_state(self, parent, name, hooks?) -> boolean",
+        .summary = "Declares a state as a CHILD of `parent`, which makes the parent COMPOUND: entering it enters the child's initial state, and the live state becomes a PATH — \"running/walk\". This is what turns sixteen flat states into three: \"idle\", \"moving\" (with \"walk\" and \"run\" under it) and \"dead\" are three states with a hierarchy, where flat they would be sixteen.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+            .{ .name = "parent", .kind = .string, .doc = "the state to nest under" },
+            .{ .name = "name", .kind = .string, .doc = "the child state's name" },
+            .{ .name = "hooks", .kind = .table, .doc = "optional: enter, update, exit" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the state was declared" },
+        },
+        .example =
+        \\sm.add_state(self, "moving", { enter = function(self) end })
+        \\sm.add_child_state(self, "moving", "walk", { enter = function(self) end })
+        \\sm.add_child_state(self, "moving", "run", { enter = function(self) end })
+        ,
+    },
+    .{
+        .name = "sm.path",
+        .module = "sm",
+        .signature = "sm.path(self) -> string",
+        .summary = "The live state path, joined with \"/\". \"running/walk\" for a compound state with an active child, and just \"idle\" for a flat one.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor },
+        },
+        .returns = &.{
+            .{ .kind = .string, .doc = "the state path" },
+        },
+        .example =
+        \\if sm.path(self) == "moving/run" then ... end
+        ,
+    },
+    .{
+        .name = "ai.pathfind",
+        .module = "ai",
+        .signature = "ai.pathfind(x1, y1, x2, y2) -> table",
+        .summary = "A path across the level, as waypoints. The waypoints are the navigation grid's CELL CENTRES, so a walker that steers towards them stays on walkable ground. The path excludes the start and includes the goal; an empty table means \"no path\". The grid is a uniform one rastered from the level's colliders, so the path knows about walls — and not about ledges, or gaps narrower than a cell.",
+        .params = &.{
+            .{ .name = "x1", .kind = .number, .doc = "the start x" },
+            .{ .name = "y1", .kind = .number, .doc = "the start y" },
+            .{ .name = "x2", .kind = .number, .doc = "the goal x" },
+            .{ .name = "y2", .kind = .number, .doc = "the goal y" },
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "the waypoints, each a table with x and y" },
+        },
+        .example =
+        \\local path = ai.pathfind(x, y, 900, 300)
+        \\if #path > 0 then self:walk_towards(path[1]) end
+        ,
+    },
+    .{
+        .name = "ai.is_walkable",
+        .module = "ai",
+        .signature = "ai.is_walkable(x, y) -> boolean",
+        .summary = "Whether an actor can stand at that position, according to the navigation grid.",
+        .params = &.{
+            .{ .name = "x", .kind = .number, .doc = "the position x" },
+            .{ .name = "y", .kind = .number, .doc = "the position y" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the cell is walkable" },
+        },
+        .example =
+        \\if not ai.is_walkable(x + 32, y) then self:turn_around() end
+        ,
+    },
+    .{
+        .name = "ai.rebuild",
+        .module = "ai",
+        .signature = "ai.rebuild() -> boolean",
+        .summary = "Rasterizes the navigation grid again. The grid is a snapshot of the level, so a level that changed — a door opened, a wall fell — needs a new one. It is a LOAD-TIME operation: it allocates, and the frame does not.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the grid was rebuilt" },
+        },
+        .example =
+        \\ai.rebuild()   -- the door opened
+        ,
+    },
+    .{
+        .name = "ai.cell_size",
+        .module = "ai",
+        .signature = "ai.cell_size() -> number",
+        .summary = "The navigation grid's cell size, in world units. A cell should be about the size of an actor: smaller and the grid gets huge, bigger and the paths get ragged.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the cell size in world units" },
+        },
+        .example =
+        \\local step = ai.cell_size()
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

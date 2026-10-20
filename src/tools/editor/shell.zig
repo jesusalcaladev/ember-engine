@@ -339,45 +339,12 @@ fn gripBody(ctx: *ui.Context) void {
 
 // ── Panel bodies ───────────────────────────────────────────────────────────
 
-/// Times one panel's body and reports it every 60 frames.
-pub fn shell_timing(name: []const u8, t0: i128) void {
-    const dt = @as(f64, @floatFromInt(@as(i128, @intCast(engine.core.time.monotonicNs())) - t0)) / 1e6;
-    for (&shell_times) |*entry| {
-        if (std.mem.eql(u8, entry.key, name)) {
-            entry.value = dt;
-            break;
-        }
-    }
-    shell_frames += 1;
-    if (shell_frames % 60 == 0) {
-        var buf: [512]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        for (shell_times) |entry| {
-            w.print("{s} {d:.2} ", .{ entry.key, entry.value }) catch {};
-        }
-        std.log.info("PANELS {s}", .{buf[0..w.end]});
-    }
-}
-
-var shell_times: [8]struct { key: []const u8, value: f64 } = .{
-    .{ .key = "hierarchy", .value = 0 },
-    .{ .key = "inspector", .value = 0 },
-    .{ .key = "assets", .value = 0 },
-    .{ .key = "console", .value = 0 },
-    .{ .key = "tilemap", .value = 0 },
-    .{ .key = "pane", .value = 0 },
-    .{ .key = "status", .value = 0 },
-    .{ .key = "tabs", .value = 0 },
-};
-var shell_frames: usize = 0;
 //
 // `ui.layout.floating` takes a `*const fn(*Context) void` and Zig has no
 // closures, so each body reaches the editor through `ed_mod.active` — set once
 // per frame by `draw` and cleared at the end of it.
 
 fn drawHierarchy(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("hierarchy", t0);
     const ed = ed_mod.active.?;
     const count = ed.model.entityCount();
     var buf: [48]u8 = undefined;
@@ -386,32 +353,24 @@ fn drawHierarchy(ctx: *ui.Context) void {
 }
 
 fn drawInspector(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("inspector", t0);
     const ed = ed_mod.active.?;
     header(ctx, "Inspector");
     inspector_mod.draw(ed, ctx);
 }
 
 fn drawAssets(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("assets", t0);
     const ed = ed_mod.active.?;
     header(ctx, "Assets");
     ed.assets.draw(ctx);
 }
 
 fn drawConsole(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("console", t0);
     const ed = ed_mod.active.?;
     header(ctx, "Console");
     console_mod.draw(&ed.console, ctx);
 }
 
 fn drawTilemap(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("tilemap", t0);
     const ed = ed_mod.active.?;
     // Did the user drag the tool? The window's position is not the one the
     // shell put there, so the tool is theirs now and stops following the
@@ -429,8 +388,6 @@ fn drawTilemap(ctx: *ui.Context) void {
 }
 
 fn drawPane(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("pane", t0);
     const ed = ed_mod.active.?;
     if (ed.pane) |pane| {
         pane.drawContents(ctx, 0);
@@ -919,8 +876,6 @@ fn playColor(t: *const ui.Theme, state: ed_mod.PlayState) ui.Rgba {
 /// WIDTHS, and `spacerToEnd` positions the next item at the edge rather than
 /// its right end.
 fn drawStatus(ctx: *ui.Context) void {
-    const t0 = @as(i128, @intCast(engine.core.time.monotonicNs()));
-    defer shell_timing("status", t0);
     const ed = ed_mod.active.?;
     const t = &ctx.theme;
 
@@ -940,11 +895,19 @@ fn drawStatus(ctx: *ui.Context) void {
     list.text(.{ .x = bar.min.x, .y = y }, t.colors.text_dim, left);
 
     // Right cluster, measured and drawn right to left from the bar's edge.
-    var tail_buf: [64]u8 = undefined;
+    var tail_buf: [96]u8 = undefined;
     const fps: f32 = if (ed.frame_dt > 0) 1 / ed.frame_dt else 0;
-    const tail = std.fmt.bufPrint(&tail_buf, "   ·   {d:.0} fps   ·   {d:.1} ms", .{
+    // The GPU's share of the frame, next to the frame's own cost.
+    //
+    // One number without the other is how a display-bound editor looks like a
+    // CPU problem: the frame is 40 ms, the editor's own work is 5 ms, and the
+    // other 35 ms is the display refusing to take another frame. Saying so is
+    // the difference between "the editor is slow" and "the editor is waiting".
+    const gpu_ms = @as(f64, @floatFromInt(ed.frame_gpu_ns)) / 1e6;
+    const tail = std.fmt.bufPrint(&tail_buf, "   ·   {d:.0} fps   ·   {d:.1} ms   ·   gpu {d:.1} ms", .{
         fps,
         ed.frame_dt * 1000.0,
+        gpu_ms,
     }) catch "";
 
     const state = playLabel(ed.play);

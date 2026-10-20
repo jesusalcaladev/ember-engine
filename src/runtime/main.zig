@@ -1004,6 +1004,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
     };
 
+    // ── The navigation grid, rastered from the level's colliders ───────────
+    // The `ai.*` bindings read it: a path is an A* over it. It is built HERE,
+    // at load time, because it allocates — and a search, which happens inside
+    // a frame, must not.
+    var nav_grid = engine.script.nav.Grid.build(boot_alloc, &world, engine.script.nav.default_cell) catch |err| {
+        log.warn("navigation grid: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer nav_grid.deinit();
+    behaviors.ctx.nav = &nav_grid;
+
     // ── The scene, and the behaviors its actors run ────────────────────────
     // AFTER the globals are mounted (a global's `start` may want to know what
     // the scene contains) and BEFORE the first frame, so the world that the

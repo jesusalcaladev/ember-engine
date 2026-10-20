@@ -18,7 +18,8 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`vec2`](#vec2) | 2D vector math: distance, length, normalization, dot/cross, rotation |
 | [`rand`](#rand) | Deterministic random numbers (floats, ints, chance, gauss, shuffle, choice) |
 | [`noise`](#noise) | Procedural noise (value, Perlin, simplex, fBm, ridged) |
-| [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit) |
+| [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit), with a **hierarchy** |
+| [`ai`](#ai) | The navigation grid and the path across it (A*) |
 | [`physics`](#physics) | Rigid-body queries: raycasts, line of sight, solver counters, activity tiers |
 | [`audio`](#audio) | The mixer: play_file, play_stream, buses, solo/sends, stats |
 | [`sound`](#sound) | This actor's `SoundEmitter2D`: play, stop, volume/pitch, radius, is_playing, describe |
@@ -1916,6 +1917,33 @@ self:sm_add_state("idle", {
 })
 ```
 
+### `sm.add_child_state(self, parent, name, hooks)`
+
+| | |
+|---|---|
+| **Signature** | `sm.add_child_state(self, parent, name, hooks?) -> boolean` |
+| **Parameters** | `self` — `Actor`; `parent` — `string` — the state to nest under; `name` — `string` — the child state's name; `hooks` — `table` — optional `{ enter, update, exit }` |
+| **Returns** | `boolean` — true when the state was declared |
+| **Description** | Declares a state as a **CHILD** of `parent`, which makes the parent **compound**: entering it enters the child's initial state, and the live state becomes a **path** — `"running/walk"`. |
+
+This is what turns sixteen flat states into three: `"idle"`, `"moving"` (with `"walk"` and `"run"` under it) and `"dead"` are three states with a hierarchy, where flat they would be sixteen.
+
+```lua
+sm.add_state(self, "moving", { enter = function(self) self.moving = true end })
+sm.add_child_state(self, "moving", "walk", { enter = function(self) self.speed = 100 end })
+sm.add_child_state(self, "moving", "run", { enter = function(self) self.speed = 250 end })
+```
+
+A transition is looked up **from the deepest active state up to the root**: a child handles the events it knows, and its parent still handles the ones its children ignore.
+
+### `sm.path(self)`
+
+| | |
+|---|---|
+| **Signature** | `sm.path(self) -> string` |
+| **Returns** | `string` — the live state path, joined with `"/"` |
+| **Description** | `"running/walk"` for a compound state with an active child, and just `"idle"` for a flat one. |
+
 ### `sm.add_transition(self, from, event, to)`
 
 | | |
@@ -1992,6 +2020,10 @@ log.info("enemy is: " .. self:sm_state())
 
 ### `sm.is_in(self, name)`
 
+> The **path** decides, not the leaf: "is the actor running?" is true while it
+> is in `"running/walk"`, because that is the question a hierarchy exists to
+> answer. A flat machine is a path of one, so nothing changes for it.
+
 | | |
 |---|---|
 | **Signature** | `self:sm_is_in(name) -> boolean` |
@@ -2003,6 +2035,49 @@ log.info("enemy is: " .. self:sm_state())
 ```lua
 if self:sm_is_in("attack") then self.hitbox_on = true end
 ```
+
+---
+
+## `ai`
+
+The navigation grid and the path over it. The grid is a UNIFORM one, rastered from the level's colliders, and an A* search finds a path across it.
+
+The grid is the cheap answer to the expensive question. A navmesh is the "right" answer, but baking it from the level's geometry is a whole subsystem; a grid of cells costs one byte per cell and answers "can I walk from here to there" in microseconds. What it cannot do is find a path through a gap narrower than a cell, or along a ledge — and the honest answer to "is a grid enough" is "for most 2D games, yes".
+
+### `ai.pathfind(x1, y1, x2, y2)`
+
+| | |
+|---|---|
+| **Signature** | `ai.pathfind(x1, y1, x2, y2) -> table` |
+| **Parameters** | `x1`, `y1` — the start; `x2`, `y2` — the goal |
+| **Returns** | `table` — the waypoints, each a table with `x` and `y` |
+| **Description** | A path across the level. The waypoints are the grid's **cell centres**, so a walker that steers towards them stays on walkable ground. The path excludes the start and includes the goal; an empty table means "no path". |
+
+```lua
+local path = ai.pathfind(x, y, 900, 300)
+if #path > 0 then self:walk_towards(path[1]) end
+```
+
+### `ai.is_walkable(x, y)`
+
+| | |
+|---|---|
+| **Signature** | `ai.is_walkable(x, y) -> boolean` |
+| **Description** | Whether an actor can stand at that position, according to the grid. |
+
+### `ai.rebuild()`
+
+| | |
+|---|---|
+| **Signature** | `ai.rebuild() -> boolean` |
+| **Description** | Rasterizes the grid again. The grid is a **snapshot** of the level, so a level that changed — a door opened, a wall fell — needs a new one. It allocates, so it belongs to a load, not to a frame. |
+
+### `ai.cell_size()`
+
+| | |
+|---|---|
+| **Signature** | `ai.cell_size() -> number` |
+| **Description** | The grid's cell size, in world units. A cell should be about the size of an actor: smaller and the grid gets huge, bigger and the paths get ragged. |
 
 ---
 

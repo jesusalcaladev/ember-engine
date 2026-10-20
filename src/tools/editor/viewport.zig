@@ -120,6 +120,9 @@ const max_zoom: f32 = 12.0;
 const grid_base: f32 = 32.0;
 /// A grid line is never drawn closer together than this on screen (pixels).
 const grid_min_px: f32 = 24.0;
+/// ...and never FURTHER apart than this, or a zoomed-in view is three lonely
+/// lines instead of a grid.
+const grid_max_px: f32 = 96.0;
 /// Handle hit radius, in screen pixels.
 const handle_hit_px: f32 = 11.0;
 /// How long the move arrows are, in screen pixels.
@@ -353,9 +356,19 @@ pub const Viewport = struct {
     }
 
     /// The grid pitch that IS drawn this frame — and what Move-snap follows.
+    ///
+    /// It adapts in BOTH directions, and the second direction is the one that
+    /// matters when you zoom in: a grid whose cell is 400 pixels wide is not a
+    /// grid, it is three lonely lines with very thick strokes between them.
+    /// The cell halves until the lines are a comfortable distance apart, and
+    /// doubles when they would be a smear.
+    ///
+    /// The cell is also the SNAP step, so what you snap to is exactly what you
+    /// see — at any zoom.
     pub fn gridCell(vp: *const Viewport) f32 {
         var cell = grid_base;
         while (cell * vp.cam.zoom < grid_min_px) cell *= 2;
+        while (cell * vp.cam.zoom > grid_max_px) cell /= 2;
         return cell;
     }
 
@@ -876,9 +889,12 @@ pub const Viewport = struct {
 
         // World axes through the origin, in the two colors Godot taught
         // everyone to read: red across (X), green down (Y).
+        //
+        // One pixel wide, like every other line: an axis that is thicker
+        // than the grid it belongs to reads as a bug, not as an emphasis.
         _ = r2d.pushInstance(.{
             .pos = .{ vp.cam.cx, 0 },
-            .half = .{ vp.cam.viewport_w / zoom, 1.5 / zoom },
+            .half = .{ vp.cam.viewport_w / zoom, thin },
             .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
             .color = col_axis_x,
             .slot = debug_slot,
@@ -887,7 +903,7 @@ pub const Viewport = struct {
         });
         _ = r2d.pushInstance(.{
             .pos = .{ 0, vp.cam.cy },
-            .half = .{ 1.5 / zoom, vp.cam.viewport_h / zoom },
+            .half = .{ thin, vp.cam.viewport_h / zoom },
             .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
             .color = col_axis_y,
             .slot = debug_slot,
@@ -993,16 +1009,24 @@ pub const Viewport = struct {
     }
 
     fn drawScaleGizmo(vp: *Viewport, list: ui.draw.List, box: Box, t: *const ui.Theme) void {
-        const hot = vp.grabbed == .scale_nw or vp.grabbed == .scale_ne or
-            vp.grabbed == .scale_se or vp.grabbed == .scale_sw or
-            vp.grabbed == .scale_center or hoverHandle(vp.hover, .scale_center);
-        const col = if (hot) t.colors.accent_hover else t.colors.accent;
-
-        for (box.corners) |corner| {
-            list.rect(ui.draw.rect(corner.x - 4, corner.y - 4, corner.x + 4, corner.y + 4), col, 1);
+        // Each corner lights up on its own: a handle that highlights when the
+        // pointer is over a DIFFERENT handle tells the user nothing about
+        // which one they are about to grab.
+        const corners = [_]Handle{ .scale_nw, .scale_ne, .scale_se, .scale_sw };
+        for (box.corners, 0..) |corner, i| {
+            const hot = vp.grabbed == corners[i] or hoverHandle(vp.hover, corners[i]);
+            const col = if (hot) t.colors.accent_hover else t.colors.accent;
+            const r = ui.draw.rect(corner.x - 5, corner.y - 5, corner.x + 5, corner.y + 5);
+            list.rect(r, t.colors.surface, 1);
+            list.rectOutline(r, col, 1, 1.5);
         }
-        // The centre handle: the uniform scale.
-        list.rect(ui.draw.rect(box.centre.x - 3.5, box.centre.y - 3.5, box.centre.x + 3.5, box.centre.y + 3.5), col, 1);
+        // The centre handle: the uniform scale. It is the one the user is
+        // most likely to want, so it is the one that reads clearest.
+        const centre_hot = vp.grabbed == .scale_center or hoverHandle(vp.hover, .scale_center);
+        const ccol = if (centre_hot) t.colors.accent_hover else t.colors.accent;
+        const c = ui.draw.rect(box.centre.x - 4.5, box.centre.y - 4.5, box.centre.x + 4.5, box.centre.y + 4.5);
+        list.rect(c, t.colors.surface, 1);
+        list.rectOutline(c, ccol, 1, 1.5);
     }
 
     // ── The HUD ──────────────────────────────────────────────────────────
@@ -1018,9 +1042,11 @@ pub const Viewport = struct {
     /// means it takes the pointer over itself and the scene does not see the
     /// clicks there. That is the point of a HUD.
     ///
-    /// It is three ROWS, not one long one: a single row of nine controls is
-    /// wider than a narrow viewport, and a HUD that spills out of the region
-    /// it belongs to is a HUD over the inspector.
+    /// It is ONE ROW, horizontally: a toolbar that stacks its controls in
+    /// three lines is a panel wearing a toolbar's clothes, and it covers a
+    /// third of a small viewport. The row is wide — the icons (see
+    /// `assets/icons/README.md`) will make it narrow — but it is wide in a
+    /// way that reads as a toolbar.
     pub fn drawHud(vp: *Viewport, ctx: *ui.Context) void {
         drawing_vp = vp;
         defer drawing_vp = null;
@@ -1048,19 +1074,9 @@ pub const Viewport = struct {
     }
 
     fn hudBody(ctx: *ui.Context) void {
-        // No `SameLine` at the end of a row: ImGui breaks the line by itself
-        // when the next item does not ask to share it, which is how three
-        // rows of controls fit in a strip without a layout call that moves
-        // the cursor (and that trips ImGui's own boundary check when the
-        // window is still finding its size).
-        hudTools(ctx);
-        hudGizmos(ctx);
-        hudToggles(ctx);
-    }
-
-    /// The pointer's tools: pick, or paint.
-    fn hudTools(ctx: *ui.Context) void {
         const vp = drawing_vp orelse return;
+
+        // ── The tools ────────────────────────────────────────────────────
         if (ui.button.render(.{
             .ctx = ctx,
             .id = "tool.cursor",
@@ -1076,11 +1092,10 @@ pub const Viewport = struct {
             .variant = if (vp.tool == .tile) .primary else .ghost,
             .tooltip = "T — the TileMap brush owns left-click",
         })) vp.tool = .tile;
-    }
 
-    /// The gizmo's three verbs.
-    fn hudGizmos(ctx: *ui.Context) void {
-        const vp = drawing_vp orelse return;
+        cimgui.ember_ui_same_line(0, 10);
+
+        // ── The gizmo modes ──────────────────────────────────────────────
         if (ui.button.render(.{
             .ctx = ctx,
             .id = "gizmo.move",
@@ -1104,12 +1119,10 @@ pub const Viewport = struct {
             .variant = if (vp.gizmo == .scale) .primary else .ghost,
             .tooltip = "R — drag a corner to scale, the middle for uniform",
         })) vp.gizmo = .scale;
-    }
 
-    /// The toggles and the readouts: what the viewport is showing, where the
-    /// pointer is, and how much is selected.
-    fn hudToggles(ctx: *ui.Context) void {
-        const vp = drawing_vp orelse return;
+        cimgui.ember_ui_same_line(0, 10);
+
+        // ── The toggles ─────────────────────────────────────────────────
         if (ui.button.render(.{
             .ctx = ctx,
             .id = "vp.grid",
@@ -1126,28 +1139,37 @@ pub const Viewport = struct {
             .tooltip = "Ctrl while dragging snaps to the grid",
         })) vp.snap = !vp.snap;
 
-        cimgui.ember_ui_same_line(0, 10);
+    }
 
-        // How much is selected. A selection of five that looks like a
-        // selection of one is a lie the user cannot see through.
-        const count = vp.selected_count;
-        if (count > 1) {
-            var count_buf: [32]u8 = undefined;
-            const count_text = std.fmt.bufPrint(&count_buf, "{d} selected", .{count}) catch "?";
-            ui.text.caption(ctx, count_text);
-            cimgui.ember_ui_same_line(0, 8);
-        }
+    /// The readouts, in the region's bottom-left corner: the zoom, the
+    /// pointer's world position and how much is selected.
+    ///
+    /// They are NOT in the toolbar. A toolbar is for controls, and a toolbar
+    /// with a number on the end of it is a toolbar that is too wide to be a
+    /// toolbar — the readouts are the first thing to move when the row runs
+    /// out of room, and they read better in a corner anyway.
+    pub fn drawReadout(vp: *Viewport, ctx: *ui.Context) void {
+        const list = ui.draw.backgroundList();
+        list.pushClip(vp.region.rect(), true);
+        defer list.popClip();
 
-        var zoom_buf: [32]u8 = undefined;
-        const zoom_text = std.fmt.bufPrint(&zoom_buf, "{d:.0}%", .{vp.cam.zoom * 100}) catch "100%";
-        ui.text.caption(ctx, zoom_text);
-        cimgui.ember_ui_same_line(0, 8);
-        var pos_buf: [64]u8 = undefined;
-        const pos_text = std.fmt.bufPrint(&pos_buf, "{d:.0}, {d:.0}", .{
+        const t = &ctx.theme;
+        var buf: [128]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("{d:.0}%   {d:.0}, {d:.0}", .{
+            vp.cam.zoom * 100,
             vp.cursor_world.x,
             vp.cursor_world.y,
-        }) catch "0, 0";
-        ui.text.caption(ctx, pos_text);
+        }) catch {};
+        if (vp.selected_count > 1) {
+            w.print("   ·   {d} selected", .{vp.selected_count}) catch {};
+        }
+
+        // The corner: the region's bottom-left, one line's padding up.
+        const size = ui.draw.textSize(buf[0..w.end]);
+        const x = vp.region.x + 12;
+        const y = vp.region.y + vp.region.h - size.y - 10;
+        list.text(.{ .x = x, .y = y }, t.colors.text_dim, buf[0..w.end]);
     }
 };
 

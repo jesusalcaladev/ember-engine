@@ -29,6 +29,7 @@ const lua = @import("luajit.zig");
 const metadata = @import("api_meta");
 const context_mod = @import("context.zig");
 const tween_mod = @import("tween.zig");
+const nav_mod = @import("nav.zig");
 const assets_mod = @import("assets");
 const ecs = @import("ecs");
 
@@ -782,15 +783,142 @@ fn lua_sm_state(L: ?*lua_State) callconv(.c) c_int {
 }
 
 /// `self:sm_is_in(name) -> boolean`.
+/// `sm.is_in(self, name) -> boolean`.
+///
+/// The PATH decides, not the leaf: "is the actor running?" is true while it
+/// is in "running/walk", because that is the question a hierarchy exists to
+/// answer.
 fn lua_sm_is_in(L: ?*lua_State) callconv(.c) c_int {
     const reg = machinesOf(L) orelse return 0;
     const bi = machineBindingOf(L, 1) orelse return 0;
     const name = lua.toSlice(L, 2) orelse return 0;
-    const want = reg.stateIndex(reg.bindings[bi].machine, name) orelse return 0;
-    const cur = reg.currentState(bi);
-    lua.lua_pushboolean(L, @intFromBool(cur == want));
+    return pushBool(L, reg.pathContains(bi, name));
+}
+
+/// `sm.add_child_state(self, parent, name, hooks?) -> boolean`.
+///
+/// Declares a state as a CHILD of `parent`, which makes the parent COMPOUND:
+/// entering it enters the child's initial state, and the live state becomes a
+/// PATH — "running/walk".
+///
+/// This is what turns sixteen flat states into three: "idle", "moving" (with
+/// "walk" and "run" under it) and "dead" are three STATES with a hierarchy,
+/// where flat they would be sixteen.
+fn lua_sm_add_child_state(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const reg = ctx.machines orelse return 0;
+    const entity = entityOf(L, 1) orelse return 0;
+    const parent = lua.toSlice(L, 2) orelse return 0;
+    const name = lua.toSlice(L, 3) orelse return 0;
+
+    // The machine, created on first use, exactly as `sm.add_state` does.
+    var machine_id: u32 = 0;
+    if (reg.bindingFor(entity.index)) |bi| machine_id = reg.bindings[bi].machine;
+    if (machine_id == 0) {
+        machine_id = reg.createMachine();
+        if (machine_id == 0) return 0;
+        const self_ref = refTableAt(L, 1);
+        if (self_ref == statemachine_mod.no_ref) return 0;
+        _ = reg.attach(machine_id, self_ref) catch return 0;
+        ctx.world.add(entity, context_mod.components.StateMachine{ .machine = machine_id }) catch return 0;
+    }
+
+    const child = reg.addChildState(machine_id, parent, name) catch return 0;
+    const st = &reg.machines[child.machine].states[child.state];
+    st.enter_ref = refStateHook(L, reg, 4, "enter");
+    st.update_ref = refStateHook(L, reg, 4, "update");
+    st.exit_ref = refStateHook(L, reg, 4, "exit");
+    return pushTrue(L);
+}
+
+/// `sm.path(self) -> string` — the live state path, joined with "/".
+///
+/// "running/walk" for a compound state with an active child, and just "idle"
+/// for a flat one.
+fn lua_sm_path(L: ?*lua_State) callconv(.c) c_int {
+    const reg = machinesOf(L) orelse return 0;
+    const bi = machineBindingOf(L, 1) orelse return 0;
+    var buf: [statemachine_mod.max_depth * (statemachine_mod.max_name_len + 1)]u8 = undefined;
+    lua.pushSlice(L, reg.pathName(bi, &buf));
     return 1;
 }
+
+// ── ai: the navigation grid and the path over it ────────────────────────────
+
+/// `ai.pathfind(x1, y1, x2, y2) -> table` — a path, as waypoints.
+///
+/// The waypoints are the CELLS' centres, so a walker that steers towards them
+/// stays on walkable ground. The path EXCLUDES the start and INCLUDES the
+/// goal; an empty table means "no path".
+///
+/// The grid is a uniform one rastered from the level's colliders, so the path
+/// knows about walls and not about ledges or gaps narrower than a cell.
+fn lua_ai_pathfind(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const grid = ctx.nav orelse {
+        lua.lua_createtable(L, 0, 0);
+        return 1;
+    };
+    const x1 = lua.toF32(L, 1);
+    const y1 = lua.toF32(L, 2);
+    const x2 = lua.toF32(L, 3);
+    const y2 = lua.toF32(L, 4);
+
+    var path: [nav_mod.max_waypoints]components.Vec2 = undefined;
+    const n = grid.pathfind(.{ .x = x1, .y = y1 }, .{ .x = x2, .y = y2 }, &path);
+
+    lua.lua_createtable(L, 0, @intCast(n));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        lua.lua_createtable(L, 0, 2); // [T, wp]
+        lua.pushF32(L, path[i].x);
+        lua.setField(L, -2, "x");
+        lua.pushF32(L, path[i].y);
+        lua.setField(L, -2, "y");
+        lua.lua_rawseti(L, -2, @intCast(i + 1)); // T[i+1] = wp
+    }
+    return 1;
+}
+
+/// `ai.is_walkable(x, y) -> boolean` — whether an actor can stand there.
+fn lua_ai_is_walkable(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const grid = ctx.nav orelse return pushBool(L, false);
+    return pushBool(L, grid.isWalkable(.{ .x = lua.toF32(L, 1), .y = lua.toF32(L, 2) }));
+}
+
+/// `ai.rebuild() -> boolean` — rasterizes the navigation grid again.
+///
+/// The grid is a snapshot of the level, so a level that changed (a door
+/// opened, a wall fell) needs a new one. It is a LOAD-TIME operation: it
+/// allocates, and the frame does not.
+fn lua_ai_rebuild(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const grid = ctx.nav orelse return pushBool(L, false);
+    const fresh = nav_mod.Grid.build(ctx.world.allocator, ctx.world, grid.cell) catch return pushBool(L, false);
+    grid.deinit();
+    grid.* = fresh;
+    return pushTrue(L);
+}
+
+/// `ai.cell_size() -> number` — the grid's cell size, in world units.
+fn lua_ai_cell_size(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const grid = ctx.nav orelse {
+        lua.pushF32(L, 0);
+        return 1;
+    };
+    lua.pushF32(L, grid.cell);
+    return 1;
+}
+
+const ai_regs = [_]luaL_Reg{
+    .{ .name = "pathfind", .func = lua_ai_pathfind },
+    .{ .name = "is_walkable", .func = lua_ai_is_walkable },
+    .{ .name = "rebuild", .func = lua_ai_rebuild },
+    .{ .name = "cell_size", .func = lua_ai_cell_size },
+    .{ .name = null, .func = null },
+};
 
 const core_log = @import("core").log.scoped("lua");
 
@@ -4694,6 +4822,8 @@ const world_regs = [_]luaL_Reg{
 /// Declarative state machines (ROADMAP M4.5). Methods on `self`; the same set
 /// covers enemy AI, the player, spawners, UI screens and game flow.
 const sm_regs = [_]luaL_Reg{
+    .{ .name = "add_child_state", .func = lua_sm_add_child_state },
+    .{ .name = "path", .func = lua_sm_path },
     .{ .name = "add_state", .func = lua_sm_add_state },
     .{ .name = "add_transition", .func = lua_sm_add_transition },
     .{ .name = "set_initial", .func = lua_sm_set_initial },
@@ -6114,6 +6244,8 @@ pub const registered_names = [_][]const u8{
     "sm.add_transition",         "sm.set_initial",
     "sm.fire",                   "sm.set_state",
     "sm.state",                  "sm.is_in",
+    "sm.add_child_state",
+    "sm.path",
     // world (M4.5)
     "world.nearby",
     // physics (M4)
@@ -6332,6 +6464,11 @@ pub const registered_names = [_][]const u8{
     "tween.time_scale",
     "tween.set_time_scale",
     "tween.properties",
+    // ai: the navigation grid and the path over it
+    "ai.pathfind",
+    "ai.is_walkable",
+    "ai.rebuild",
+    "ai.cell_size",
     // flow: the global state machine, with a stack of states
     "flow.add_state",
     "flow.add_transition",
@@ -6427,6 +6564,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "timer", &timer_regs);
     installModule(L, ctx, "time", &time_regs);
     installModule(L, ctx, "tween", &tween_regs);
+    installModule(L, ctx, "ai", &ai_regs);
     installModule(L, ctx, "flow", &flow_regs);
     installModule(L, ctx, "anim", &anim_regs);
     // M14: the game UI (Label/Button/Panel/ProgressBar + layout + queries).

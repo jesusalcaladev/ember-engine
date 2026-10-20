@@ -2603,7 +2603,16 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
             0,
             0,
         };
-        wgpu.wgpuQueueWriteBuffer(self.queue, self.smaa_uniform_buf, 0, &t, SmaaUniformBytes);
+        // Into the BLEND uniform — the one the copy pass actually binds.
+        //
+        // It went into the EDGE uniform instead, which is a different buffer
+        // that only the SMAA's first pass writes. With the SMAA on, the blend
+        // uniform had been written by the SMAA's own passes, so the copy
+        // happened to read a valid texel size and the frame appeared. With the
+        // SMAA off — which is what the editor wants — nothing ever wrote it,
+        // the copy read zeros, and the scene was composed from garbage: an
+        // editor with a perfectly good viewport and nothing in it.
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.smaa_blend_uniform_buf, 0, &t, SmaaUniformBytes);
 
         // The blit reads whichever view the post pass produced. Binding the raw
         // scene unconditionally is the bug that makes bloom and fog render
