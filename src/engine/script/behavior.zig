@@ -189,12 +189,23 @@ const coroutine_src =
     \\-- them to the engine so they land in the same counter the behaviors'
     \\-- errors do: a broken coroutine has to show up in the report.
     \\local pending_errors = 0
+    \\-- The handles are numbers, and they are NOT per instance: a handle is
+    \\-- unique for the whole process, so a stale handle cannot silently
+    \\-- cancel somebody else's coroutine.
+    \\local next_handle = 0
     \\-- Starts `fn` as a coroutine on this instance.
     \\--
     \\-- `fn` is called with the instance's `self` as its argument and may call
-    \\-- the global `wait(seconds)` to pause. The coroutine is resumed by the
-    \\-- engine's fixed step.
-    \\function M.async(self, fn)
+    \\-- the global `wait(seconds)` to pause, or `self:wait_until(fn)` to pause
+    \\-- until something is true. The coroutine is resumed by the engine's
+    \\-- fixed step.
+    \\--
+    \\-- `opts.timeout` (in seconds of game time) puts a clock on it: a
+    \\-- coroutine that runs out of time is stopped and reported, instead of
+    \\-- waiting forever on a condition that will never come true.
+    \\--
+    \\-- Returns a HANDLE, which is what `self:cancel(handle)` takes.
+    \\function M.async(self, fn, opts)
     \\  if type(fn) ~= "function" then
     \\    error("async expects a function", 2)
     \\  end
@@ -203,14 +214,32 @@ const coroutine_src =
     \\    list = {}
     \\    self[LIST] = list
     \\  end
-    \\  local entry = { co = coroutine.create(fn), wait = 0, dead = false }
+    \\  local entry = {
+    \\    co = coroutine.create(fn),
+    \\    wait = 0,
+    \\    dead = false,
+    \\    cond = nil,
+    \\    timeout = nil,
+    \\    elapsed = 0,
+    \\    handle = 0,
+    \\  }
+    \\  if type(opts) == "table" and opts.timeout ~= nil then
+    \\    entry.timeout = tonumber(opts.timeout) or 0
+    \\  end
+    \\  next_handle = next_handle + 1
+    \\  entry.handle = next_handle
     \\  list[#list + 1] = entry
     \\  M.resume(self, entry)
-    \\  return true
+    \\  return entry.handle
     \\end
-    \\-- Resumes a coroutine once. A YIELD means "sleep this long"; a coroutine
-    \\-- that ERRORED is reported and dropped, exactly like a broken behavior.
+    \\-- Resumes a coroutine once. A YIELD means "sleep this long" or "sleep
+    \\-- until the condition is true"; a coroutine that ERRORED is reported and
+    \\-- dropped, exactly like a broken behavior.
     \\function M.resume(self, entry)
+    \\  if entry.cancelled then
+    \\    entry.dead = true
+    \\    return
+    \\  end
     \\  local ok, value = coroutine.resume(entry.co, self)
     \\  if not ok then
     \\    if report ~= nil then report(self, value) end
@@ -222,7 +251,15 @@ const coroutine_src =
     \\    entry.dead = true
     \\    return
     \\  end
-    \\  entry.wait = value or 0
+    \\  -- The yield value: a number is a sleep, a table with `until` is a
+    \\  -- condition to wait for.
+    \\  if type(value) == "table" and value.cond ~= nil then
+    \\    entry.cond = value.cond
+    \\    entry.wait = 0
+    \\  else
+    \\    entry.cond = nil
+    \\    entry.wait = value or 0
+    \\  end
     \\end
     \\-- Pauses the current coroutine for `seconds` of game time.
     \\--
@@ -241,6 +278,71 @@ const coroutine_src =
     \\  end
     \\  return coroutine.yield(seconds or 0)
     \\end
+    \\-- Pauses the current coroutine until `predicate` is true.
+    \\--
+    \\-- The predicate is called with the instance's `self` on every fixed
+    \\-- step, so it has to be cheap: it is called a lot, and a coroutine
+    \\-- waiting on a condition is woken the moment the condition comes true.
+    \\function M.wait_until(self, predicate)
+    \\  if type(predicate) ~= "function" then
+    \\    error("wait_until expects a function", 2)
+    \\  end
+    \\  local _, is_main = coroutine.running()
+    \\  if is_main then
+    \\    error("wait_until() only works inside a coroutine: start one with self:async(function() ... end)", 2)
+    \\  end
+    \\  return coroutine.yield({ cond = predicate })
+    \\end
+    \\-- Pauses the current coroutine until a tween finishes.
+    \\--
+    \\-- `handle` is a tween handle from `tween.to`. The tween is already
+    \\-- running: this does not start one, it waits for the one that is.
+    \\function M.await_tween(self, handle)
+    \\  return M.wait_until(self, function()
+    \\    return not tween.is_alive(handle)
+    \\  end)
+    \\end
+    \\-- Stops a coroutine. It never resumes again.
+    \\--
+    \\-- A cancelled coroutine does NOT get to clean up: Lua has no
+    \\-- `finally`, and a coroutine that is stopped mid-way is simply
+    \\-- stopped. The handle comes back so a script can tell a cancellation
+    \\-- from a coroutine that was never there.
+    \\function M.cancel(self, handle)
+    \\  local list = self[LIST]
+    \\  if list == nil then return false end
+    \\  for i = 1, #list do
+    \\    local entry = list[i]
+    \\    if entry.handle == handle then
+    \\      entry.cancelled = true
+    \\      entry.dead = true
+    \\      table.remove(list, i)
+    \\      return true
+    \\    end
+    \\  end
+    \\  return false
+    \\end
+    \\-- Stops every coroutine of this instance. Returns how many.
+    \\function M.cancel_all(self)
+    \\  local list = self[LIST]
+    \\  if list == nil then return 0 end
+    \\  local n = #list
+    \\  for i = 1, n do
+    \\    list[i].cancelled = true
+    \\    list[i].dead = true
+    \\  end
+    \\  self[LIST] = {}
+    \\  return n
+    \\end
+    \\-- Whether a coroutine is still running.
+    \\function M.alive(self, handle)
+    \\  local list = self[LIST]
+    \\  if list == nil then return false end
+    \\  for i = 1, #list do
+    \\    if list[i].handle == handle then return not list[i].dead end
+    \\  end
+    \\  return false
+    \\end
     \\-- Advances every coroutine of every instance by `dt`.
     \\function M.drive_co(insts, dt)
     \\  local n = #insts
@@ -255,10 +357,39 @@ const coroutine_src =
     \\        if entry.dead then
     \\          table.remove(list, k)
     \\        else
-    \\          entry.wait = entry.wait - dt
-    \\          if entry.wait <= 0 then
-    \\            M.resume(inst, entry)
-    \\            if entry.dead then table.remove(list, k) end
+    \\          -- The TIMEOUT: a coroutine with a clock on it that runs out
+    \\          -- of time is stopped and reported. A coroutine waiting on a
+    \\          -- condition that never comes true would otherwise wait
+    \\          -- forever, and "forever" is a bug nobody reports.
+    \\          if entry.timeout ~= nil then
+    \\            entry.elapsed = entry.elapsed + dt
+    \\            if entry.elapsed >= entry.timeout then
+    \\              entry.dead = true
+    \\              pending_errors = pending_errors + 1
+    \\              if report ~= nil then
+    \\                report(inst, "the coroutine ran out of time (" .. tostring(entry.timeout) .. "s)")
+    \\              end
+    \\            end
+    \\          end
+    \\          -- A condition: the coroutine wakes the moment it is true, and
+    \\          -- NOT before. A pending condition is not a clock: the sleep
+    \\          -- branch is skipped entirely while it is waiting.
+    \\          local waiting = false
+    \\          if not entry.dead and entry.cond ~= nil then
+    \\            local ok = entry.cond(inst)
+    \\            if ok then
+    \\              entry.cond = nil
+    \\              entry.wait = 0
+    \\            else
+    \\              waiting = true
+    \\            end
+    \\          end
+    \\          if not entry.dead and not waiting then
+    \\            entry.wait = entry.wait - dt
+    \\            if entry.wait <= 0 then
+    \\              M.resume(inst, entry)
+    \\              if entry.dead then table.remove(list, k) end
+    \\            end
     \\          end
     \\        end
     \\        k = k - 1
@@ -335,6 +466,16 @@ pub const Behaviors = struct {
     /// The coroutine layer's `wait` method, injected into every instance's
     /// `self` table: `self:wait(seconds)`.
     wait_ref: i32 = no_ref,
+    /// The coroutine layer's `cancel` method: `self:cancel(handle)`.
+    cancel_ref: i32 = no_ref,
+    /// The coroutine layer's `cancel_all` method: `self:cancel_all()`.
+    cancel_all_ref: i32 = no_ref,
+    /// The coroutine layer's `wait_until` method: `self:wait_until(predicate)`.
+    wait_until_ref: i32 = no_ref,
+    /// The coroutine layer's `await_tween` method: `self:await_tween(handle)`.
+    await_tween_ref: i32 = no_ref,
+    /// The coroutine layer's `alive` method: `self:alive(handle)`.
+    alive_ref: i32 = no_ref,
     /// The coroutine layer's resume loop, driven once per fixed step.
     co_driver_ref: i32 = no_ref,
     /// The mounted GLOBAL scripts (see `GlobalInstance`). Kept in a second
@@ -514,6 +655,16 @@ pub const Behaviors = struct {
         self.async_ref = self.vm.refTop(); // ref + pop
         lua.getField(L, -1, "wait_self"); // [module, wait_self]
         self.wait_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "cancel"); // [module, cancel]
+        self.cancel_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "cancel_all"); // [module, cancel_all]
+        self.cancel_all_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "wait_until"); // [module, wait_until]
+        self.wait_until_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "await_tween"); // [module, await_tween]
+        self.await_tween_ref = self.vm.refTop(); // ref + pop
+        lua.getField(L, -1, "alive"); // [module, alive]
+        self.alive_ref = self.vm.refTop(); // ref + pop
         lua.getField(L, -1, "wait"); // [module, wait]
         lua.setGlobal(L, "wait"); // the global a coroutine calls to pause
         lua.getField(L, -1, "drive_co"); // [module, drive_co]
@@ -543,6 +694,11 @@ pub const Behaviors = struct {
         if (self.driver_ref != no_ref) self.vm.unref(self.driver_ref);
         if (self.async_ref != no_ref) self.vm.unref(self.async_ref);
         if (self.wait_ref != no_ref) self.vm.unref(self.wait_ref);
+        if (self.cancel_ref != no_ref) self.vm.unref(self.cancel_ref);
+        if (self.cancel_all_ref != no_ref) self.vm.unref(self.cancel_all_ref);
+        if (self.wait_until_ref != no_ref) self.vm.unref(self.wait_until_ref);
+        if (self.await_tween_ref != no_ref) self.vm.unref(self.await_tween_ref);
+        if (self.alive_ref != no_ref) self.vm.unref(self.alive_ref);
         if (self.co_driver_ref != no_ref) self.vm.unref(self.co_driver_ref);
         if (self.insts_table_ref != no_ref) self.vm.unref(self.insts_table_ref);
         if (self.globals_table_ref != no_ref) self.vm.unref(self.globals_table_ref);
@@ -600,6 +756,29 @@ pub const Behaviors = struct {
             }
             self.removeInstanceAt(i);
             return;
+        }
+    }
+
+    /// Puts the coroutine methods on the table on top of the stack (the
+    /// instance's `self`).
+    ///
+    /// The methods go on the INSTANCE's table, so they are found before the
+    /// prototype's `__index` — a script that defines its own `async` would be
+    /// shadowed, which is why the names are documented as the engine's.
+    fn injectCoroutineMethods(self: *Behaviors, L: ?*lua_State) void {
+        const methods = [_]struct { name: [*:0]const u8, ref: i32 }{
+            .{ .name = "async", .ref = self.async_ref },
+            .{ .name = "wait", .ref = self.wait_ref },
+            .{ .name = "cancel", .ref = self.cancel_ref },
+            .{ .name = "cancel_all", .ref = self.cancel_all_ref },
+            .{ .name = "wait_until", .ref = self.wait_until_ref },
+            .{ .name = "await_tween", .ref = self.await_tween_ref },
+            .{ .name = "alive", .ref = self.alive_ref },
+        };
+        for (methods) |m| {
+            if (m.ref == no_ref) continue;
+            self.vm.pushRef(m.ref); // [self, fn]
+            lua.setField(L, -2, m.name); // self.<name> = fn (pops fn)
         }
     }
 
@@ -725,14 +904,7 @@ pub const Behaviors = struct {
         self.scripts.instantiate(script_id); // leaves `self` on top
         // The coroutine method, the same injection a behavior gets: a global
         // can sequence too (it just cannot touch an actor).
-        if (self.async_ref != no_ref) {
-            self.vm.pushRef(self.async_ref); // [self, async]
-            lua.setField(L, -2, "async"); // self.async = async (pops async)
-        }
-        if (self.wait_ref != no_ref) {
-            self.vm.pushRef(self.wait_ref); // [self, wait]
-            lua.setField(L, -2, "wait"); // self.wait = wait (pops wait)
-        }
+        self.injectCoroutineMethods(L);
         const self_ref = self.vm.refTop(); // ref + pop `self`
 
         // 2. Record the instance and resolve its cached method refs. From the
@@ -886,14 +1058,7 @@ pub const Behaviors = struct {
         // before the prototype's `__index` — a script that defines its own
         // `async` would be shadowed, which is why the name is documented as
         // the engine's.
-        if (self.async_ref != no_ref) {
-            self.vm.pushRef(self.async_ref); // [self, async]
-            lua.setField(L, -2, "async"); // self.async = async (pops async)
-        }
-        if (self.wait_ref != no_ref) {
-            self.vm.pushRef(self.wait_ref); // [self, wait]
-            lua.setField(L, -2, "wait"); // self.wait = wait (pops wait)
-        }
+        self.injectCoroutineMethods(L);
         const self_ref = self.vm.refTop(); // ref + pop `self`
 
         // 2. Record the instance and resolve its cached method refs.
@@ -2657,6 +2822,66 @@ test "a coroutine runs, waits, and resumes on the fixed step" {
     while (i < 30) : (i += 1) h.b.fixedUpdate(1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 3), readSelfLogLength(&h.b, self_ref));
     try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 2, "c"));
+}
+
+const coroutine_control_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.log = {}
+    \\  self.frame = 0
+    \\  -- A coroutine with a clock on it that waits for a minute: the timeout
+    \\  -- has to stop it, or it waits forever.
+    \\  self:async(function(self)
+    \\    self:wait(60)
+    \\    table.insert(self.log, "never")
+    \\  end, { timeout = 0.2 })
+    \\  -- A coroutine that is cancelled before it ever waits.
+    \\  local h = self:async(function(self)
+    \\    self:wait(0.1)
+    \\    table.insert(self.log, "cancelled")
+    \\  end)
+    \\  self:cancel(h)
+    \\  -- A coroutine that waits for a CONDITION, not for a clock.
+    \\  self:async(function(self)
+    \\    self:wait_until(function() return self.done end)
+    \\    table.insert(self.log, "until")
+    \\  end)
+    \\end
+    \\function M:fixed_update()
+    \\  self.frame = self.frame + 1
+    \\  if self.frame == 20 then self.done = true end
+    \\end
+    \\return M
+;
+
+test "a coroutine can be cancelled, given a clock, and woken by a condition" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("coroutine_control.lua", coroutine_control_src);
+    const e = try h.world.spawn(.{components.Transform{}});
+    try h.b.attach(e, sid);
+    h.b.startAll();
+
+    const self_ref = h.b.instances.items[0].self_ref;
+    // Nothing has run yet: the cancelled one is gone, the other two wait.
+    try std.testing.expectEqual(@as(usize, 0), readSelfLogLength(&h.b, self_ref));
+
+    // The clock runs out at 0.2s (twelve steps): the coroutine is stopped and
+    // REPORTED, and the line it would have written never appears.
+    const before = h.b.errors;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expect(h.b.errors > before);
+    try std.testing.expectEqual(@as(usize, 0), readSelfLogLength(&h.b, self_ref));
+
+    // The condition comes true at the twentieth step, and the coroutine wakes
+    // on the step after it.
+    i = 0;
+    while (i < 10) : (i += 1) h.b.fixedUpdate(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), readSelfLogLength(&h.b, self_ref));
+    try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 0, "until"));
 }
 
 test "a coroutine that errors is reported, not fatal" {

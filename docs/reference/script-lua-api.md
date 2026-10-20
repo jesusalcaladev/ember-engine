@@ -1000,20 +1000,26 @@ if flow.is_in(self, "paused") then time.pause() end
 
 ---
 
-## Behavior methods: `async` and `wait`
+## Behavior methods: the coroutines
 
-Two methods the **engine** injects into every behavior's and global's `self`
+The methods the **engine** injects into every behavior's and global's `self`
 table. They are not module functions: they belong to the actor whose coroutine
 they belong to.
 
-### `self:async(fn)`
+### `self:async(fn, opts?)`
 
 | | |
 |---|---|
-| **Signature** | `self:async(fn) -> boolean` |
+| **Signature** | `self:async(fn, opts?) -> number` |
 | **Parameters** | `fn` — `function` — called with the actor's `self` |
-| **Returns** | `boolean` — true when the coroutine started |
-| **Description** | Starts `fn` as a **coroutine**. The function may call `self:wait(seconds)` to pause; the engine resumes it on the fixed step. A coroutine that raises an error is **logged** and the frame survives it. The name `async` is the engine's: a script that defines its own `async` in the prototype would be shadowed by it. |
+| | `opts` — `table` — optional: `timeout` (seconds of game time) |
+| **Returns** | `number` — the coroutine's **handle**, which is what `self:cancel` takes |
+| **Description** | Starts `fn` as a **coroutine**. The function may call `self:wait(seconds)` to pause, or `self:wait_until(predicate)` to pause until something is true; the engine resumes it on the fixed step. A coroutine that raises an error is **logged** and the frame survives it. The name `async` is the engine's: a script that defines its own `async` in the prototype would be shadowed by it. |
+
+`opts.timeout` puts a **clock** on the coroutine: a coroutine that runs out of
+time is stopped and reported, instead of waiting forever on a condition that
+will never come true. A timeout is measured in **game** seconds, so it slows
+down with the global time scale like everything else.
 
 ### `self:wait(seconds)`
 
@@ -1023,12 +1029,55 @@ they belong to.
 | **Parameters** | `seconds` — `number` — how long to pause, in **game** seconds |
 | **Description** | Pauses the current coroutine. The wait is measured on the fixed step, so it slows down with the global time scale and replays identically. Only valid inside a coroutine; the global `wait(seconds)` is the same function. |
 
+### `self:wait_until(predicate)`
+
+| | |
+|---|---|
+| **Signature** | `self:wait_until(predicate)` |
+| **Parameters** | `predicate` — `function` — called with the actor's `self` on every fixed step |
+| **Description** | Pauses the current coroutine until the predicate is true. The coroutine wakes the moment it is, not on the next clock. The predicate is called a lot, so it has to be cheap. Only valid inside a coroutine. |
+
+### `self:await_tween(handle)`
+
+| | |
+|---|---|
+| **Signature** | `self:await_tween(handle)` |
+| **Parameters** | `handle` — `number` — a tween handle from `tween.to` |
+| **Description** | Pauses the current coroutine until that tween finishes. It does **not** start one: it waits for the tween that is already running. Only valid inside a coroutine. |
+
+### `self:cancel(handle)` · `self:cancel_all()`
+
+| | |
+|---|---|
+| **Signature** | `self:cancel(handle) -> boolean` · `self:cancel_all() -> number` |
+| **Description** | Stops a coroutine (it never resumes again) or every coroutine of this actor, and says how many were stopped. A cancelled coroutine does **not** get to clean up: Lua has no `finally`, and a coroutine stopped mid-way is simply stopped. |
+
+### `self:alive(handle)`
+
+| | |
+|---|---|
+| **Signature** | `self:alive(handle) -> boolean` |
+| **Description** | Whether that coroutine is still running. |
+
 ```lua
 function M:start()
   self:async(function(self)
     actor.set_position(self, 0, 0)
     self:wait(1.0)              -- one second of game time
     actor.set_position(self, 100, 0)
+  end)
+
+  -- A coroutine with a clock on it, and one that waits for a condition.
+  self:async(function(self)
+    self:wait_until(function() return self.enemies_left == 0 end)
+    self:win()
+  end, { timeout = 30.0 })
+
+  -- A tween the coroutine waits for.
+  self:async(function(self)
+    local tw = tween.to(self, "position.x", 100, 0.5)
+    self:await_tween(tw)
+    self:landed()
   end)
 end
 ```

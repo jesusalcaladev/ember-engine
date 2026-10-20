@@ -281,6 +281,22 @@ for a number of **game** seconds. The engine resumes it on the fixed step, so:
 A coroutine that raises an error is **logged**, and the frame survives it —
 exactly like a behavior that raises one.
 
+The coroutine can also be **stopped**, given a **clock**, and woken by a
+**condition** instead of by the clock:
+
+```lua
+function M:start_sequence()
+  -- A handle, so it can be stopped later.
+  self.handle = self:async(function(self)
+    self:wait_until(function() return self.arrived end)
+    log.info("player: we are there")
+  end, { timeout = 10.0 })     -- and it gives up after ten seconds
+
+  -- Somewhere else:
+  -- self:cancel(self.handle)
+end
+```
+
 ---
 
 ## Step 6: run it
@@ -304,8 +320,9 @@ arrow keys, and the log should show the flow entering `menu`.
 - **Global scripts**: the game manager, the score, the flow — code with no
   actor, reached with `globals.get("name")`.
 - **The flow**: a global state machine with a stack of states.
-- **Coroutines**: `self:async(fn)` and `self:wait(seconds)` — a sequence
-  without a frame counter.
+- **Coroutines**: `self:async(fn)`, `self:wait(seconds)` and
+  `self:wait_until(predicate)` — a sequence without a frame counter, that can
+  be stopped (`self:cancel`) and can time out on its own.
 - **Input**: actions, not keys (`input.get_axis`, `input.is_action_pressed`).
 - **Movement**: `actor.move_by`, and the `vec2` normalization that keeps a
   diagonal from being faster.
