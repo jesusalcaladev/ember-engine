@@ -43,9 +43,25 @@ function M:start()
   })
 
   flow.set_initial(self, "menu")
+
+  -- The spawner: an actor created at runtime, with a behavior attached.
+  self.spawned = 0
+  self.spawn_timer = 0
 end
 
 function M:update(dt)
+  -- SPAWNING: an actor created at runtime, with a behavior attached. The
+  -- `script` option is the index of the behavior in the project's
+  -- `scripts { behavior "..." }` list — the same index a scene file's
+  -- `Script {script: 2}` means.
+  self.spawn_timer = self.spawn_timer + dt
+  if self.spawn_timer >= 2.0 and self.spawned < 3 then
+    self.spawn_timer = 0
+    self.spawned = self.spawned + 1
+    local x = 200 + self.spawned * 120
+    actor.spawn(x, 300, { name = "coin" .. self.spawned, script = 2 })
+  end
+
   -- Anyone can drive the flow, from anywhere: a signal handler, an input
   -- action, a coroutine.
   if input.is_action_pressed("pause") then

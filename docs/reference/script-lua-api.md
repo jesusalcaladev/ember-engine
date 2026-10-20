@@ -38,6 +38,54 @@ All `actor` methods take `self` as their first argument — the behavior's `self
 > physics surface, under [`physics`](#physics), because the rule they share
 > ("write the component, never the solver") only makes sense next to each other.
 
+### `actor.spawn(x, y, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `actor.spawn(x, y, opts?) -> actor` |
+| **Parameters** | `x` — `number`; `y` — `number`; `opts` — `table` — optional: `name` (a `string`), `script` (a `number`) |
+| **Returns** | `actor` — the new actor |
+| **Description** | Creates an actor at a position. It carries a `Transform` there, and the options may give it a **name** (so `actor.find_by_name` can find it) and a **script** — the index of a behavior in the project's `scripts { behavior "..." }` list, the same index a scene file's `Script {script: 2}` means. The behavior is attached and its `start` runs **immediately**, so a spawned actor is live on the same frame. |
+
+It is a **world** operation and takes no `self`: a global script — the game manager — spawns actors too, and it has no actor of its own.
+
+```lua
+local coin = actor.spawn(100, 200, { name = "coin", script = 2 })
+```
+
+### `actor.find_by_name(name)`
+
+| | |
+|---|---|
+| **Signature** | `actor.find_by_name(name) -> actor|nil` |
+| **Parameters** | `name` — `string` |
+| **Returns** | `actor` — the actor, or `nil` when there is none |
+| **Description** | The actor with that name. A world query, so it takes no `self` either. The names in a scene are unique — the loader uniquifies a duplicate — so there is exactly one answer. |
+
+```lua
+local player = actor.find_by_name("player")
+if player then actor.set_position(player, 0, 0) end
+```
+
+### `actor.destroy(self)`
+
+| | |
+|---|---|
+| **Signature** | `actor.destroy(self) -> boolean` |
+| **Parameters** | `self` — `actor` — the actor to remove |
+| **Returns** | `boolean` — true when the actor was removed |
+| **Description** | Removes the actor from the world. The behavior's `on_destroy` runs **first**, with the actor still alive, so a handler that reads its position — to spawn an effect where it died — sees the truth. Then the solver body goes, then the entity. |
+
+It takes an **actor**, not only a `self`: a manager destroys the actors it owns, and those are the tables it got from `actor.spawn` or `actor.find_by_name`.
+
+```lua
+function M:on_signal(name, payload)
+  if name == "collected" then
+    actor.destroy(payload.coin)
+  end
+end
+```
+
 ### `actor.get_position(self)`
 
 | | |

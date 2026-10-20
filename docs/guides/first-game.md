@@ -218,6 +218,33 @@ end
 return M
 ```
 
+**Spawning, finding and removing actors** are three functions:
+
+```lua
+-- A coin that appears where the player is.
+local coin = actor.spawn(100, 200, { name = "coin", script = 2 })
+
+-- The player, by name.
+local player = actor.find_by_name("player")
+
+-- And the coin, gone.
+actor.destroy(coin)
+```
+
+The `samples/first-game` project does exactly this: the flow global spawns a
+coin every two seconds, and the coin destroys itself after ten. The log reads
+`coin: born` … `coin: collected` … `coin: gone`.
+
+`actor.spawn` and `actor.find_by_name` are **world** operations and take no
+`self`: a global script (the game manager) spawns actors too, and it has no
+actor of its own. `actor.destroy` takes an actor, because a manager destroys
+the actors it owns.
+
+The `script` option is the index of a behavior in the project's
+`scripts { behavior "..." }` list — the same index a scene file's
+`Script {script: 2}` means — and the behavior's `start` runs immediately, so a
+spawned actor is live on the same frame.
+
 **The stack is the point.** A flat state machine cannot express "paused",
 because leaving "paused" has to return to "playing" and not to whatever came
 before it. `flow.push` puts a state on top and keeps the one below;
@@ -282,6 +309,8 @@ arrow keys, and the log should show the flow entering `menu`.
 - **Input**: actions, not keys (`input.get_axis`, `input.is_action_pressed`).
 - **Movement**: `actor.move_by`, and the `vec2` normalization that keeps a
   diagonal from being faster.
+- **The actor's life**: `actor.spawn`, `actor.find_by_name` and
+  `actor.destroy` — creating, finding and removing actors at runtime.
 - **The clock**: `time.pause()`, `time.set_scale(0.5)` — the world and the
   animations, slowed down.
 
@@ -294,11 +323,9 @@ missing API, not a missing idea:
 
 | You want | Today | The gap |
 |---|---|---|
-| Spawn an actor from a script | — | there is no `actor.spawn`. Declare the actors in the scene |
-| Remove an actor | `actor.remove_component(self, "Sprite")` | there is no `actor.destroy`. Removing the `Sprite` hides it |
-| Find an actor by name | — | there is no `actor.find_by_name`. Publish the reference from a global script instead |
 | Give an actor a new component with values | `actor.add_component(self, "Sprite")` | the component gets its **defaults**; there is no per-field setter from Lua |
 | Read a component's fields | `actor.get_all(self)` | a table of everything the actor carries |
+| Move an actor that has a physics body | `actor.set_linear_velocity(self, vx, vy)` | the script sets a **velocity** and the solver moves it; writing the position of a dynamic body is fighting the solver |
 
 ---
 

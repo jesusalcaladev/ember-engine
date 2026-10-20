@@ -1005,7 +1005,113 @@ fn lua_actor_from_entity(L: ?*lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// `actor.spawn(x, y, opts?) -> actor` — creates an actor.
+///
+/// The new actor carries a `Transform` at the given position, and whatever
+/// else the options ask for:
+///
+///   - `name` — a string, so `actor.find_by_name` can find it later;
+///   - `script` — the INDEX of a behavior in the project's
+///     `scripts { behavior "..." }` list (the same index a scene file's
+///     `Script {script: 2}` means). The behavior is attached and its `start`
+///     runs immediately, so a spawned actor is live on the same frame.
+///
+/// It is a WORLD operation and takes no `self`: a global script (the game
+/// manager) spawns actors too, and it has no actor of its own.
+///
+/// The returned table is an ACTOR: every `actor.*` function takes it.
+fn lua_actor_spawn(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const x = lua.toF32(L, 1);
+    const y = lua.toF32(L, 2);
+
+    var name: []const u8 = "";
+    var script_index: u32 = 0;
+    if (lua.isTable(L, 3)) {
+        lua.getField(L, 3, "name");
+        if (lua.isString(L, -1)) name = lua.toString(L, -1);
+        lua.pop(L, 1);
+        lua.getField(L, 3, "script");
+        if (lua.isNumber(L, -1)) script_index = @intFromFloat(@max(lua.toF32(L, -1), 0));
+        lua.pop(L, 1);
+    }
+
+    // The component set is FIXED — {Transform, Name} — whatever the options
+    // say, and the behavior's `Script` component is the only other one.
+    //
+    // It has to be fixed, because a NEW archetype is an ALLOCATION, and the
+    // frame's guard turns an allocation into a panic. A spawn whose component
+    // set depended on its options would need an archetype per combination,
+    // and the engine cannot know which ones a script will ask for.
+    //
+    // So the runtime reserves the two sets a spawn can produce, at load time
+    // where allocating is allowed, and a spawn NEVER allocates.
+    var n = components.Name{};
+    n.set(name);
+    const e = ctx.world.spawn(.{
+        components.Transform{ .position = .{ .x = x, .y = y } },
+        n,
+    }) catch {
+        lua.pushNil(L);
+        return 1;
+    };
+
+    // The behavior, and its `start`.
+    if (script_index != 0) {
+        if (ctx.actor_hooks) |hooks| {
+            _ = hooks.attach(hooks.ctx, @bitCast(@as(u64, @bitCast(e))), script_index);
+        }
+    }
+
+    // The actor table.
+    lua.lua_createtable(L, 0, 1);
+    stampEntity(L, e);
+    return 1;
+}
+
+/// `actor.find_by_name(name) -> actor|nil` — the actor with that name.
+///
+/// A WORLD query, so it takes no `self` either. The names in a scene are
+/// unique (the loader uniquifies a duplicate), so there is exactly one
+/// answer; nil when there is no such actor.
+fn lua_actor_find_by_name(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const name = lua.toString(L, 1);
+    const e = ctx.world.findByName(name) orelse {
+        lua.pushNil(L);
+        return 1;
+    };
+    lua.lua_createtable(L, 0, 1);
+    stampEntity(L, e);
+    return 1;
+}
+
+/// `actor.destroy(self) -> boolean` — removes the actor from the world.
+///
+/// The behavior's `on_destroy` runs FIRST, with the actor still alive, so a
+/// handler that reads its position — to spawn an effect where it died — sees
+/// the truth. Then the solver body goes, then the entity.
+///
+/// It takes an ACTOR, not only a `self`: a manager destroys the actors it
+/// owns, and those are tables it got from `actor.spawn` or
+/// `actor.find_by_name`.
+fn lua_actor_destroy(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return pushBool(L, false);
+    if (!ctx.world.isAlive(e)) return pushBool(L, false);
+    if (ctx.actor_hooks) |hooks| {
+        return pushBool(L, hooks.destroy(hooks.ctx, @bitCast(@as(u64, @bitCast(e)))));
+    }
+    // No behaviors wired: the entity still goes, and the solver body with it.
+    if (ctx.physics) |sys| sys.removeEntity(ctx.world, e);
+    _ = ctx.world.despawn(e);
+    return pushBool(L, true);
+}
+
 const actor_regs = [_]luaL_Reg{
+    .{ .name = "spawn", .func = lua_actor_spawn },
+    .{ .name = "find_by_name", .func = lua_actor_find_by_name },
+    .{ .name = "destroy", .func = lua_actor_destroy },
     .{ .name = "entity_bits", .func = lua_actor_entity_bits },
     .{ .name = "from_entity", .func = lua_actor_from_entity },
     .{ .name = "get_position", .func = lua_get_position },
@@ -6144,6 +6250,9 @@ pub const registered_names = [_][]const u8{
     "actor.add_component",
     "actor.has_component",
     "actor.remove_component",
+    "actor.spawn",
+    "actor.find_by_name",
+    "actor.destroy",
     "actor.entity_bits",
     "actor.from_entity",
     "physics.create_shape",

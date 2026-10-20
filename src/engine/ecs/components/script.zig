@@ -15,8 +15,17 @@ const std = @import("std");
 /// stable id, exactly as the ECS is an internal detail and the public API is
 /// Actor + Components + Signals (spec §7).
 pub const Script = struct {
-    /// Index into the script cache. 0 means "no script" (the default), so ids
-    /// start at 1 — the same convention `SceneId` uses.
+    /// Index into the script cache.
+    ///
+    /// NOT the project's behavior index: a scene file's `Script {script: 1}`
+    /// means "the FIRST behavior the project declares", and the loader
+    /// resolves that through the project's table into the cache id this field
+    /// stores. The two are different numbering systems, and the scene file
+    /// uses the one the project controls.
+    ///
+    /// The cache's own ids start at ZERO — the first script loaded is id 0 — so
+    /// this field cannot use 0 to mean "no script". A `Script` component with
+    /// `script = 0` is a VALID script: the first one loaded.
     script: u32 = 0,
 };
 

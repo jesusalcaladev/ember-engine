@@ -153,6 +153,23 @@ function Actor:entity_bits() end
 ---@return Actor the actor, or nil when the handle is dead
 function actor.from_entity(bits) end
 
+---Creates an actor at a position. The new actor carries a `Transform` there, and the options may give it a `name` (so `actor.find_by_name` can find it) and a `script` — the INDEX of a behavior in the project's `scripts { behavior "..." }` list, the same index a scene file's `Script {script: 2}` means. The behavior is attached and its `start` runs immediately, so a spawned actor is live on the same frame. It is a world operation and takes no `self`: a global script spawns actors too.
+---@param x number the position x
+---@param y number the position y
+---@param opts table optional: name, script
+---@return Actor the new actor
+function actor.spawn(x, y, opts) end
+
+---The actor with that name, or nil. A world query, so it takes no `self`. The names in a scene are unique — the loader uniquifies a duplicate — so there is exactly one answer.
+---@param name string the actor's name
+---@return Actor the actor, or nil when there is none
+function actor.find_by_name(name) end
+
+---Removes the actor from the world. The behavior's `on_destroy` runs FIRST, with the actor still alive, so a handler that reads its position sees the truth; then the solver body goes, then the entity. It takes an ACTOR, not only a `self`: a manager destroys the actors it owns.
+---@param self Actor the actor to remove
+---@return boolean true when the actor was removed
+function Actor:destroy() end
+
 ---Sets the velocity outright. Leaves the angular velocity alone.
 ---@param self Actor 
 ---@param vx number velocity x in units/second

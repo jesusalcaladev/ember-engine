@@ -589,36 +589,10 @@ fn loadScene(
     behaviors: *script.Behaviors,
     world: *ecs.World,
     physics_sys: *physics.System,
-    cfg: *const project.config.Config,
     scene_path: []const u8,
     alloc: std.mem.Allocator,
 ) void {
-    // 1. The behavior scripts, in the config's order. The index in the list is
-    //    the id a scene file refers to.
-    var ids = alloc.alloc(u32, cfg.scripts.behavior.len) catch {
-        log.warn("no memory for the behavior script table", .{});
-        return;
-    };
-    defer alloc.free(ids);
-    @memset(ids, 0);
-    for (cfg.scripts.behavior, 0..) |path, i| {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(assets.script_asset.default_max_bytes)) catch {
-            log.warn("behavior script '{s}': file not found, skipping it", .{path});
-            continue;
-        };
-        defer alloc.free(bytes);
-        const v = assets.script_asset.validate(bytes, assets.script_asset.default_max_bytes) catch |err| {
-            log.warn("behavior script '{s}' rejected ({s}), skipping it", .{ path, @errorName(err) });
-            continue;
-        };
-        ids[i] = behaviors.load(path, v.source) catch |err| {
-            log.warn("behavior script '{s}' failed to compile ({s})", .{ path, @errorName(err) });
-            continue;
-        };
-    }
-
-    // 2. The scene itself.
+    // 1. The scene itself.
     const io = std.Io.Threaded.global_single_threaded.io();
     const text = std.Io.Dir.cwd().readFileAlloc(io, scene_path, alloc, .limited(64 * 1024 * 1024)) catch |err| {
         log.warn("scene '{s}': {s}", .{ scene_path, @errorName(err) });
@@ -647,12 +621,10 @@ fn loadScene(
         const entities = batch.entitySlice();
         for (scripts, entities) |*sc, e| {
             const index = sc.script;
-            if (index == 0 or index > ids.len) {
+            const id = behaviors.behaviorIdAt(index) orelse {
                 log.warn("entity {d} wants script {d}, which the project does not declare", .{ e.index, index });
                 continue;
-            }
-            const id = ids[index - 1];
-            if (id == 0) continue; // the script failed to load
+            };
             behaviors.attach(e, id) catch |err| {
                 log.warn("entity {d}: script {d} failed to attach ({s})", .{ e.index, index, @errorName(err) });
             };
@@ -662,6 +634,54 @@ fn loadScene(
     // script can already see the whole scene.
     behaviors.startAll();
 }
+
+/// The `scripts { behavior "..." }` section: the behaviors an actor can run.
+///
+/// Loaded at BOOT, not with the scene: a project may have behaviors and no
+/// scene (the built-in canonical one), and `actor.spawn` needs the table even
+/// when nothing was loaded from disk.
+///
+/// The list's ORDER is the id: the first entry is script 1, and that is what a
+/// scene file's `Script {script: 1}` and a script's `actor.spawn(x, y,
+/// { script = 1 })` both mean. The ids live in the behaviors, so the scene
+/// loader and the spawn path cannot disagree about what "script 1" is.
+fn loadBehaviorScripts(
+    behaviors: *script.Behaviors,
+    cfg: *const project.config.Config,
+    alloc: std.mem.Allocator,
+) void {
+    for (cfg.scripts.behavior, 0..) |path, i| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(assets.script_asset.default_max_bytes)) catch {
+            log.warn("behavior script '{s}': file not found, skipping it", .{path});
+            continue;
+        };
+        defer alloc.free(bytes);
+        const v = assets.script_asset.validate(bytes, assets.script_asset.default_max_bytes) catch |err| {
+            log.warn("behavior script '{s}' rejected ({s}), skipping it", .{ path, @errorName(err) });
+            continue;
+        };
+        const id = behaviors.load(path, v.source) catch |err| {
+            log.warn("behavior script '{s}' failed to compile ({s})", .{ path, @errorName(err) });
+            continue;
+        };
+        // 1-based: 0 means "no script" in the component and in the spawn
+        // options, and a list that starts at 0 would make the first entry
+        // unreachable.
+        behaviors.setBehaviorId(@intCast(i + 1), id);
+    }
+    if (behaviors.behaviorCount() != 0) {
+        log.info("behaviors: {d} script(s) declared", .{behaviors.behaviorCount()});
+    }
+}
+
+/// How many actors a script may SPAWN before the world runs out of slots.
+///
+/// A reservation, not a limit: the slots are capacity, and a script that
+/// spawns past it gets the frame guard's panic — which is the engine's
+/// standing answer to "you allocated in the frame". A game that needs more
+/// raises this.
+const spawn_reserve = 4096;
 
 /// M9: the payload a finished scene transition carries on the world bus.
 ///
@@ -967,6 +987,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // defaults, so `zig build run -- --headless` measures the empty world.
     if (!args.headless) mountGlobalScripts(&behaviors, &project_config, boot_alloc);
 
+    // The project's BEHAVIOR scripts, at boot for the same reason the globals
+    // are: the scene may not exist, and `actor.spawn` needs the table either
+    // way.
+    if (!args.headless) loadBehaviorScripts(&behaviors, &project_config, boot_alloc);
+
     // ── The collision signal, bridged to Lua ───────────────────────────────
     // The physics publishes contacts on the world's typed bus, which only the
     // Zig listeners see. The bridge is what lets a SCRIPT react to being
@@ -987,8 +1012,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The built-in canonical scene is the default: `--scene game.zson` is how
     // a project ships its own.
     if (args.scene.len != 0) {
-        loadScene(&behaviors, &world, &physics_sys, &project_config, args.scene, boot_alloc);
+        loadScene(&behaviors, &world, &physics_sys, args.scene, boot_alloc);
     }
+
+    // The world is REBUILT by the scene load (`zson.replace`), so the
+    // reservations above are gone with the old world. And the spawn path
+    // needs room it cannot ask for in the frame: a new archetype and a free
+    // entity slot are ALLOCATIONS, and the frame's guard turns an allocation
+    // into a panic.
+    //
+    // So the two archetypes a spawned actor can need, and the slots for the
+    // actors, are reserved HERE — at load time, where allocating is allowed.
+    try world.reserveEntities(spawn_reserve);
+    try world.reserve(.{components.Transform, components.Name}, spawn_reserve);
+    try world.reserve(.{components.Transform, components.Name, components.Script}, spawn_reserve);
 
     // ── M9: the scene-transition fader. Owned by the runtime like the camera:
     // it is engine state that outlives a script, and the `scene.*` bindings
@@ -1579,6 +1616,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         else
             .{ .x = 0, .y = 0 });
         z_sim.end();
+
+        // The bodies of the actors that are gone. A body that outlives its
+        // actor keeps simulating — the solver does not know the ECS despawned
+        // it — so it falls forever and costs solver time for an actor nobody
+        // can see.
+        physics_sys.sweepDead(&world);
 
         // M3: the scripted per-frame update (decoupled from the fixed step, like
         // the renderer) plus the incremental GC step. spec §3.2 budgets that GC

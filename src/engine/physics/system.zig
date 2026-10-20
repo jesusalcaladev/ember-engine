@@ -313,6 +313,22 @@ pub const System = struct {
         self.list_dirty = true;
     }
 
+    /// Removes the solver bodies of the actors that are gone.
+    ///
+    /// A body that outlives its actor keeps simulating: the solver does not
+    /// know the ECS despawned it, so it falls forever and costs solver time
+    /// for an actor nobody can see. `removeEntity` is the one place a body is
+    /// destroyed, so the sweep calls it and the two cannot disagree.
+    pub fn sweepDead(self: *System, world: *World) void {
+        var i: usize = 0;
+        while (i < self.active.items.len) {
+            const entry = self.active.items[i];
+            i += 1;
+            if (world.isAlive(entry.entity)) continue;
+            self.removeEntity(world, entry.entity);
+        }
+    }
+
     /// Destroys the solver body for an entity and clears its handle. Called from
     /// the entity sweep so a dead actor does not leave a body behind.
     pub fn removeEntity(self: *System, world: *World, entity: Entity) void {

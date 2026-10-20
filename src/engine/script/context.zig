@@ -111,6 +111,30 @@ pub const ParticleHooks = struct {
     stats: *const fn (ctx: ?*anyopaque, out: *[16]f64) u32,
 };
 
+/// The hooks a Lua `actor.spawn` / `actor.destroy` needs.
+///
+/// The script layer cannot import `behavior.zig` — the dependency runs the
+/// other way — so the two calls that need the Behaviors cross as function
+/// pointers, the same way every other optional system in this file does.
+pub const ActorHooks = struct {
+    ctx: ?*anyopaque,
+    /// Attaches the behavior whose PROJECT INDEX is `index` to the actor
+    /// whose handle is `entity_bits`.
+    ///
+    /// The index is the one a scene file uses: `Script {script: 1}` is the
+    /// first entry of the project's `scripts { behavior "..." }` list. Zero
+    /// means "no behavior" and is never attached.
+    ///
+    /// False when the project declares no such behavior.
+    attach: *const fn (ctx: ?*anyopaque, entity_bits: u64, index: u32) bool,
+    /// Destroys an actor, in the order that lets a handler still use it:
+    /// the behavior's `on_destroy` runs FIRST, with the actor alive, so a
+    /// handler that reads its position (to spawn an effect there) sees the
+    /// truth and not a despawned entity. Then the solver body goes, then the
+    /// entity.
+    destroy: *const fn (ctx: ?*anyopaque, entity_bits: u64) bool,
+};
+
 /// The global-script surface (scripts mounted with NO actor), as a vtable over
 /// the `Behaviors` system that owns them.
 ///
@@ -316,6 +340,11 @@ pub const Context = struct {
     /// pointer. A zero delta is the SAFE answer — a script that multiplies by
     /// `time.delta()` gets a still frame instead of a crash.
     time: ?*core_loop.GameTime = null,
+
+    /// The hooks behind `actor.spawn` and `actor.destroy`. Null in a harness
+    /// that has no behaviors wired: the two bindings then report failure
+    /// rather than spawning an actor nothing can drive.
+    actor_hooks: ?*const ActorHooks = null,
 
     /// The tween pool, behind the `tween.*` bindings. Null in a harness that
     /// never wires one: the `tween.*` bindings then report failure rather

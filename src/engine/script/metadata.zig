@@ -2984,6 +2984,54 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "actor.spawn",
+        .module = "actor",
+        .signature = "actor.spawn(x, y, opts?) -> actor",
+        .summary = "Creates an actor at a position. The new actor carries a `Transform` there, and the options may give it a `name` (so `actor.find_by_name` can find it) and a `script` — the INDEX of a behavior in the project's `scripts { behavior \"...\" }` list, the same index a scene file's `Script {script: 2}` means. The behavior is attached and its `start` runs immediately, so a spawned actor is live on the same frame. It is a world operation and takes no `self`: a global script spawns actors too.",
+        .params = &.{
+            .{ .name = "x", .kind = .number, .doc = "the position x" },
+            .{ .name = "y", .kind = .number, .doc = "the position y" },
+            .{ .name = "opts", .kind = .table, .doc = "optional: name, script" },
+        },
+        .returns = &.{
+            .{ .kind = .actor, .doc = "the new actor" },
+        },
+        .example =
+        \\local coin = actor.spawn(100, 200, { name = "coin", script = 2 })
+        ,
+    },
+    .{
+        .name = "actor.find_by_name",
+        .module = "actor",
+        .signature = "actor.find_by_name(name) -> actor|nil",
+        .summary = "The actor with that name, or nil. A world query, so it takes no `self`. The names in a scene are unique — the loader uniquifies a duplicate — so there is exactly one answer.",
+        .params = &.{
+            .{ .name = "name", .kind = .string, .doc = "the actor's name" },
+        },
+        .returns = &.{
+            .{ .kind = .actor, .doc = "the actor, or nil when there is none" },
+        },
+        .example =
+        \\local player = actor.find_by_name("player")
+        \\if player then actor.set_position(player, 0, 0) end
+        ,
+    },
+    .{
+        .name = "actor.destroy",
+        .module = "actor",
+        .signature = "actor.destroy(self) -> boolean",
+        .summary = "Removes the actor from the world. The behavior's `on_destroy` runs FIRST, with the actor still alive, so a handler that reads its position sees the truth; then the solver body goes, then the entity. It takes an ACTOR, not only a `self`: a manager destroys the actors it owns.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "the actor to remove" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the actor was removed" },
+        },
+        .example =
+        \\actor.destroy(coin)
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

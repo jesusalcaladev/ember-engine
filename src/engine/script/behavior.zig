@@ -47,6 +47,10 @@ const components = ecs.components;
 const lua = @import("luajit.zig");
 const lua_State = lua.lua_State;
 const no_ref = vm_mod.no_ref;
+
+/// How many behavior scripts a project may declare. The same cap as the
+/// config's `scripts.behavior` list.
+pub const max_behavior_scripts = 64;
 const entity_key = bindings.entity_key;
 
 // Local aliases over the raw C ABI, so the hot loops read as Lua operations
@@ -294,6 +298,31 @@ pub const Behaviors = struct {
     grid: spatial_mod.Grid,
     /// Registry ref of the steering module's `for` constructor.
     steer_ref: i32 = no_ref,
+    /// The project's BEHAVIOR scripts, by their index in the config's list.
+    ///
+    /// The index is what a scene file's `Script {script: N}` means and what
+    /// `actor.spawn` uses: 1 is the first entry of
+    /// `scripts { behavior "..." }`. The list is 1-based because 0 means "no
+    /// script" in the component.
+    behavior_ids: [max_behavior_scripts]u32 = [_]u32{0} ** max_behavior_scripts,
+    /// Which entries of the table are filled.
+    ///
+    /// A SEPARATE bitmask, and not a sentinel in the id: the script cache's
+    /// ids START AT ZERO — the first script loaded is id 0 — so the id itself
+    /// cannot say "there is no script here". A table that used 0 as its
+    /// "empty" marker silently refused to attach the FIRST behavior a project
+    /// declares, which is exactly the one a scene is most likely to use.
+    behavior_present: u64 = 0,
+    /// How many entries of the table are filled.
+    behavior_count: u8 = 0,
+    /// The hooks `actor.spawn` and `actor.destroy` reach. A FIELD and not a
+    /// local: the context holds the pointer, and a stack temporary would die
+    /// with the frame that made it.
+    actor_hooks: context.ActorHooks = .{
+        .ctx = null,
+        .attach = attachBehaviorHook,
+        .destroy = destroyActorHook,
+    },
     /// The context the collision bridge hands the bus. A FIELD and not a
     /// local: the bus holds the pointer for as long as the subscription
     /// lives, and a local would die with the frame that made it.
@@ -384,6 +413,8 @@ pub const Behaviors = struct {
         // the Behaviors the bindings' shared upvalue already reaches.
         self.globals_hooks.ctx = self;
         self.ctx.globals = &self.globals_hooks;
+        self.actor_hooks.ctx = self;
+        self.ctx.actor_hooks = &self.actor_hooks;
         bindings.registerAll(self.vm.state(), &self.ctx);
         if (build_options.steering) {
             self.buildSteer() catch |e| {
@@ -512,6 +543,54 @@ pub const Behaviors = struct {
         self.grid.deinit();
         self.scripts.deinit();
         self.vm.deinit();
+    }
+
+    /// Records the script id of the project's behavior at `index`.
+    ///
+    /// The runtime calls this once per entry of `scripts { behavior "..." }`,
+    /// in the list's order. The index is 1-based (0 means "no script").
+    pub fn setBehaviorId(self: *Behaviors, index: u32, script_id: u32) void {
+        if (index == 0 or index > max_behavior_scripts) return;
+        self.behavior_ids[index - 1] = script_id;
+        self.behavior_present |= @as(u64, 1) << @intCast(index - 1);
+        if (index > self.behavior_count) self.behavior_count = @intCast(index);
+    }
+
+    /// The script id of the project's behavior at `index`, or null when the
+    /// project declares no such behavior.
+    pub fn behaviorIdAt(self: *const Behaviors, index: u32) ?u32 {
+        if (index == 0 or index > self.behavior_count) return null;
+        if (self.behavior_present & (@as(u64, 1) << @intCast(index - 1)) == 0) return null;
+        return self.behavior_ids[index - 1];
+    }
+
+    /// The number of behaviors the project declares.
+    pub fn behaviorCount(self: *const Behaviors) u32 {
+        return self.behavior_count;
+    }
+
+    /// Fires the `on_destroy` of the behavior attached to an actor, and
+    /// releases it.
+    ///
+    /// The hook runs with the actor ALIVE, on purpose: a handler that reads
+    /// the actor's position — to spawn an effect where it died — sees the
+    /// truth. The sweep (`sweepDestroyed`) does the same for an actor that
+    /// died some other way, and the two paths cannot both fire: this one
+    /// removes the instance, so the sweep never sees it.
+    pub fn fireDestroy(self: *Behaviors, entity: Entity) void {
+        var i: usize = 0;
+        while (i < self.instances.items.len) : (i += 1) {
+            const inst = &self.instances.items[i];
+            if (inst.entity.index != entity.index) continue;
+            if (inst.entity.generation != entity.generation) continue;
+            if (inst.alive and inst.on_destroy_ref != no_ref) {
+                self.vm.pushRef(inst.on_destroy_ref); // [fn]
+                self.vm.pushRef(inst.self_ref); // [fn, self]
+                self.callMethod(inst, 1); // pcall(1): fn(self)
+            }
+            self.removeInstanceAt(i);
+            return;
+        }
     }
 
     /// Subscribes the script layer to the world's COLLISION signal, so a
@@ -891,12 +970,28 @@ pub const Behaviors = struct {
         for (self.instances.items) |*inst| {
             if (inst.started) continue;
             if (!self.ctx.world.isAlive(inst.entity)) continue; // sweep finalizes it
+            self.startInstance(inst.entity);
+        }
+    }
+
+    /// Runs `start` for the behavior attached to one actor.
+    ///
+    /// Split out of `startAll` so a SPAWNED actor can start immediately: an
+    /// actor created a moment ago is not an actor that waits for the next
+    /// `startAll`, because there may not be one.
+    ///
+    /// `start` is resolved on demand here (once per instance, not per frame),
+    /// so it is not in the cached hot-path set. Stack: [self] -> getfield ->
+    /// [self, fn]; then push self again as the argument -> [self, fn, self] and
+    /// pcall(1) (function + one arg = self), leaving the original [self].
+    pub fn startInstance(self: *Behaviors, entity: Entity) void {
+        const L = self.vm.state().?;
+        for (self.instances.items) |*inst| {
+            if (inst.started) continue;
+            if (inst.entity.index != entity.index) continue;
+            if (inst.entity.generation != entity.generation) continue;
+            if (!self.ctx.world.isAlive(entity)) continue;
             inst.started = true;
-            // Call `self:start()` if the script defines it. `start` is resolved
-            // on demand here (once per instance, not per frame), so it is not in
-            // the cached hot-path set. Stack: [self] -> getfield -> [self, fn];
-            // then push self again as the argument -> [self, fn, self] and
-            // pcall(1) (function + one arg = self), leaving the original [self].
             self.vm.pushRef(inst.self_ref); // [self]
             lua.getField(L, -1, "start"); // [self, fn_or_nil]
             if (lua.isFunction(L, -1)) {
@@ -906,6 +1001,7 @@ pub const Behaviors = struct {
                 lua.pop(L, 1); // [self]
             }
             lua.pop(L, 1); // []
+            return;
         }
     }
 
@@ -1322,6 +1418,130 @@ fn globalRefOfSelfHook(ctx: ?*anyopaque, L: ?*lua_State, idx: c_int) i32 {
         if (got != null and got == want) return g.self_ref;
     }
     return statemachine_mod.no_ref;
+}
+
+// ── Spawn, find and destroy ─────────────────────────────────────────────────
+
+const watcher_script_src =
+    \\local M = {}
+    \\function M:on_destroy()
+    \\  WATCHER_DESTROYS = (WATCHER_DESTROYS or 0) + 1
+    \\end
+    \\return M
+;
+
+const spawn_script_src =
+    \\local M = {}
+    \\function M:start()
+    \\  SPAWNED_STARTS = (SPAWNED_STARTS or 0) + 1
+    \\end
+    \\function M:on_destroy()
+    \\  SPAWNED_DESTROYS = (SPAWNED_DESTROYS or 0) + 1
+    \\end
+    \\return M
+;
+
+test "an actor can be spawned, found by name and destroyed" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // A behavior the spawned actor will run.
+    const sid = try h.b.load("spawned.lua", spawn_script_src);
+    h.b.setBehaviorId(1, sid);
+
+    // A behavior on an existing actor, to check the destroy path fires
+    // `on_destroy` too.
+    const watcher_sid = try h.b.load("watcher.lua", watcher_script_src);
+    const watcher = try h.world.spawn(.{components.Transform{}, components.Name{}});
+    h.world.get(watcher, components.Name).?.set("watcher");
+    try h.b.attach(watcher, watcher_sid);
+    h.b.startAll();
+
+    // The spawn goes through the LUA surface, so the whole path is covered.
+    const L = h.b.vm.state().?;
+    // The script returns the STEP that failed, 0 when everything passed: a
+    // boolean would say "no" and not where.
+    const script =
+        \\local a = actor.spawn(10, 20, { name = "spawned", script = 1 })
+        \\if not a then return 1 end
+        \\local x, y = actor.get_position(a)
+        \\if x ~= 10 or y ~= 20 then return 2 end
+        \\local found = actor.find_by_name("spawned")
+        \\if not found then return 3 end
+        \\local fx, fy = actor.get_position(found)
+        \\if fx ~= 10 or fy ~= 20 then return 4 end
+        \\if actor.find_by_name("nobody") ~= nil then return 5 end
+        \\if SPAWNED_STARTS ~= 1 then return 6 end
+        \\if not actor.destroy(a) then return 7 end
+        \\if actor.find_by_name("spawned") ~= nil then return 8 end
+        \\if SPAWNED_DESTROYS ~= 1 then return 9 end
+        \\return 0
+    ;
+    h.b.vm.loadBuffer(script, "spawn_test") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.TestUnexpectedResult;
+    const step = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    if (step != 0) {
+        std.debug.print("spawn test stopped at step {d} (instances={d})\n", .{ step, h.b.instanceCount() });
+    }
+    try std.testing.expectEqual(@as(f32, 0), step);
+
+    // The script above already checked the two counters: the spawned actor ran
+    // its behavior's `start` on the SAME frame, and its `on_destroy` ran when
+    // it was destroyed.
+}
+
+test "destroying an actor fires on_destroy while the actor is still alive" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const sid = try h.b.load("destroyed.lua", spawn_script_src);
+    h.b.setBehaviorId(1, sid);
+
+    const L = h.b.vm.state().?;
+    const script =
+        \\local a = actor.spawn(0, 0, { script = 1 })
+        \\actor.destroy(a)
+        \\return true
+    ;
+    h.b.vm.loadBuffer(script, "destroy_test") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) return error.TestUnexpectedResult;
+    try std.testing.expect(lua.toBool(L, -1));
+    lua.pop(L, 1);
+
+    // The instance is gone: the behavior was released, not left dangling.
+    try std.testing.expectEqual(@as(usize, 0), h.b.instanceCount());
+}
+
+// ── The actor hooks: spawn and destroy ──────────────────────────────────────
+
+/// Attaches the project's behavior at `index` to a newly spawned actor.
+fn attachBehaviorHook(ctx: ?*anyopaque, entity_bits: u64, index: u32) bool {
+    const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return false));
+    const id = b.behaviorIdAt(index) orelse return false;
+    const e: Entity = @bitCast(entity_bits);
+    b.attach(e, id) catch return false;
+    // The behavior's `start` runs NOW: an actor that was spawned a moment ago
+    // is not an actor that starts on the next `startAll`, because there may
+    // not be one.
+    b.startInstance(e);
+    return true;
+}
+
+/// Destroys an actor: the behavior's `on_destroy` first (with the actor
+/// alive), then the solver body, then the entity.
+fn destroyActorHook(ctx: ?*anyopaque, entity_bits: u64) bool {
+    const b: *Behaviors = @ptrCast(@alignCast(ctx orelse return false));
+    const e: Entity = @bitCast(entity_bits);
+    if (!b.ctx.world.isAlive(e)) return false;
+    b.fireDestroy(e);
+    // The solver body goes before the entity: a body that outlives its actor
+    // keeps simulating, and the solver does not know the ECS despawned it.
+    if (b.ctx.physics) |sys| sys.removeEntity(b.ctx.world, e);
+    _ = b.ctx.world.despawn(e);
+    return true;
 }
 
 // ── The collision bridge: the physics reaches Lua ────────────────────────────

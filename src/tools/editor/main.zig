@@ -477,7 +477,18 @@ pub fn main(init: std.process.Init) !void {
     defer physics_debug.deinit();
     physics_debug.reserve(debug_quad_budget) catch |err| log.warn("physics debug reserve failed: {s}", .{@errorName(err)});
 
-    // ── Scene ───────────────────────────────────────────────────────────────
+    physics_sys.syncLoad(world);
+
+    // The two component sets a SPAWNED actor can need, reserved at load time.
+    //
+    // A new archetype is an ALLOCATION, and the frame's guard turns an
+    // allocation into a panic — so a script that spawns an actor must not
+    // invent a component set the world has never seen. The spawn's set is
+    // fixed ({Transform, Name}, plus the behavior's `Script`), and it is
+    // reserved HERE, where allocating is allowed.
+    world.reserveEntities(4096) catch {};
+    world.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
+    world.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
     if (!args.empty_scene) spawnDemoScene(world) catch |err| {
         log.warn("demo scene spawn failed: {s}", .{@errorName(err)});
     };
@@ -621,8 +632,10 @@ pub fn main(init: std.process.Init) !void {
     var tiles_pushed: usize = 0;
     while (true) {
         // Frame limiter
+        const t_loop0 = core.time.monotonicNs();
         const pacing = limiter.wait(core.time.monotonicNs());
         limiter.sleep(pacing.wait_ns);
+        const t_after_limit = core.time.monotonicNs();
 
         if (has_window) {
             window.poll();
@@ -763,12 +776,14 @@ pub fn main(init: std.process.Init) !void {
         // guard, and the `draw` inside the frame only reads the cache this
         // warmed. Re-lexing inside the guard is how the editor died on its
         // first keystroke with "allocation of 132 bytes outside the frame".
+        const t_a = core.time.monotonicNs();
         if (has_window) {
             pane.handleInput(&window.input);
             pane.handleText(&window.input);
         }
         pane.applyRequests();
         _ = pane.tokens() catch {};
+        const t_b = core.time.monotonicNs();
 
         // ── TileMap brush, OUTSIDE the frame ───────────────────────────────
         //
@@ -828,8 +843,10 @@ pub fn main(init: std.process.Init) !void {
         if (editor.viewport.takeEdited() and editor.play == .stopped) physics_dirty = true;
         if (editor.viewport.tool != .tile) tilemap.hover = null;
 
+        const t_c = core.time.monotonicNs();
         // ── Editor pre-frame (queued edits, asset refresh, scene replace) ─────
         editor.preFrame();
+        const t_d = core.time.monotonicNs();
         if (editor.should_quit) break;
         if (editor.takeSceneReplaced()) {
             physics_dirty = true;
@@ -847,6 +864,7 @@ pub fn main(init: std.process.Init) !void {
         // in the next `preFrame`, on the safe side.
         _ = editor.tickAutosave(editor.frame_dt);
 
+        const t_preframe = core.time.monotonicNs();
         // ── The allocation-guarded frame ───────────────────────────────────
         tracker.beginFrame(); // from here on: no allocations outside the arena
         frame_arena.beginFrame();
@@ -868,8 +886,11 @@ pub fn main(init: std.process.Init) !void {
         // ONE call: the shell owns every panel, including the code pane and the
         // tilemap tool. Drawing them here as well is what used to put two
         // copies of each window on screen.
+        const t_nf = core.time.monotonicNs();
         ui_ctx.newFrame(real_dt);
+        const t_nf1 = core.time.monotonicNs();
         editor_shell.draw(&editor, &ui_ctx, fb_w, geom);
+        const t_shell = core.time.monotonicNs();
 
         // The viewport's gizmo: the selection, the handles and the hover
         // ghost. Drawn on ImGui's BACKGROUND list, so it is over the scene
@@ -886,6 +907,7 @@ pub fn main(init: std.process.Init) !void {
         // readouts. It lives INSIDE the viewport region, so it never covers a
         // dock.
         editor.viewport.drawHud(&ui_ctx);
+        const t_hud = core.time.monotonicNs();
 
         // ── Fixed-step simulation ──────────────────────────────────────────
         // The Play menu is not decoration: stopped means the world does not
@@ -932,6 +954,7 @@ pub fn main(init: std.process.Init) !void {
         // backend's sprite emitter returns early when no scene is active, so an
         // editor that skipped this compiled, ran, and showed a black window
         // with zero draw calls — no error anywhere to point at the omission.
+        const t_scene0 = core.time.monotonicNs();
         renderer.beginScene(target, sceneCamera(camera_view, fb_w, fb_h));
 
         // The editor grid: layer 0, pushed FIRST — the batcher's stable sort
@@ -975,9 +998,12 @@ pub fn main(init: std.process.Init) !void {
 
         r2d.submit(renderer);
 
+        const t_scene1 = core.time.monotonicNs();
+
         // ── Lighting ───────────────────────────────────────────────────────
         const lighting_env = lighting_driver.Driver.environmentOf(world, defaultEnvironment());
         _ = lighting.render(world, &r2d, renderer, lighting_env, 0);
+        const t_light = core.time.monotonicNs();
 
         // Fader
         fader.update(real_dt);
@@ -988,7 +1014,8 @@ pub fn main(init: std.process.Init) !void {
         // and the UI was therefore painted over by the scene every frame: the
         // draw data was real (thousands of vertices per frame) and nothing was
         // on screen.
-        renderer.endScene(true, .Medium);
+        renderer.endScene(false, .Medium);
+        const t_compose = core.time.monotonicNs();
 
         // ── Editor overlay on top ──────────────────────────────────────────
         //
@@ -1008,6 +1035,34 @@ pub fn main(init: std.process.Init) !void {
         }.draw);
 
         renderer.present();
+        const t_present = core.time.monotonicNs();
+        if (frame_count % 60 == 0) {
+            const ms = struct {
+                fn f(a: u64, b: u64) f64 {
+                    return @as(f64, @floatFromInt(b - a)) / 1e6;
+                }
+            }.f;
+            log.info("PHASE limit {d:.2} pre {d:.2} imgui {d:.2} scene {d:.2} light {d:.2} compose {d:.2} present {d:.2} | pane {d:.2} brush {d:.2} preframe {d:.2} ms | ui lists {d} verts {d} | newframe {d:.2} shell {d:.2} gizmo {d:.2} | gpu {d:.2} ms passes {d} post {d}", .{
+                ms(t_loop0, t_after_limit),
+                ms(t_after_limit, t_preframe),
+                ms(t_preframe, t_scene0),
+                ms(t_scene0, t_scene1),
+                ms(t_scene1, t_light),
+                ms(t_light, t_compose),
+                ms(t_compose, t_present),
+                ms(t_a, t_b),
+                ms(t_b, t_c),
+                ms(t_c, t_d),
+                ui_stats[0],
+                ui_stats[1],
+                ms(t_nf, t_nf1),
+                ms(t_nf1, t_shell),
+                ms(t_shell, t_hud),
+                @as(f64, @floatFromInt(renderer.stats().gpu_ns)) / 1e6,
+                renderer.stats().render_passes,
+                renderer.stats().post_passes,
+            });
+        }
 
         // Close the frame: the arena drains and the tracker's allocation guard
         // is disarmed. Without `endFrame` the guard stays armed from the first

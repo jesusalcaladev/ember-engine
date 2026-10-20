@@ -144,6 +144,10 @@ pub const World = struct {
     /// First alive entity carrying this name (linear: `zson` apply and tools,
     /// never the frame loop).
     pub fn findByName(self: *Self, name: []const u8) ?Entity {
+        // An EMPTY name is not a name: a spawned actor with no name carries an
+        // empty one, and `findByName("")` would then find whichever unnamed
+        // actor came first — which is nobody's idea of a lookup.
+        if (name.len == 0) return null;
         var slot: usize = 0;
         while (slot < self.slots.items.len) : (slot += 1) {
             const e = self.entityAtSlot(slot) orelse continue;
