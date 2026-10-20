@@ -259,15 +259,6 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
     const s = box * 0.5;
     const t = if (thickness <= 0) Icon.default_thickness else thickness;
     const h = s * 0.5; // half extent: 4pt at a 16px box
-    const p = struct {
-        /// A point relative to the icon's CENTRE. The centre is the icon's
-        /// anchor: an icon drawn at the origin instead is an icon drawn in
-        /// the top-left corner of the window, which is what happened when
-        /// this lost its `c`.
-        fn at(x: f32, y: f32) Vec2 {
-            return .{ .x = c.x + x, .y = c.y + y };
-        }
-    };
 
     switch (icon) {
         // ── Chevrons ────────────────────────────────────────────────────
@@ -281,23 +272,23 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
 
         // ── Marks ───────────────────────────────────────────────────────
         .check => {
-            dl.line(p.at(-h * 0.8, 0), p.at(-h * 0.15, h * 0.65), col, t);
-            dl.line(p.at(-h * 0.15, h * 0.65), p.at(h * 0.85, -h * 0.7), col, t);
+            dl.line(at(c, -h * 0.8, 0), at(c, -h * 0.15, h * 0.65), col, t);
+            dl.line(at(c, -h * 0.15, h * 0.65), at(c, h * 0.85, -h * 0.7), col, t);
         },
         .plus => {
-            dl.line(p.at(-h, 0), p.at(h, 0), col, t);
-            dl.line(p.at(0, -h), p.at(0, h), col, t);
+            dl.line(at(c, -h, 0), at(c, h, 0), col, t);
+            dl.line(at(c, 0, -h), at(c, 0, h), col, t);
         },
-        .minus => dl.line(p.at(-h, 0), p.at(h, 0), col, t),
+        .minus => dl.line(at(c, -h, 0), at(c, h, 0), col, t),
         .close => {
-            dl.line(p.at(-h, -h), p.at(h, h), col, t);
-            dl.line(p.at(h, -h), p.at(-h, h), col, t);
+            dl.line(at(c, -h, -h), at(c, h, h), col, t);
+            dl.line(at(c, h, -h), at(c, -h, h), col, t);
         },
 .dot_ => dl.circle(c, s * 0.18, col),
 .dots => {
-            dl.circle(p.at(-h, 0), s * 0.16, col);
+            dl.circle(at(c, -h, 0), s * 0.16, col);
             dl.circle(c, s * 0.16, col);
-            dl.circle(p.at(h, 0), s * 0.16, col);
+            dl.circle(at(c, h, 0), s * 0.16, col);
         },
 
         // ── Transport ───────────────────────────────────────────────────
@@ -315,11 +306,11 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             dl.rect(draw.rect(c.x + q * 0.5, c.y - q, c.x + q * 1.5, c.y + q), col, s * 0.14);
         },
         .skip_start => {
-            triangle(dl, p.at(-s * 0.25, 0), s * 0.5, pi, col, false);
+            triangle(dl, at(c, -s * 0.25, 0), s * 0.5, pi, col, false);
             dl.rect(draw.rect(c.x + s * 0.45, c.y - s * 0.5, c.x + s * 0.65, c.y + s * 0.5), col, s * 0.08);
         },
         .skip_end => {
-            triangle(dl, p.at(s * 0.25, 0), s * 0.5, 0, col, false);
+            triangle(dl, at(c, s * 0.25, 0), s * 0.5, 0, col, false);
             dl.rect(draw.rect(c.x - s * 0.65, c.y - s * 0.5, c.x - s * 0.45, c.y + s * 0.5), col, s * 0.08);
         },
         .refresh => {
@@ -328,8 +319,8 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             // which a 3/4 gear would not be.
             dl.pathArc(c, s * 0.62, -pi * 0.4, pi * 1.1, 12);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(s * 0.62, -s * 0.30), p.at(s * 0.30, -s * 0.42), col, t);
-            dl.line(p.at(s * 0.62, -s * 0.30), p.at(s * 0.52, -s * 0.62), col, t);
+            dl.line(at(c, s * 0.62, -s * 0.30), at(c, s * 0.30, -s * 0.42), col, t);
+            dl.line(at(c, s * 0.62, -s * 0.30), at(c, s * 0.52, -s * 0.62), col, t);
         },
 
         // ── Files ───────────────────────────────────────────────────────
@@ -340,14 +331,14 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             const w = s * 0.72;
             const fold = s * 0.30;
             dl.pathReset();
-            dl.pathLine(p.at(-w, -h));
-            dl.pathLine(p.at(w - fold, -h));
-            dl.pathLine(p.at(w, -h + fold));
-            dl.pathLine(p.at(w, h));
-            dl.pathLine(p.at(-w, h));
+            dl.pathLine(at(c, -w, -h));
+            dl.pathLine(at(c, w - fold, -h));
+            dl.pathLine(at(c, w, -h + fold));
+            dl.pathLine(at(c, w, h));
+            dl.pathLine(at(c, -w, h));
             dl.pathStroke(col, t, true);
-            dl.line(p.at(w - fold, -h), p.at(w - fold, -h + fold), col, t);
-            dl.line(p.at(w - fold, -h + fold), p.at(w, -h + fold), col, t);
+            dl.line(at(c, w - fold, -h), at(c, w - fold, -h + fold), col, t);
+            dl.line(at(c, w - fold, -h + fold), at(c, w, -h + fold), col, t);
         },
         .save => {
             const q = s * 0.72;
@@ -355,13 +346,13 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             dl.rect(draw.rect(c.x - q * 0.5, c.y - q, c.x + q * 0.5, c.y - q * 0.2), col, s * 0.06);
         },
         .trash => {
-            dl.line(p.at(-h, -h * 0.5), p.at(h, -h * 0.5), col, t);
-            dl.line(p.at(-h * 0.4, -h * 0.5), p.at(-h * 0.55, h), col, t);
-            dl.line(p.at(h * 0.4, -h * 0.5), p.at(h * 0.55, h), col, t);
-            dl.line(p.at(-h * 0.55, h), p.at(h * 0.55, h), col, t);
-            dl.line(p.at(-h * 0.3, -h * 0.5), p.at(-h * 0.3, -h * 0.8), col, t);
-            dl.line(p.at(h * 0.3, -h * 0.5), p.at(h * 0.3, -h * 0.8), col, t);
-            dl.line(p.at(-h * 0.3, -h * 0.8), p.at(h * 0.3, -h * 0.8), col, t);
+            dl.line(at(c, -h, -h * 0.5), at(c, h, -h * 0.5), col, t);
+            dl.line(at(c, -h * 0.4, -h * 0.5), at(c, -h * 0.55, h), col, t);
+            dl.line(at(c, h * 0.4, -h * 0.5), at(c, h * 0.55, h), col, t);
+            dl.line(at(c, -h * 0.55, h), at(c, h * 0.55, h), col, t);
+            dl.line(at(c, -h * 0.3, -h * 0.5), at(c, -h * 0.3, -h * 0.8), col, t);
+            dl.line(at(c, h * 0.3, -h * 0.5), at(c, h * 0.3, -h * 0.8), col, t);
+            dl.line(at(c, -h * 0.3, -h * 0.8), at(c, h * 0.3, -h * 0.8), col, t);
         },
         .copy => {
             dl.rectOutline(draw.rect(c.x - h, c.y - h, c.x + h * 0.2, c.y + h * 0.2), col, s * 0.12, t);
@@ -371,8 +362,8 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
         // ── Chrome ──────────────────────────────────────────────────────
         .search => {
             const r = s * 0.55;
-            dl.circleOutline(p.at(-s * 0.15, -s * 0.15), r, col, t);
-            dl.line(p.at(s * 0.25, s * 0.25), p.at(h, h), col, t);
+            dl.circleOutline(at(c, -s * 0.15, -s * 0.15), r, col, t);
+            dl.line(at(c, s * 0.25, s * 0.25), at(c, h, h), col, t);
         },
         .gear => gear(dl, c, s, t, col),
         .eye => {
@@ -387,7 +378,7 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             dl.pathStroke(col, t, false);
             dl.pathArc(c, s * 0.8, 0, pi, 16);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(-h, -h), p.at(h, h), col, t);
+            dl.line(at(c, -h, -h), at(c, h, h), col, t);
         },
         .grid => {
             for (0..2) |i| {
@@ -402,8 +393,8 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
         .list_ => {
             for (0..3) |i| {
                 const y = c.y + @as(f32, @floatFromInt(i)) * h - h;
-                dl.circle(p.at(-h * 0.75, y), s * 0.14, col);
-                dl.line(p.at(-h * 0.25, y), p.at(h, y), col, t);
+                dl.circle(at(c, -h * 0.75, y), s * 0.14, col);
+                dl.line(at(c, -h * 0.25, y), at(c, h, y), col, t);
             }
         },
         .camera => {
@@ -411,45 +402,45 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             const h2 = s * 0.58;
             dl.rectOutline(draw.rect(c.x - w, c.y - h2, c.x + w * 0.4, c.y + h2), col, s * 0.16, t);
             dl.pathReset();
-            dl.pathLine(p.at(w * 0.25, -h2 * 0.4));
-            dl.pathLine(p.at(w * 0.65, -h2 * 0.9));
-            dl.pathLine(p.at(w, -h2 * 0.4));
+            dl.pathLine(at(c, w * 0.25, -h2 * 0.4));
+            dl.pathLine(at(c, w * 0.65, -h2 * 0.9));
+            dl.pathLine(at(c, w, -h2 * 0.4));
             dl.pathStroke(col, t, false);
         },
         .layers => {
             for (0..2) |i| {
                 const off = @as(f32, @floatFromInt(i)) * s * 0.42;
                 dl.pathReset();
-                dl.pathLine(p.at(-h, -h * 0.4 + off));
-                dl.pathLine(p.at(0, -h + off));
-                dl.pathLine(p.at(h, -h * 0.4 + off));
+                dl.pathLine(at(c, -h, -h * 0.4 + off));
+                dl.pathLine(at(c, 0, -h + off));
+                dl.pathLine(at(c, h, -h * 0.4 + off));
                 dl.pathStroke(col, t, false);
             }
         },
         .lock_ => {
             dl.rect(draw.rect(c.x - h * 0.7, c.y - h * 0.1, c.x + h * 0.7, c.y + h), col, s * 0.16);
-            dl.pathArc(p.at(0, -h * 0.1), s * 0.42, pi, pi * 2.0, 12);
+            dl.pathArc(at(c, 0, -h * 0.1), s * 0.42, pi, pi * 2.0, 12);
             dl.pathStroke(col, t, false);
         },
         .link => {
-            dl.pathArc(p.at(-s * 0.25, 0), s * 0.45, pi * 0.5, pi * 1.5, 12);
+            dl.pathArc(at(c, -s * 0.25, 0), s * 0.45, pi * 0.5, pi * 1.5, 12);
             dl.pathStroke(col, t, false);
-            dl.pathArc(p.at(s * 0.25, 0), s * 0.45, -pi * 0.5, pi * 0.5, 12);
+            dl.pathArc(at(c, s * 0.25, 0), s * 0.45, -pi * 0.5, pi * 0.5, 12);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(-s * 0.1, 0), p.at(s * 0.1, 0), col, t);
+            dl.line(at(c, -s * 0.1, 0), at(c, s * 0.1, 0), col, t);
         },
         .unlink => {
-            dl.pathArc(p.at(-s * 0.35, 0), s * 0.45, pi * 0.5, pi * 1.5, 12);
+            dl.pathArc(at(c, -s * 0.35, 0), s * 0.45, pi * 0.5, pi * 1.5, 12);
             dl.pathStroke(col, t, false);
-            dl.pathArc(p.at(s * 0.35, 0), s * 0.45, -pi * 0.5, pi * 0.5, 12);
+            dl.pathArc(at(c, s * 0.35, 0), s * 0.45, -pi * 0.5, pi * 0.5, 12);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(-h, h), p.at(h, -h), col, t);
+            dl.line(at(c, -h, h), at(c, h, -h), col, t);
         },
         .drag => {
             for (0..2) |i| {
                 const x = c.x + @as(f32, @floatFromInt(i)) * s * 0.55 - s * 0.55;
-                dl.circle(p.at(x, -s * 0.3), s * 0.13, col);
-                dl.circle(p.at(x, s * 0.3), s * 0.13, col);
+                dl.circle(at(c, x, -s * 0.3), s * 0.13, col);
+                dl.circle(at(c, x, s * 0.3), s * 0.13, col);
             }
         },
 
@@ -469,25 +460,25 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
         },
         .error_ => {
             dl.circleOutline(c, s * 0.78, col, t);
-            dl.line(p.at(-h * 0.45, -h * 0.45), p.at(h * 0.45, h * 0.45), col, t);
-            dl.line(p.at(h * 0.45, -h * 0.45), p.at(-h * 0.45, h * 0.45), col, t);
+            dl.line(at(c, -h * 0.45, -h * 0.45), at(c, h * 0.45, h * 0.45), col, t);
+            dl.line(at(c, h * 0.45, -h * 0.45), at(c, -h * 0.45, h * 0.45), col, t);
         },
         .success_ => {
             dl.circleOutline(c, s * 0.78, col, t);
-            dl.line(p.at(-h * 0.5, 0), p.at(-h * 0.1, h * 0.4), col, t);
-            dl.line(p.at(-h * 0.1, h * 0.4), p.at(h * 0.55, -h * 0.45), col, t);
+            dl.line(at(c, -h * 0.5, 0), at(c, -h * 0.1, h * 0.4), col, t);
+            dl.line(at(c, -h * 0.1, h * 0.4), at(c, h * 0.55, -h * 0.45), col, t);
         },
         .undo => {
             dl.pathArc(c, s * 0.6, 0, pi * 1.2, 12);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(-h, -h * 0.2), p.at(-h, h * 0.4), col, t);
-            dl.line(p.at(-h, h * 0.4), p.at(-h * 0.3, h * 0.1), col, t);
+            dl.line(at(c, -h, -h * 0.2), at(c, -h, h * 0.4), col, t);
+            dl.line(at(c, -h, h * 0.4), at(c, -h * 0.3, h * 0.1), col, t);
         },
         .redo => {
             dl.pathArc(c, s * 0.6, pi * 0.8, pi * 2.0, 12);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(h, -h * 0.2), p.at(h, h * 0.4), col, t);
-            dl.line(p.at(h, h * 0.4), p.at(h * 0.3, h * 0.1), col, t);
+            dl.line(at(c, h, -h * 0.2), at(c, h, h * 0.4), col, t);
+            dl.line(at(c, h, h * 0.4), at(c, h * 0.3, h * 0.1), col, t);
         },
 
         // ── The viewport's tools ─────────────────────────────────────────
@@ -498,31 +489,37 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
         .cursor => {
             // An arrow: a triangle with a stem.
             dl.pathReset();
-            dl.pathLine(p.at(-h * 0.7, -h));
-            dl.pathLine(p.at(-h * 0.7, h * 0.55));
-            dl.pathLine(p.at(-h * 0.15, h * 0.05));
+            dl.pathLine(at(c, -h * 0.7, -h));
+            dl.pathLine(at(c, -h * 0.7, h * 0.55));
+            dl.pathLine(at(c, -h * 0.15, h * 0.05));
             dl.pathStroke(col, t, false);
         },
         .move => {
             // A four-way cross: the universal "move".
-            dl.line(p.at(-h, 0), p.at(h, 0), col, t);
-            dl.line(p.at(0, -h), p.at(0, h), col, t);
-            for ([_]Vec2{ p.at(-h, 0), p.at(h, 0), p.at(0, -h), p.at(0, h) }) |tip| {
+            dl.line(at(c, -h, 0), at(c, h, 0), col, t);
+            dl.line(at(c, 0, -h), at(c, 0, h), col, t);
+            for ([_]Vec2{ at(c, -h, 0), at(c, h, 0), at(c, 0, -h), at(c, 0, h) }) |tip| {
                 dl.circle(tip, t * 0.9, col);
             }
         },
         .rotate => {
             dl.pathArc(c, s * 0.62, -pi * 0.35, pi * 1.2, 14);
             dl.pathStroke(col, t, false);
-            dl.line(p.at(s * 0.60, -s * 0.42), p.at(s * 0.28, -s * 0.48), col, t);
-            dl.line(p.at(s * 0.60, -s * 0.42), p.at(s * 0.56, -s * 0.10), col, t);
+            dl.line(at(c, s * 0.60, -s * 0.42), at(c, s * 0.28, -s * 0.48), col, t);
+            dl.line(at(c, s * 0.60, -s * 0.42), at(c, s * 0.56, -s * 0.10), col, t);
         },
         .scale => {
-            // A diagonal double arrow: the corner handle, in a box.
-            dl.line(p.at(-h * 0.9, h * 0.9), p.at(h * 0.55, -h * 0.55), col, t);
-            dl.line(p.at(h * 0.9, h * 0.9), p.at(-h * 0.55, -h * 0.55), col, t);
-            dl.line(p.at(h * 0.9, h * 0.9), p.at(h * 0.35, h * 0.9), col, t);
-            dl.line(p.at(h * 0.9, h * 0.9), p.at(h * 0.9, h * 0.35), col, t);
+            // A diagonal double arrow: the corner handle, in a box. It is the
+            // one icon with no file yet, so the drawn one has to carry the
+            // meaning on its own — and a mark smaller than the box it lives in
+            // is a smudge, not an icon.
+            const d = h * 0.85;
+            dl.line(at(c, -d, d), at(c, d, -d), col, t);
+            // The two arrowheads, at the ends of the diagonal.
+            dl.line(at(c, -d, d), at(c, -d + d * 0.5, d), col, t);
+            dl.line(at(c, -d, d), at(c, -d, d - d * 0.5), col, t);
+            dl.line(at(c, d, -d), at(c, d - d * 0.5, -d), col, t);
+            dl.line(at(c, d, -d), at(c, d, -d + d * 0.5), col, t);
         },
         .tiles => {
             // A 2x2 grid of squares: a tile map in one glyph.
@@ -540,40 +537,40 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             for (corner) |k| {
                 const x = c.x + k[0] * h * 0.85;
                 const y = c.y + k[1] * h * 0.85;
-                dl.line(p.at(x, y), p.at(x - k[0] * arm, y), col, t);
-                dl.line(p.at(x, y), p.at(x, y - k[1] * arm), col, t);
+                dl.line(at(c, x, y), at(c, x - k[0] * arm, y), col, t);
+                dl.line(at(c, x, y), at(c, x, y - k[1] * arm), col, t);
             }
         },
         .home => {
             // A crosshair: "the origin".
             dl.circleOutline(c, s * 0.45, col, t);
-            dl.line(p.at(-h, 0), p.at(-s * 0.2, 0), col, t);
-            dl.line(p.at(s * 0.2, 0), p.at(h, 0), col, t);
-            dl.line(p.at(0, -h), p.at(0, -s * 0.2), col, t);
-            dl.line(p.at(0, s * 0.2), p.at(0, h), col, t);
+            dl.line(at(c, -h, 0), at(c, -s * 0.2, 0), col, t);
+            dl.line(at(c, s * 0.2, 0), at(c, h, 0), col, t);
+            dl.line(at(c, 0, -h), at(c, 0, -s * 0.2), col, t);
+            dl.line(at(c, 0, s * 0.2), at(c, 0, h), col, t);
         },
 
         // ── The panel headers ────────────────────────────────────────────
         .panel_hierarchy => {
             for (0..3) |i| {
                 const y = c.y + @as(f32, @floatFromInt(i)) * h * 0.7 - h * 0.7;
-                dl.circle(p.at(-h * 0.7, y), s * 0.12, col);
-                dl.line(p.at(-h * 0.3, y), p.at(h * 0.8, y), col, t);
+                dl.circle(at(c, -h * 0.7, y), s * 0.12, col);
+                dl.line(at(c, -h * 0.3, y), at(c, h * 0.8, y), col, t);
             }
         },
         .panel_inspector => {
             // A slider: the inspector in one glyph.
             for (0..3) |i| {
                 const y = c.y + @as(f32, @floatFromInt(i)) * h * 0.6 - h * 0.6;
-                dl.line(p.at(-h, y), p.at(h, y), col, t);
-                dl.circle(p.at(-h * 0.2 + @as(f32, @floatFromInt(i)) * h * 0.35, y), s * 0.16, col);
+                dl.line(at(c, -h, y), at(c, h, y), col, t);
+                dl.circle(at(c, -h * 0.2 + @as(f32, @floatFromInt(i)) * h * 0.35, y), s * 0.16, col);
             }
         },
         .panel_assets => folder(dl, c, s, t, col, false),
         .panel_console => {
             dl.rectOutline(draw.rect(c.x - h, c.y - h * 0.8, c.x + h, c.y + h * 0.8), col, s * 0.14, t);
-            dl.line(p.at(-h * 0.5, -h * 0.2), p.at(-h * 0.1, h * 0.2), col, t);
-            dl.line(p.at(-h * 0.1, h * 0.2), p.at(h * 0.45, -h * 0.35), col, t);
+            dl.line(at(c, -h * 0.5, -h * 0.2), at(c, -h * 0.1, h * 0.2), col, t);
+            dl.line(at(c, -h * 0.1, h * 0.2), at(c, h * 0.45, -h * 0.35), col, t);
         },
         .panel_tilemap => {
             for (0..3) |row| {
@@ -586,6 +583,18 @@ fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness:
             }
         },
     }
+}
+
+/// A point relative to an icon's CENTRE.
+///
+/// It is a module-level function and not a nested one because Zig 0.16 does
+/// not let a nested function capture the enclosing scope — and the centre is
+/// exactly what it needs. The helper it replaced returned the coordinates
+/// as they were, so every DRAWN icon (the ones with no PNG) was drawn at the
+/// window's origin instead of in its box: the toolbar had a hole in it where
+/// the scale handle should have been.
+fn at(c: Vec2, x: f32, y: f32) Vec2 {
+    return .{ .x = c.x + x, .y = c.y + y };
 }
 
 fn rotp(cx: f32, cy: f32, x: f32, y: f32, ca: f32, sa: f32) Vec2 {
@@ -675,7 +684,9 @@ test "ui icons: the set is total, so adding an icon is a compile error here" {
             .pause, .stop, .skip_start, .skip_end, .refresh, .trash, .copy, .eye,
             .eye_off, .warning_, .info_, .error_, .success_, .lock_, .dot_, .dots,
             .undo, .redo, .save, .grid, .list_, .camera, .layers, .link, .unlink,
-            .drag, => {},
+            .drag, .cursor, .move, .rotate, .scale, .tiles, .focus, .home,
+            .panel_hierarchy, .panel_inspector, .panel_assets, .panel_console,
+            .panel_tilemap, => {},
         }
     }
 }

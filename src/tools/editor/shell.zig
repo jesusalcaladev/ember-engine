@@ -406,18 +406,21 @@ fn drawPane(ctx: *ui.Context) void {
 /// and its tab look like the same thing.
 fn header(ctx: *ui.Context, name: []const u8, icon: ui.Icon) void {
     const t = &ctx.theme;
-    const p = ui.draw.cursorPos();
-    // The WINDOW's draw list, not the item's: at the top of a panel's body
-    // there is no item yet, and the item list still belongs to the PREVIOUS
-    // panel — so the icon would be drawn in another window entirely.
-    ui.icons.render(ui.draw.windowList(), icon, .{ .x = p.x + 8, .y = p.y + 9 }, t.colors.text_dim, 16, 0);
-    // The title sits to the right of the icon, on the same line.
-    ui.draw.setCursorPos(.{ .x = p.x + 22, .y = p.y });
+
+    // The icon is an ITEM, not a picture painted on top of the panel: a dummy
+    // reserves its box, the icon is drawn in that box, and the title follows
+    // it. Painting it by hand meant guessing where the panel's content
+    // started, and the guess was wrong — the icon ended up in the top-left
+    // corner of the screen, and the panel had no icon at all.
+    cimgui.ember_ui_dummy(16, 16);
+    const r = ui.draw.itemRect();
+    ui.icons.render(ui.draw.itemList(), icon, ui.draw.center(r), t.colors.text_dim, 16, 0);
+    cimgui.ember_ui_same_line(0, 6);
+
     ui.text.title(ctx, name);
     const after = ui.draw.cursorPos();
-    ui.draw.setCursorPos(.{ .x = p.x, .y = after.y });
     ui.draw.itemList().rect(
-        ui.draw.rect(p.x, after.y + 1, p.x + 28, after.y + 3),
+        ui.draw.rect(r.min.x, after.y + 1, r.min.x + 28, after.y + 3),
         t.colors.accent,
         1,
     );
