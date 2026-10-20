@@ -220,14 +220,82 @@ logic ends up firing every frame. Signals are ordered by spawn and drained once
 per frame (spec §6).
 
 ```lua
-function on_signal(self, name, event)
+function M:on_signal(name, payload)
   if name == "collision" then
-    if event.began and event.approach_speed > 200 then
-      effects.spawn("dust", self.px, self.py)
+    if payload.began and payload.approach_speed > 200 then
+      -- a hard landing
     end
   end
 end
 ```
+
+The event reaches Lua as a **payload**, and the payload says which actors it
+is about: `payload.self` and `payload.other` are entity handles
+(`actor.entity_bits` and `actor.from_entity` turn them into actors). Every
+behavior receives the event — it is a broadcast — so a handler filters on
+`payload.self`.
+
+---
+
+## Areas: the engine's answer to Godot's `Area2D`
+
+**There is no `Area2D` component, and there does not need to be one.** Godot's
+area is a node with a shape that reports overlaps; this engine's answer is a
+**sensor** — a `Collider2D` with `is_sensor = true` — and the contact signal.
+
+A sensor reports its overlaps through the same contact queue as a solid body
+and **stops nothing**, which is exactly what an area does. The one thing the
+engine had to add to make the difference legible is a flag on the event:
+
+| Field | Meaning |
+|---|---|
+| `other_is_sensor` | **the other side is a trigger, not a wall** |
+
+Without it, a script cannot tell "I hit a wall" from "I entered a trigger" —
+the engine cannot either, because the two arrive through the same queue. With
+it, the area pattern is two lines:
+
+```lua
+-- scripts/globals/triggers.lua
+local M = {}
+
+function M:start()
+  self.bits = actor.entity_bits(self)
+  self.player_bits = nil
+end
+
+function M:update(dt)
+  -- Who is in my box? The layer mask says WHICH kind of actor I care about.
+  local n, a, b = physics.overlap_rect(self.x, self.y, 32, 32, PLAYER_LAYER)
+  for i = 1, n do
+    local actor_in_box = (i == 1) and a or b
+    if actor_in_box then
+      local bits = actor.entity_bits(actor_in_box)
+      if self.player_bits and bits == self.player_bits then
+        self:fire("player_entered")
+      end
+    end
+  end
+end
+```
+
+or, from the actor's side, with the signal:
+
+```lua
+function M:on_signal(name, payload)
+  if name ~= "collision" then return end
+  if payload.self ~= self.bits then return end
+  if payload.began and payload.other_is_sensor then
+    self:enter_area()
+  end
+end
+```
+
+**What the engine does NOT have:** a `monitoring`/`monitorable` pair (Godot's
+way of saying "I detect things" and "I can be detected"), and a dedicated
+`Area2D` component with its own shape and its own signal. The sensor plus
+`other_is_sensor` plus `physics.overlap_rect` covers the same ground with the
+pieces the engine already had.
 
 ---
 

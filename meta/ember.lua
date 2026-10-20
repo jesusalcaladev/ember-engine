@@ -143,6 +143,16 @@ function Actor:async(fn) end
 ---@param seconds number how long to pause, in game seconds
 function Actor:wait(seconds) end
 
+---This actor's handle as a number. The handle is what a signal payload carries: the physics publishes the entities involved in a collision, and a script matches them against its own with this number.
+---@param self Actor 
+---@return number the actor's handle
+function Actor:entity_bits() end
+
+---The actor a handle names, built on demand. The inverse of `actor.entity_bits`: the result can be passed to every other `actor.*` function. Nil when the handle names no live entity.
+---@param bits number an entity handle
+---@return Actor the actor, or nil when the handle is dead
+function actor.from_entity(bits) end
+
 ---Sets the velocity outright. Leaves the angular velocity alone.
 ---@param self Actor 
 ---@param vx number velocity x in units/second
@@ -227,14 +237,15 @@ function physics.set_body_type(self, kind) end
 ---@param enabled boolean false to make it intangible
 function physics.set_body_enabled(self, enabled) end
 
----Every actor overlapping a box. The selection query. Approximate: a shape is found when a ray crosses it.
+---Every actor overlapping a box. The selection query, and the AREA query: "what is in this box". Approximate: a shape is found when a ray crosses it. The optional fifth argument is a LAYER mask — only the actors whose `CollisionLayers.layer` is in the mask are returned, which is how a trigger asks about the one kind of actor it cares about.
 ---@param cx number box centre x
 ---@param cy number box centre y
 ---@param half_w number half the box width
 ---@param half_h number half the box height
+---@param mask number optional: a layer mask
 ---@return integer how many actors were found
 ---@return Actor each one, as varargs
-function physics.overlap_rect(cx, cy, half_w, half_h) end
+function physics.overlap_rect(cx, cy, half_w, half_h, mask) end
 
 ---The actor under a point, for click-to-select.
 ---@param x number point x in world units

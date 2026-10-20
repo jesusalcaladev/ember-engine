@@ -23,6 +23,12 @@
 
 **Connects to:** **requires `RigidBody2D`** — a shape is only ever created for an entity that has a body. Also `CollisionLayers` and `Transform`.
 
+**The sensor IS the area.** There is no `Area2D` component: an area is a
+`Collider2D` with `is_sensor = true`, and the contact signal says which it is
+through `other_is_sensor`. A sensor reports its overlaps through the same
+contact queue as a solid body and stops nothing — which is exactly what an
+area does. See [Areas](../physics-overview.md#areas-the-engines-answer-to-gods-area2d).
+
 **Gotchas:**
 - A `Collider2D` without a `RigidBody2D` is **inert**.
 - `size` is **half**-extents: a box of `{0.5, 0.5}` is 1×1 world units.

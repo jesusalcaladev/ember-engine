@@ -74,6 +74,15 @@ pub const ContactEvent = extern struct {
     began: bool,
     /// True when it ended (a foot leaving the ground).
     ended: bool,
+    /// True when the OTHER side is a SENSOR — a trigger, an area, a pickup
+    /// zone.
+    ///
+    /// This is the difference between "I hit a wall" and "I entered an area",
+    /// and the engine cannot tell them apart without it: a sensor reports its
+    /// overlaps through the same contact queue as a solid body. A script that
+    /// receives the contact and cannot ask this question can only implement a
+    /// trigger by keeping its own list of what it thinks is a trigger.
+    other_is_sensor: bool,
 };
 
 pub const Error = error{WorldCreationFailed} || physics.Error;
@@ -843,6 +852,12 @@ pub const System = struct {
         fn side(self: *ContactSink, c: physics.Contact, self_body: physics.BodyId, other_body: physics.BodyId) void {
             const entity = self.system.entityFor(self_body) orelse return;
             const other = self.system.entityFor(other_body);
+            // Is the other side a SENSOR — a trigger, an area, a pickup zone?
+            // One lookup, and it is the difference between a wall and an area.
+            const other_is_sensor = if (other) |o| blk: {
+                const col = self.world.get(o, components.Collider2D) orelse break :blk false;
+                break :blk col.is_sensor;
+            } else false;
             // A body with no entity (a wall, the floor) still produces an event
             // for the actor that touched it — that is the case that matters, and
             // `other_index` comes out as `Entity.invalid` so the listener can
@@ -855,6 +870,7 @@ pub const System = struct {
                 .approach_speed = c.approach_speed,
                 .began = c.began,
                 .ended = c.ended,
+                .other_is_sensor = other_is_sensor,
             });
             self.emitted += 1;
         }
@@ -1028,16 +1044,48 @@ pub const System = struct {
         return sink.count;
     }
 
+    /// The same query, restricted to the actors ON the given layers.
+    ///
+    /// `mask` is a LAYER mask: an actor is returned when the `layer` of its
+    /// `CollisionLayers` is in the mask. Zero means "every layer", which is
+    /// what the unmasked query does.
+    ///
+    /// The filter is applied HERE, in the visitor, and not in the solver's
+    /// filter: the solver's filter is a PAIR of masks (what I am, what I
+    /// collide with) and a query wants one ("what is in this box"), and
+    /// borrowing the solver's shape for it would answer a different question.
+    pub fn overlapEntitiesMasked(
+        self: *const System,
+        world: *World,
+        box: physics.Aabb,
+        mask: u64,
+        out: []Entity,
+    ) usize {
+        var sink = OverlapSink{ .system = self, .out = out, .count = 0, .mask = mask, .world = world };
+        self.world.overlapBox(box, .pass_all, visitOverlap, &sink);
+        return sink.count;
+    }
+
     const OverlapSink = struct {
         system: *const System,
         out: []Entity,
         count: usize,
+        /// The layer mask, 0 = every layer.
+        mask: u64 = 0,
+        /// The ECS world, for the layer of each candidate. Null when the query
+        /// is unmasked.
+        world: ?*World = null,
     };
 
     fn visitOverlap(user: *anyopaque, shape: physics.ShapeId) void {
         const sink: *OverlapSink = @ptrCast(@alignCast(user));
         const body = sink.system.shapeOwner(shape) orelse return;
         const entity = sink.system.entityFor(body) orelse return;
+        if (sink.mask != 0) {
+            const w = sink.world orelse return;
+            const layers = w.get(entity, components.CollisionLayers) orelse return;
+            if (layers.layer & sink.mask == 0) return;
+        }
         if (sink.count < sink.out.len) sink.out[sink.count] = entity;
         sink.count += 1;
     }

@@ -974,7 +974,40 @@ fn lua_noise_ridged(L: ?*lua_State) callconv(.c) c_int {
 // ── Registration ─────────────────────────────────────────────────────────────
 
 /// The actor methods, installed on the `actor` table. `self` is always arg 1.
+/// `actor.entity_bits(self) -> number` — this actor's handle as a number.
+///
+/// The handle is what a signal payload carries: the physics publishes the
+/// entities involved in a collision, and a script matches them against its own
+/// with this number. It is also how a script keeps a reference to another
+/// actor in a plain field (see `actor.from_entity`).
+fn lua_actor_entity_bits(L: ?*lua_State) callconv(.c) c_int {
+    const e = entityOf(L, 1) orelse return 0;
+    lua.lua_pushinteger(L, @intCast(@as(u64, @bitCast(e))));
+    return 1;
+}
+
+/// `actor.from_entity(bits) -> actor|nil` — the actor a handle names.
+///
+/// The inverse of `actor.entity_bits`: it builds a table stamped with the
+/// handle, so the result can be passed to every other `actor.*` function.
+/// Nil when the handle names no live entity — a despawned actor, or a handle
+/// from another world.
+fn lua_actor_from_entity(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const bits: u64 = @bitCast(lua.toInteger(L, 1));
+    const e: context_mod.Entity = @bitCast(bits);
+    if (!ctx.world.isAlive(e)) {
+        lua.pushNil(L);
+        return 1;
+    }
+    lua.lua_createtable(L, 0, 1); // [T]
+    stampEntity(L, e);
+    return 1;
+}
+
 const actor_regs = [_]luaL_Reg{
+    .{ .name = "entity_bits", .func = lua_actor_entity_bits },
+    .{ .name = "from_entity", .func = lua_actor_from_entity },
     .{ .name = "get_position", .func = lua_get_position },
     .{ .name = "set_position", .func = lua_set_position },
     .{ .name = "translate", .func = lua_translate },
@@ -1383,7 +1416,16 @@ fn lua_physics_overlap_rect(L: ?*lua_State) callconv(.c) c_int {
     const hh = @abs(lua.toF32(L, 4));
 
     const box = physics_mod.Aabb.centred(cx, cy, hw, hh);
-    const total = sys.overlapEntities(box, &overlap_scratch);
+    // The optional fifth argument is a LAYER mask: only the actors whose
+    // `CollisionLayers.layer` is in the mask are returned. Without it the
+    // query answers "what is in this box", and with it it answers "what is
+    // in this box THAT I CARE ABOUT" — which is the question an area or a
+    // trigger asks.
+    const mask: u64 = if (lua.getTop(L) >= 5) @bitCast(lua.toInteger(L, 5)) else 0;
+    const total = if (mask != 0)
+        sys.overlapEntitiesMasked(ctx.world, box, mask, &overlap_scratch)
+    else
+        sys.overlapEntities(box, &overlap_scratch);
 
     // De-duplicate: the ray grid crosses one shape many times, and an editor
     // selection must not contain the same actor twice.
@@ -6102,6 +6144,8 @@ pub const registered_names = [_][]const u8{
     "actor.add_component",
     "actor.has_component",
     "actor.remove_component",
+    "actor.entity_bits",
+    "actor.from_entity",
     "physics.create_shape",
     "physics.reshape",
     "physics.set_material",

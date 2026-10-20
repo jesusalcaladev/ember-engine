@@ -559,13 +559,14 @@ pub const bindings = [_]Binding{
     .{
         .name = "physics.overlap_rect",
         .module = "physics",
-        .signature = "physics.overlap_rect(cx, cy, half_w, half_h) -> integer, actor...",
-        .summary = "Every actor overlapping a box. The selection query. Approximate: a shape is found when a ray crosses it.",
+        .signature = "physics.overlap_rect(cx, cy, half_w, half_h, mask?) -> integer, actor...",
+        .summary = "Every actor overlapping a box. The selection query, and the AREA query: \"what is in this box\". Approximate: a shape is found when a ray crosses it. The optional fifth argument is a LAYER mask — only the actors whose `CollisionLayers.layer` is in the mask are returned, which is how a trigger asks about the one kind of actor it cares about.",
         .params = &.{
             .{ .name = "cx", .kind = .number, .doc = "box centre x" },
             .{ .name = "cy", .kind = .number, .doc = "box centre y" },
             .{ .name = "half_w", .kind = .number, .doc = "half the box width" },
             .{ .name = "half_h", .kind = .number, .doc = "half the box height" },
+            .{ .name = "mask", .kind = .number, .doc = "optional: a layer mask" },
         },
         .returns = &.{
             .{ .kind = .integer, .doc = "how many actors were found" },
@@ -2944,6 +2945,42 @@ pub const bindings = [_]Binding{
         .returns = &.{},
         .example =
         \\sprite.set_image(self, "assets/sprites/player.png")
+        ,
+    },
+    .{
+        .name = "actor.entity_bits",
+        .module = "actor",
+        .signature = "actor.entity_bits(self) -> number",
+        .summary = "This actor's handle as a number. The handle is what a signal payload carries: the physics publishes the entities involved in a collision, and a script matches them against its own with this number.",
+        .params = &.{.{ .name = "self", .kind = .actor }},
+        .returns = &.{
+            .{ .kind = .number, .doc = "the actor's handle" },
+        },
+        .example =
+        \\function M:start()
+        \\  self.bits = actor.entity_bits(self)
+        \\end
+        \\function M:on_signal(name, payload)
+        \\  if name == "collision" and payload.self == self.bits then
+        \\    -- this contact is about ME
+        \\  end
+        \\end
+        ,
+    },
+    .{
+        .name = "actor.from_entity",
+        .module = "actor",
+        .signature = "actor.from_entity(bits) -> actor|nil",
+        .summary = "The actor a handle names, built on demand. The inverse of `actor.entity_bits`: the result can be passed to every other `actor.*` function. Nil when the handle names no live entity.",
+        .params = &.{
+            .{ .name = "bits", .kind = .number, .doc = "an entity handle" },
+        },
+        .returns = &.{
+            .{ .kind = .actor, .doc = "the actor, or nil when the handle is dead" },
+        },
+        .example =
+        \\local other = actor.from_entity(payload.other)
+        \\if other then log.info(actor.get_name(other)) end
         ,
     },
     .{

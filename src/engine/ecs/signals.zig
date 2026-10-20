@@ -21,6 +21,29 @@ const entity = @import("entity.zig");
 
 pub const SceneId = entity.SceneId;
 
+/// One field of a signal payload: a name and a POD value.
+///
+/// The payload crosses from the ENGINE (which knows what happened) to the
+/// SCRIPT layer (which wants a table), and the engine module cannot import
+/// the script module — the dependency runs the other way. So the FIELD type
+/// lives here, in the layer both can see, and the script layer turns it into a
+/// Lua table.
+///
+/// The values are POD: a number, an integer, a boolean, or a borrowed string
+/// (copied into the VM when the table is built).
+pub const PayloadField = struct {
+    name: [*:0]const u8,
+    value: Value,
+
+    pub const Value = union(enum) {
+        number: f64,
+        integer: i64,
+        boolean: bool,
+        /// Borrowed for the duration of the call; copied into the VM.
+        string: []const u8,
+    };
+};
+
 /// Maximum payload bytes copied per emitted event (a compile error above).
 pub const max_payload = 64;
 

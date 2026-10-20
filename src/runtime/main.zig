@@ -949,6 +949,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // defaults, so `zig build run -- --headless` measures the empty world.
     if (!args.headless) mountGlobalScripts(&behaviors, &project_config, boot_alloc);
 
+    // ── The collision signal, bridged to Lua ───────────────────────────────
+    // The physics publishes contacts on the world's typed bus, which only the
+    // Zig listeners see. The bridge is what lets a SCRIPT react to being
+    // touched — and, with `other_is_sensor`, tells a trigger from a wall.
+    //
+    // The runtime has no physics system yet (the editor does), so nothing
+    // publishes the signal here yet; the subscription is in place for the day
+    // it lands, and it costs nothing while it is quiet.
+    behaviors.bridgeCollisions(&world) catch |err| {
+        log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
+    };
+
     // ── The scene, and the behaviors its actors run ────────────────────────
     // AFTER the globals are mounted (a global's `start` may want to know what
     // the scene contains) and BEFORE the first frame, so the world that the

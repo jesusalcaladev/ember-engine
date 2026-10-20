@@ -774,6 +774,52 @@ for _, name in ipairs(tween.properties()) do print(name) end
 
 ---
 
+## The `collision` signal
+
+Not a module: a signal the physics publishes, delivered to every behavior's
+`on_signal(name, payload)`.
+
+```lua
+function M:start()
+  self.bits = actor.entity_bits(self)
+end
+
+function M:on_signal(name, payload)
+  if name ~= "collision" then return end
+  if payload.self ~= self.bits then return end   -- not about me
+  if payload.began and payload.other_is_sensor then
+    -- I entered an AREA
+  end
+end
+```
+
+| Field | Type | What it is |
+|---|---|---|
+| `began` | `boolean` | The contact started this step (as opposed to persisting) |
+| `ended` | `boolean` | The contact ended (a foot leaving the ground) |
+| `approach_speed` | `number` | The impact speed, so a tap can be told from a crash |
+| `other_is_sensor` | `boolean` | **The other side is a trigger, not a wall.** A sensor reports its overlaps through the same contact queue as a solid body, so this is the only way to tell an area from a wall |
+| `self` | `number` | The handle of the actor the event is about (`actor.entity_bits`) |
+| `other` | `number` | The handle of the OTHER actor (`actor.from_entity` turns it into an actor) |
+
+**The event is a broadcast.** Every behavior receives it, and the payload says
+which actors it is about — so a handler filters on `payload.self`, the way a
+Zig listener filters on `self_index`.
+
+**The signal is published once per side.** A contact between two actors
+produces two events, one for each, and each one's `other` is the other actor.
+
+```lua
+function M:on_signal(name, payload)
+  if name ~= "collision" then return end
+  local other = actor.from_entity(payload.other)
+  if other and payload.began then
+    log.info("touched " .. actor.get_name(other))
+  end
+end
+```
+
+---
 ## `flow`
 
 The game's own phases — menu → playing → paused → game over — as a **global**

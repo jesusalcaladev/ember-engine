@@ -33,6 +33,7 @@ const scripts_mod = @import("scripts.zig");
 const bindings = @import("bindings.zig");
 const context = @import("context.zig");
 const statemachine_mod = @import("statemachine.zig");
+const physics_mod = @import("physics");
 const tween_mod = @import("tween.zig");
 const spatial_mod = @import("spatial.zig");
 const steer_mod = @import("steer.zig");
@@ -293,6 +294,10 @@ pub const Behaviors = struct {
     grid: spatial_mod.Grid,
     /// Registry ref of the steering module's `for` constructor.
     steer_ref: i32 = no_ref,
+    /// The context the collision bridge hands the bus. A FIELD and not a
+    /// local: the bus holds the pointer for as long as the subscription
+    /// lives, and a local would die with the frame that made it.
+    collision_ctx: CollisionCtx = .{},
     /// The coroutine layer's `async` method, injected into every instance's
     /// `self` table so a script can start a coroutine: `self:async(fn)`.
     async_ref: i32 = no_ref,
@@ -507,6 +512,41 @@ pub const Behaviors = struct {
         self.grid.deinit();
         self.scripts.deinit();
         self.vm.deinit();
+    }
+
+    /// Subscribes the script layer to the world's COLLISION signal, so a
+    /// script can react to being touched.
+    ///
+    /// The physics publishes contacts on the world's typed bus, which only the
+    /// ZIG listeners see. Without this bridge a Lua script cannot react to a
+    /// collision AT ALL — and in a 2D game that is the same as saying a script
+    /// cannot play the game.
+    ///
+    /// The event is a BROADCAST: every behavior receives it, and the payload
+    /// says which actors it is about. A handler filters:
+    ///
+    /// ```lua
+    /// function M:on_signal(name, payload)
+    ///   if name ~= "collision" then return end
+    ///   if payload.self ~= self.bits then return end   -- not about me
+    ///   if payload.began and payload.other_is_sensor then
+    ///     -- I entered an area
+    ///   end
+    /// end
+    /// ```
+    ///
+    /// `payload.other_is_sensor` is the AREA answer: a sensor reports overlaps
+    /// through the same contact queue as a solid body, so without it a script
+    /// cannot tell "I hit a wall" from "I entered a trigger".
+    pub fn bridgeCollisions(self: *Behaviors, world: *World) !void {
+        self.collision_ctx.behaviors = self;
+        try world.signals.on(
+            physics_mod.ContactEvent,
+            physics_mod.contact_signal,
+            0, // the spawn order of the subscription: the bridge is first
+            &self.collision_ctx,
+            CollisionCtx.fire,
+        );
     }
 
     /// The VM (for the runtime to drive the GC step and read heap stats).
@@ -1049,21 +1089,13 @@ pub const Behaviors = struct {
 
     /// One field of a signal payload, as Lua sees it: a name and a value.
     ///
-    /// The engine side stays POD (a union of scalars and one borrowed string),
-    /// and building the Lua TABLE is this module's business — the runtime that
-    /// emits `sound_finished` must not have to reach into `lua_State`.
-    pub const PayloadField = struct {
-        name: [*:0]const u8,
-        value: Value,
-
-        pub const Value = union(enum) {
-            number: f64,
-            integer: i64,
-            boolean: bool,
-            /// Borrowed for the duration of the call; copied into the VM.
-            string: []const u8,
-        };
-    };
+    /// The type lives in the ECS module because the ENGINE builds these
+    /// payloads (the physics publishes a collision, the audio publishes a
+    /// finished sound) and the ECS cannot import the script module — the
+    /// dependency runs the other way. Building the Lua TABLE is this module's
+    /// business: the runtime that emits `sound_finished` must not have to
+    /// reach into `lua_State`.
+    pub const PayloadField = ecs.signals.PayloadField;
 
     /// Invokes `on_signal(name)` on every live instance that defines it. The
     /// runtime calls this from the signal drain so Lua handlers run in the same
@@ -1290,6 +1322,67 @@ fn globalRefOfSelfHook(ctx: ?*anyopaque, L: ?*lua_State, idx: c_int) i32 {
         if (got != null and got == want) return g.self_ref;
     }
     return statemachine_mod.no_ref;
+}
+
+// ── The collision bridge: the physics reaches Lua ────────────────────────────
+
+const collide_script_src =
+    \\local M = {}
+    \\function M:start()
+    \\  self.bits = actor.entity_bits(self)
+    \\  self.hits = 0
+    \\  self.sensor = false
+    \\end
+    \\function M:on_signal(name, payload)
+    \\  if name ~= "collision" then return end
+    \\  if payload.self ~= self.bits then return end
+    \\  if not payload.began then return end
+    \\  self.hits = self.hits + 1
+    \\  self.sensor = payload.other_is_sensor and 1 or 0
+    \\end
+    \\return M
+;
+
+test "the collision signal reaches Lua, and says whether the other side is a sensor" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // A real solver world, with a SENSOR (an area) and a body inside it.
+    var phys = physics_mod.System.init(std.testing.allocator, .box2d, .{}) catch
+        return error.TestUnexpectedResult;
+    defer phys.deinit();
+
+    _ = try h.world.spawn(.{
+        components.Transform{},
+        components.RigidBody2D{ .body_type = 0 }, // fixed
+        components.Collider2D{ .kind = 0, .size = .{ .x = 20, .y = 20 }, .is_sensor = true },
+    });
+    const body = try h.world.spawn(.{
+        components.Transform{},
+        components.RigidBody2D{ .body_type = 2 }, // dynamic
+        components.Collider2D{ .kind = 0, .size = .{ .x = 10, .y = 10 } },
+    });
+    phys.syncLoad(&h.world);
+
+    // The bridge: the physics publishes on the world's bus, and the script
+    // layer listens to it.
+    try h.b.bridgeCollisions(&h.world);
+
+    const sid = try h.b.load("collide.lua", collide_script_src);
+    try h.b.attach(body, sid);
+    h.b.startAll();
+
+    const self_ref = h.b.instances.items[0].self_ref;
+    try std.testing.expectEqual(@as(f64, 0), readSelfNumber(&h.b, self_ref, "hits").?);
+
+    // A step publishes the contact; the drain hands it to the script.
+    _ = phys.step(&h.world, 1.0 / 60.0);
+    h.world.signals.drain();
+
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, self_ref, "hits").?);
+    // The other side IS a sensor: this is the AREA answer.
+    try std.testing.expectEqual(@as(f64, 1), readSelfNumber(&h.b, self_ref, "sensor").?);
 }
 
 // ── The flow: the global state machine with a stack ─────────────────────────
@@ -1869,6 +1962,32 @@ const Harness = struct {
 };
 
 const script_Input = @import("input.zig").Input;
+
+/// The collision bridge's context: the script layer, and the bus callback
+/// that reaches it.
+pub const CollisionCtx = struct {
+    behaviors: ?*Behaviors = null,
+
+    fn fire(ctx: ?*anyopaque, value: *const anyopaque) void {
+        const self: *CollisionCtx = @ptrCast(@alignCast(ctx orelse return));
+        const b = self.behaviors orelse return;
+        const c: *const physics_mod.ContactEvent = @ptrCast(@alignCast(value));
+
+        // The two actors, as the handles a script can match and resolve.
+        const self_entity: Entity = .{ .index = c.self_index, .generation = c.self_generation };
+        const other_entity: Entity = .{ .index = c.other_index, .generation = c.other_generation };
+
+        var fields = [_]ecs.signals.PayloadField{
+            .{ .name = "began", .value = .{ .boolean = c.began } },
+            .{ .name = "ended", .value = .{ .boolean = c.ended } },
+            .{ .name = "approach_speed", .value = .{ .number = c.approach_speed } },
+            .{ .name = "other_is_sensor", .value = .{ .boolean = c.other_is_sensor } },
+            .{ .name = "self", .value = .{ .integer = @bitCast(@as(u64, @bitCast(self_entity))) } },
+            .{ .name = "other", .value = .{ .integer = @bitCast(@as(u64, @bitCast(other_entity))) } },
+        };
+        b.dispatchSignalPayload(physics_mod.contact_signal, &fields);
+    }
+};
 
 // ── Coroutines: `self:async(fn)` and the global `wait(seconds)` ─────────────
 
