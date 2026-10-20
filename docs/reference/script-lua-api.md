@@ -20,6 +20,7 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`noise`](#noise) | Procedural noise (value, Perlin, simplex, fBm, ridged) |
 | [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit), with a **hierarchy** |
 | [`ai`](#ai) | The navigation grid and the path across it (A*) |
+| [`save`](#save) | Saving the game: what the developer wants to keep, optionally encrypted |
 | [`physics`](#physics) | Rigid-body queries: raycasts, line of sight, solver counters, activity tiers |
 | [`audio`](#audio) | The mixer: play_file, play_stream, buses, solo/sends, stats |
 | [`sound`](#sound) | This actor's `SoundEmitter2D`: play, stop, volume/pitch, radius, is_playing, describe |
@@ -2088,6 +2089,38 @@ if #path > 0 then self:walk_towards(path[1]) end
 |---|---|
 | **Signature** | `ai.cell_size() -> number` |
 | **Description** | The grid's cell size, in world units. A cell should be about the size of an actor: smaller and the grid gets huge, bigger and the paths get ragged. |
+
+---
+
+## `save`
+
+Saving the game — and **what the developer wants to save**, not "the world".
+
+### `save.save(slot, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `save.save(slot, opts?) -> boolean` |
+| **Parameters** | `slot` — `string`; `opts` — `table` — optional: `only`, `exclude`, `password` |
+| **Returns** | `boolean` — true when the save was written |
+| **Description** | Saves the game. `opts.only` names the actors to save and `opts.exclude` the ones to leave out; with neither, every actor is saved. `opts.password` encrypts the file: **AES-256-GCM** with the key derived by PBKDF2-HMAC-SHA256 from the password and a random per-file salt. A save with no password is written in the clear and says so in its header. |
+
+```lua
+save.save("slot1", { only = { "player", "coins" }, password = "hunter2" })
+```
+
+### `save.load(slot, opts?)`
+
+| | |
+|---|---|
+| **Signature** | `save.load(slot, opts?) -> boolean` |
+| **Description** | Loads a slot into the world, **replacing** it — the same path a scene load takes, so everything wired to the world is re-established. An encrypted save needs `opts.password`. |
+
+### `save.list()` · `save.delete(slot)` · `save.exists(slot)`
+
+| | |
+|---|---|
+| **Description** | The slots on disk (each with `name`, `encrypted` and `size`), removing a slot, and whether a slot is there. |
 
 ---
 

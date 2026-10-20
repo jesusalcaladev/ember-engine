@@ -13,19 +13,23 @@ pub fn build(b: *std.Build) void {
     // `-Dsteering` publishes the M4.5 steering accumulator and the `world`
     // table behind `world.nearby`.
     //
-    // DEFAULT OFF, and that is a deliberate statement, not a staging accident:
-    // `world.nearby` measures ~16 us per call, roughly 100x what the spatial
-    // grid should cost, and the cause is not yet known. Shipping it enabled
-    // would put a known-wrong number inside the frame. Everything else in M4.5
-    // (`rand`, `noise`, the state machine) is unaffected and always on.
+    // ON by default, and it was not always: `world.nearby` measured ~16 us per
+    // call, roughly 100x what a spatial grid should cost, and the cause was
+    // NOT the query.
     //
-    // Turn it on with `-Dsteering` once `nearby` is fixed; the acceptance suite
-    // exercises both configurations.
+    // The grid was rebuilt from EVERY sprite in the world, twice per frame, and
+    // a radius query then walked those cells — so a query paid for the 50 000
+    // sprites of a level to find the two hundred behaviours that actually have
+    // neighbours. The grid now holds the behaviours' actors, and the cost is
+    // what a grid query should cost.
+    //
+    // The flag stays for the record, and to turn the module off in a project
+    // that does not want it.
     const steering = b.option(
         bool,
         "steering",
-        "Enable the M4.5 steering accumulator and world.nearby (default: off until nearby is within budget)",
-    ) orelse false;
+        "Enable the M4.5 steering accumulator and world.nearby (default: on)",
+    ) orelse true;
     const options = b.addOptions();
     options.addOption(bool, "steering", steering);
 

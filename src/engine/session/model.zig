@@ -445,6 +445,11 @@ pub const Model = struct {
         old.deinit();
         self.allocator.destroy(restored);
         self.dirty = true;
+        // The world's CONTENTS are new, so everything wired to the old ones
+        // has to be re-established: the signal queue's capacity, the
+        // subscriptions, the entity slots. The hooks are the mechanism, and
+        // this is the call that runs them.
+        self.cell.notifyReloaded();
     }
 
     /// The cells of an entity, captured as they are now: what a redo has to land

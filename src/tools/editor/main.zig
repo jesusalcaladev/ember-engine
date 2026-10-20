@@ -35,6 +35,7 @@ const ui = @import("ui");
 const physics = @import("physics");
 const session = @import("session");
 const code_pane = @import("code_pane.zig");
+const editor_icons = @import("icons.zig");
 const tilemap_panel = @import("tilemap_panel.zig");
 const editor_shell = @import("shell.zig");
 const editor_state = @import("editor_state.zig");
@@ -339,6 +340,34 @@ pub fn main(init: std.process.Init) !void {
         log.warn("run `bash libs/bootstrap.sh` to fetch the typefaces", .{});
     }
 
+    // ── Icons ──────────────────────────────────────────────────────────────
+    //
+    // The PNGs in `assets/icons/`, packed into one texture and handed to the
+    // UI layer. A missing folder is not an error: the icons are then drawn as
+    // geometry, exactly as they were before anyone put a PNG in it.
+    var icon_atlas = editor_icons.load(boot_alloc, "assets/icons") catch |err| blk: {
+        log.warn("icons: {s} — the editor draws its icons as geometry", .{@errorName(err)});
+        break :blk editor_icons.Icons{
+            .allocator = boot_alloc,
+            .pixels = &.{},
+            .width = 0,
+            .height = 0,
+            .entries = &.{},
+        };
+    };
+    defer icon_atlas.deinit();
+    if (icon_atlas.entries.len > 0) {
+        ui.icons.setAtlas(boot_alloc, icon_atlas.pixels, icon_atlas.width, icon_atlas.height, icon_atlas.entries);
+        log.info("icons: {d} loaded into a {d}x{d} atlas", .{
+            icon_atlas.entries.len,
+            icon_atlas.width,
+            icon_atlas.height,
+        });
+    }
+    if (icon_atlas.failed > 0) {
+        log.warn("icons: {d} file(s) could not be read and were skipped", .{icon_atlas.failed});
+    }
+
     // ── Code pane ───────────────────────────────────────────────────────────
     //
     // A real document on the real Lua lexer: type into it, Ctrl+S formats and
@@ -486,20 +515,30 @@ pub fn main(init: std.process.Init) !void {
 
     physics_sys.syncLoad(world);
 
-    // The two component sets a SPAWNED actor can need, reserved at load time.
+    // The scene's wiring, as a RELOAD HOOK.
     //
-    // A new archetype is an ALLOCATION, and the frame's guard turns an
-    // allocation into a panic — so a script that spawns an actor must not
-    // invent a component set the world has never seen. The spawn's set is
-    // fixed ({Transform, Name}, plus the behavior's `Script`), and it is
-    // reserved HERE, where allocating is allowed.
-    world.reserveEntities(4096) catch {};
-    world.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
-    world.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
-    // The SIGNAL QUEUE, for the same reason: the scene load rebuilt the
-    // world, so the queue went back to ZERO capacity, and the first contact
-    // would panic the process.
-    world.reserveSignals(4096) catch {};
+    // The editor's scene load REPLACES the world, and everything wired to the
+    // old one goes with it: the signal queue's capacity (back to zero, so the
+    // first contact panics the process), the entity slots, the archetypes a
+    // spawn needs. A HOOK is re-established every time, so there is no "did you
+    // remember" left to get wrong.
+    const EditorWiring = struct {
+        world: *ecs.World,
+
+        fn reload(ctx: ?*anyopaque, world: *ecs.World) void {
+            const self: *EditorWiring = @ptrCast(@alignCast(ctx orelse return));
+            world.reserveSignals(4096) catch {};
+            world.reserveEntities(4096) catch {};
+            // The two component sets a SPAWNED actor can need: a new archetype
+            // is an ALLOCATION, and the frame's guard turns an allocation into
+            // a panic.
+            world.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
+            world.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
+        }
+    };
+    var editor_wiring = EditorWiring{ .world = world };
+    world.onReload(.{ .ctx = @ptrCast(&editor_wiring), .run = EditorWiring.reload }) catch {};
+    EditorWiring.reload(&editor_wiring, world);
     if (!args.empty_scene) spawnDemoScene(world) catch |err| {
         log.warn("demo scene spawn failed: {s}", .{@errorName(err)});
     };

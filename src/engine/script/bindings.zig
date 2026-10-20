@@ -30,6 +30,7 @@ const metadata = @import("api_meta");
 const context_mod = @import("context.zig");
 const tween_mod = @import("tween.zig");
 const nav_mod = @import("nav.zig");
+const save_mod = @import("save.zig");
 const assets_mod = @import("assets");
 const ecs = @import("ecs");
 
@@ -911,6 +912,148 @@ fn lua_ai_cell_size(L: ?*lua_State) callconv(.c) c_int {
     lua.pushF32(L, grid.cell);
     return 1;
 }
+
+// ── save: what the developer wants to keep ───────────────────────────────────
+
+/// Reads the options table: `{ only = {...}, exclude = {...}, password = "..." }`.
+fn saveOptionsFromLua(
+    L: ?*lua_State,
+    idx: c_int,
+    allocator: std.mem.Allocator,
+    only: *std.ArrayList([]const u8),
+    exclude: *std.ArrayList([]const u8),
+    password: *?[]const u8,
+) void {
+    if (!lua.isTable(L, idx)) return;
+    // The name lists: `only` and `exclude`.
+    for ([_][:0]const u8{ "only", "exclude" }) |key| {
+        lua.getField(L, idx, key);
+        if (lua.isTable(L, -1)) {
+            const n = lua.lua_objlen(L, -1);
+            var i: i32 = 1;
+            while (i <= n) : (i += 1) {
+                lua.lua_rawgeti(L, -1, i);
+                if (lua.isString(L, -1)) {
+                    const name = lua.toString(L, -1);
+                    const target = if (std.mem.eql(u8, key, "only")) only else exclude;
+                    const owned = allocator.dupe(u8, name) catch continue;
+                    target.append(allocator, owned) catch {};
+                }
+                lua.pop(L, 1);
+            }
+        }
+        lua.pop(L, 1);
+    }
+    // The password.
+    lua.getField(L, idx, "password");
+    if (lua.isString(L, -1)) password.* = lua.toString(L, -1);
+    lua.pop(L, 1);
+}
+
+/// `save.save(slot, opts?) -> boolean`.
+///
+/// Saves the game. `opts.only` names the actors to save, `opts.exclude` the
+/// ones to leave out, and `opts.password` encrypts the file (the key is
+/// derived from the password; a save encrypted with a key stored next to it is
+/// not encrypted).
+fn lua_save_save(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const saves = ctx.saves orelse return pushBool(L, false);
+    const slot = lua.toSlice(L, 1) orelse return pushBool(L, false);
+
+    var only = std.ArrayList([]const u8).empty;
+    defer {
+        for (only.items) |n| ctx.world.allocator.free(n);
+        only.deinit(ctx.world.allocator);
+    }
+    var exclude = std.ArrayList([]const u8).empty;
+    defer {
+        for (exclude.items) |n| ctx.world.allocator.free(n);
+        exclude.deinit(ctx.world.allocator);
+    }
+    var password: ?[]const u8 = null;
+    saveOptionsFromLua(L, 2, ctx.world.allocator, &only, &exclude, &password);
+
+    saves.save(ctx.world, slot, .{
+        .only = if (only.items.len != 0) only.items else null,
+        .exclude = if (exclude.items.len != 0) exclude.items else null,
+        .password = password,
+    }) catch |err| {
+        core_log.warn("save '{s}': {s}", .{ slot, @errorName(err) });
+        return pushBool(L, false);
+    };
+    return pushBool(L, true);
+}
+
+/// `save.load(slot, opts?) -> boolean`.
+///
+/// Loads a slot into the world, REPLACING it — the same path a scene load
+/// takes, so everything wired to the world is re-established.
+fn lua_save_load(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const saves = ctx.saves orelse return pushBool(L, false);
+    const slot = lua.toSlice(L, 1) orelse return pushBool(L, false);
+
+    var only = std.ArrayList([]const u8).empty;
+    defer only.deinit(ctx.world.allocator);
+    var exclude = std.ArrayList([]const u8).empty;
+    defer exclude.deinit(ctx.world.allocator);
+    var password: ?[]const u8 = null;
+    saveOptionsFromLua(L, 2, ctx.world.allocator, &only, &exclude, &password);
+
+    saves.load(ctx.world, slot, .{ .password = password }) catch |err| {
+        core_log.warn("load '{s}': {s}", .{ slot, @errorName(err) });
+        return pushBool(L, false);
+    };
+    return pushBool(L, true);
+}
+
+/// `save.list() -> table` — the slots on disk.
+fn lua_save_list(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const saves = ctx.saves orelse {
+        lua.lua_createtable(L, 0, 0);
+        return 1;
+    };
+    var slots = std.ArrayList(save_mod.Slot).empty;
+    defer slots.deinit(ctx.world.allocator);
+    saves.listSlots(&slots) catch {};
+    lua.lua_createtable(L, 0, @intCast(slots.items.len));
+    for (slots.items, 0..) |slot, i| {
+        lua.lua_createtable(L, 0, 2); // [T, entry]
+        lua.pushSlice(L, slot.name);
+        lua.setField(L, -2, "name");
+        _ = pushBool(L, slot.encrypted);
+        lua.setField(L, -2, "encrypted");
+        lua.lua_rawseti(L, -2, @intCast(i + 1));
+    }
+    return 1;
+}
+
+/// `save.delete(slot) -> boolean` — removes a slot.
+fn lua_save_delete(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const saves = ctx.saves orelse return pushBool(L, false);
+    const slot = lua.toSlice(L, 1) orelse return pushBool(L, false);
+    return pushBool(L, saves.delete(slot) catch false);
+}
+
+/// `save.exists(slot) -> boolean`.
+fn lua_save_exists(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const saves = ctx.saves orelse return pushBool(L, false);
+    const slot = lua.toSlice(L, 1) orelse return pushBool(L, false);
+    return pushBool(L, saves.exists(slot));
+}
+
+const save_regs = [_]luaL_Reg{
+    .{ .name = "save", .func = lua_save_save },
+    .{ .name = "load", .func = lua_save_load },
+    .{ .name = "list", .func = lua_save_list },
+    .{ .name = "delete", .func = lua_save_delete },
+    .{ .name = "exists", .func = lua_save_exists },
+    .{ .name = null, .func = null },
+};
 
 const ai_regs = [_]luaL_Reg{
     .{ .name = "pathfind", .func = lua_ai_pathfind },
@@ -6469,6 +6612,12 @@ pub const registered_names = [_][]const u8{
     "ai.is_walkable",
     "ai.rebuild",
     "ai.cell_size",
+    // save: what the developer wants to keep
+    "save.save",
+    "save.load",
+    "save.list",
+    "save.delete",
+    "save.exists",
     // flow: the global state machine, with a stack of states
     "flow.add_state",
     "flow.add_transition",
@@ -6565,6 +6714,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     installModule(L, ctx, "time", &time_regs);
     installModule(L, ctx, "tween", &tween_regs);
     installModule(L, ctx, "ai", &ai_regs);
+    installModule(L, ctx, "save", &save_regs);
     installModule(L, ctx, "flow", &flow_regs);
     installModule(L, ctx, "anim", &anim_regs);
     // M14: the game UI (Label/Button/Panel/ProgressBar + layout + queries).

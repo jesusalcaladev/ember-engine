@@ -188,6 +188,17 @@ pub const Grid = struct {
         return self_;
     }
 
+    /// Rebuilds the grid from the world's colliders, in place.
+    ///
+    /// The grid is a SNAPSHOT of the level, so a level that changed needs a
+    /// new one. It is a LOAD-TIME operation: it allocates, and the frame does
+    /// not.
+    pub fn rebuild(self: *Grid, world: *ecs.World) !void {
+        const fresh = try Grid.build(self.allocator, world, self.cell);
+        self.deinit();
+        self.* = fresh;
+    }
+
     fn allocate(self: *Grid) !void {
         const n = @as(usize, self.cols) * @as(usize, self.rows);
         self.blocked = try self.allocator.alloc(u8, n);

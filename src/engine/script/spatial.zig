@@ -141,6 +141,44 @@ pub const Grid = struct {
         }
     }
 
+    /// Rebuilds the grid from a LIST of actors.
+    ///
+    /// The grid answers "which behaviours are near me", so it holds the
+    /// BEHAVIOURS' actors and not every sprite in the world. The difference is
+    /// the whole cost: a world with 50 000 sprites and 200 behaviours went
+    /// from two walks over 50 000 rows per frame to two walks over 200.
+    pub fn rebuildFrom(self: *Grid, world: *World, entities: []const Entity) void {
+        @memset(self.counts, 0);
+        @memset(self.self_refs, no_self_ref);
+        self.outside = 0;
+
+        // Pass 1: how many land in each cell.
+        for (entities) |e| {
+            const t = world.get(e, Transform) orelse continue;
+            if (self.cellIndex(t.position.x, t.position.y)) |cell| {
+                self.counts[cell] += 1;
+            } else {
+                self.outside += 1;
+            }
+        }
+
+        // Prefix sum: offsets[i] is where cell i's run begins in `entries`.
+        var acc: u32 = 0;
+        for (self.counts, 0..) |c, i| {
+            self.offsets[i] = acc;
+            acc += c;
+        }
+        self.offsets[self.counts.len] = acc;
+
+        // Pass 2: fill, with offsets doubling as the write cursor.
+        for (entities) |e| {
+            const t = world.get(e, Transform) orelse continue;
+            const cell = self.cellIndex(t.position.x, t.position.y) orelse continue;
+            self.entries[self.offsets[cell]] = e;
+            self.offsets[cell] += 1;
+        }
+    }
+
     pub fn rebuild(self: *Grid, world: *World) void {
         @memset(self.counts, 0);
         @memset(self.self_refs, no_self_ref);

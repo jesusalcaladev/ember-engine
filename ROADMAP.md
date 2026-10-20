@@ -223,6 +223,10 @@ Placed here on purpose: every item below depends only on what already exists (sc
 | `Camera2D` | **done** — `ecs/components/camera.zig` (the component) + `ecs/camera.zig` (the fixed-step system) + the `camera.*` bindings, and the runtime now feeds its `View` into BOTH the culler and the draw camera |
 | The hierarchical state machine | **done** — a state can have CHILDREN, which makes it COMPOUND: entering it enters the child's initial state, and the live state becomes a PATH ("moving/walk"). `sm.add_child_state` declares one, `sm.path` reads it, and `sm.is_in` asks the PATH — so "is the actor running?" is true while it is in "moving/walk". A transition is looked up from the deepest active state UP to the root, so a child handles the events it knows and its parent still handles the ones its children ignore. Sixteen flat states become three. |
 | A* navigation | **done** — a uniform navigation grid rastered from the level's colliders, and an A* over it: `ai.pathfind(x1, y1, x2, y2)` returns the waypoints (the cells' centres, so a walker stays on walkable ground), `ai.is_walkable`, `ai.rebuild` and `ai.cell_size`. A sensor is walkable — a trigger is something you walk THROUGH. The search's scratch is allocated when the grid is BUILT, because a search happens inside a frame and the frame does not allocate. The path is SMOOTHED (a waypoint is dropped whenever a straight line can skip it, so the agent walks a line and not a staircase), and an UNREACHABLE goal gives the path to the closest reachable cell instead of nothing: the difference between "no way" and "the way is around there" is the difference between an agent that gives up and an agent that tries. |
+| The scene load took the world with it | **done** — a scene load REPLACES the world, and everything wired to the old one went with it: the signal queue's capacity (back to zero, so the first event PANICKED the process), the collision bridge's subscription (so the events had nowhere to arrive), the entity slots, the spawn archetypes, the solver's bodies and the navigation grid. The world now has **RELOAD HOOKS**: a subsystem registers one at boot and never has to think about scene loads again, and the runtime's single hook re-establishes the lot. |
+| Saving a game | **done** — `save.save(slot, opts)` saves **what the developer wants**: `opts.only` names the actors to save and `opts.exclude` the ones to leave out, and with neither every actor is saved. `save.load`, `save.list`, `save.delete` and `save.exists` complete it. The format is the same bit-exact `.zson` the editor uses, so a save and a scene are the same kind of document. |
+| Encrypted saves | **done** — `opts.password` encrypts the file with **AES-256-GCM**, the key derived by **PBKDF2-HMAC-SHA256** (100 000 rounds) from the password and a random per-file salt, and the slot name authenticated as the associated data so a file cannot be moved between slots. A save with no password is written in the clear and says so in its header. A wrong password and a tampered file are the SAME failure on purpose: GCM cannot tell them apart and must not. |
+| The steering was behind a flag | **done** — `world.nearby` measured ~16 us per call, ~100x what a spatial grid should cost, and the cause was NOT the query: the grid was rebuilt from EVERY sprite in the world, twice per frame, and a radius query then walked those cells. The grid now holds the BEHAVIOURS' actors (the ones that can be neighbours), and the steering is **on by default** — the flag stays for the record. |
 | The runtime's physics produced no contacts | **done** — the cause was not the physics at all: the scene load REBUILDS the world (`zson.replace`), and it took two things with it. The **signal queue's capacity went back to zero**, so the first contact PANICKED the process ("the event queue is full (0 events)"), and the **collision bridge's subscription went with the old world**, so the contacts had nowhere to arrive. Both are re-established AFTER the scene load, next to the entity slots and the spawn archetypes — the whole class of bug in one place, because a world that is replaced takes everything wired to it with it. The editor loads scenes too and had the same hole. The reproduction is `behavior.test.a scene loaded into the world produces contacts`, and it runs the runtime's exact path. |
 | The actor's life from a script | **done** — `actor.spawn(x, y, { name, script })` creates an actor (the behavior's `start` runs on the same frame), `actor.find_by_name(name)` finds one, and `actor.destroy(actor)` removes it. The `on_destroy` hook runs FIRST, with the actor still alive, so a handler that reads its position sees the truth; then the solver body goes, then the entity. |
 | The runtime has a physics system | **done** — the runtime had none, so the `physics.*` bindings were inert in a game and the collision signal had nothing to publish. It now creates the solver world, syncs the scene's bodies, steps it in the fixed window, and moves the activity FOCUS with the camera (a focus that never moves tiers the whole world by its distance to the origin). |
@@ -411,6 +415,31 @@ passes are the most expensive thing in the frame on a weak GPU.
 **The frame cost is on the status bar**: the frame's own milliseconds AND the
 GPU's. A frame that is 40 ms long with 5 ms of CPU in it is a frame that is
 WAITING, and the two look identical on a status bar that shows only one.
+
+#### The icons (M5.8, third pass)
+
+The editor's icons were drawn as geometry — a few line segments and an arc
+each. That is exact at any DPI and free, and it is also why a rotate handle
+does not look like a rotate handle.
+
+So the icons are FILES now: `assets/icons/` holds a PNG per icon, the editor
+packs them into one atlas at boot and hands it to the UI layer, which draws
+the cell when it has one and the geometry when it does not. A missing file is
+never an error — it is the drawn icon, and the editor looks the way it always
+did.
+
+Three things the loader does to each file, and each of them is the difference
+between "an icon" and "a picture of an icon":
+
+- **the transparent margin is cropped**, so the icon fills its box instead of
+  sitting in the middle of one;
+- **the ink is scaled to a 64px cell** with a box filter, so a 2px stroke does
+  not alias into a dotted line;
+- **the colour becomes white**, because an icon is a MASK: the theme tints it,
+  and a black PNG multiplied by a blue tint is black.
+
+The toolbar is icon buttons now (a row of pictures, not a row of words), and
+the dock headers carry their icon.
 
 #### Autosave, hot reload and flat prefabs
 

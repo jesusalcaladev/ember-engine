@@ -169,6 +169,16 @@ pub fn replace(world: *World, text: []const u8) !void {
     // own address).
     world.deinit();
     world.* = fresh;
+    // The world's CONTENTS are new, so everything wired to the old ones has to
+    // be re-established: the signal queue's capacity, the subscriptions, the
+    // entity slots, the archetypes a spawn needs, the solver's bodies.
+    //
+    // The hooks are the mechanism: a subsystem registers one at boot and never
+    // has to think about scene loads again. Without this call, the first
+    // contact after a scene load PANICKED the process (the queue's capacity
+    // came back as zero) and the collision bridge was subscribing to a bus
+    // that no longer existed.
+    world.notifyReloaded();
 }
 
 // ── Flat prefabs ─────────────────────────────────────────────────────────────

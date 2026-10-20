@@ -36,6 +36,7 @@ const statemachine_mod = @import("statemachine.zig");
 const physics_mod = @import("physics");
 const tween_mod = @import("tween.zig");
 const nav_mod = @import("nav.zig");
+const save_mod = @import("save.zig");
 const spatial_mod = @import("spatial.zig");
 const steer_mod = @import("steer.zig");
 const build_options = @import("options");
@@ -453,16 +454,24 @@ pub const Behaviors = struct {
 
     /// Rebuilds the spatial grid and republishes each entity's `self` ref, so
     /// `world.nearby` can hand Lua a real `self` table.
+    /// Rebuilds the spatial grid the steering queries.
+    ///
+    /// The grid holds the BEHAVIOURS' actors, not every sprite in the world:
+    /// "which behaviours are near me" is a question about behaviours, and the
+    /// difference is the whole cost — two walks over the actors per frame
+    /// instead of two walks over every sprite in the level.
     fn rebuildGrid(self: *Behaviors) void {
-        self.grid.rebuild(self.ctx.world);
-        // `self_refs` is indexed by entity slot; the instance array is dense and
-        // small next to the slot space, so a linear pass over instances beats
-        // any lookup structure here.
+        var entities = std.ArrayList(Entity).empty;
+        defer entities.deinit(self.allocator);
+        entities.ensureTotalCapacity(self.allocator, self.instances.items.len) catch {};
+
         for (self.instances.items) |inst| {
             if (!self.ctx.world.isAlive(inst.entity)) continue;
             if (inst.entity.index >= self.grid.self_refs.len) continue;
             self.grid.self_refs[inst.entity.index] = inst.self_ref;
+            entities.append(self.allocator, inst.entity) catch {};
         }
+        self.grid.rebuildFrom(self.ctx.world, entities.items);
     }
 
     /// Compiles the Lua-side loop and the dense `self` table it iterates.
@@ -1585,6 +1594,71 @@ test "a scene loaded into the world produces contacts" {
     try std.testing.expect(Counter.hits > 0);
 }
 
+// ── Saving and loading ───────────────────────────────────────────────────────
+
+test "a save keeps what the developer asked for, and the password protects it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A directory of its own: the test must not write into the project's.
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/ember-save-test-{d}", .{std.os.linux.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var world = ecs.World.init(std.testing.allocator);
+    defer world.deinit();
+    try world.reserveSignals(32);
+
+    // Three named actors.
+    const names = [_][]const u8{ "player", "coin", "camera" };
+    for (names) |name| {
+        var n = components.Name{};
+        n.set(name);
+        _ = try world.spawn(.{ components.Transform{}, n });
+    }
+
+    var m = save_mod.Manager.init(std.testing.allocator, io, dir);
+    defer m.deinit();
+
+    // Only what was asked for.
+    try m.save(&world, "slot1", .{ .only = &.{"player"} });
+    try std.testing.expect(m.exists("slot1"));
+
+    // A fresh world, and the save restores only the player.
+    var loaded = ecs.World.init(std.testing.allocator);
+    defer loaded.deinit();
+    try loaded.reserveSignals(32);
+    try m.load(&loaded, "slot1", .{});
+    try std.testing.expectEqual(@as(usize, 1), loaded.entityCount());
+    const first = loaded.entityAtSlot(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("player", loaded.get(first, components.Name).?.slice());
+
+    // The list and the delete.
+    var slots = std.ArrayList(save_mod.Slot).empty;
+    defer slots.deinit(std.testing.allocator);
+    try m.listSlots(&slots);
+    try std.testing.expectEqual(@as(usize, 1), slots.items.len);
+    try std.testing.expect(try m.delete("slot1"));
+    try std.testing.expect(!m.exists("slot1"));
+
+    // The PASSWORD: the right one loads, the wrong one does not.
+    try m.save(&world, "secret", .{ .password = "hunter2" });
+    try std.testing.expect(m.exists("secret"));
+
+    var ok_world = ecs.World.init(std.testing.allocator);
+    defer ok_world.deinit();
+    try ok_world.reserveSignals(32);
+    try m.load(&ok_world, "secret", .{ .password = "hunter2" });
+    try std.testing.expectEqual(@as(usize, 3), ok_world.entityCount());
+
+    var bad_world = ecs.World.init(std.testing.allocator);
+    defer bad_world.deinit();
+    try std.testing.expectError(error.WrongPassword, m.load(&bad_world, "secret", .{ .password = "wrong" }));
+
+    // And no password at all is refused, rather than silently loading garbage.
+    var no_pw = ecs.World.init(std.testing.allocator);
+    defer no_pw.deinit();
+    try std.testing.expectError(error.PasswordRequired, m.load(&no_pw, "secret", .{}));
+}
+
 // ── The navigation grid ─────────────────────────────────────────────────────
 
 test "the navigation grid finds a path AROUND a wall" {
@@ -2464,7 +2538,6 @@ pub const CollisionCtx = struct {
         const self_entity: Entity = .{ .index = c.self_index, .generation = c.self_generation };
         const other_entity: Entity = .{ .index = c.other_index, .generation = c.other_generation };
 
-        @import("core").log.warn("DIAG bridge: a contact reached Lua", .{});
         var fields = [_]ecs.signals.PayloadField{
             .{ .name = "began", .value = .{ .boolean = c.began } },
             .{ .name = "ended", .value = .{ .boolean = c.ended } },

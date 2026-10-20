@@ -3128,6 +3128,81 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "save.save",
+        .module = "save",
+        .signature = "save.save(slot, opts?) -> boolean",
+        .summary = "Saves the game. `opts.only` names the actors to save, `opts.exclude` the ones to leave out, and `opts.password` encrypts the file — the key is DERIVED from the password, because a save encrypted with a key stored next to it is not encrypted. With neither list, every actor is saved.",
+        .params = &.{
+            .{ .name = "slot", .kind = .string, .doc = "the slot's name" },
+            .{ .name = "opts", .kind = .table, .doc = "optional: only, exclude, password" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the save was written" },
+        },
+        .example =
+        \\save.save("slot1", { only = { "player", "coins" }, password = "hunter2" })
+        ,
+    },
+    .{
+        .name = "save.load",
+        .module = "save",
+        .signature = "save.load(slot, opts?) -> boolean",
+        .summary = "Loads a slot into the world, REPLACING it — the same path a scene load takes, so everything wired to the world is re-established. With an encrypted save, `opts.password` is required.",
+        .params = &.{
+            .{ .name = "slot", .kind = .string, .doc = "the slot's name" },
+            .{ .name = "opts", .kind = .table, .doc = "optional: password" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the save was loaded" },
+        },
+        .example =
+        \\save.load("slot1", { password = "hunter2" })
+        ,
+    },
+    .{
+        .name = "save.list",
+        .module = "save",
+        .signature = "save.list() -> table",
+        .summary = "The slots on disk, each a table with `name`, `encrypted` and `size`.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .table, .doc = "the slots" },
+        },
+        .example =
+        \\for _, slot in ipairs(save.list()) do print(slot.name) end
+        ,
+    },
+    .{
+        .name = "save.delete",
+        .module = "save",
+        .signature = "save.delete(slot) -> boolean",
+        .summary = "Removes a slot.",
+        .params = &.{
+            .{ .name = "slot", .kind = .string, .doc = "the slot's name" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the slot was removed" },
+        },
+        .example =
+        \\save.delete("slot1")
+        ,
+    },
+    .{
+        .name = "save.exists",
+        .module = "save",
+        .signature = "save.exists(slot) -> boolean",
+        .summary = "Whether a slot exists on disk.",
+        .params = &.{
+            .{ .name = "slot", .kind = .string, .doc = "the slot's name" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the slot is there" },
+        },
+        .example =
+        \\if save.exists("slot1") then save.load("slot1") end
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

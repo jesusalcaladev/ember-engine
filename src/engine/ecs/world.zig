@@ -60,8 +60,49 @@ pub const World = struct {
     signals: signals_mod.Signals = .{},
     /// When locked, any growth panics: the frame loop must not allocate.
     alloc_locked: bool = false,
+    /// The hooks that run after the world's CONTENTS are replaced.
+    ///
+    /// WHY: loading a scene REPLACES the world, and everything wired to the
+    /// old one goes with it — the signal queue's capacity (back to zero, so
+    /// the first event PANICKED the process), the subscriptions (so the events
+    /// had nowhere to arrive), the entity slots' capacity, the archetypes a
+    /// spawn needs.
+    ///
+    /// A hook is the answer: a subsystem that depends on the world registers
+    /// ONCE, at boot, and never has to think about scene loads again. There
+    /// is no "did you remember to re-wire it?" left to get wrong.
+    hooks: std.ArrayListUnmanaged(ReloadHook) = .empty,
 
     const Self = @This();
+
+    /// A thing that has to be re-established when the world's contents are
+    /// replaced.
+    pub const ReloadHook = struct {
+        ctx: ?*anyopaque,
+        run: *const fn (ctx: ?*anyopaque, world: *Self) void,
+    };
+
+    /// Registers a hook that runs after the world's contents are replaced.
+    ///
+    /// Connect at LOAD time: a hook added during a frame is a hook that ran
+    /// against a world that is about to be thrown away.
+    pub fn onReload(self: *Self, hook: ReloadHook) !void {
+        if (self.alloc_locked) {
+            std.debug.panic("world: a reload hook was added during the frame loop; connect it at load time (spec §3.1)", .{});
+        }
+        try self.hooks.append(self.allocator, hook);
+    }
+
+    /// Runs every reload hook, in registration order.
+    ///
+    /// Called by whatever replaced the contents (the scene loader). The
+    /// hooks are what re-establish the wiring, so a subsystem that registered
+    /// one is re-established for free.
+    pub fn notifyReloaded(self: *Self) void {
+        for (self.hooks.items) |hook| {
+            hook.run(hook.ctx, self);
+        }
+    }
 
     pub fn init(allocator: std.mem.Allocator) World {
         var world = World{ .allocator = allocator };
@@ -76,6 +117,7 @@ pub const World = struct {
         self.slots.deinit(alloc);
         self.free_slots.deinit(alloc);
         self.hierarchy.deinit(alloc);
+        self.hooks.deinit(alloc);
         self.signals.deinit();
         self.* = undefined;
     }

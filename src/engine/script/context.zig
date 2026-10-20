@@ -26,6 +26,7 @@ const core_loop = @import("core").loop;
 const statemachine = @import("statemachine.zig");
 const tween_mod = @import("tween.zig");
 const nav_mod = @import("nav.zig");
+const save_mod = @import("save.zig");
 const spatial = @import("spatial.zig");
 const physics_mod = @import("physics");
 const assets = @import("assets");
@@ -341,6 +342,10 @@ pub const Context = struct {
     /// pointer. A zero delta is the SAFE answer — a script that multiplies by
     /// `time.delta()` gets a still frame instead of a crash.
     time: ?*core_loop.GameTime = null,
+
+    /// The save manager, behind the `save.*` bindings. Null when the runtime
+    /// has no saves directory (a headless tool, a test).
+    saves: ?*save_mod.Manager = null,
 
     /// The navigation grid, behind the `ai.*` bindings. Null when the runtime
     /// has not built one: a project with no colliders has nothing to

@@ -683,6 +683,57 @@ fn loadBehaviorScripts(
 /// raises this.
 const spawn_reserve = 4096;
 
+/// Everything that has to be re-established when the scene changes.
+///
+/// The scene load REPLACES the world, and everything wired to the old one goes
+/// with it: the signal queue's capacity (back to zero, so the first event
+/// PANICKED the process), the collision bridge's subscription (so the events
+/// had nowhere to arrive), the entity slots, the archetypes a spawn needs, the
+/// solver's bodies and the navigation grid.
+///
+/// This is the ONE place that knows the list. It is registered once, at boot,
+/// and the world's reload path runs it every time — so there is no "did you
+/// remember to re-wire it?" left to get wrong.
+const SceneWiring = struct {
+    behaviors: *script.Behaviors,
+    physics: *physics.System,
+    nav: *engine.script.nav.Grid,
+
+    fn reload(ctx: ?*anyopaque, world: *ecs.World) void {
+        const self: *SceneWiring = @ptrCast(@alignCast(ctx orelse return));
+
+        // The capacities. The signal queue's is the one that bites: without it
+        // the first event published after a scene load panics the process.
+        world.reserveSignals(signal_reserve) catch |err| {
+            log.warn("scene: could not reserve the signal queue ({s})", .{@errorName(err)});
+        };
+        world.reserveEntities(spawn_reserve) catch |err| {
+            log.warn("scene: could not reserve the entity slots ({s})", .{@errorName(err)});
+        };
+        // The archetypes a SPAWN needs: a new archetype is an allocation, and
+        // the frame does not allocate.
+        world.reserve(.{components.Transform, components.Name}, spawn_reserve) catch |err| {
+            log.warn("scene: could not reserve the spawn archetype ({s})", .{@errorName(err)});
+        };
+        world.reserve(.{components.Transform, components.Name, components.Script}, spawn_reserve) catch |err| {
+            log.warn("scene: could not reserve the scripted archetype ({s})", .{@errorName(err)});
+        };
+
+        // The solver's bodies: the scene's colliders become bodies.
+        self.physics.syncLoad(world);
+
+        // The collision bridge: the script layer listens to the world's bus.
+        self.behaviors.bridgeCollisions(world) catch |err| {
+            log.warn("scene: could not bridge the collision signal to Lua ({s})", .{@errorName(err)});
+        };
+
+        // The navigation grid: it is a snapshot of the level.
+        self.nav.rebuild(world) catch |err| {
+            log.warn("scene: could not rebuild the navigation grid ({s})", .{@errorName(err)});
+        };
+    }
+};
+
 /// How many events the world's signal queue holds. The physics publishes a
 /// contact per touching pair per step, so a busy scene needs room: the queue
 /// is a BUDGET, and a full one panics rather than dropping the event.
@@ -1001,6 +1052,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The `ai.*` bindings read it: a path is an A* over it. It is built HERE,
     // at load time, because it allocates — and a search, which happens inside
     // a frame, must not.
+    // The save manager: the `save.*` bindings. The directory is relative to
+    // the project root, like every other path the project owns.
+    var save_manager = engine.script.save.Manager.init(boot_alloc, std.Io.Threaded.global_single_threaded.io(), "saves");
+    behaviors.ctx.saves = &save_manager;
+
     var nav_grid = engine.script.nav.Grid.build(boot_alloc, &world, engine.script.nav.default_cell) catch |err| {
         log.warn("navigation grid: {s}", .{@errorName(err)});
         return err;
@@ -1027,27 +1083,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     //
     // So the two archetypes a spawned actor can need, and the slots for the
     // actors, are reserved HERE — at load time, where allocating is allowed.
-    // The SIGNAL QUEUE, for the same reason: the scene load rebuilt the
-    // world, so the queue went back to ZERO capacity — and the first contact
-    // (or the first sound finishing, or the first button press) would PANIC the
-    // process with "the event queue is full (0 events)".
+    // The scene's wiring, as a RELOAD HOOK.
     //
-    // This is the whole class of bug in one line: anything the world owns has
-    // to be reserved AFTER the scene, because the scene replaces the world.
-    try world.reserveSignals(signal_reserve);
-    try world.reserveEntities(spawn_reserve);
-
-    // The collision signal, bridged to Lua — AFTER the scene load, because
-    // the scene load REBUILT the world and took the subscription with it.
+    // The scene load REPLACES the world, and everything wired to the old one
+    // goes with it: the signal queue's capacity (back to zero, so the first
+    // event PANICKED the process), the collision bridge's subscription (so the
+    // events had nowhere to arrive), the entity slots, the archetypes a spawn
+    // needs, the solver's bodies and the navigation grid.
     //
-    // The physics publishes contacts on the world's bus, which only the Zig
-    // listeners see. The bridge is what lets a SCRIPT react to being touched
-    // — and, with `other_is_sensor`, tells a trigger from a wall.
-    behaviors.bridgeCollisions(&world) catch |err| {
-        log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
+    // This is the ONE place that knows the list. It is registered once, here,
+    // and the world's reload path runs it every time — so there is no "did you
+    // remember to re-wire it?" left to get wrong.
+    var wiring = SceneWiring{
+        .behaviors = &behaviors,
+        .physics = &physics_sys,
+        .nav = &nav_grid,
     };
-    try world.reserve(.{components.Transform, components.Name}, spawn_reserve);
-    try world.reserve(.{components.Transform, components.Name, components.Script}, spawn_reserve);
+    world.onReload(.{ .ctx = @ptrCast(&wiring), .run = SceneWiring.reload }) catch |err| {
+        log.warn("could not register the scene reload hook: {s}", .{@errorName(err)});
+    };
+    // The world is replaced by the scene load below, so the hook runs right
+    // after it. Running it once here as well is harmless (it is idempotent) and
+    // covers the case of no scene at all: the built-in one needs the wiring too.
+    SceneWiring.reload(&wiring, &world);
 
     // ── M9: the scene-transition fader. Owned by the runtime like the camera:
     // it is engine state that outlives a script, and the `scene.*` bindings
