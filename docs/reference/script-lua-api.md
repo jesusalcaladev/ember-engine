@@ -2051,7 +2051,17 @@ The grid is the cheap answer to the expensive question. A navmesh is the "right"
 | **Signature** | `ai.pathfind(x1, y1, x2, y2) -> table` |
 | **Parameters** | `x1`, `y1` — the start; `x2`, `y2` — the goal |
 | **Returns** | `table` — the waypoints, each a table with `x` and `y` |
-| **Description** | A path across the level. The waypoints are the grid's **cell centres**, so a walker that steers towards them stays on walkable ground. The path excludes the start and includes the goal; an empty table means "no path". |
+| **Description** | A path across the level. The waypoints are the grid's **cell centres**, so a walker that steers towards them stays on walkable ground. The path excludes the start and includes the goal. |
+
+The path is **smoothed**: a waypoint is dropped whenever a straight line can
+skip it, so the agent walks a line and not a staircase of cell centres. The
+line is exactly what a line-of-sight check proved walkable.
+
+An **unreachable** goal does not give an empty path: it gives the path to the
+closest cell the search reached — the edge of what is walkable, which is where
+an agent has to decide what to do. An empty path would say "there is no way",
+and the difference between "no way" and "the way is around there" is the
+difference between an agent that gives up and an agent that tries.
 
 ```lua
 local path = ai.pathfind(x, y, 900, 300)

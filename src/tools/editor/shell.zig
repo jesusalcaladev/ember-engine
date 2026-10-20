@@ -599,7 +599,9 @@ pub fn draw(ed: *Editor, ctx: *ui.Context, fb_w: u32, g: Geometry) void {
     // a "first use" condition is ignored from the second frame on — which
     // would leave the tool exactly where the layout used to be.
     if (ed.panels.tilemap and ed.workspace == .scene) {
-        const tw: f32 = 300;
+        // The panel is as wide as the viewport allows: a 300-pixel tool in a
+        // 340-pixel viewport is a tool that covers the viewport.
+        const tw = @min(@as(f32, 300), @max(g.center_w - 48, 180));
         const th: f32 = 430;
         const tx = @max(g.center_x + g.center_w - tw - 12, g.center_x + 8);
         // Below the viewport's HUD, not beside it: in a narrow viewport the

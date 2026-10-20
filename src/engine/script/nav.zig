@@ -348,7 +348,32 @@ pub const Grid = struct {
                 }) catch return 0;
             }
         }
-        if (!found) return 0;
+        if (!found) {
+            // NO PATH to the goal. The closest cell the search REACHED is
+            // still a path — to the edge of what is walkable, which is where
+            // an agent has to give up and go around. An empty path would say
+            // "there is no way", and the difference between "no way" and "the
+            // way is around there" is the difference between an agent that
+            // gives up and an agent that tries.
+            const partial = self.closestReached(goal_cell, start_index, gen) orelse return 0;
+            // The same walk, from the partial cell back to the start.
+            var rev: [max_waypoints]Vec2 = undefined;
+            var m: usize = 0;
+            var cur: i32 = @intCast(partial);
+            while (cur >= 0 and m < max_waypoints) {
+                const cols_i: i32 = @intCast(self.cols);
+                const cx = @rem(cur, cols_i);
+                const cy = @divTrunc(cur, cols_i);
+                rev[m] = self.cellCenter(cx, cy);
+                m += 1;
+                if (@as(usize, @intCast(cur)) == start_index) break;
+                cur = self.came_from[@intCast(cur)];
+            }
+            if (m == 0) return 0;
+            std.mem.reverse(Vec2, rev[0..m]);
+            if (m >= 2) return self.emitPath(out, rev[1..m], true);
+            return self.emitPath(out, rev[0..m], true);
+        }
 
         // Walk the parents back, then reverse.
         var path: [max_waypoints]Vec2 = undefined;
@@ -364,13 +389,107 @@ pub const Grid = struct {
             cur = self.came_from[@intCast(cur)];
         }
         if (n == 0) return 0;
-        // The start is the actor's own cell: the path starts at the NEXT one.
-        const count = @min(n - 1, out.len);
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            out[i] = path[n - 2 - i];
+        // `path` is goal..start; the path EXCLUDES the start (the actor is
+        // already there), so the forward order is what is left.
+        std.mem.reverse(Vec2, path[0..n]);
+        if (n >= 2) {
+            return self.emitPath(out, path[1..n], true);
         }
-        return count;
+        return self.emitPath(out, path[0..n], true);
+    }
+
+    /// Turns the reversed cell path into waypoints, SMOOTHED.
+    ///
+    /// The raw path is a staircase of cell centres: an agent that walks it
+    /// walks in little steps, and a path that hugs a wall's corner wiggles.
+    /// The smoothed path drops every waypoint a STRAIGHT LINE can skip — the
+    /// agent walks the line instead of the staircase, and the line is exactly
+    /// what a line-of-sight check proved is walkable.
+    ///
+    /// `last` is the index of the last cell of the reversed path (the goal's
+    /// index in the array) and `start` the start cell's index.
+    fn emitPath(self: *Grid, out: []Vec2, path: []const Vec2, smooth: bool) usize {
+        if (out.len == 0 or path.len == 0) return 0;
+        if (!smooth) {
+            const count = @min(path.len, out.len);
+            for (path[0..count], 0..) |p, i| out[i] = p;
+            return count;
+        }
+        // The smoothing: a waypoint is KEPT only when the straight line to the
+        // next one is blocked. An agent that walks the smooth path walks a
+        // line, not a staircase, and the line is exactly what a line-of-sight
+        // check proved is walkable.
+        var n: usize = 0;
+        var kept = path[0];
+        var i: usize = 1;
+        while (i < path.len) : (i += 1) {
+            const candidate = path[i];
+            if (self.lineIsClear(kept, candidate)) continue; // the line skips it
+            if (n < out.len) {
+                out[n] = kept;
+                n += 1;
+            }
+            kept = candidate;
+        }
+        // The last waypoint is the goal: it is never dropped.
+        if (n < out.len) {
+            out[n] = kept;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The visited cell closest to the goal — the best a failed search can do.
+    fn closestReached(self: *const Grid, goal: Cell, start: usize, gen: u32) ?usize {
+        var best: ?usize = null;
+        var best_h: f32 = std.math.inf(f32);
+        var i: usize = 0;
+        while (i < self.g_score.len) : (i += 1) {
+            if (self.stamp[i] != gen) continue;
+            const cx = @as(i32, @intCast(i % @as(usize, @intCast(self.cols))));
+            const cy = @as(i32, @intCast(i / @as(usize, @intCast(self.cols))));
+            const h = self.heuristic(.{ .cx = cx, .cy = cy }, goal);
+            if (h >= best_h) continue;
+            best_h = h;
+            best = i;
+        }
+        _ = start;
+        return best;
+    }
+
+    /// Whether the straight line between two world positions crosses only
+    /// walkable cells.
+    ///
+    /// The grid's own line walk (a DDA over the cells), not the physics's
+    /// raycast: the question is "could an agent walk straight there", and the
+    /// answer is about the GRID, which is what the path is made of.
+    fn lineIsClear(self: *const Grid, a: Vec2, b: Vec2) bool {
+        const ca = self.clampCell(self.cellOf(a));
+        const cb = self.clampCell(self.cellOf(b));
+        // A DDA over the cells the segment crosses.
+        var x = ca.cx;
+        var y = ca.cy;
+        const raw_dx = cb.cx - ca.cx;
+        const raw_dy = cb.cy - ca.cy;
+        const dxi: i32 = if (raw_dx < 0) -raw_dx else raw_dx;
+        const dyi: i32 = if (raw_dy < 0) -raw_dy else raw_dy;
+        const sx: i32 = if (ca.cx < cb.cx) 1 else -1;
+        const sy: i32 = if (ca.cy < cb.cy) 1 else -1;
+        var err: i32 = dxi - dyi;
+        while (true) {
+            if (!self.inBounds(x, y)) return false;
+            if (self.blocked[self.index(x, y)] != 0) return false;
+            if (x == cb.cx and y == cb.cy) return true;
+            const e2: i32 = 2 * err;
+            if (e2 > -dyi) {
+                err -= dyi;
+                x += sx;
+            }
+            if (e2 < dxi) {
+                err += dxi;
+                y += sy;
+            }
+        }
     }
 
     /// The closest walkable cell to a target, searched in rings.
