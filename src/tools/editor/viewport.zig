@@ -122,7 +122,7 @@ const grid_base: f32 = 32.0;
 const grid_min_px: f32 = 24.0;
 /// ...and never FURTHER apart than this, or a zoomed-in view is three lonely
 /// lines instead of a grid.
-const grid_max_px: f32 = 96.0;
+const grid_max_px: f32 = 140.0;
 /// Handle hit radius, in screen pixels.
 const handle_hit_px: f32 = 11.0;
 /// How long the move arrows are, in screen pixels.
@@ -139,10 +139,15 @@ const grid_layer: u16 = 0;
 
 /// Grid colors. Literal, like the physics overlay's, because a gizmo color
 /// is an editor decision the runtime theme has no stake in.
-const col_grid_minor = [4]u8{ 128, 140, 160, 22 };
-const col_grid_major = [4]u8{ 150, 165, 190, 52 };
-const col_axis_x = [4]u8{ 235, 84, 84, 150 };
-const col_axis_y = [4]u8{ 96, 224, 128, 150 };
+///
+/// The GRID is the quietest thing on screen: it is a ruler, not an object.
+/// The minor lines are barely there (8 % alpha) and the major ones are
+/// twice that — enough to measure against, not enough to compete with the
+/// art. A grid you notice is a grid you are reading instead of the scene.
+const col_grid_minor = [4]u8{ 126, 140, 162, 20 };
+const col_grid_major = [4]u8{ 150, 166, 192, 38 };
+const col_axis_x = [4]u8{ 232, 86, 86, 120 };
+const col_axis_y = [4]u8{ 96, 220, 128, 120 };
 
 /// The rectangle of the editor window the scene is drawn in.
 pub const Region = struct {
@@ -1077,66 +1082,68 @@ pub const Viewport = struct {
         const vp = drawing_vp orelse return;
 
         // ── The tools ────────────────────────────────────────────────────
-        if (ui.button.render(.{
+        // ICONS, not words: a toolbar is a row of pictures, and a picture of
+        // a rotate handle is understood where the word "Rotate" is read.
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "tool.cursor",
-            .text = "Cursor",
+            .icon = .cursor,
             .variant = if (vp.tool == .cursor) .primary else .ghost,
-            .tooltip = "Q — pick entities in the scene",
+            .tooltip = "Cursor (Q) — pick entities in the scene",
         })) vp.tool = .cursor;
         cimgui.ember_ui_same_line(0, 4);
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "tool.tile",
-            .text = "Tiles",
+            .icon = .tiles,
             .variant = if (vp.tool == .tile) .primary else .ghost,
-            .tooltip = "T — the TileMap brush owns left-click",
+            .tooltip = "Tiles (T) — the TileMap brush owns left-click",
         })) vp.tool = .tile;
 
         cimgui.ember_ui_same_line(0, 10);
 
         // ── The gizmo modes ──────────────────────────────────────────────
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "gizmo.move",
-            .text = "Move",
+            .icon = .move,
             .variant = if (vp.gizmo == .move) .primary else .ghost,
-            .tooltip = "W — drag the object, or an arrow to move along one axis",
+            .tooltip = "Move (W) — drag the object, or an arrow to move along one axis",
         })) vp.gizmo = .move;
         cimgui.ember_ui_same_line(0, 4);
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "gizmo.rotate",
-            .text = "Rotate",
+            .icon = .rotate,
             .variant = if (vp.gizmo == .rotate) .primary else .ghost,
-            .tooltip = "E — drag the ring to rotate",
+            .tooltip = "Rotate (E) — drag the ring to rotate",
         })) vp.gizmo = .rotate;
         cimgui.ember_ui_same_line(0, 4);
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "gizmo.scale",
-            .text = "Scale",
+            .icon = .scale,
             .variant = if (vp.gizmo == .scale) .primary else .ghost,
-            .tooltip = "R — drag a corner to scale, the middle for uniform",
+            .tooltip = "Scale (R) — drag a corner to scale, the middle for uniform",
         })) vp.gizmo = .scale;
 
         cimgui.ember_ui_same_line(0, 10);
 
         // ── The toggles ─────────────────────────────────────────────────
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "vp.grid",
-            .text = "Grid",
+            .icon = .grid,
             .variant = if (vp.show_grid) .primary else .ghost,
-            .tooltip = "the adaptive grid",
+            .tooltip = "The grid",
         })) vp.show_grid = !vp.show_grid;
         cimgui.ember_ui_same_line(0, 4);
-        if (ui.button.render(.{
+        if (ui.button.icon(.{
             .ctx = ctx,
             .id = "vp.snap",
-            .text = "Snap",
+            .icon = .link,
             .variant = if (vp.snap) .primary else .ghost,
-            .tooltip = "Ctrl while dragging snaps to the grid",
+            .tooltip = "Snap — Ctrl while dragging snaps to the grid",
         })) vp.snap = !vp.snap;
 
     }
@@ -1364,12 +1371,17 @@ test "viewport: wrapPi unwraps a rotation so 359°→1° spins the short way" {
 }
 
 test "viewport: grid cell widens as the camera zooms out" {
-    // Zoomed IN, the cell HALVES: a 32-unit cell at zoom 4 is 128 px apart on
-    // screen, which is not a grid but three lonely lines. The cell adapts in
-    // both directions, and this is the direction that matters.
-    const vp = Viewport{ .cam = .{ .zoom = 4 } };
+    // Zoomed IN, the cell HALVES once the lines would be further apart than
+    // `grid_max_px`: a 32-unit cell at zoom 8 is 256 px apart, which is not a
+    // grid but three lonely lines. The cell adapts in both directions, and
+    // this is the direction that matters.
+    const vp = Viewport{ .cam = .{ .zoom = 8 } };
     try testing.expectEqual(grid_base / 2, vp.gridCell());
     try testing.expect(vp.gridCell() * vp.cam.zoom <= grid_max_px);
+    // At zoom 4 the cell still fits, so it stays: a grid that halves too
+    // eagerly is a grid that is never still.
+    const mid = Viewport{ .cam = .{ .zoom = 4 } };
+    try testing.expectEqual(grid_base, mid.gridCell());
     // Zoomed far out, lines every 32 world units would be sub-pixel soup:
     // the cell must double until it clears the minimum screen spacing.
     var vp_out = Viewport{ .cam = .{ .zoom = 0.3 } };

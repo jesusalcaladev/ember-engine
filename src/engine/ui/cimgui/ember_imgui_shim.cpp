@@ -21,6 +21,11 @@
 #include "ember_imgui_shim.h"
 
 #include "imgui.h"
+// The user-texture API (ImTextureData) lives in the internal header: it is
+// still marked EXPERIMENTAL in 1.92, and it is the only way for an app to
+// hand ImGui a texture of its own. The official backends include this header
+// for the same reason.
+#include "imgui_internal.h"
 
 #if !defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
 #error "IMGUI_IMPL_WEBGPU_BACKEND_DAWN must be defined: the engine renders with Dawn, and imgui_impl_wgpu needs to be told which WebGPU implementation it is talking to."
@@ -867,6 +872,55 @@ extern "C" void ember_draw_rect_filled_multi(void* dl, float x0, float y0, float
 
 extern "C" void ember_draw_circle_filled(void* dl, float cx, float cy, float radius, unsigned int col, int segments) {
     ((ImDrawList*)dl)->AddCircleFilled(ImVec2(cx, cy), radius, col, segments);
+}
+
+extern "C" void ember_draw_image(
+    void* dl,
+    void* texture,
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float u0,
+    float v0,
+    float u1,
+    float v1,
+    unsigned int col) {
+    // The texture is an ImTextureData the app owns: ImGui uploads it to the
+    // GPU on the next render and hands the backend its identifier. That is
+    // the whole reason the UI layer can have a texture of its own without
+    // knowing what a graphics API is.
+    ImTextureRef ref;
+    ref._TexData = (ImTextureData*)texture;
+    ((ImDrawList*)dl)->AddImage(
+        ref,
+        ImVec2(x0, y0),
+        ImVec2(x1, y1),
+        ImVec2(u0, v0),
+        ImVec2(u1, v1),
+        col);
+}
+
+extern "C" void* ember_ui_texture_create(int w, int h, const unsigned char* rgba) {
+    ImTextureData* tex = new ImTextureData();
+    tex->Create(ImTextureFormat_RGBA32, w, h);
+    if (tex->Pixels != nullptr)
+        memcpy(tex->Pixels, rgba, (size_t)w * (size_t)h * 4);
+    tex->SetStatus(ImTextureStatus_WantCreate);
+    ImGui::RegisterUserTexture(tex);
+    return tex;
+}
+
+extern "C" void ember_ui_texture_destroy(void* texture) {
+    ImTextureData* tex = (ImTextureData*)texture;
+    if (tex == nullptr)
+        return;
+    ImGui::UnregisterUserTexture(tex);
+    // The GPU side is released by the backend once the texture has been
+    // unused for a frame; the ImTextureData itself is the app's, and ImGui
+    // no longer references it once it is unregistered.
+    tex->SetStatus(ImTextureStatus_WantDestroy);
+    delete tex;
 }
 
 extern "C" void ember_draw_circle(void* dl, float cx, float cy, float radius, unsigned int col, int segments, float thickness) {

@@ -88,29 +88,40 @@ theme: the accent when it is active, the dim grey when it is not.
 | `panel-console.png` | a terminal prompt |
 | `panel-tilemap.png` | a brick wall |
 
-## How the engine will use them
+## How the engine uses them
 
-The plan (it is not implemented yet — the drawn icons are the fallback):
+**This is implemented.** The editor loads every PNG in this folder at boot,
+packs them into ONE atlas and hands it to the UI layer, which draws the icons
+from it. What it does to each file:
 
-1. `engine/ui/icons.zig` grows a loader: at boot it looks for
-   `assets/icons/<name>.png` and packs the ones it finds into the same atlas
-   the sprites use.
-2. `ui.icons.render` draws the atlas cell when the icon has one, and the
-   drawn geometry when it does not. **A missing file is never an error** — it
-   is the drawn icon, and the editor looks exactly as it does today.
-3. A file that is present but corrupt is a WARNING in the console, not a
-   crash: a broken icon must not take the editor down.
+1. **The transparent margin is cropped.** An icon set ships every glyph in a
+   square canvas with the drawing in the middle, so a 240px file with a 2px
+   stroke is mostly emptiness. Cropping to the ink is what makes the icon FILL
+   its box instead of sitting in the middle of one.
+2. **The ink is scaled to a 64px cell** (a box filter, so a 2px stroke does not
+   alias into a dotted line).
+3. **The colour becomes white.** An icon is a MASK: the theme tints it (the
+   accent when it is active, the dim grey when it is disabled). A black PNG
+   multiplied by a blue tint is black, so the RGB is replaced by white and the
+   ALPHA — where the anti-aliasing lives — is kept.
 
-So: download what you want, drop the files in this folder, and the editor
-picks them up. Nothing has to be registered by hand.
+**A missing file is never an error.** An icon without a cell is drawn as
+geometry, exactly as it always was, and a file that cannot be decoded is a
+warning in the console. The atlas is an improvement, never a requirement.
+
+**The names are the icon set's own** (Tabler's): the table above lists the
+file each icon expects, and the code maps them
+(`src/engine/ui/icons.zig`, `Icon.fileName`).
 
 ## The priority order
 
 If you only do a few, do these first — they are the ones the drawn geometry
 cannot do justice to:
 
-1. `cursor.png`, `move.png`, `rotate.png`, `scale.png`, `tiles.png` — the
+1. `arrows-move.png`, `rotate.png`, `pointer.png`, `tiles.png` — the
    viewport's tools, on the toolbar you use every day.
-2. `panel-hierarchy.png`, `panel-inspector.png`, `panel-assets.png`,
-   `panel-console.png` — the dock headers.
+2. `hierarchy.png`, `panel-console.png`, `tilemap.png` — the dock headers.
 3. The rest, as you feel like it.
+
+**Still missing** (they fall back to the drawn geometry, which is fine):
+`scale` — a diagonal double arrow. The rest of the set is there.

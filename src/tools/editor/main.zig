@@ -35,7 +35,6 @@ const ui = @import("ui");
 const physics = @import("physics");
 const session = @import("session");
 const code_pane = @import("code_pane.zig");
-const editor_icons = @import("icons.zig");
 const tilemap_panel = @import("tilemap_panel.zig");
 const editor_shell = @import("shell.zig");
 const editor_state = @import("editor_state.zig");
@@ -345,9 +344,9 @@ pub fn main(init: std.process.Init) !void {
     // The PNGs in `assets/icons/`, packed into one texture and handed to the
     // UI layer. A missing folder is not an error: the icons are then drawn as
     // geometry, exactly as they were before anyone put a PNG in it.
-    var icon_atlas = editor_icons.load(boot_alloc, "assets/icons") catch |err| blk: {
+    var icon_atlas = assets.icon_atlas.load(boot_alloc, "assets/icons") catch |err| blk: {
         log.warn("icons: {s} — the editor draws its icons as geometry", .{@errorName(err)});
-        break :blk editor_icons.Icons{
+        break :blk assets.icon_atlas.Atlas{
             .allocator = boot_alloc,
             .pixels = &.{},
             .width = 0,
@@ -357,7 +356,15 @@ pub fn main(init: std.process.Init) !void {
     };
     defer icon_atlas.deinit();
     if (icon_atlas.entries.len > 0) {
-        ui.icons.setAtlas(boot_alloc, icon_atlas.pixels, icon_atlas.width, icon_atlas.height, icon_atlas.entries);
+        // The cells, in the UI layer's own type. The asset pipeline knows
+        // about PNGs and the UI layer knows about textures; neither has to know
+        // about the other, and the conversion is four fields.
+        const cells = try boot_alloc.alloc(ui.icons.Entry, icon_atlas.entries.len);
+        defer boot_alloc.free(cells);
+        for (icon_atlas.entries, 0..) |e, i| {
+            cells[i] = .{ .name = e.name, .u0 = e.u0, .v0 = e.v0, .u1 = e.u1, .v1 = e.v1 };
+        }
+        ui.icons.setAtlas(boot_alloc, icon_atlas.pixels, icon_atlas.width, icon_atlas.height, cells);
         log.info("icons: {d} loaded into a {d}x{d} atlas", .{
             icon_atlas.entries.len,
             icon_atlas.width,

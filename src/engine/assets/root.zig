@@ -34,6 +34,7 @@ pub const asset_types = @import("asset_types.zig");
 pub const compress = @import("compress.zig");
 /// Image decoding (`stb_image`), from a path or from memory.
 pub const image = @import("image.zig");
+pub const icon_atlas = @import("icon_atlas.zig");
 /// The `.pak` container: writer, reader, entry table.
 pub const pack = @import("pack.zig");
 /// Virtual filesystem: `.pak` + filesystem behind one surface.

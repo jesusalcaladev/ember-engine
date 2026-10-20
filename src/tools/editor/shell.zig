@@ -348,25 +348,25 @@ fn drawHierarchy(ctx: *ui.Context) void {
     const ed = ed_mod.active.?;
     const count = ed.model.entityCount();
     var buf: [48]u8 = undefined;
-    header(ctx, std.fmt.bufPrint(&buf, "Hierarchy  ({d})", .{count}) catch "Hierarchy");
+    header(ctx, std.fmt.bufPrint(&buf, "Hierarchy  ({d})", .{count}) catch "Hierarchy", .panel_hierarchy);
     hierarchy_mod.draw(ed, ctx);
 }
 
 fn drawInspector(ctx: *ui.Context) void {
     const ed = ed_mod.active.?;
-    header(ctx, "Inspector");
+    header(ctx, "Inspector", .panel_inspector);
     inspector_mod.draw(ed, ctx);
 }
 
 fn drawAssets(ctx: *ui.Context) void {
     const ed = ed_mod.active.?;
-    header(ctx, "Assets");
+    header(ctx, "Assets", .panel_assets);
     ed.assets.draw(ctx);
 }
 
 fn drawConsole(ctx: *ui.Context) void {
     const ed = ed_mod.active.?;
-    header(ctx, "Console");
+    header(ctx, "Console", .panel_console);
     console_mod.draw(&ed.console, ctx);
 }
 
@@ -400,12 +400,24 @@ fn drawPane(ctx: *ui.Context) void {
 /// the layout is four anonymous regions. The 28px accent rule under the label
 /// is the chrome's one signature: the same mark on every dock, so "where a
 /// panel starts" is readable from across the room.
-fn header(ctx: *ui.Context, name: []const u8) void {
+///
+/// The ICON is the point of the header: a picture of a tree says "hierarchy"
+/// before the word does, and it is the same picture the tab uses, so the panel
+/// and its tab look like the same thing.
+fn header(ctx: *ui.Context, name: []const u8, icon: ui.Icon) void {
     const t = &ctx.theme;
-    ui.text.title(ctx, name);
     const p = ui.draw.cursorPos();
+    // The WINDOW's draw list, not the item's: at the top of a panel's body
+    // there is no item yet, and the item list still belongs to the PREVIOUS
+    // panel — so the icon would be drawn in another window entirely.
+    ui.icons.render(ui.draw.windowList(), icon, .{ .x = p.x + 8, .y = p.y + 9 }, t.colors.text_dim, 16, 0);
+    // The title sits to the right of the icon, on the same line.
+    ui.draw.setCursorPos(.{ .x = p.x + 22, .y = p.y });
+    ui.text.title(ctx, name);
+    const after = ui.draw.cursorPos();
+    ui.draw.setCursorPos(.{ .x = p.x, .y = after.y });
     ui.draw.itemList().rect(
-        ui.draw.rect(p.x, p.y + 1, p.x + 28, p.y + 3),
+        ui.draw.rect(p.x, after.y + 1, p.x + 28, after.y + 3),
         t.colors.accent,
         1,
     );

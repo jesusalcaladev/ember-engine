@@ -210,6 +210,21 @@ pub extern fn ember_draw_rect_filled(dl: ?*anyopaque, x0: f32, y0: f32, x1: f32,
 pub extern fn ember_draw_rect(dl: ?*anyopaque, x0: f32, y0: f32, x1: f32, y1: f32, col: c_uint, rounding: f32, thickness: f32, flags: c_int) void;
 pub extern fn ember_draw_rect_filled_multi(dl: ?*anyopaque, x0: f32, y0: f32, x1: f32, y1: f32, c_tl: c_uint, c_tr: c_uint, c_br: c_uint, c_bl: c_uint) void;
 pub extern fn ember_draw_circle_filled(dl: ?*anyopaque, cx: f32, cy: f32, radius: f32, col: c_uint, segments: c_int) void;
+pub extern fn ember_draw_image(
+    dl: ?*anyopaque,
+    texture: ?*anyopaque,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    col: c_uint,
+) void;
+pub extern fn ember_ui_texture_create(w: c_int, h: c_int, rgba: [*]const u8) ?*anyopaque;
+pub extern fn ember_ui_texture_destroy(texture: ?*anyopaque) void;
 pub extern fn ember_draw_circle(dl: ?*anyopaque, cx: f32, cy: f32, radius: f32, col: c_uint, segments: c_int, thickness: f32) void;
 pub extern fn ember_draw_line(dl: ?*anyopaque, x0: f32, y0: f32, x1: f32, y1: f32, col: c_uint, thickness: f32) void;
 pub extern fn ember_draw_text(dl: ?*anyopaque, font: ?*anyopaque, x: f32, y: f32, col: c_uint, s: [*:0]const u8) void;

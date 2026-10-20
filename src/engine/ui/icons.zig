@@ -1,6 +1,6 @@
-//! `ui.icons` — icons as geometry, not as assets.
+//! `ui.icons` — icons as geometry, and as assets when there are any.
 //!
-//! ## Why not a font, and not PNGs
+//! ## Why the geometry is still here
 //!
 //! An icon font means an extra atlas, an extra file, a licence to vendor, and
 //! a set of glyphs that render at ONE weight — so a chevron is 1px thinner
@@ -12,6 +12,22 @@
 //! geometry they are exact at any DPI, they take the CURRENT text colour (so a
 //! disabled button's icon is disabled), they cost zero bytes of assets, and
 //! they can be animated by changing a number.
+//!
+//! ## And the PNGs, when there are any
+//!
+//! Geometry cannot draw a rotate handle that reads as a rotate handle, and
+//! geometry that tries is the reason a toolbar looks like a drawing exercise.
+//! So the UI layer ALSO accepts a TEXTURE ATLAS: the icons the app loaded
+//! from `assets/icons/`, packed into one image, with a name per cell.
+//!
+//! The rule is simple and it is the whole contract:
+//!
+//! - an icon WITH a cell is drawn from the atlas, tinted with the colour the
+//!   caller passed (so it still goes grey when it is disabled);
+//! - an icon WITHOUT a cell is drawn as geometry, exactly as before.
+//!
+//! So the atlas is an improvement, never a requirement: a missing file is a
+//! missing file, not a broken editor.
 //!
 //! ## The contract
 //!
@@ -72,6 +88,23 @@ pub const Icon = enum {
     unlink,
     drag,
 
+    /// The viewport's tools. They are in the SET because the toolbar is the
+    /// one place where a picture says more than a word.
+    cursor,
+    move,
+    rotate,
+    scale,
+    tiles,
+    focus,
+    home,
+
+    /// The panel headers.
+    panel_hierarchy,
+    panel_inspector,
+    panel_assets,
+    panel_console,
+    panel_tilemap,
+
     /// The default stroke. 1.5 at a 16px box: 1.0 disappears into the fill and
     /// 2.0 is a bold font's weight on a 13.5px line of text.
     pub const default_thickness: f32 = 1.5;
@@ -80,18 +113,159 @@ pub const Icon = enum {
         _ = self;
         return 16.0;
     }
+
+    /// The file this icon comes from, in `assets/icons/`.
+    ///
+    /// The names are the ones the ICON SET uses (Tabler's), so the list in
+    /// `assets/icons/README.md` and the files on disk agree. An icon with no
+    /// file — `scale` is the one that tends to be missing — falls back to the
+    /// drawn geometry, and the editor looks the way it always did.
+    pub fn fileName(self: Icon) ?[]const u8 {
+        return switch (self) {
+            .chevron_right => "chevron-right",
+            .chevron_down => "chevron-down",
+            .chevron_up => "chevron-up",
+            .chevron_left => "chevron-left",
+            .check => "check",
+            .plus => "plus",
+            .minus => "minus",
+            .close => "x",
+            .search => "search",
+            .folder => "folder",
+            .folder_open => "folder-open",
+            .file => "file",
+            .gear => "settings",
+            .play => "player-play",
+            .pause => "player-pause",
+            .stop => "player-stop",
+            .skip_start => "player-skip-back",
+            .skip_end => "player-skip-forward",
+            .refresh => "refresh",
+            .trash => "trash",
+            .copy => "copy",
+            .eye => "eye",
+            .eye_off => "eye-off",
+            .warning_ => "alert-circle",
+            .info_ => "info-circle",
+            .error_ => "exclamation-circle",
+            .success_ => "success",
+            .lock_ => "lock",
+            .dot_ => "circle-dot",
+            .dots => "dots",
+            .undo => "undo",
+            .redo => "redo",
+            .save => "device-floppy",
+            .grid => "grid",
+            .list_ => "list",
+            .camera => "camera",
+            .layers => "layers",
+            .link => "link",
+            .unlink => "unlink",
+            .drag => "drag",
+            .cursor => "pointer",
+            .move => "arrows-move",
+            .rotate => "rotate",
+            .scale => null,
+            .tiles => "tiles",
+            .focus => "focus",
+            .home => "home",
+            .panel_hierarchy => "hierarchy",
+            .panel_inspector => "list",
+            .panel_assets => "folder",
+            .panel_console => "panel-console",
+            .panel_tilemap => "tilemap",
+        };
+    }
 };
+
+// ── The atlas ──────────────────────────────────────────────────────────────
+
+/// One icon's cell in the atlas: where it is and which file it came from.
+pub const Entry = struct {
+    /// The file's name without the extension ("move", not "move.png").
+    name: []const u8,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+};
+
+/// The loaded atlas: one texture and the cells in it.
+///
+/// It lives in the UI layer because the UI layer is what draws it, and the
+/// layer that loads the PNGs (the editor) hands it over. The alternative —
+/// the UI layer loading files — would make the widget library depend on the
+/// filesystem, and a widget library that can read files is a widget library
+/// that has opinions about where files are.
+var atlas_texture: ?*anyopaque = null;
+var atlas_entries: []const Entry = &.{};
+
+/// Installs the atlas: the texture's pixels and the cells in it.
+///
+/// The pixels are COPIED (ImGui owns its own copy) and the entries are kept
+/// by the caller for as long as the atlas lives.
+pub fn setAtlas(allocator: std.mem.Allocator, pixels: []const u8, width: u32, height: u32, entries: []const Entry) void {
+    if (atlas_texture) |t| cimgui.ember_ui_texture_destroy(t);
+    atlas_texture = cimgui.ember_ui_texture_create(@intCast(width), @intCast(height), pixels.ptr);
+    atlas_entries = allocator.dupe(Entry, entries) catch &.{};
+}
+
+/// The cell for an icon, if the atlas has one.
+pub fn lookup(icon: Icon) ?Entry {
+    const name = icon.fileName() orelse return null;
+    for (atlas_entries) |e| {
+        if (std.mem.eql(u8, e.name, name)) return e;
+    }
+    return null;
+}
+
+/// Is there an atlas at all? The HUD asks, so it can say "no icons" instead of
+/// drawing nothing.
+pub fn hasAtlas() bool {
+    return atlas_texture != null;
+}
 
 const pi: f32 = std.math.pi;
 
 /// Draws `icon` centred on `c` in a `box`-sized square.
+///
+/// The atlas wins when it has the icon: a picture of a rotate handle reads as
+/// a rotate handle, and no number of line segments will.
 pub fn render(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness: f32) void {
+    if (atlas_texture) |tex| {
+        if (lookup(icon)) |e| {
+            const s = box * 0.5;
+            cimgui.ember_draw_image(
+                dl.ptr,
+                tex,
+                c.x - s,
+                c.y - s,
+                c.x + s,
+                c.y + s,
+                e.u0,
+                e.v0,
+                e.u1,
+                e.v1,
+                col.pack(),
+            );
+            return;
+        }
+    }
+    renderGeometry(dl, icon, c, col, box, thickness);
+}
+
+/// The drawn fallback: the geometry this module always had.
+fn renderGeometry(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness: f32) void {
     const s = box * 0.5;
     const t = if (thickness <= 0) Icon.default_thickness else thickness;
     const h = s * 0.5; // half extent: 4pt at a 16px box
     const p = struct {
+        /// A point relative to the icon's CENTRE. The centre is the icon's
+        /// anchor: an icon drawn at the origin instead is an icon drawn in
+        /// the top-left corner of the window, which is what happened when
+        /// this lost its `c`.
         fn at(x: f32, y: f32) Vec2 {
-            return .{ .x = x, .y = y };
+            return .{ .x = c.x + x, .y = c.y + y };
         }
     };
 
@@ -314,6 +488,102 @@ pub fn render(dl: List, icon: Icon, c: Vec2, col: Rgba, box: f32, thickness: f32
             dl.pathStroke(col, t, false);
             dl.line(p.at(h, -h * 0.2), p.at(h, h * 0.4), col, t);
             dl.line(p.at(h, h * 0.4), p.at(h * 0.3, h * 0.1), col, t);
+        },
+
+        // ── The viewport's tools ─────────────────────────────────────────
+        //
+        // These are the FALLBACKS: the atlas has pictures for all of them
+        // except `scale` (the one file that tends to go missing), so this is
+        // where the scale handle is drawn from.
+        .cursor => {
+            // An arrow: a triangle with a stem.
+            dl.pathReset();
+            dl.pathLine(p.at(-h * 0.7, -h));
+            dl.pathLine(p.at(-h * 0.7, h * 0.55));
+            dl.pathLine(p.at(-h * 0.15, h * 0.05));
+            dl.pathStroke(col, t, false);
+        },
+        .move => {
+            // A four-way cross: the universal "move".
+            dl.line(p.at(-h, 0), p.at(h, 0), col, t);
+            dl.line(p.at(0, -h), p.at(0, h), col, t);
+            for ([_]Vec2{ p.at(-h, 0), p.at(h, 0), p.at(0, -h), p.at(0, h) }) |tip| {
+                dl.circle(tip, t * 0.9, col);
+            }
+        },
+        .rotate => {
+            dl.pathArc(c, s * 0.62, -pi * 0.35, pi * 1.2, 14);
+            dl.pathStroke(col, t, false);
+            dl.line(p.at(s * 0.60, -s * 0.42), p.at(s * 0.28, -s * 0.48), col, t);
+            dl.line(p.at(s * 0.60, -s * 0.42), p.at(s * 0.56, -s * 0.10), col, t);
+        },
+        .scale => {
+            // A diagonal double arrow: the corner handle, in a box.
+            dl.line(p.at(-h * 0.9, h * 0.9), p.at(h * 0.55, -h * 0.55), col, t);
+            dl.line(p.at(h * 0.9, h * 0.9), p.at(-h * 0.55, -h * 0.55), col, t);
+            dl.line(p.at(h * 0.9, h * 0.9), p.at(h * 0.35, h * 0.9), col, t);
+            dl.line(p.at(h * 0.9, h * 0.9), p.at(h * 0.9, h * 0.35), col, t);
+        },
+        .tiles => {
+            // A 2x2 grid of squares: a tile map in one glyph.
+            const q = h * 0.42;
+            for ([_][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, 1 } }) |cell| {
+                const cx = c.x + cell[0] * q;
+                const cy = c.y + cell[1] * q;
+                dl.rectOutline(draw.rect(cx - q * 0.8, cy - q * 0.8, cx + q * 0.8, cy + q * 0.8), col, s * 0.1, t);
+            }
+        },
+        .focus => {
+            // Corner brackets: "frame this".
+            const arm = s * 0.36;
+            const corner = [_][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, 1 } };
+            for (corner) |k| {
+                const x = c.x + k[0] * h * 0.85;
+                const y = c.y + k[1] * h * 0.85;
+                dl.line(p.at(x, y), p.at(x - k[0] * arm, y), col, t);
+                dl.line(p.at(x, y), p.at(x, y - k[1] * arm), col, t);
+            }
+        },
+        .home => {
+            // A crosshair: "the origin".
+            dl.circleOutline(c, s * 0.45, col, t);
+            dl.line(p.at(-h, 0), p.at(-s * 0.2, 0), col, t);
+            dl.line(p.at(s * 0.2, 0), p.at(h, 0), col, t);
+            dl.line(p.at(0, -h), p.at(0, -s * 0.2), col, t);
+            dl.line(p.at(0, s * 0.2), p.at(0, h), col, t);
+        },
+
+        // ── The panel headers ────────────────────────────────────────────
+        .panel_hierarchy => {
+            for (0..3) |i| {
+                const y = c.y + @as(f32, @floatFromInt(i)) * h * 0.7 - h * 0.7;
+                dl.circle(p.at(-h * 0.7, y), s * 0.12, col);
+                dl.line(p.at(-h * 0.3, y), p.at(h * 0.8, y), col, t);
+            }
+        },
+        .panel_inspector => {
+            // A slider: the inspector in one glyph.
+            for (0..3) |i| {
+                const y = c.y + @as(f32, @floatFromInt(i)) * h * 0.6 - h * 0.6;
+                dl.line(p.at(-h, y), p.at(h, y), col, t);
+                dl.circle(p.at(-h * 0.2 + @as(f32, @floatFromInt(i)) * h * 0.35, y), s * 0.16, col);
+            }
+        },
+        .panel_assets => folder(dl, c, s, t, col, false),
+        .panel_console => {
+            dl.rectOutline(draw.rect(c.x - h, c.y - h * 0.8, c.x + h, c.y + h * 0.8), col, s * 0.14, t);
+            dl.line(p.at(-h * 0.5, -h * 0.2), p.at(-h * 0.1, h * 0.2), col, t);
+            dl.line(p.at(-h * 0.1, h * 0.2), p.at(h * 0.45, -h * 0.35), col, t);
+        },
+        .panel_tilemap => {
+            for (0..3) |row| {
+                for (0..3) |colx| {
+                    if ((row + colx) % 2 != 0) continue;
+                    const x = c.x + @as(f32, @floatFromInt(colx)) * h * 0.62 - h * 0.62;
+                    const y = c.y + @as(f32, @floatFromInt(row)) * h * 0.62 - h * 0.62;
+                    dl.rect(draw.rect(x - h * 0.3, y - h * 0.3, x + h * 0.3, y + h * 0.3), col, 0);
+                }
+            }
         },
     }
 }
