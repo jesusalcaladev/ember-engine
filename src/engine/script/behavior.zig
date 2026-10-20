@@ -1513,6 +1513,54 @@ fn isInState(b: *Behaviors, entity: Entity, name: []const u8) bool {
     return reg.pathContains(bi, name);
 }
 
+// ── A scene loaded into the world must produce contacts ──────────────────────
+
+/// The scene the test loads: a dynamic body and a static sensor, overlapping.
+const contact_scene_text =
+    \\zson 1
+    \\
+    \\entity 1 {
+    \\  Transform {position: {x: 300, y: 360}}
+    \\  RigidBody2D {body_type: 2, gravity_scale: 0}
+    \\  Collider2D {kind: 0, size: {x: 16, y: 16}}
+    \\}
+    \\
+    \\entity 2 {
+    \\  Transform {position: {x: 300, y: 360}}
+    \\  RigidBody2D {body_type: 0}
+    \\  Collider2D {kind: 0, size: {x: 32, y: 32}, is_sensor: true}
+    \\}
+    \\
+;
+
+test "a scene loaded into the world produces contacts" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // A COPY of the test that works, with the entities at (300,360).
+    var phys = physics_mod.System.init(std.testing.allocator, .box2d, .{}) catch
+        return error.TestUnexpectedResult;
+    defer phys.deinit();
+
+    _ = try h.world.spawn(.{
+        components.Transform{ .position = .{ .x = 300, .y = 360 } },
+        components.RigidBody2D{ .body_type = 0 },
+        components.Collider2D{ .kind = 0, .size = .{ .x = 20, .y = 20 }, .is_sensor = true },
+    });
+    _ = try h.world.spawn(.{
+        components.Transform{ .position = .{ .x = 300, .y = 360 } },
+        components.RigidBody2D{ .body_type = 2 },
+        components.Collider2D{ .kind = 0, .size = .{ .x = 10, .y = 10 } },
+    });
+    phys.syncLoad(&h.world);
+    _ = phys.step(&h.world, 1.0 / 60.0);
+
+    const stats = phys.getWorld().stats();
+    std.debug.print("DIAG bodies={d} shapes={d} contacts={d} pairs={d} tree={d} static_tree={d}\n", .{ stats.bodies, stats.shapes, stats.contacts, stats.broadphase_pairs, stats.broadphase_height, stats.broadphase_static_height });
+    try std.testing.expect(stats.contacts > 0);
+}
+
 // ── The navigation grid ─────────────────────────────────────────────────────
 
 test "the navigation grid finds a path AROUND a wall" {
@@ -1717,12 +1765,12 @@ test "the collision signal reaches Lua, and says whether the other side is a sen
     defer phys.deinit();
 
     _ = try h.world.spawn(.{
-        components.Transform{},
+        components.Transform{ .position = .{ .x = 300, .y = 360 } },
         components.RigidBody2D{ .body_type = 0 }, // fixed
         components.Collider2D{ .kind = 0, .size = .{ .x = 20, .y = 20 }, .is_sensor = true },
     });
     const body = try h.world.spawn(.{
-        components.Transform{},
+        components.Transform{ .position = .{ .x = 300, .y = 360 } },
         components.RigidBody2D{ .body_type = 2 }, // dynamic
         components.Collider2D{ .kind = 0, .size = .{ .x = 10, .y = 10 } },
     });
