@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const engine = @import("engine");
+const physics = engine.physics;
 const core = engine.core;
 const platform = engine.platform;
 const render = engine.render;
@@ -587,6 +588,7 @@ fn mountGlobalScripts(
 fn loadScene(
     behaviors: *script.Behaviors,
     world: *ecs.World,
+    physics_sys: *physics.System,
     cfg: *const project.config.Config,
     scene_path: []const u8,
     alloc: std.mem.Allocator,
@@ -632,6 +634,11 @@ fn loadScene(
         return;
     };
     log.info("scene '{s}': {d} entities", .{ scene_path, world.entityCount() });
+
+    // The bodies the scene declares become SOLVER bodies. Without this the
+    // colliders are data and nothing simulates: the physics is a separate
+    // system and it has to be told what exists.
+    physics_sys.syncLoad(world);
 
     // 3. The behaviors: every entity that carries a `Script` component.
     var q = world.query(.{components.Script});
@@ -942,6 +949,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // behavior's `start()` sees the real system rather than null.
     behaviors.ctx.audio = audio_system;
 
+    // ── Physics ─────────────────────────────────────────────────────────────
+    // The runtime had NO physics system, which meant the `physics.*` bindings
+    // were inert in a game and the collision signal had nothing to publish.
+    // The editor has had one all along; this is the same wiring.
+    var physics_sys = physics.System.init(boot_alloc, .box2d, .{}) catch |err| {
+        log.warn("physics init failed ({s}); the world will not simulate", .{@errorName(err)});
+        return err;
+    };
+    defer physics_sys.deinit();
+    behaviors.ctx.physics = &physics_sys;
+
     // ── Global scripts, mounted before the first frame ───────────────────
     // AFTER the audio publish above (a global's `start` deserves the same
     // full binding surface a behavior's gets), and skipped in headless mode
@@ -969,7 +987,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The built-in canonical scene is the default: `--scene game.zson` is how
     // a project ships its own.
     if (args.scene.len != 0) {
-        loadScene(&behaviors, &world, &project_config, args.scene, boot_alloc);
+        loadScene(&behaviors, &world, &physics_sys, &project_config, args.scene, boot_alloc);
     }
 
     // ── M9: the scene-transition fader. Owned by the runtime like the camera:
@@ -1532,6 +1550,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // integration rather than the next one. Same fixed dt, same order
             // every frame, which is what makes a particle scene deterministic.
             particles.fixedUpdate(&world, fixed_dt);
+            // The solver runs AFTER the gameplay (so the scripts' writes are
+            // pushed to it) and BEFORE the root motion (which must be last).
+            // It also publishes the contacts the collision bridge hands to Lua.
+            _ = physics_sys.step(&world, fixed_dt);
             // M13: root motion runs LAST — after the physics step and gameplay —
             // so a solver (or a behavior) that wrote `Transform` this tick does
             // not overwrite the clip's baked displacement.
@@ -1547,6 +1569,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             @floatFromInt(view_w),
             @floatFromInt(view_h),
         );
+        // The physics FOCUS: the camera's centre. The activity tiers decide
+        // how much physics a body gets from its distance to the focus, so a
+        // focus that never moves tiers the whole world by its distance to the
+        // ORIGIN — and a level that does not sit on the origin simulates
+        // nothing.
+        physics_sys.setFocus(if (camera_view) |v|
+            .{ .x = v.cx, .y = v.cy }
+        else
+            .{ .x = 0, .y = 0 });
         z_sim.end();
 
         // M3: the scripted per-frame update (decoupled from the fixed step, like

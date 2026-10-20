@@ -212,6 +212,13 @@ pub const System = struct {
         // Same reasoning: `pending` is written by gameplay during the frame and
         // must never reallocate while it is being written.
         try self_.pending.ensureTotalCapacity(allocator, 256);
+        // The ACTIVE list is rebuilt on every retune, and a retune happens
+        // INSIDE the frame. Its capacity is reserved here for the same
+        // reason: `retune`'s own comment claimed the list "never allocates
+        // inside the frame", and it did — the first retune of a run grew it,
+        // and the frame's allocation guard turned that into a hard
+        // OutOfMemory in the middle of the first physics step.
+        try self_.active.ensureTotalCapacity(allocator, 4096);
         return self_;
     }
 
@@ -265,7 +272,12 @@ pub const System = struct {
             const e = r.entity();
             const body = world.get(e, RigidBody2D) orelse continue;
             if (!body.isSimulated()) {
-                self.createFor(world, e) catch {};
+                // The error is LOGGED, not swallowed: a body that could not be
+                // created is an actor that will not collide, and a swallowed
+                // error there is a level that silently does not work.
+                self.createFor(world, e) catch |err| {
+                    @import("core").log.warn("physics: body {d} could not be created ({s})", .{ e.index, @errorName(err) });
+                };
             }
         }
         self.reindex(world);
@@ -341,6 +353,12 @@ pub const System = struct {
             .fixed_rotation = rb.fixed_rotation,
             .allow_sleep = rb.allow_sleep,
             .is_bullet = rb.is_bullet,
+            // The component's velocity, applied at CREATION. Without it a
+            // scene that says "this actor is already moving" starts at rest,
+            // and the difference is invisible until the actor is supposed to
+            // be somewhere else.
+            .linear_velocity = rb.linear_velocity,
+            .angular_velocity = rb.angular_velocity,
         };
         const id = self.world.createBody(desc) orelse return error.WorldCreationFailed;
         const bits = bodyBits(id);
@@ -430,6 +448,12 @@ pub const System = struct {
                     .linear = rb.linear_velocity,
                     .angular = rb.angular_velocity,
                 });
+                // A SLEEPING body ignores a velocity change: the solver is not
+                // simulating it, so the new velocity would sit there until
+                // something else woke it. Gameplay that moves a body has to
+                // wake it, or "the actor set its velocity and nothing
+                // happened" is a bug with no error anywhere.
+                self.world.setAwake(id, true);
             }
 
             // Same rule as velocity, for the same reason: setting gravity on a

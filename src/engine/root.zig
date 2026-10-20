@@ -33,6 +33,8 @@ pub const light = render.light;
 /// Separate from `light` because `light.zig` is the system and the driver is
 /// the wiring, and the runtime needs the wiring.
 pub const lighting_driver = render.lighting_driver;
+/// M4: the physics — bodies, shapes, contacts, the activity tiers.
+pub const physics = @import("physics");
 /// M3: the LuaJIT scripting layer (behaviors, bindings, metadata). Exposed
 /// through the engine boundary so gameplay/runtime can drive it without ever
 /// importing LuaJIT directly (spec §7: Lua never touches the platform).

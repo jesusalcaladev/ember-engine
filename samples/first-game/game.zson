@@ -1,8 +1,32 @@
 zson 1
 
 entity 1 {
+  Name "camera"
+  Transform {position: {x: 300, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
+  Camera2D {_offset: {x: 300, y: 360}}
+}
+
+entity 2 {
   Name "player"
-  Transform {position: {x: 640, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
+  Transform {position: {x: 300, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
   Sprite {atlas: 0, layer: 0, size: {x: 32, y: 32}, tint: [0.2, 0.6, 1, 1], blend: alpha, visible: true}
+  RigidBody2D {body_type: 0}
+  Collider2D {kind: 0, size: {x: 16, y: 16}}
   Script {script: 1}
+}
+
+entity 3 {
+  Name "trigger"
+  Transform {position: {x: 400, y: 360}, rotation: 0, scale: {x: 1, y: 1}}
+  Sprite {atlas: 0, layer: 1, size: {x: 64, y: 64}, tint: [0.4, 0.9, 0.4, 0.35], blend: alpha, visible: true}
+  RigidBody2D {body_type: 0}
+  Collider2D {kind: 0, size: {x: 32, y: 32}, is_sensor: true}
+}
+
+entity 4 {
+  Name "floor"
+  Transform {position: {x: 640, y: 700}, rotation: 0, scale: {x: 1, y: 1}}
+  Sprite {atlas: 0, layer: 1, size: {x: 1280, y: 40}, tint: [0.2, 0.2, 0.25, 1], blend: alpha, visible: true}
+  RigidBody2D {body_type: 0}
+  Collider2D {kind: 0, size: {x: 640, y: 20}}
 }
