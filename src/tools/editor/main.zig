@@ -496,6 +496,10 @@ pub fn main(init: std.process.Init) !void {
     world.reserveEntities(4096) catch {};
     world.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
     world.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
+    // The SIGNAL QUEUE, for the same reason: the scene load rebuilt the
+    // world, so the queue went back to ZERO capacity, and the first contact
+    // would panic the process.
+    world.reserveSignals(4096) catch {};
     if (!args.empty_scene) spawnDemoScene(world) catch |err| {
         log.warn("demo scene spawn failed: {s}", .{@errorName(err)});
     };

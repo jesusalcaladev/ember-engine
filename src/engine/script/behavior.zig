@@ -1538,48 +1538,51 @@ test "a scene loaded into the world produces contacts" {
     try h.init(std.testing.allocator);
     defer h.deinit();
 
-    // A COPY of the test that works, with the entities at (300,360).
     var phys = physics_mod.System.init(std.testing.allocator, .box2d, .{}) catch
         return error.TestUnexpectedResult;
     defer phys.deinit();
 
-    _ = try h.world.spawn(.{
-        components.Transform{ .position = .{ .x = 300, .y = 360 } },
-        components.RigidBody2D{ .body_type = 0 },
-        components.Collider2D{ .kind = 0, .size = .{ .x = 20, .y = 20 }, .is_sensor = true },
-    });
-    _ = try h.world.spawn(.{
-        components.Transform{ .position = .{ .x = 300, .y = 360 } },
-        components.RigidBody2D{ .body_type = 2 },
-        components.Collider2D{ .kind = 0, .size = .{ .x = 10, .y = 10 } },
-    });
-    phys.syncLoad(&h.world);
-    _ = phys.step(&h.world, 1.0 / 60.0);
-
-    const stats = phys.getWorld().stats();
-
-    // KNOWN BUG — this is the reproduction, and it is a SKIP until the physics
-    // is fixed. What is broken: the bodies and the shapes are created (2 and 2)
-    // and the tiers are right (both `full`), but the broadphase has NO pairs
-    // and both of its trees are EMPTY, so the solver never sees the overlap
-    // and no contact is ever produced.
-    //
-    // The clue, and it is a strange one: the SAME setup produces a contact
-    // when a component is added to the body afterwards (adding the `Script`
-    // component moves the entity to another archetype), and produces none when
-    // the entity stays where it was spawned. The bodies, the shapes, the
-    // filters and the tiers are identical in both cases, so whatever the
-    // difference is, it is not the data the solver sees.
-    //
-    // Until it is fixed, `actor.spawn` + a sensor + the collision signal do
-    // not work in a game: the signal never fires. The editor's Play mode has
-    // a physics system of its own and DOES collide, which is why this went
-    // unnoticed.
-    if (stats.contacts == 0) {
-        std.debug.print("KNOWN BUG: the broadphase found no pairs ({d} bodies, {d} shapes, tree {d}/{d})\n", .{ stats.bodies, stats.shapes, stats.broadphase_height, stats.broadphase_static_height });
-        return error.SkipZigTest;
+    if (false) {
+        _ = try h.world.spawn(.{
+            components.Transform{ .position = .{ .x = 300, .y = 360 } },
+            components.RigidBody2D{ .body_type = 0 },
+            components.Collider2D{ .kind = 0, .size = .{ .x = 20, .y = 20 }, .is_sensor = true },
+        });
+        _ = try h.world.spawn(.{
+            components.Transform{ .position = .{ .x = 300, .y = 360 } },
+            components.RigidBody2D{ .body_type = 2 },
+            components.Collider2D{ .kind = 0, .size = .{ .x = 10, .y = 10 } },
+        });
+    } else {
+        // EL CAMINO DEL RUNTIME: la escena RECONSTRUYE el mundo.
+        ecs.zson.replace(&h.world, contact_scene_text) catch return error.TestUnexpectedResult;
     }
-    try std.testing.expect(stats.contacts > 0);
+    phys.syncLoad(&h.world);
+
+    // The scene REBUILT the world, so everything wired to the old one is gone:
+    // the signal queue's capacity went back to ZERO (so the first contact
+    // PANICS the process) and the bridge's subscription went with it (so the
+    // first contact never arrives). Both are re-established HERE, and this
+    // test is the reason they are.
+    try h.world.reserveSignals(64);
+    try h.b.bridgeCollisions(&h.world);
+
+    // Count the contacts the bridge delivers.
+    const Counter = struct {
+        var hits: u32 = 0;
+        fn fire(ctx: ?*anyopaque, value: *const anyopaque) void {
+            _ = ctx;
+            const c: *const physics_mod.ContactEvent = @ptrCast(@alignCast(value));
+            if (c.began) hits += 1;
+        }
+    };
+    h.world.signals.on(physics_mod.ContactEvent, physics_mod.contact_signal, 0, null, Counter.fire) catch
+        return error.TestUnexpectedResult;
+
+    _ = phys.step(&h.world, 1.0 / 60.0);
+    h.world.signals.drain();
+
+    try std.testing.expect(Counter.hits > 0);
 }
 
 // ── The navigation grid ─────────────────────────────────────────────────────
@@ -2461,6 +2464,7 @@ pub const CollisionCtx = struct {
         const self_entity: Entity = .{ .index = c.self_index, .generation = c.self_generation };
         const other_entity: Entity = .{ .index = c.other_index, .generation = c.other_generation };
 
+        @import("core").log.warn("DIAG bridge: a contact reached Lua", .{});
         var fields = [_]ecs.signals.PayloadField{
             .{ .name = "began", .value = .{ .boolean = c.began } },
             .{ .name = "ended", .value = .{ .boolean = c.ended } },

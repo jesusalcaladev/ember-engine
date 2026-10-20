@@ -683,6 +683,11 @@ fn loadBehaviorScripts(
 /// raises this.
 const spawn_reserve = 4096;
 
+/// How many events the world's signal queue holds. The physics publishes a
+/// contact per touching pair per step, so a busy scene needs room: the queue
+/// is a BUDGET, and a full one panics rather than dropping the event.
+const signal_reserve = 4096;
+
 /// M9: the payload a finished scene transition carries on the world bus.
 ///
 /// The signal is what a Lua `on_signal("scene_faded")` handler and a Zig
@@ -992,18 +997,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // way.
     if (!args.headless) loadBehaviorScripts(&behaviors, &project_config, boot_alloc);
 
-    // ── The collision signal, bridged to Lua ───────────────────────────────
-    // The physics publishes contacts on the world's typed bus, which only the
-    // Zig listeners see. The bridge is what lets a SCRIPT react to being
-    // touched — and, with `other_is_sensor`, tells a trigger from a wall.
-    //
-    // The runtime has no physics system yet (the editor does), so nothing
-    // publishes the signal here yet; the subscription is in place for the day
-    // it lands, and it costs nothing while it is quiet.
-    behaviors.bridgeCollisions(&world) catch |err| {
-        log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
-    };
-
     // ── The navigation grid, rastered from the level's colliders ───────────
     // The `ai.*` bindings read it: a path is an A* over it. It is built HERE,
     // at load time, because it allocates — and a search, which happens inside
@@ -1034,7 +1027,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     //
     // So the two archetypes a spawned actor can need, and the slots for the
     // actors, are reserved HERE — at load time, where allocating is allowed.
+    // The SIGNAL QUEUE, for the same reason: the scene load rebuilt the
+    // world, so the queue went back to ZERO capacity — and the first contact
+    // (or the first sound finishing, or the first button press) would PANIC the
+    // process with "the event queue is full (0 events)".
+    //
+    // This is the whole class of bug in one line: anything the world owns has
+    // to be reserved AFTER the scene, because the scene replaces the world.
+    try world.reserveSignals(signal_reserve);
     try world.reserveEntities(spawn_reserve);
+
+    // The collision signal, bridged to Lua — AFTER the scene load, because
+    // the scene load REBUILT the world and took the subscription with it.
+    //
+    // The physics publishes contacts on the world's bus, which only the Zig
+    // listeners see. The bridge is what lets a SCRIPT react to being touched
+    // — and, with `other_is_sensor`, tells a trigger from a wall.
+    behaviors.bridgeCollisions(&world) catch |err| {
+        log.warn("could not bridge the collision signal to Lua: {s}", .{@errorName(err)});
+    };
     try world.reserve(.{components.Transform, components.Name}, spawn_reserve);
     try world.reserve(.{components.Transform, components.Name, components.Script}, spawn_reserve);
 
