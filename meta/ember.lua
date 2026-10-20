@@ -271,6 +271,26 @@ function physics.overlap_rect(cx, cy, half_w, half_h, mask) end
 ---@return Actor the actor found, or nil
 function physics.contains_point(x, y) end
 
+---Whether the physics overlay is drawn. With no argument it TOGGLES. The overlay shows the bodies, the sensors and the contacts, which is the only way to see what the solver actually did.
+---@param enabled boolean optional: true or false
+---@return boolean whether it is on
+function physics.debug_draw(enabled) end
+
+---The overlay's flags, by name: each one is true or false. The names are `solid_static`, `solid_kinematic`, `solid_dynamic`, `sensor_shapes`, `one_way_shapes`, `tilemap_shapes`, `shape_aabbs`, `contacts` and `center_of_mass`.
+---@return table the flags
+function physics.debug_flags() end
+
+---Turns one overlay flag on or off, by NAME. False when the name is not a flag. A script sets a flag by name and not by number: the numbers are a bitmask an implementation detail.
+---@param name string the flag's name
+---@param on boolean true or false
+---@return boolean true when the flag exists
+function physics.debug_set(name, on) end
+
+---The overlay's colours, by name (0..255 per channel). With a table it SETS them; without one it returns them.
+---@param table table optional: the colours to set
+---@return table the colours
+function physics.debug_colors(table) end
+
 ---Casts a segment and reports what it hit: `hit, t, px, py, nx, ny`.
 ---@param x1 number segment start x
 ---@param y1 number segment start y

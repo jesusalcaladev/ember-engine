@@ -2291,6 +2291,35 @@ end
 physics.set_view(camera.cx, camera.cy, camera.half_w, camera.half_h, true)
 ```
 
+### `physics.debug_draw(enabled?)`
+
+| | |
+|---|---|
+| **Signature** | `physics.debug_draw(enabled?) -> boolean` |
+| **Parameters** | `enabled` — `boolean` — optional: with no argument it **toggles** |
+| **Returns** | `boolean` — whether it is on |
+| **Description** | Whether the **physics overlay** is drawn. The overlay shows the bodies, the sensors and the contacts — the only way to see what the solver actually did. |
+
+### `physics.debug_flags()` · `physics.debug_set(name, on)`
+
+| | |
+|---|---|
+| **Signature** | `physics.debug_flags() -> table` · `physics.debug_set(name, on) -> boolean` |
+| **Description** | The overlay's flags, by name: `solid_static`, `solid_kinematic`, `solid_dynamic`, `sensor_shapes`, `one_way_shapes`, `tilemap_shapes`, `shape_aabbs`, `contacts`, `center_of_mass`. `debug_set` turns one on or off and says whether the name is a flag at all. A script sets a flag by **name** and not by number: the numbers are a bitmask an implementation detail. |
+
+### `physics.debug_colors(table?)`
+
+| | |
+|---|---|
+| **Signature** | `physics.debug_colors(table?) -> table` |
+| **Description** | The overlay's colours, by name (0..255 per channel). With a table it **sets** them; without one it returns them. |
+
+```lua
+physics.debug_draw(true)
+physics.debug_set("contacts", true)
+physics.debug_colors({ contact = { r = 255, g = 0, b = 255, a = 255 } })
+```
+
 ### `physics.set_focus(x, y)`
 
 | | |

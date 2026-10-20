@@ -3204,6 +3204,65 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "physics.debug_draw",
+        .module = "physics",
+        .signature = "physics.debug_draw(enabled?) -> boolean",
+        .summary = "Whether the physics overlay is drawn. With no argument it TOGGLES. The overlay shows the bodies, the sensors and the contacts, which is the only way to see what the solver actually did.",
+        .params = &.{
+            .{ .name = "enabled", .kind = .boolean, .doc = "optional: true or false" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "whether it is on" },
+        },
+        .example =
+        \\\\physics.debug_draw(true)
+        ,
+    },
+    .{
+        .name = "physics.debug_flags",
+        .module = "physics",
+        .signature = "physics.debug_flags() -> table",
+        .summary = "The overlay's flags, by name: each one is true or false. The names are `solid_static`, `solid_kinematic`, `solid_dynamic`, `sensor_shapes`, `one_way_shapes`, `tilemap_shapes`, `shape_aabbs`, `contacts` and `center_of_mass`.",
+        .params = &.{},
+        .returns = &.{
+            .{ .kind = .table, .doc = "the flags" },
+        },
+        .example =
+        \\\\for name, on in pairs(physics.debug_flags()) do print(name, on) end
+        ,
+    },
+    .{
+        .name = "physics.debug_set",
+        .module = "physics",
+        .signature = "physics.debug_set(name, on) -> boolean",
+        .summary = "Turns one overlay flag on or off, by NAME. False when the name is not a flag. A script sets a flag by name and not by number: the numbers are a bitmask an implementation detail.",
+        .params = &.{
+            .{ .name = "name", .kind = .string, .doc = "the flag's name" },
+            .{ .name = "on", .kind = .boolean, .doc = "true or false" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when the flag exists" },
+        },
+        .example =
+        \\\\physics.debug_set("contacts", true)
+        ,
+    },
+    .{
+        .name = "physics.debug_colors",
+        .module = "physics",
+        .signature = "physics.debug_colors(table?) -> table",
+        .summary = "The overlay's colours, by name (0..255 per channel). With a table it SETS them; without one it returns them.",
+        .params = &.{
+            .{ .name = "table", .kind = .table, .doc = "optional: the colours to set" },
+        },
+        .returns = &.{
+            .{ .kind = .table, .doc = "the colours" },
+        },
+        .example =
+        \\\\physics.debug_colors({ contact = { r = 255, g = 0, b = 255, a = 255 } })
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

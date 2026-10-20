@@ -347,6 +347,10 @@ pub const Context = struct {
     /// has no saves directory (a headless tool, a test).
     saves: ?*save_mod.Manager = null,
 
+    /// The physics debug overlay, behind the `physics.debug_*` bindings. Null
+    /// when there is no overlay (a headless tool, a test).
+    physics_debug: ?*physics_mod.debug.PhysicsDebugRenderer = null,
+
     /// The navigation grid, behind the `ai.*` bindings. Null when the runtime
     /// has not built one: a project with no colliders has nothing to
     /// navigate, and a grid that answers from an empty world would send an

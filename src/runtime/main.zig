@@ -745,6 +745,10 @@ const SceneWiring = struct {
 /// is a BUDGET, and a full one panics rather than dropping the event.
 const signal_reserve = 4096;
 
+/// How many debug quads the physics overlay may hold. Reserved once, at boot:
+/// the frame does not allocate.
+const debug_quad_budget = 4096;
+
 /// How many rows the archetypes `actor.add_component` produces can hold. A
 /// hundred and twenty-eight is plenty for the widgets a game builds at
 /// runtime, and the columns are the components' own size.
@@ -1046,6 +1050,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     defer physics_sys.deinit();
     behaviors.ctx.physics = &physics_sys;
+
+    // The physics debug overlay, behind the `physics.debug_*` bindings. It is
+    // OFF until a script turns it on, and it is the only way to SEE what the
+    // solver did: the bodies, the sensors and the contacts.
+    var physics_debug = physics.debug.PhysicsDebugRenderer.init(boot_alloc);
+    defer physics_debug.deinit();
+    physics_debug.reserve(debug_quad_budget) catch |err| log.warn("physics debug reserve failed: {s}", .{@errorName(err)});
+    behaviors.ctx.physics_debug = &physics_debug;
 
     // ── Global scripts, mounted before the first frame ───────────────────
     // AFTER the audio publish above (a global's `start` deserves the same
@@ -1492,6 +1504,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // ── Resize handling, OUTSIDE the forbidden zone. Building the
         // offscreen target creates GPU objects and allocates, and spec §3.6
         // forbids both inside a frame: the loop may only USE a target.
+        // The physics debug overlay. It is collected HERE (after the physics
+        // stepped) and pushed BEFORE the sprites are submitted, so it lands on
+        // top of the world.
+        if (physics_debug.enabled) {
+            physics_debug.collect(&world, physics_sys.getWorld());
+            for (physics_debug.quadSlice()) |q| {
+                _ = r2d.pushInstance(.{
+                    .pos = q.pos,
+                    .half = q.half,
+                    .uv = .{ 0, 0, std.math.maxInt(u16), std.math.maxInt(u16) },
+                    .color = q.color,
+                    .slot = 0, // the white fallback texture
+                    .shape = 0,
+                    .layer = 63, // the top of the light-mask layer space
+                });
+            }
+        }
+
         if (has_window) {
             const fb = window.framebufferSize();
             if (window.resized or target.width != fb.w or target.height != fb.h) {

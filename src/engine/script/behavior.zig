@@ -2884,6 +2884,42 @@ test "a coroutine can be cancelled, given a clock, and woken by a condition" {
     try std.testing.expect(selfLogEntryIs(&h.b, self_ref, 0, "until"));
 }
 
+test "the physics debug overlay can be driven from Lua" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    var debug = physics_mod.debug.PhysicsDebugRenderer.init(std.testing.allocator);
+    defer debug.deinit();
+    h.b.ctx.physics_debug = &debug;
+
+    const L = h.b.vm.state().?;
+    const script =
+        \\if physics.debug_draw(true) ~= true then return 1 end
+        \\if physics.debug_draw() ~= false then return 2 end
+        \\if physics.debug_draw(true) ~= true then return 3 end
+        \\if physics.debug_set("contacts", true) ~= true then return 4 end
+        \\if physics.debug_set("nonsense", true) ~= false then return 5 end
+        \\local flags = physics.debug_flags()
+        \\if flags.contacts ~= true then return 6 end
+        \\if flags.solid_static ~= true then return 7 end
+        \\physics.debug_colors({ contact = { r = 10, g = 20, b = 30, a = 40 } })
+        \\local colors = physics.debug_colors()
+        \\if colors.contact.r ~= 10 then return 8 end
+        \\if colors.contact.a ~= 40 then return 9 end
+        \\return 0
+    ;
+    h.b.vm.loadBuffer(script, "physics_debug") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) {
+        std.debug.print("physics debug test: {s}\n", .{lua.toString(L, -1)});
+        return error.TestUnexpectedResult;
+    }
+    const step = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    if (step != 0) std.debug.print("physics debug test stopped at step {d}\n", .{step});
+    try std.testing.expectEqual(@as(f32, 0), step);
+}
+
 test "a coroutine that errors is reported, not fatal" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);

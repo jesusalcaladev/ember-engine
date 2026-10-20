@@ -1924,6 +1924,134 @@ fn lua_physics_contains_point(L: ?*lua_State) callconv(.c) c_int {
 //PHYSDBG-PARKED     return 0;
 //PHYSDBG-PARKED }
 
+// ── Physics debug: the overlay a script can turn on ─────────────────────────
+
+/// The debug overlay's flags, by name.
+///
+/// A script sets a flag by NAME and not by number: the numbers are a bitmask
+/// an implementation detail, and a script that had to know them would break
+/// the day a flag was inserted in the middle.
+const debug_flag_names = [_]struct { name: [:0]const u8, bit: u32 }{
+    .{ .name = "solid_static", .bit = physics_mod.debug.DebugFlags.solid_static },
+    .{ .name = "solid_kinematic", .bit = physics_mod.debug.DebugFlags.solid_kinematic },
+    .{ .name = "solid_dynamic", .bit = physics_mod.debug.DebugFlags.solid_dynamic },
+    .{ .name = "sensor_shapes", .bit = physics_mod.debug.DebugFlags.sensor_shapes },
+    .{ .name = "one_way_shapes", .bit = physics_mod.debug.DebugFlags.one_way_shapes },
+    .{ .name = "tilemap_shapes", .bit = physics_mod.debug.DebugFlags.tilemap_shapes },
+    .{ .name = "shape_aabbs", .bit = physics_mod.debug.DebugFlags.shape_aabbs },
+    .{ .name = "contacts", .bit = physics_mod.debug.DebugFlags.contacts },
+    .{ .name = "center_of_mass", .bit = physics_mod.debug.DebugFlags.center_of_mass },
+};
+
+/// The overlay's colours, by name.
+const debug_color_names = [_][:0]const u8{
+    "solid_static", "solid_kinematic", "solid_dynamic", "sensor", "one_way",
+    "tilemap_solid", "tilemap_sensor", "contact", "com", "aabb",
+};
+
+/// Reads a colour table `{r,g,b,a}` (0..255) into a `[4]u8`.
+fn debugParseColor(L: ?*lua_State, idx: c_int) [4]u8 {
+    var out: [4]u8 = .{ 255, 255, 255, 255 };
+    if (!lua.isTable(L, idx)) return out;
+    const keys = [_][:0]const u8{ "r", "g", "b", "a" };
+    for (keys, 0..) |key, i| {
+        lua.getField(L, idx, key);
+        if (lua.isNumber(L, -1)) {
+            const v = @as(i32, @intFromFloat(lua.toF32(L, -1)));
+            out[i] = @intCast(@max(0, @min(255, v)));
+        }
+        lua.pop(L, 1);
+    }
+    return out;
+}
+
+/// `physics.debug_draw(enabled?) -> boolean`
+///
+/// Whether the physics overlay is drawn. With no argument it TOGGLES. The
+/// overlay shows the bodies, the sensors and the contacts, which is the only
+/// way to see what the solver actually did.
+fn lua_physics_debug_draw(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const debug = ctx.physics_debug orelse return 0;
+    if (lua.getTop(L) >= 1) {
+        debug.enabled = lua.toBool(L, 1);
+    } else {
+        debug.enabled = !debug.enabled;
+    }
+    lua.lua_pushboolean(L, @intFromBool(debug.enabled));
+    return 1;
+}
+
+/// `physics.debug_flags() -> table`
+///
+/// The overlay's flags, by name: each one is true or false.
+fn lua_physics_debug_flags(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const debug = ctx.physics_debug orelse return 0;
+    lua.lua_createtable(L, 0, debug_flag_names.len);
+    for (debug_flag_names) |f| {
+        lua.lua_pushboolean(L, @intFromBool(debug.flags & f.bit != 0));
+        lua.setField(L, -2, f.name);
+    }
+    return 1;
+}
+
+/// `physics.debug_set(name, on) -> boolean`
+///
+/// Turns one flag on or off, by name. False when the name is not a flag.
+fn lua_physics_debug_set(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const debug = ctx.physics_debug orelse return 0;
+    const name = lua.toSlice(L, 1) orelse return 0;
+    const on = lua.toBool(L, 2);
+    for (debug_flag_names) |f| {
+        if (!std.mem.eql(u8, name, f.name)) continue;
+        if (on) {
+            debug.flags |= f.bit;
+        } else {
+            debug.flags &= ~f.bit;
+        }
+        lua.lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua.lua_pushboolean(L, 0);
+    return 1;
+}
+
+/// `physics.debug_colors(table?) -> table`
+///
+/// The overlay's colours, by name. With a table it SETS them; without one it
+/// returns them.
+fn lua_physics_debug_colors(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const debug = ctx.physics_debug orelse return 0;
+    if (lua.isTable(L, 1)) {
+        // INLINE, because the field name has to be comptime-known: the colour
+        // set is a struct, and a struct's field cannot be picked by a runtime
+        // string.
+        inline for (debug_color_names) |name| {
+            lua.getField(L, 1, name);
+            if (!lua.isNil(L, -1)) {
+                @field(debug.colors, name) = debugParseColor(L, -1);
+            }
+            lua.pop(L, 1);
+        }
+        return 0;
+    }
+    lua.lua_createtable(L, 0, debug_color_names.len);
+    inline for (debug_color_names) |name| {
+        const color: [4]u8 = @field(debug.colors, name);
+        lua.lua_createtable(L, 0, 4);
+        const keys = [_][:0]const u8{ "r", "g", "b", "a" };
+        for (keys, 0..) |key, i| {
+            lua.lua_pushinteger(L, @intCast(color[i]));
+            lua.setField(L, -2, key);
+        }
+        lua.setField(L, -2, name);
+    }
+    return 1;
+}
+
 // ── Sprite primitives: making a prototype without an art pipeline ────────────
 //
 // Godot can draw a rectangle, a circle, a line and a polygon with no texture at
@@ -4938,10 +5066,11 @@ const physics_regs = [_]luaL_Reg{
     .{ .name = "set_body_enabled", .func = lua_physics_set_body_enabled },
     .{ .name = "overlap_rect", .func = lua_physics_overlap_rect },
     .{ .name = "contains_point", .func = lua_physics_contains_point },
-    // PARKED: physics debug bindings are unfinished (no functions yet).
-    // .{ .name = "debug_draw", .func = lua_physics_debug_draw },
-    // .{ .name = "debug_flags", .func = lua_physics_debug_flags },
-    // .{ .name = "debug_colors", .func = lua_physics_debug_colors },
+    // The debug overlay: the only way to SEE what the solver did.
+    .{ .name = "debug_draw", .func = lua_physics_debug_draw },
+    .{ .name = "debug_flags", .func = lua_physics_debug_flags },
+    .{ .name = "debug_set", .func = lua_physics_debug_set },
+    .{ .name = "debug_colors", .func = lua_physics_debug_colors },
     .{ .name = null, .func = null },
 };
 
@@ -6385,6 +6514,11 @@ pub const registered_names = [_][]const u8{
                  "physics.cast_ray",
     "physics.line_of_sight",
     "physics.stats",
+    // The physics debug overlay: the only way to SEE what the solver did.
+    "physics.debug_draw",
+    "physics.debug_flags",
+    "physics.debug_set",
+    "physics.debug_colors",
     "physics.set_view",
     "physics.set_focus",
     // audio (M8)

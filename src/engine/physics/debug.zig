@@ -116,6 +116,9 @@ pub const PhysicsDebugRenderer = struct {
     /// Reused across frames: `collect` keeps the capacity, so a frame with the
     /// same or fewer bodies allocates nothing.
     quads: std.ArrayListUnmanaged(DebugQuad) = .empty,
+    /// Whether the overlay is drawn at all. The flags say WHAT to draw; this
+    /// says WHETHER to draw anything, and it is what a script toggles.
+    enabled: bool = true,
     flags: u32 = DebugFlags.EDITOR_DEFAULT,
     colors: DebugColorSet = .{},
     stats: Stats = .{},
@@ -153,6 +156,7 @@ pub const PhysicsDebugRenderer = struct {
     /// no dependency on `system.zig`.
     pub fn collect(self: *PhysicsDebugRenderer, world: *ecs.World, physics_world: physics.World) void {
         self.clear();
+        if (!self.enabled) return;
 
         var q = world.query(.{ RigidBody2D, Collider2D });
         while (q.nextBatch()) |batch| {
