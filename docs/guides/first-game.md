@@ -311,6 +311,9 @@ arrow keys, and the log should show the flow entering `menu`.
   diagonal from being faster.
 - **The actor's life**: `actor.spawn`, `actor.find_by_name` and
   `actor.destroy` — creating, finding and removing actors at runtime.
+- **The actor's parts**: `actor.add_component(self, "Sprite", { size = { x = 40, y = 32 } })`
+  — giving an actor a component **with its values**, in the same names and
+  shapes the `.zson` format uses.
 - **The clock**: `time.pause()`, `time.set_scale(0.5)` — the world and the
   animations, slowed down.
 
@@ -323,7 +326,6 @@ missing API, not a missing idea:
 
 | You want | Today | The gap |
 |---|---|---|
-| Give an actor a new component with values | `actor.add_component(self, "Sprite")` | the component gets its **defaults**; there is no per-field setter from Lua |
 | Read a component's fields | `actor.get_all(self)` | a table of everything the actor carries |
 | Move an actor that has a physics body | `actor.set_linear_velocity(self, vx, vy)` | the script sets a **velocity** and the solver moves it; writing the position of a dynamic body is fighting the solver |
 

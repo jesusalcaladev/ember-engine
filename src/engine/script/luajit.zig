@@ -229,6 +229,19 @@ pub inline fn remove(L: ?*lua_State, idx: c_int) void {
 }
 
 /// Returns the index of the top element in the stack.
+/// The absolute index of a stack slot.
+///
+/// A negative index counts from the top, so it MOVES whenever the stack
+/// changes. Anything that holds an index across a push has to make it
+/// absolute first — `lua_next` in particular, which walks a table and is
+/// happier with an index that means the same thing before and after the walk.
+pub inline fn absIndex(L: ?*lua_State, idx: c_int) c_int {
+    if (idx > 0) return idx;
+    // LuaJIT 2.1 does not export `lua_absindex`, and the formula is one line:
+    // a negative index counts back from the top.
+    return getTop(L) + idx + 1;
+}
+
 pub inline fn getTop(L: ?*lua_State) c_int {
     return lua_gettop(L);
 }

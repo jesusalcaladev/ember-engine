@@ -718,6 +718,12 @@ const SceneWiring = struct {
         world.reserve(.{components.Transform, components.Name, components.Script}, spawn_reserve) catch |err| {
             log.warn("scene: could not reserve the scripted archetype ({s})", .{@errorName(err)});
         };
+        // The archetypes `actor.add_component` can need: adding a component to
+        // an actor that does not have it yet means a NEW archetype, and a new
+        // archetype is an allocation the frame is not allowed to make.
+        engine.script.fields.reserveAddable(world, addable_reserve) catch |err| {
+            log.warn("scene: could not reserve the addable archetypes ({s})", .{@errorName(err)});
+        };
 
         // The solver's bodies: the scene's colliders become bodies.
         self.physics.syncLoad(world);
@@ -738,6 +744,11 @@ const SceneWiring = struct {
 /// contact per touching pair per step, so a busy scene needs room: the queue
 /// is a BUDGET, and a full one panics rather than dropping the event.
 const signal_reserve = 4096;
+
+/// How many rows the archetypes `actor.add_component` produces can hold. A
+/// hundred and twenty-eight is plenty for the widgets a game builds at
+/// runtime, and the columns are the components' own size.
+const addable_reserve = 128;
 
 /// M9: the payload a finished scene transition carries on the world bus.
 ///

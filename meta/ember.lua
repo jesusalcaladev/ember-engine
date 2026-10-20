@@ -114,11 +114,12 @@ function Actor:direction_to(other) end
 ---@return number angle in radians
 function Actor:angle_to(other) end
 
----Adds a component by name. False if it was already there or the name is unknown.
+---Adds a component by name, WITH its values. False if it was already there or the name is unknown. The values are a table of the component's FIELDS, with the names and shapes the `.zson` format uses: a number, a bool, `{x,y}` for a Vec2, `{r,g,b,a}` for a colour, the NAME of an enum, and a table for a nested struct. A field the table does not mention keeps its default.
 ---@param self Actor 
----@param name string Sprite, CollisionLayers, Name, RigidBody2D, Collider2D
+---@param name string Sprite, CollisionLayers, Name, SoundEmitter2D, Timer, Camera2D, Velocity, UiCanvas, Label, UiButton, UiPanel, UiProgressBar
+---@param values table optional: the component's fields
 ---@return boolean true when it was added
-function Actor:add_component(name) end
+function Actor:add_component(name, values) end
 
 ---Whether an actor carries a component.
 ---@param self Actor 
@@ -1389,6 +1390,34 @@ function ai.rebuild() end
 ---The navigation grid's cell size, in world units. A cell should be about the size of an actor: smaller and the grid gets huge, bigger and the paths get ragged.
 ---@return number the cell size in world units
 function ai.cell_size() end
+
+
+-- ── save ──
+---Saves the game. `opts.only` names the actors to save, `opts.exclude` the ones to leave out, and `opts.password` encrypts the file — the key is DERIVED from the password, because a save encrypted with a key stored next to it is not encrypted. With neither list, every actor is saved.
+---@param slot string the slot's name
+---@param opts table optional: only, exclude, password
+---@return boolean true when the save was written
+function save.save(slot, opts) end
+
+---Loads a slot into the world, REPLACING it — the same path a scene load takes, so everything wired to the world is re-established. With an encrypted save, `opts.password` is required.
+---@param slot string the slot's name
+---@param opts table optional: password
+---@return boolean true when the save was loaded
+function save.load(slot, opts) end
+
+---The slots on disk, each a table with `name`, `encrypted` and `size`.
+---@return table the slots
+function save.list() end
+
+---Removes a slot.
+---@param slot string the slot's name
+---@return boolean true when the slot was removed
+function save.delete(slot) end
+
+---Whether a slot exists on disk.
+---@param slot string the slot's name
+---@return boolean true when the slot is there
+function save.exists(slot) end
 
 
 -- ── tween ──

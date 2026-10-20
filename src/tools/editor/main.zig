@@ -525,15 +525,22 @@ pub fn main(init: std.process.Init) !void {
     const EditorWiring = struct {
         world: *ecs.World,
 
-        fn reload(ctx: ?*anyopaque, world: *ecs.World) void {
-            const self: *EditorWiring = @ptrCast(@alignCast(ctx orelse return));
-            world.reserveSignals(4096) catch {};
-            world.reserveEntities(4096) catch {};
+        fn reload(ctx: ?*anyopaque, w: *ecs.World) void {
+            // The world the hook is handed is the NEW one: the reload
+            // REPLACES it, and everything reserved on the old one went with
+            // it. A function cannot capture the outer `world`, and it must
+            // not: the outer one is the world being replaced.
+            _ = ctx;
+            w.reserveSignals(4096) catch {};
+            w.reserveEntities(4096) catch {};
             // The two component sets a SPAWNED actor can need: a new archetype
             // is an ALLOCATION, and the frame's guard turns an allocation into
             // a panic.
-            world.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
-            world.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
+            w.reserve(.{ ecs.components.Transform, ecs.components.Name }, 256) catch {};
+            w.reserve(.{ ecs.components.Transform, ecs.components.Name, ecs.components.Script }, 256) catch {};
+            // The archetypes `actor.add_component` can need: a component added
+            // to an actor that does not have it yet means a NEW archetype.
+            engine.script.fields.reserveAddable(w, 128) catch {};
         }
     };
     var editor_wiring = EditorWiring{ .world = world };

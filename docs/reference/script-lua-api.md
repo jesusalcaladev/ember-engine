@@ -191,6 +191,46 @@ actor.set_rotation(self, math.deg_to_rad(90))
 log.info("hello from " .. actor.get_name(self))
 ```
 
+### `actor.add_component(self, name, values?)`
+
+| | |
+|---|---|
+| **Signature** | `actor.add_component(self, name, values?) -> boolean` |
+| **Parameters** | `self` — `Actor` |
+| | `name` — `string` — `Sprite`, `CollisionLayers`, `Name`, `SoundEmitter2D`, `Timer`, `Camera2D`, `Velocity`, `UiCanvas`, `Label`, `UiButton`, `UiPanel`, `UiProgressBar` |
+| | `values` — `table` — optional: the component's fields |
+| **Returns** | `boolean` — true when it was added |
+| **Description** | Adds a component by name, **with its values**. False if it was already there or the name is unknown. |
+
+The values are a table of the component's **fields**, with the names and the
+shapes the `.zson` format uses — because the same developer is typing both:
+
+| Field type | The Lua value |
+|---|---|
+| a number | a number |
+| a bool | a bool |
+| `Vec2` | `{ x = .., y = .. }` |
+| a colour (`[4]f32`) | `{ r = .., g = .., b = .., a = .. }` or `{ r, g, b, a }` |
+| a name (`Name`, `InlineText`) | the string itself (`text = "Score"`) |
+| an enum | its **name**: `"additive"`, `"center"`, `"loop"` |
+| a struct (`UiLayout`) | a table of its own fields, recursively |
+
+A field the table does not mention keeps its **default**, and a key that is not
+a field of the component is reported and ignored.
+
+```lua
+actor.add_component(self, "Sprite", {
+  size = { x = 40, y = 32 },
+  layer = 3,
+  tint = { r = 1, g = 0, b = 0, a = 1 },
+  blend = "additive",
+})
+```
+
+The components a **system** owns (a collider, a rigid body) are not on the
+list: the solver wires them when the scene loads, and a half-added collider —
+one the solver does not know about — is worse than none.
+
 ### `actor.emit(self, event)`
 
 | | |

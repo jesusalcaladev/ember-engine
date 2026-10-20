@@ -1659,6 +1659,56 @@ test "a save keeps what the developer asked for, and the password protects it" {
     try std.testing.expectError(error.PasswordRequired, m.load(&no_pw, "secret", .{}));
 }
 
+test "a component can be added WITH its values" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    const L = h.b.vm.state().?;
+    // The script returns the STEP that failed, 0 when everything passed.
+    const script =
+        \\local a = actor.spawn(0, 0, { name = "sized" })
+        \\if not a then return 1 end
+        \\if not actor.add_component(a, "Sprite", { size = { x = 40, y = 32 }, layer = 3, tint = { r = 1, g = 0, b = 0, a = 1 }, blend = "additive" }) then return 2 end
+        \\if actor.add_component(a, "Sprite", {}) then return 3 end
+        \\if not actor.add_component(a, "Label", { text = "Score", layout = { size = { x = 100, y = 20 }, anchor = "center" } }) then return 4 end
+        \\if not actor.add_component(a, "Timer", { duration = 1.5, kind = "loop" }) then return 5 end
+        \\return 0
+    ;
+    h.b.vm.loadBuffer(script, "component_values") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) {
+        std.debug.print("component values test: {s}\n", .{lua.toString(L, -1)});
+        return error.TestUnexpectedResult;
+    }
+    const step = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    if (step != 0) {
+        std.debug.print("component values test stopped at step {d}\n", .{step});
+    }
+    try std.testing.expectEqual(@as(f32, 0), step);
+
+    // And the world really holds those values.
+    const a = h.world.findByName("sized") orelse return error.TestUnexpectedResult;
+    const sprite = h.world.get(a, components.Sprite).?;
+    try std.testing.expectEqual(@as(f32, 40), sprite.size.x);
+    try std.testing.expectEqual(@as(f32, 32), sprite.size.y);
+    try std.testing.expectEqual(@as(u16, 3), sprite.layer);
+    try std.testing.expectEqual(@as(f32, 1), sprite.tint[0]);
+    try std.testing.expectEqual(@as(f32, 0), sprite.tint[1]);
+    try std.testing.expectEqual(@as(f32, 0), sprite.tint[2]);
+    try std.testing.expectEqual(components.Blend.additive, sprite.blend);
+
+    const label = h.world.get(a, components.Label).?;
+    try std.testing.expectEqualStrings("Score", label.text.slice());
+    try std.testing.expectEqual(@as(f32, 100), label.layout.size.x);
+    try std.testing.expectEqual(@as(f32, 20), label.layout.size.y);
+    try std.testing.expectEqual(components.UiAnchor.center, label.layout.anchor);
+
+    const timer = h.world.get(a, components.Timer).?;
+    try std.testing.expectEqual(@as(f32, 1.5), timer.duration);
+    try std.testing.expectEqual(components.TimerType.loop, timer.kind);
+}
+
 // ── The navigation grid ─────────────────────────────────────────────────────
 
 test "the navigation grid finds a path AROUND a wall" {

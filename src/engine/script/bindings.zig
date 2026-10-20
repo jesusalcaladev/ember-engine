@@ -30,6 +30,7 @@ const metadata = @import("api_meta");
 const context_mod = @import("context.zig");
 const tween_mod = @import("tween.zig");
 const nav_mod = @import("nav.zig");
+const fields_mod = @import("fields.zig");
 const save_mod = @import("save.zig");
 const assets_mod = @import("assets");
 const ecs = @import("ecs");
@@ -2070,49 +2071,38 @@ const render_regs = [_]luaL_Reg{
 /// True when the component was added. False when the actor already had it, or
 /// when the name is not a component — a tool must not be able to add something
 /// the engine does not know, because nothing would ever read it.
+/// Adds a component with its defaults, then with the caller's values.
+fn addComponent(comptime T: type, ctx: *Context, e: context_mod.Entity, L: ?*lua_State) bool {
+    if (ctx.world.get(e, T) != null) return false;
+    var value: T = .{};
+    fields_mod.applyFields(T, &value, L, 3);
+    ctx.world.add(e, value) catch return false;
+    return true;
+}
+
+/// `actor.add_component(name, values?) -> boolean`
+///
+/// The values are a table of the component's FIELDS, with the same names and
+/// the same shapes the `.zson` format uses:
+///
+/// ```lua
+/// actor.add_component(self, "Sprite", { size = { x = 40, y = 32 }, layer = 3 })
+/// ```
 fn lua_actor_add_component(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return pushFalse(L);
     const name = lua.toSlice(L, 2) orelse "";
 
-    if (std.mem.eql(u8, name, "Sprite")) {
-        if (ctx.world.get(e, Sprite) != null) return pushFalse(L);
-        _ = ctx.world.add(e, Sprite{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "CollisionLayers")) {
-        if (ctx.world.get(e, CollisionLayers) != null) return pushFalse(L);
-        _ = ctx.world.add(e, CollisionLayers{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "Name")) {
-        if (ctx.world.get(e, context_mod.components.Name) != null) return pushFalse(L);
-        _ = ctx.world.add(e, context_mod.components.Name{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "SoundEmitter2D")) {
-        // M8: the emitter is plain data (a bank slot, a bus, a gain), so adding
-        // one from the inspector is safe and needs no system call.
-        if (ctx.world.get(e, SoundEmitter2D) != null) return pushFalse(L);
-        _ = ctx.world.add(e, SoundEmitter2D{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "UiCanvas")) {
-        // M14: the UI widgets are plain data too. Adding one starts from the
-        // component defaults (a 100x30 top-left box), which `ui.*` then styles.
-        if (ctx.world.get(e, components.UiCanvas) != null) return pushFalse(L);
-        _ = ctx.world.add(e, components.UiCanvas{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "Label")) {
-        if (ctx.world.get(e, components.Label) != null) return pushFalse(L);
-        _ = ctx.world.add(e, components.Label{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "UiButton")) {
-        if (ctx.world.get(e, components.UiButton) != null) return pushFalse(L);
-        _ = ctx.world.add(e, components.UiButton{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "UiPanel")) {
-        if (ctx.world.get(e, components.UiPanel) != null) return pushFalse(L);
-        _ = ctx.world.add(e, components.UiPanel{}) catch return pushFalse(L);
-    } else if (std.mem.eql(u8, name, "UiProgressBar")) {
-        if (ctx.world.get(e, components.UiProgressBar) != null) return pushFalse(L);
-        _ = ctx.world.add(e, components.UiProgressBar{}) catch return pushFalse(L);
-    } else {
-        // An unknown name is a reportable error, not a silent no-op: a tool that
-        // asks for a component that does not exist has a bug, and hiding it here
-        // is how an inspector ends up with a field that never does anything.
-        return pushFalse(L);
+    inline for (fields_mod.addable_components) |ac| {
+        if (std.mem.eql(u8, name, ac.name)) {
+            if (addComponent(ac.T, ctx, e, L)) return pushTrue(L);
+            return pushFalse(L);
+        }
     }
-    return pushTrue(L);
+    // An unknown name is a reportable error, not a silent no-op: a tool that
+    // asks for a component that does not exist has a bug, and hiding it here
+    // is how an inspector ends up with a field that never does anything.
+    return pushFalse(L);
 }
 
 /// `actor.has_component(name) -> boolean`

@@ -1058,17 +1058,18 @@ pub const bindings = [_]Binding{
     .{
         .name = "actor.add_component",
         .module = "actor",
-        .signature = "actor.add_component(self, name) -> boolean",
-        .summary = "Adds a component by name. False if it was already there or the name is unknown.",
+        .signature = "actor.add_component(self, name, values?) -> boolean",
+        .summary = "Adds a component by name, WITH its values. False if it was already there or the name is unknown. The values are a table of the component's FIELDS, with the names and shapes the `.zson` format uses: a number, a bool, `{x,y}` for a Vec2, `{r,g,b,a}` for a colour, the NAME of an enum, and a table for a nested struct. A field the table does not mention keeps its default.",
         .params = &.{
             .{ .name = "self", .kind = .actor, .doc = "" },
-            .{ .name = "name", .kind = .string, .doc = "Sprite, CollisionLayers, Name, RigidBody2D, Collider2D" },
+            .{ .name = "name", .kind = .string, .doc = "Sprite, CollisionLayers, Name, SoundEmitter2D, Timer, Camera2D, Velocity, UiCanvas, Label, UiButton, UiPanel, UiProgressBar" },
+            .{ .name = "values", .kind = .table, .doc = "optional: the component's fields" },
         },
         .returns = &.{
             .{ .kind = .boolean, .doc = "true when it was added" },
         },
         .example =
-        \\\actor.add_component(self, "Sprite")
+        \\\actor.add_component(self, "Sprite", { size = { x = 40, y = 32 }, layer = 3, blend = "additive" })
         ,
     },
     .{
