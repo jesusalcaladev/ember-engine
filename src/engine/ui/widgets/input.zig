@@ -315,10 +315,7 @@ pub fn numberField(n: NumberField) bool {
     const r = draw.itemRect();
     cimgui.ember_ui_pop_id();
     const list = draw.itemList();
-    const hovered = cimgui.ember_ui_is_item_hovered(cimgui.HoveredFlags.None) != 0;
-    const active = cimgui.ember_ui_is_item_active() != 0;
     const focused = cimgui.ember_ui_is_item_focused() != 0;
-    const state: theme.State = if (n.disabled) .disabled else if (active) .active else if (hovered) .hover else .idle;
     // The focus ring, and only the focus ring: it goes ON TOP of the value,
     // which is the one thing that may be drawn over it.
     if (focused) {

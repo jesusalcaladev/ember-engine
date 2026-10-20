@@ -499,8 +499,6 @@ pub fn main(init: std.process.Init) !void {
     if (!args.empty_scene) spawnDemoScene(world) catch |err| {
         log.warn("demo scene spawn failed: {s}", .{@errorName(err)});
     };
-    // TEMP(visual check)
-    if (world.entityAtSlot(1)) |demo_box| editor.select(demo_box);
 
     // Bodies for the scene that just arrived. A LOAD-TIME operation: it
     // allocates, and a frame may not.

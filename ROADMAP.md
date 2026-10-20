@@ -324,7 +324,6 @@ viewport, the pointer was measured in the wrong axis, the gizmo was three
 axis-aligned quads, and every dock wore ImGui's title bar on top of the
 editor's own header. Four bugs, all of them visible, and all of them in the
 same place — the part of the editor the user looks at most.
-
 **The viewport is a REGION, and the camera is the region's camera.** The
 hierarchy is on the left, the inspector on the right, the console at the
 bottom, and the scene is what is left over. So the camera shows that
@@ -372,8 +371,45 @@ flags they want (a dock that lists a thousand entities has to scroll, and
 `NoDecoration` takes the scrollbar with it).
 
 What is still open, and is next: **multi-select and the drag-select
-marquee**, and the handles over `physics.reshape` / `occluder.set_polygon`
-that the 2D tab promises.
+marquee** (the marquee is here; the GROUP transform — one gizmo moving the
+whole selection — is not), and the handles over `physics.reshape` /
+`occluder.set_polygon` that the 2D tab promises.
+
+#### The fields, the grid and the frame cost (M5.8, second pass)
+
+The second pass was the user's complaints, and every one of them turned out
+to be a real bug rather than a taste:
+
+**The inspector's fields showed no values.** The field's background was
+painted AFTER the widget drew its text, so the background covered the number:
+every field in the editor showed its unit ("px", "rad") and nothing else, and
+the text fields showed their placeholder and never their content. ImGui draws
+the frame AND the text, so the frame is ImGui's now and the theme styles it;
+the only thing drawn on top is the focus ring.
+
+**A field's label slot is an ABSOLUTE offset** from the line's start, which
+is what a table needs and what a row inside a row cannot use: the "X" of an
+X/Y pair jumped back to the column it never left and drew its box on top of
+the row's own label — which is why "Position" read as "Po". There is a
+relative label slot now, and the X/Y labels use it.
+
+**The grid only ever doubled its cell**, so zooming in left three lonely
+lines with very thick strokes between them. It adapts in both directions now,
+and the axes are one pixel wide like every other line.
+
+**The scene never reached the screen with the SMAA off.** The no-SMAA path
+wrote its texel uniform into the EDGE uniform instead of the BLEND one — the
+buffer the copy pass actually binds. With the SMAA on, the blend uniform had
+been written by the SMAA's own passes, so the copy happened to read a valid
+texel size and the frame appeared. With the SMAA off — which is what the
+editor wants — nothing ever wrote it, the copy read zeros, and the editor had
+a perfectly good viewport and nothing in it. The editor's SMAA is off by
+default now: the scene being edited is flat 2D art, and three full-screen
+passes are the most expensive thing in the frame on a weak GPU.
+
+**The frame cost is on the status bar**: the frame's own milliseconds AND the
+GPU's. A frame that is 40 ms long with 5 ms of CPU in it is a frame that is
+WAITING, and the two look identical on a status bar that shows only one.
 
 #### Autosave, hot reload and flat prefabs
 
