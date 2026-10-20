@@ -629,6 +629,12 @@ render_mod.addImport("assets", assets_mod);
         "src/engine/render/shaders/smaa.wgsl",
         "src/engine/render/shaders/light.wgsl",
         "src/engine/render/shaders/post.wgsl",
+        // M9: the GPU particle shaders. They are in the list because a WGSL
+        // file that does not compile is a blank screen with nothing in the log
+        // to explain it, and the GPU path is the one the null backend cannot
+        // check for us.
+        "src/engine/render/shaders/particle_sim.wgsl",
+        "src/engine/render/shaders/particle_draw.wgsl",
     }) |rel| {
         const run = b.addSystemCommand(&.{
             b.path("libs/dawn/build/tint").getPath(b),

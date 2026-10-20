@@ -1154,6 +1154,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     particles.setFixedDt(fixed_dt);
     particles.lock();
 
+    // M9: the GPU particle backend. The emitters that ask for it keep their
+    // particles on the GPU: the CPU packs the recipes and never touches a
+    // particle again. The renderer is handed over once, at boot, because the
+    // system asks the backend to run the simulation and to draw the result.
+    var gpu_particles = engine.render.particles_gpu.System.init(boot_alloc);
+    defer gpu_particles.deinit();
+    gpu_particles.reserve() catch |err| {
+        log.warn("gpu particle reserve failed: {s}", .{@errorName(err)});
+    };
+    // The renderer is handed over once, here: the system asks the backend to
+    // run the simulation and to draw the result, and the backend is the only
+    // one that can.
+    gpu_particles.renderer = renderer;
+
     var anim_system = ecs.animation.System.init(boot_alloc);
     defer anim_system.deinit();
     // M13: `anim.length` needs the clip registry, and nothing else hands the
@@ -1708,6 +1722,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // integration rather than the next one. Same fixed dt, same order
             // every frame, which is what makes a particle scene deterministic.
             particles.fixedUpdate(&world, fixed_dt);
+            // The GPU emitters, in the same tick and with the same dt: a
+            // particle born on the GPU is born on the GPU's clock.
+            gpu_particles.fixedUpdate(&world, fixed_dt);
             // The solver runs AFTER the gameplay (so the scripts' writes are
             // pushed to it) and BEFORE the root motion (which must be last).
             // It also publishes the contacts the collision bridge hands to Lua.
@@ -1881,6 +1898,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const fb = window.framebufferSize();
             renderer.beginScene(target, sceneCamera(camera_view, fb.w, fb.h));
             r2d.submit(renderer);
+            // The GPU particles are their own pass, between the sprites and
+            // the light: the light has to reach them, or they would glow.
+            gpu_particles.draw();
             lighting_drawn = lighting.render(&world, &r2d, renderer, lighting_env, frame_index);
             renderer.endScene(args.smaa, .Medium);
         } else {
@@ -1888,6 +1908,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // backend so CI measures draw calls and batching for real.
             renderer.beginScene(target, sceneCamera(camera_view, view_w, view_h));
             r2d.submit(renderer);
+            gpu_particles.draw();
             lighting_drawn = lighting.render(&world, &r2d, renderer, lighting_env, frame_index);
             renderer.endScene(args.smaa, .Medium);
         }

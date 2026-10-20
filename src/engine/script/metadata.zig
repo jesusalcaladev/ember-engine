@@ -1687,6 +1687,37 @@ pub const bindings = [_]Binding{
     },
     // ── M9: particles (the CPU pool) ──────────────────────────────────────────
     .{
+        .name = "particles.set_backend",
+        .module = "particles",
+        .signature = "particles.set_backend(self, backend) -> boolean",
+        .summary = "Which simulator owns this emitter's particles: `\"cpu\"` (the main thread's pool) or `\"gpu\"` (the compute shader's). The two are the same recipe run in two places, so an emitter can move between them without changing how it looks. The switch takes effect on the next tick, and the particles that were alive are NOT carried over.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "backend", .kind = .string, .doc = "\"cpu\" or \"gpu\"" },
+        },
+        .returns = &.{
+            .{ .kind = .boolean, .doc = "true when it was set" },
+        },
+        .example =
+        \\\\particles.set_backend(self, "gpu")
+        ,
+    },
+    .{
+        .name = "particles.backend",
+        .module = "particles",
+        .signature = "particles.backend(self) -> string",
+        .summary = "Which simulator owns this emitter's particles: `\"cpu\"` or `\"gpu\"`.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{
+            .{ .kind = .string, .doc = "the backend's name" },
+        },
+        .example =
+        \\\\if particles.backend(self) == "gpu" then ... end
+        ,
+    },
+    .{
         .name = "particles.burst",
         .module = "particles",
         .signature = "particles.burst(self, count) -> emitted",

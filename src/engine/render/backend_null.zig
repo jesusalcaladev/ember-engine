@@ -15,6 +15,9 @@ pub const Backend = struct {
     frames: u64 = 0,
     quads_drawn: u64 = 0,
     sprites_drawn: u64 = 0,
+    /// The emitters the GPU particle simulation was given. A count, so the
+    /// null backend's report says the same thing the real one does.
+    gpu_particle_emitters: u32 = 0,
     /// M7: lights submitted and shadow-map bytes uploaded. Asserted by the
     /// headless tests, which is the only way the light pass is checked without
     /// a GPU.
@@ -48,6 +51,8 @@ pub const Backend = struct {
         .beginScene = beginScene,
         .endScene = endScene,
         .drawSprites = drawSprites,
+        .gpuParticlesSimulate = gpuParticlesSimulate,
+        .gpuParticlesDraw = gpuParticlesDraw,
         .drawLights = drawLights,
         .createShadowMap = createShadowMap,
         .uploadShadowMap = uploadShadowMap,
@@ -208,6 +213,22 @@ fn drawSprites(ptr: *anyopaque, instances: []const render.SpriteInstance, count:
         self.stats_data.render_passes += 1;
         self.stats_data.vertex_count += @as(u64, count) * 4;
         self.stats_data.upload_bytes += @as(u64, count) * @sizeOf(render.SpriteInstance);
+    }
+
+    /// The null backend has no GPU, so the simulation is a no-op and the draw
+    /// counts what a real one would have drawn. The metrics stay comparable
+    /// between the two backends, which is the point of the null backend.
+    fn gpuParticlesSimulate(ptr: *anyopaque, dt: f32, params: []const u8, emitter_count: u32) void {
+        _ = dt;
+        _ = params;
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        self.gpu_particle_emitters = emitter_count;
+    }
+
+    fn gpuParticlesDraw(ptr: *anyopaque) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        self.stats_data.draw_calls += 1;
+        self.stats_data.render_passes += 1;
     }
 
     fn createTexture(ptr: *anyopaque, width: u32, height: u32, pixels: []const u8) ?*anyopaque {

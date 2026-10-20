@@ -54,6 +54,7 @@ pub const two_d = @import("2d.zig");
 pub const font = @import("font.zig");
 pub const ui_draw = @import("ui_draw.zig");
 pub const particles = @import("particles.zig");
+pub const particles_gpu = @import("particles_gpu.zig");
 pub const fade = @import("fade.zig");
 pub const tint = @import("tint.zig");
 pub const light = @import("light.zig");
@@ -69,6 +70,7 @@ test {
     _ = font;
     _ = ui_draw;
     _ = particles;
+    _ = particles_gpu;
     _ = fade;
     _ = tint;
     _ = light;
@@ -176,6 +178,8 @@ test "the renderer's tests are in this binary, not just its code" {
             @compileError("2d.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(particles.System))
             @compileError("particles.zig is reachable as a module, so its tests are compiled and never run");
+        if (!isRootModule(particles_gpu.System))
+            @compileError("particles_gpu.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(fade.Fader))
             @compileError("fade.zig is reachable as a module, so its tests are compiled and never run");
         if (!isRootModule(tint.Tint))

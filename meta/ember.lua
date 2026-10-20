@@ -851,6 +851,17 @@ function scene.tint_amount() end
 
 
 -- ── particles ──
+---Which simulator owns this emitter's particles: `"cpu"` (the main thread's pool) or `"gpu"` (the compute shader's). The two are the same recipe run in two places, so an emitter can move between them without changing how it looks. The switch takes effect on the next tick, and the particles that were alive are NOT carried over.
+---@param self Actor 
+---@param backend string "cpu" or "gpu"
+---@return boolean true when it was set
+function particles.set_backend(self, backend) end
+
+---Which simulator owns this emitter's particles: `"cpu"` or `"gpu"`.
+---@param self Actor 
+---@return string the backend's name
+function particles.backend(self) end
+
 ---Emits `count` particles NOW from this actor's ParticleEmitter2D. Returns how many were actually emitted (may be less if the emitter's slab is full).
 ---@param self Actor 
 ---@param count integer how many to emit

@@ -34,6 +34,19 @@ const light_wgsl = @embedFile("shaders/light.wgsl");
 const sprite_wgsl = @embedFile("shaders/sprite.wgsl");
 const smaa_wgsl = @embedFile("shaders/smaa.wgsl");
 const post_wgsl = @embedFile("shaders/post.wgsl");
+const particle_sim_wgsl = @embedFile("shaders/particle_sim.wgsl");
+const particle_draw_wgsl = @embedFile("shaders/particle_draw.wgsl");
+
+// ── M9: the GPU particle pool's measures ────────────────────────────────────
+//
+// 256 emitters, 256 particles each, 64 bytes per particle: 4 MB of GPU
+// memory, uploaded ONCE at boot and never touched by the CPU again.
+const ParticleEmitterCount: u32 = 256;
+const ParticleSliceSize: u32 = 256;
+const ParticleBytes: u64 = 64;
+const ParticlePoolBytes: u64 = ParticleEmitterCount * ParticleSliceSize * ParticleBytes;
+const ParticleStateBytes: u64 = ParticleEmitterCount * 20;
+const ParticleParamsBytes: u64 = ParticleEmitterCount * 104;
 
 // Dawn ships the C API as a dispatch table (libdawn_proc) whose default
 // procs are null stubs; the real implementation lives in libdawn_native.
@@ -327,6 +340,23 @@ pub const Backend = struct {
     sprite_shader: wgpu.WGPUShaderModule,
     sprite_bgl: wgpu.WGPUBindGroupLayout,
     sprite_layout: wgpu.WGPUPipelineLayout,
+
+    // ── M9: the GPU particle backend ───────────────────────────────────────
+    // The particles live in a storage buffer the compute shader writes and
+    // the draw shader reads. The CPU never sees them.
+    particle_buf: wgpu.WGPUBuffer,
+    particle_state_buf: wgpu.WGPUBuffer,
+    particle_params_buf: wgpu.WGPUBuffer,
+    particle_sim_uniform_buf: wgpu.WGPUBuffer,
+    particle_sim_bgl: wgpu.WGPUBindGroupLayout,
+    particle_sim_layout: wgpu.WGPUPipelineLayout,
+    particle_sim_pipeline: wgpu.WGPUComputePipeline,
+    particle_spawn_pipeline: wgpu.WGPUComputePipeline,
+    particle_sim_bind_group: wgpu.WGPUBindGroup,
+    particle_draw_bgl: wgpu.WGPUBindGroupLayout,
+    particle_draw_layout: wgpu.WGPUPipelineLayout,
+    particle_draw_pipeline: wgpu.WGPURenderPipeline,
+    particle_draw_bind_group: wgpu.WGPUBindGroup,
     /// Textured + solid variants, and the alpha/additive blend variants.
     sprite_pipeline_textured: wgpu.WGPURenderPipeline,
     sprite_pipeline_solid: wgpu.WGPURenderPipeline,
@@ -451,6 +481,8 @@ pub const Backend = struct {
         .beginScene = beginScene,
         .endScene = endScene,
         .drawSprites = drawSprites,
+        .gpuParticlesSimulate = gpuParticlesSimulate,
+        .gpuParticlesDraw = gpuParticlesDraw,
         .drawLights = drawLights,
         .createShadowMap = createShadowMap,
         .uploadShadowMap = uploadShadowMap,
@@ -480,6 +512,11 @@ pub const Backend = struct {
         .{ .label = "sprite.wgsl", .src = sprite_wgsl },
         .{ .label = "smaa.wgsl", .src = smaa_wgsl },
         .{ .label = "post.wgsl", .src = post_wgsl },
+        // M9: the GPU particle shaders. They are in the list because the list
+        // is the gate: a WGSL file that does not compile is a mistake the
+        // device catches, and the only place that catches it is here.
+        .{ .label = "particle_sim.wgsl", .src = particle_sim_wgsl },
+        .{ .label = "particle_draw.wgsl", .src = particle_draw_wgsl },
     };
 
     /// Compiles every shipped shader on a REAL device and reports what failed.
@@ -817,6 +854,170 @@ pub const Backend = struct {
             .{ .binding = 2, .sampler = @ptrCast(sampler) },
         }, "sprite.white");
         resources_created += 1;
+
+        // ── M9: the GPU particle resources ─────────────────────────────────
+        //
+        // The pool is 65 536 particles of 64 bytes (4 MB), split into 256
+        // slices of 256 — one slice per emitter. The pool is uploaded ONCE at
+        // boot with every slot on its emitter's free list; from then on the
+        // GPU owns it.
+        const particle_sim_shader = try createShader(device, particle_sim_wgsl, "particle_sim.wgsl");
+        resources_created += 1;
+        const particle_draw_shader = try createShader(device, particle_draw_wgsl, "particle_draw.wgsl");
+        resources_created += 1;
+
+        const particle_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("particles"),
+            .usage = wgpu.BufferUsage_Storage | wgpu.BufferUsage_CopyDst,
+            .size = ParticlePoolBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        const particle_state_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("particles.state"),
+            .usage = wgpu.BufferUsage_Storage | wgpu.BufferUsage_CopyDst,
+            .size = ParticleStateBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        const particle_params_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("particles.params"),
+            .usage = wgpu.BufferUsage_Storage | wgpu.BufferUsage_CopyDst,
+            .size = ParticleParamsBytes,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        const particle_sim_uniform_buf = wgpu.wgpuDeviceCreateBuffer(device, &.{
+            .label = wgpu.StringView.from("particles.sim"),
+            .usage = wgpu.BufferUsage_Uniform | wgpu.BufferUsage_CopyDst,
+            .size = 16,
+        }) orelse return error.BufferCreationFailed;
+        resources_created += 1;
+
+        // The compute bind group: 0 the particles (read and written), 1 the
+        // emitters' state (the free lists), 2 the recipes, 3 the frame's
+        // uniforms.
+        const particle_sim_bgl = try createBindGroupLayout(device, &[_]wgpu.BindGroupLayoutEntry{
+            .{
+                .binding = 0,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_Storage,
+                .buffer_minBindingSize = ParticlePoolBytes,
+            },
+            .{
+                .binding = 1,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_Storage,
+                .buffer_minBindingSize = ParticleStateBytes,
+            },
+            .{
+                .binding = 2,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_ReadOnlyStorage,
+                .buffer_minBindingSize = ParticleParamsBytes,
+            },
+            .{
+                .binding = 3,
+                .visibility = wgpu.ShaderStage_Compute,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                .buffer_minBindingSize = 16,
+            },
+        }, "particles.sim.bgl");
+        resources_created += 1;
+
+        const particle_sim_layout = try createPipelineLayout(device, &[_]wgpu.WGPUBindGroupLayout{particle_sim_bgl}, "particles.sim.layout");
+        resources_created += 1;
+
+        const particle_sim_bind_group = try createBindGroup(device, particle_sim_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = particle_buf, .offset = 0, .size = ParticlePoolBytes },
+            .{ .binding = 1, .buffer = particle_state_buf, .offset = 0, .size = ParticleStateBytes },
+            .{ .binding = 2, .buffer = particle_params_buf, .offset = 0, .size = ParticleParamsBytes },
+            .{ .binding = 3, .buffer = particle_sim_uniform_buf, .offset = 0, .size = 16 },
+        }, "particles.sim");
+        resources_created += 1;
+
+        // TWO entry points in ONE module: the spawn pass and the simulation.
+        // They run in the same compute pass, in that order, and WebGPU puts a
+        // memory barrier between the dispatches — which is what makes a
+        // particle spawned by the first visible to the second.
+        const particle_sim_pipeline = wgpu.wgpuDeviceCreateComputePipeline(device, &.{
+            .label = wgpu.StringView.from("particles.sim"),
+            .layout = particle_sim_layout,
+            .compute = .{
+                .module = particle_sim_shader,
+                .entryPoint = wgpu.StringView.from("sim_pass"),
+            },
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
+        const particle_spawn_pipeline = wgpu.wgpuDeviceCreateComputePipeline(device, &.{
+            .label = wgpu.StringView.from("particles.spawn"),
+            .layout = particle_sim_layout,
+            .compute = .{
+                .module = particle_sim_shader,
+                .entryPoint = wgpu.StringView.from("spawn_pass"),
+            },
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
+        // The draw bind group: 0 the globals (the same uniform the sprites
+        // use — the same camera), 1 the particles.
+        const particle_draw_bgl = try createBindGroupLayout(device, &[_]wgpu.BindGroupLayoutEntry{
+            .{
+                .binding = 0,
+                .visibility = wgpu.ShaderStage_Vertex | wgpu.ShaderStage_Fragment,
+                .buffer_type = wgpu.BufferBindingType_Uniform,
+                .buffer_minBindingSize = SpriteUniformBytes,
+            },
+            .{
+                .binding = 1,
+                .visibility = wgpu.ShaderStage_Vertex,
+                .buffer_type = wgpu.BufferBindingType_ReadOnlyStorage,
+                .buffer_minBindingSize = ParticlePoolBytes,
+            },
+        }, "particles.draw.bgl");
+        resources_created += 1;
+
+        const particle_draw_layout = try createPipelineLayout(device, &[_]wgpu.WGPUBindGroupLayout{particle_draw_bgl}, "particles.draw.layout");
+        resources_created += 1;
+
+        const particle_draw_bind_group = try createBindGroup(device, particle_draw_bgl, &[_]wgpu.BindGroupEntry{
+            .{ .binding = 0, .buffer = sprite_uniform_buf, .offset = 0, .size = SpriteUniformBytes },
+            .{ .binding = 1, .buffer = particle_buf, .offset = 0, .size = ParticlePoolBytes },
+        }, "particles.draw");
+        resources_created += 1;
+
+        // The pool's initial state: every slot on its emitter's free list.
+        // This is a ONE-TIME upload of 4 MB at boot, not a per-frame one.
+        {
+            const pool = try allocator.alloc(u8, ParticlePoolBytes);
+            defer allocator.free(pool);
+            @memset(pool, 0);
+            // The free list: slot i points at i+1, and the last one of each
+            // slice points at the sentinel.
+            var e: u32 = 0;
+            while (e < ParticleEmitterCount) : (e += 1) {
+                const base = e * ParticleSliceSize;
+                var k: u32 = 0;
+                while (k < ParticleSliceSize) : (k += 1) {
+                    const idx = base + k;
+                    const next = if (k + 1 < ParticleSliceSize) idx + 1 else 0xffffffff;
+                    std.mem.writeInt(u32, pool[idx * 64 + 44 ..][0..4], next, .little);
+                }
+            }
+            wgpu.wgpuQueueWriteBuffer(queue, particle_buf, 0, pool.ptr, pool.len);
+
+            const states = try allocator.alloc(u8, ParticleStateBytes);
+            defer allocator.free(states);
+            @memset(states, 0);
+            e = 0;
+            while (e < ParticleEmitterCount) : (e += 1) {
+                const at = e * 20;
+                std.mem.writeInt(u32, states[at..][0..4], e * ParticleSliceSize, .little); // the head
+                std.mem.writeInt(u32, states[at + 4 ..][0..4], ParticleSliceSize, .little); // the count
+            }
+            wgpu.wgpuQueueWriteBuffer(queue, particle_state_buf, 0, states.ptr, states.len);
+        }
 
         // Pipelines: textured (alpha blend), solid (no texture), additive.
         // Instance layout: one 32-byte record per sprite, stepping per INSTANCE.
@@ -1354,6 +1555,31 @@ pub const Backend = struct {
             }
             query_set_made = query_set;
         }
+        // The particle draw pipeline: NO vertex buffer (the particle IS the
+        // instance, read by its index in the vertex shader) and one colour
+        // attachment (the particles do not write the light-layer target: they
+        // are lit by whatever layer is under them).
+        const particle_target = [_]wgpu.ColorTargetState{
+            .{ .format = format, .blend = @ptrCast(&blend) },
+        };
+        const particle_fragment = wgpu.FragmentState{
+            .module = particle_draw_shader,
+            .entryPoint = wgpu.StringView.from("fs_main"),
+            .targetCount = 1,
+            .targets = &particle_target,
+        };
+        const particle_draw_pipeline = wgpu.wgpuDeviceCreateRenderPipeline(device, &.{
+            .label = wgpu.StringView.from("particles.draw"),
+            .layout = particle_draw_layout,
+            .primitive_topology = wgpu.PrimitiveTopology_TriangleStrip,
+            .vertex_module = particle_draw_shader,
+            .vertex_entryPoint = wgpu.StringView.from("vs_main"),
+            .vertex_bufferCount = 0,
+            .vertex_buffers = null,
+            .fragment = &particle_fragment,
+        }) orelse return error.PipelineCreationFailed;
+        resources_created += 1;
+
         // NOTE: nothing here may write to `self` before `self.* = .{...}`
         // below: the struct literal would overwrite it.
         self.* = .{
@@ -1373,6 +1599,19 @@ pub const Backend = struct {
             .quad_vertex_buf = vertex_buf,
             .quad_index_buf = index_buf,
             .sprite_shader = sprite_shader,
+            .particle_buf = particle_buf,
+            .particle_state_buf = particle_state_buf,
+            .particle_params_buf = particle_params_buf,
+            .particle_sim_uniform_buf = particle_sim_uniform_buf,
+            .particle_sim_bgl = particle_sim_bgl,
+            .particle_sim_layout = particle_sim_layout,
+            .particle_sim_pipeline = particle_sim_pipeline,
+            .particle_spawn_pipeline = particle_spawn_pipeline,
+            .particle_sim_bind_group = particle_sim_bind_group,
+            .particle_draw_bgl = particle_draw_bgl,
+            .particle_draw_layout = particle_draw_layout,
+            .particle_draw_pipeline = particle_draw_pipeline,
+            .particle_draw_bind_group = particle_draw_bind_group,
             .sprite_bgl = sprite_bgl,
             .sprite_layout = sprite_layout,
             .sprite_pipeline_textured = sprite_pipeline_textured,
@@ -2921,6 +3160,97 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
     }
 
+    /// M9 (GPU): runs the particle simulation on the GPU.
+    ///
+    /// The recipes go up, and two dispatches come down: the spawn pass (one
+    /// thread per emitter) and the simulation (one thread per particle). They
+    /// share a compute pass, so the second sees the first's writes — which is
+    /// what lets a particle spawned this tick be integrated this tick.
+    fn gpuParticlesSimulate(ptr: *anyopaque, dt: f32, params: []const u8, emitter_count: u32) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        if (emitter_count == 0) return;
+        if (params.len == 0) return;
+
+        // The recipes.
+        const bytes = @min(params.len, ParticleParamsBytes);
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.particle_params_buf, 0, params.ptr, bytes);
+        self.stats_data.upload_bytes += bytes;
+
+        // The frame's uniforms: the timestep, the time and how many emitters
+        // there are.
+        // Four floats: the timestep, the time, the emitter count and the
+        // padding the shader's struct declares.
+        const uniforms = [_]f32{ dt, @floatFromInt(self.frames), @floatFromInt(emitter_count), 0 };
+        wgpu.wgpuQueueWriteBuffer(self.queue, self.particle_sim_uniform_buf, 0, &uniforms, 16);
+
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse return;
+        defer wgpu.wgpuCommandEncoderRelease(encoder);
+        var pass_desc = wgpu.ComputePassDescriptor{};
+        const pass = wgpu.wgpuCommandEncoderBeginComputePass(encoder, &pass_desc) orelse return;
+        defer wgpu.wgpuComputePassEncoderRelease(pass);
+        wgpu.wgpuComputePassEncoderSetBindGroup(pass, 0, self.particle_sim_bind_group, 0, null);
+
+        // The spawn: one thread per emitter.
+        wgpu.wgpuComputePassEncoderSetPipeline(pass, self.particle_spawn_pipeline);
+        wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, (emitter_count + 63) / 64, 1, 1);
+
+        // The simulation: one thread per particle.
+        wgpu.wgpuComputePassEncoderSetPipeline(pass, self.particle_sim_pipeline);
+        wgpu.wgpuComputePassEncoderDispatchWorkgroups(pass, @intCast(ParticlePoolBytes / ParticleBytes / 64), 1, 1);
+
+        wgpu.wgpuComputePassEncoderEnd(pass);
+        const cmd = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse return;
+        defer wgpu.wgpuCommandBufferRelease(cmd);
+        wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
+    }
+
+    /// M9 (GPU): draws the particles out of the storage buffer.
+    ///
+    /// One instanced draw over the whole pool: the vertex shader reads the
+    /// particle by its index, and a dead one produces a degenerate quad that
+    /// the rasteriser throws away. It is not a compaction pass — it is the
+    /// trade that makes the CPU never touch a particle.
+    fn gpuParticlesDraw(ptr: *anyopaque) void {
+        const self: *Backend = @ptrCast(@alignCast(ptr));
+        if (!self.scene_active) return;
+        const o = self.scene_target orelse return;
+
+        const encoder = wgpu.wgpuDeviceCreateCommandEncoder(self.device, null) orelse return;
+        defer wgpu.wgpuCommandEncoderRelease(encoder);
+
+        // ONE attachment: the particles do not write the light-layer target.
+        // They are lit by whatever layer is under them, which is a documented
+        // simplification and not a bug: a particle has no layer of its own.
+        const color_attachment = wgpu.RenderPassColorAttachment{
+            .view = o.color_view.?,
+            // LOAD, not CLEAR: the scene is already in this target.
+            .loadOp = wgpu.LoadOp_Load,
+            .storeOp = wgpu.StoreOp_Store,
+        };
+        var pass_desc = wgpu.RenderPassDescriptor{
+            .colorAttachmentCount = 1,
+            .colorAttachments = @ptrCast(&color_attachment),
+        };
+        const pass = wgpu.wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc) orelse return;
+        defer wgpu.wgpuRenderPassEncoderRelease(pass);
+        self.stats_data.render_passes += 1;
+
+        wgpu.wgpuRenderPassEncoderSetPipeline(pass, self.particle_draw_pipeline);
+        self.stats_data.pipeline_changes += 1;
+        wgpu.wgpuRenderPassEncoderSetBindGroup(pass, 0, self.particle_draw_bind_group, 0, null);
+        self.stats_data.bind_group_changes += 1;
+        // 4 vertices per particle as a triangle strip, one instance per
+        // particle in the pool.
+        wgpu.wgpuRenderPassEncoderDraw(pass, 4, @intCast(ParticlePoolBytes / ParticleBytes), 0, 0);
+        self.stats_data.draw_calls += 1;
+        self.stats_data.vertex_count += ParticlePoolBytes / ParticleBytes * 4;
+
+        wgpu.wgpuRenderPassEncoderEnd(pass);
+        const cmd = wgpu.wgpuCommandEncoderFinish(encoder, null) orelse return;
+        defer wgpu.wgpuCommandBufferRelease(cmd);
+        wgpu.wgpuQueueSubmit(self.queue, 1, @ptrCast(&cmd));
+    }
+
     /// One instanced draw: 4 corners (triangle strip) x `n` instances.
     fn emitInstancedDraw(self: *Backend, pass: wgpu.WGPURenderPassEncoder, first: u32, n: u32, slot: u8) void {
         if (n == 0) return;
@@ -3213,6 +3543,20 @@ fn destroyOffscreen(self: *Backend, o: *Offscreen) void {
         wgpu.wgpuShaderModuleRelease(self.sprite_shader);
         wgpu.wgpuBufferRelease(self.sprite_uniform_buf);
         wgpu.wgpuBufferRelease(self.sprite_instance_buf);
+        // M9: the GPU particle resources.
+        wgpu.wgpuBindGroupRelease(self.particle_sim_bind_group);
+        wgpu.wgpuBindGroupRelease(self.particle_draw_bind_group);
+        wgpu.wgpuComputePipelineRelease(self.particle_sim_pipeline);
+        wgpu.wgpuComputePipelineRelease(self.particle_spawn_pipeline);
+        wgpu.wgpuRenderPipelineRelease(self.particle_draw_pipeline);
+        wgpu.wgpuPipelineLayoutRelease(self.particle_sim_layout);
+        wgpu.wgpuPipelineLayoutRelease(self.particle_draw_layout);
+        wgpu.wgpuBindGroupLayoutRelease(self.particle_sim_bgl);
+        wgpu.wgpuBindGroupLayoutRelease(self.particle_draw_bgl);
+        wgpu.wgpuBufferRelease(self.particle_buf);
+        wgpu.wgpuBufferRelease(self.particle_state_buf);
+        wgpu.wgpuBufferRelease(self.particle_params_buf);
+        wgpu.wgpuBufferRelease(self.particle_sim_uniform_buf);
         wgpu.wgpuSamplerRelease(self.sampler);
         // M2 SMAA
         wgpu.wgpuRenderPipelineRelease(self.smaa_pipeline_edge);

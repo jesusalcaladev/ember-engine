@@ -597,7 +597,15 @@ Docs: [audio-system](docs/reference/audio-system.md),
 [audio-config](docs/reference/audio-config.md).
 
 ### M9 — FX
-- GPU particles (compute): 100k particles ≤ 1 ms GPU.
+- **GPU particles (compute) — done.** The particles live in a storage buffer
+  the compute shader writes and the draw shader reads: the CPU packs the
+  emitters' recipes and never touches a particle again. Two compute passes (the
+  spawn and the simulation), one instanced draw over the pool, a lock-free
+  free list per emitter, and the SAME rules as the CPU system — the same drag,
+  the same gravity, the same colour interpolation — so an emitter can move from
+  one backend to the other without changing how it looks.
+  `particles.set_backend(self, "gpu")` picks it at runtime.
+  Docs: [gpu-particles](docs/reference/gpu-particles.md).
 - Soft bloom for lights; scene transitions/fades.
 
 **Criteria**: particle scene within budget; zero allocations per frame.

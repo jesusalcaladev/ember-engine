@@ -21,6 +21,7 @@ This document is the complete reference of every Lua binding the Ember Engine ex
 | [`sm`](#sm) | Declarative state machines (states, transitions, enter/update/exit), with a **hierarchy** |
 | [`ai`](#ai) | The navigation grid and the path across it (A*) |
 | [`save`](#save) | Saving the game: what the developer wants to keep, optionally encrypted |
+| [`particles`](#particles) | The particles of an emitter, on the CPU or on the GPU |
 | [`physics`](#physics) | Rigid-body queries: raycasts, line of sight, solver counters, activity tiers |
 | [`audio`](#audio) | The mixer: play_file, play_stream, buses, solo/sends, stats |
 | [`sound`](#sound) | This actor's `SoundEmitter2D`: play, stop, volume/pitch, radius, is_playing, describe |
@@ -2210,6 +2211,42 @@ save.save("slot1", { only = { "player", "coins" }, password = "hunter2" })
 | | |
 |---|---|
 | **Description** | The slots on disk (each with `name`, `encrypted` and `size`), removing a slot, and whether a slot is there. |
+
+---
+
+## `particles`
+
+The particles of an emitter. The emitter is a **component**; these calls act on
+the actor's own.
+
+### `particles.set_backend(self, backend)`
+
+| | |
+|---|---|
+| **Signature** | `particles.set_backend(self, backend) -> boolean` |
+| **Parameters** | `self` — `Actor` |
+| | `backend` — `string` — `"cpu"` or `"gpu"` |
+| **Returns** | `boolean` — true when it was set |
+| **Description** | Which simulator owns this emitter's particles: the main thread's pool (`"cpu"`) or the compute shader's (`"gpu"`). The two are the **same recipe run in two places**, so an emitter can move between them without changing how it looks. The switch takes effect on the next tick, and the particles that were alive are **not** carried over: the old ones are dropped and the new ones are born from the recipe. Carrying them over would mean reading the GPU's memory back, and a readback is a stall. |
+
+### `particles.backend(self)`
+
+| | |
+|---|---|
+| **Signature** | `particles.backend(self) -> string` |
+| **Returns** | `string` — `"cpu"` or `"gpu"` |
+
+### `particles.burst(self, count)` · `particles.stats()`
+
+| | |
+|---|---|
+| **Description** | `burst` emits `count` particles at once — one explosion, not a fountain. `stats` reports the CPU system's counters (`simulated`, `live`, `spawned`, `drawn`, `culled`, `dropped_spawn`, `slab_denied`, `sim_ms`, `collect_ms`). |
+
+```lua
+particles.set_backend(self, "gpu")
+```
+
+The GPU backend in full: [gpu-particles](gpu-particles.md).
 
 ---
 

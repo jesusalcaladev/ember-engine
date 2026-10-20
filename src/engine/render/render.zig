@@ -22,6 +22,8 @@ pub const font = @import("font.zig");
 pub const ui_draw = @import("ui_draw.zig");
 /// M9: the CPU particle system (the GPU simulator is `particles_gpu`).
 pub const particles = @import("particles.zig");
+/// M9: the GPU particle backend — the emitters whose particles live on the GPU.
+pub const particles_gpu = @import("particles_gpu.zig");
 /// M9: scene transitions — the fade.
 pub const fade = @import("fade.zig");
 /// M14: CanvasModulate — the full-screen tint.
@@ -333,6 +335,16 @@ pub const Renderer = struct {
         /// Submits a batch of sprites, already ordered by the CPU batcher. The
         /// backend issues one instanced draw per (slot, blend) run.
         drawSprites: *const fn (ptr: *anyopaque, instances: []const SpriteInstance, count: usize) void,
+        /// M9 (GPU): uploads the emitters' recipes and runs the particle
+        /// simulation in a compute shader.
+        ///
+        /// `params` is the packed recipes, `emitter_count` how many of them
+        /// there are. The particles do not come back: the whole point of the
+        /// backend is that the CPU never touches them.
+        gpuParticlesSimulate: *const fn (ptr: *anyopaque, dt: f32, params: []const u8, emitter_count: u32) void,
+        /// M9 (GPU): draws the particles out of the storage buffer the
+        /// simulation wrote.
+        gpuParticlesDraw: *const fn (ptr: *anyopaque) void,
         /// M7: the light pass. One instanced quad per light, sampled against the
         /// 1D shadow map the CPU built.
         ///
@@ -449,6 +461,14 @@ pub const Renderer = struct {
     }
     pub fn drawSprites(self: Renderer, instances: []const SpriteInstance, count: usize) void {
         self.vtable.drawSprites(self.ptr, instances, count);
+    }
+    /// M9 (GPU): runs the particle simulation on the GPU.
+    pub fn gpuParticlesSimulate(self: Renderer, dt: f32, params: []const u8, emitter_count: u32) void {
+        self.vtable.gpuParticlesSimulate(self.ptr, dt, params, emitter_count);
+    }
+    /// M9 (GPU): draws the particles the simulation produced.
+    pub fn gpuParticlesDraw(self: Renderer) void {
+        self.vtable.gpuParticlesDraw(self.ptr);
     }
     /// M5: draws the editor overlay on top of the resolved frame.
     ///

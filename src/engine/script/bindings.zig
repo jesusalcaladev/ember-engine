@@ -3916,9 +3916,49 @@ const scene_regs = [_]luaL_Reg{
     .{ .name = null, .func = null },
 };
 
+/// `particles.set_backend(self, backend) -> boolean`
+///
+/// Which simulator owns this emitter's particles: `"cpu"` (the main thread's
+/// pool) or `"gpu"` (the compute shader's). The two are the same recipe run in
+/// two places, so an emitter can move between them without changing how it
+/// looks.
+///
+/// The switch takes effect on the next tick, and the particles that were
+/// alive are NOT carried over: the old ones are dropped and the new ones are
+/// born from the recipe. Carrying them over would mean reading the GPU's
+/// memory back, and a readback is a stall — the one thing the GPU backend
+/// exists to avoid.
+fn lua_particles_set_backend(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return pushFalse(L);
+    const name = lua.toSlice(L, 2) orelse return pushFalse(L);
+    const em = ctx.world.get(e, context_mod.components.ParticleEmitter2D) orelse return pushFalse(L);
+    if (std.mem.eql(u8, name, "cpu")) {
+        em.backend = .cpu;
+    } else if (std.mem.eql(u8, name, "gpu")) {
+        em.backend = .gpu;
+    } else {
+        return pushFalse(L);
+    }
+    return pushTrue(L);
+}
+
+/// `particles.backend(self) -> string`
+///
+/// Which simulator owns this emitter's particles: `"cpu"` or `"gpu"`.
+fn lua_particles_backend(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const em = ctx.world.get(e, context_mod.components.ParticleEmitter2D) orelse return 0;
+    lua.pushSlice(L, if (em.backend == .gpu) "gpu" else "cpu");
+    return 1;
+}
+
 const particles_regs = [_]luaL_Reg{
     .{ .name = "burst", .func = lua_particles_burst },
     .{ .name = "stats", .func = lua_particles_stats },
+    .{ .name = "set_backend", .func = lua_particles_set_backend },
+    .{ .name = "backend", .func = lua_particles_backend },
     .{ .name = null, .func = null },
 };
 
@@ -6594,6 +6634,8 @@ pub const registered_names = [_][]const u8{
     "scene.tint_amount",
     // M9: particles (the CPU pool)
     "particles.burst",
+    "particles.set_backend",
+    "particles.backend",
     "particles.stats",
     "light.set_color",
     "light.set_energy",
