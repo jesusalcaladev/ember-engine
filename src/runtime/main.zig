@@ -1154,6 +1154,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
     particles.setFixedDt(fixed_dt);
     particles.lock();
 
+    // M15: the tile store and the tilemap renderer.
+    //
+    // The tiles live in the STORE (the ECS layer ✓) and not in the component ✓:
+    // a grid does not fit in a fixed-size record ✓, and a pointer does not
+    // fit in a column ✓ (the registry forbids both ✓). The renderer, the
+    // physics and the script layer all read the SAME tiles ✓.
+    var tile_store = ecs.tilemap.Store.init(boot_alloc);
+    defer tile_store.deinit();
+    tile_store.reserve(64, 256) catch |err| {
+        log.warn("tile store reserve failed: {s}", .{@errorName(err)});
+    };
+    var tilemap_renderer = engine.render.tilemap.TileMapRenderer.init(boot_alloc);
+    defer tilemap_renderer.deinit();
+    tilemap_renderer.reserve(64, 16_384) catch |err| {
+        log.warn("tilemap renderer reserve failed: {s}", .{@errorName(err)});
+    };
+    tilemap_renderer.lock();
+
     // M9: the GPU particle backend. The emitters that ask for it keep their
     // particles on the GPU: the CPU packs the recipes and never touches a
     // particle again. The renderer is handed over once, at boot, because the
@@ -1785,6 +1803,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // M9: the particles go into the SAME instance list as the sprites, so
         // they batch with them: one atlas, one draw call, and the ≤ 32 draw-call
         // budget (spec §4) counts them the same way it counts every other quad.
+        // M15: the tilemap. The tiles are collected from the store and pushed
+        // into the SAME batcher as the sprites ✓ — the sprite pass clears the
+        // target ✓, so a second draw call would erase the scene ✓.
+        tilemap_renderer.beginFrame();
+        tilemap_renderer.collect(
+            &world,
+            &tile_store,
+            if (camera_view) |v| render2d.ViewRect.around(
+                v.cx,
+                v.cy,
+                v.viewport_w / v.zoom * 0.5,
+                v.viewport_h / v.zoom * 0.5,
+                64,
+            ) else null,
+            null,
+        );
+        for (tilemap_renderer.instanceSlice()) |inst| {
+            _ = r2d.pushInstance(inst);
+        }
+
         particles.beginFrame();
         particles.collect(
             &r2d,

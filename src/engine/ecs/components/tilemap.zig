@@ -12,7 +12,11 @@ pub const Filter = registry.Filter;
 
 /// AssetGUID - content-addressable asset identifier (FNV-1a hash).
 pub const AssetGUID = struct {
-    value: u64,
+    /// The hash. The default is ZERO, and it means "no asset" ✓ — the
+    /// registry's rule is that every field of a component has a default ✓
+    /// (the `.zson` baseline ✓: a field with no default has no baseline to
+    /// fall back to ✓).
+    value: u64 = 0,
 
     pub fn fromContent(path: []const u8, content: []const u8) AssetGUID {
         var h: u64 = 0xcbf29ce484222325;
@@ -124,8 +128,14 @@ pub const TileSet = struct {
 /// NO slices, NO pointers, NO allocators.
 /// All chunk storage lives in TileMapSystem / TileMapRenderSystem.
 pub const TileMapLayer = struct {
-    /// TileSet GUID (the palette this layer draws from).
-    tileset_guid: AssetGUID = .{ .value = 0 },
+    /// The tile set's identity, as the hash the asset registry uses ✓.
+    ///
+    /// A plain `u64` and not the asset's own `AssetGUID` type ✓: the ECS
+    /// layer does not depend on the asset layer ✓ (the dependency runs the
+    /// other way ✓), and the identity is a hash either way ✓. The renderer
+    /// turns it back into the registry's type when it looks the tile set up
+    /// ✓.
+    tileset_guid: u64 = 0,
     /// Render layer (same as Sprite.layer). Lower draws first.
     layer: u16 = 0,
     /// Z offset for parallax / layering within the same render layer.
@@ -134,6 +144,23 @@ pub const TileMapLayer = struct {
     physics_enabled: bool = false,
     /// Override tile size (0 = use TileSet default).
     tile_size_override: f32 = 0.0,
+    /// The tile size in world units, when the layer does not use the tile
+    /// set's own ✓. Zero means "the tile set's" ✓.
+    ///
+    /// The layer carries the tile set's MEASUREMENTS ✓ (the size ✓, the
+    /// atlas page ✓, the tiles per row ✓) and not the tile set's data ✓
+    /// (the physics shapes ✓, the autotiling rules ✓): the measurements are
+    /// what a LAYER needs to place its tiles ✓, and they are four numbers ✓
+    /// that fit in a component ✓ — while the rules are a recipe that belongs
+    /// in the asset ✓.
+    tile_size: f32 = 32.0,
+    /// The atlas page the tiles sample ✓.
+    atlas_slot: u8 = 0,
+    /// How many tiles fit in one row of the atlas page ✓. The UV of a tile
+    /// is its index in that grid ✓.
+    tiles_per_row: u8 = 8,
+    /// How many tiles the atlas page has ✓.
+    tile_count: u16 = 0,
     /// Default flip for new tiles.
     default_flip_x: bool = false,
     default_flip_y: bool = false,

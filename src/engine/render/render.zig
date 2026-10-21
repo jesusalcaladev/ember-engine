@@ -22,6 +22,8 @@ pub const font = @import("font.zig");
 pub const ui_draw = @import("ui_draw.zig");
 /// M9: the CPU particle system (the GPU simulator is `particles_gpu`).
 pub const particles = @import("particles.zig");
+/// M15: the tilemap renderer — the chunks drawn as instances.
+pub const tilemap = @import("tilemap.zig");
 /// M9: the GPU particle backend — the emitters whose particles live on the GPU.
 pub const particles_gpu = @import("particles_gpu.zig");
 /// M9: scene transitions — the fade.

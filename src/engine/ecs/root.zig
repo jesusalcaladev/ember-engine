@@ -27,6 +27,8 @@ pub const timer = @import("timer.zig");
 pub const camera = @import("camera.zig");
 pub const animation = @import("animation.zig");
 pub const actor = @import("actor.zig");
+/// M15: the tile store — the chunks of every tile layer in the world.
+pub const tilemap = @import("tilemap.zig");
 /// M14: the game-UI system (canvas, layout, hit-testing, button signals).
 pub const ui_system = @import("ui_system.zig");
 

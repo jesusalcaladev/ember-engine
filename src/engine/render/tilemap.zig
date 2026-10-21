@@ -16,6 +16,8 @@ const core = @import("core");
 const log = core.log.scoped("tilemap_render");
 const render = @import("render.zig");
 const batcher_mod = @import("batcher.zig");
+const two_d = @import("2d.zig");
+const render2d = two_d;
 const ecs = @import("ecs");
 const components = ecs.components;
 const TileMapLayer = components.TileMapLayer;
@@ -23,10 +25,6 @@ const TileChunk = components.TileChunk;
 const ChunkHandle = components.ChunkHandle;
 const ChunkKey = components.ChunkKey;
 const Tile = components.Tile;
-const assets = @import("assets");
-const AssetGUID = assets.AssetGUID;
-const TileSet = assets.TileSet;
-const TilePhysics = assets.TilePhysics;
 
 const World = ecs.World;
 const Transform = components.Transform;
@@ -40,6 +38,10 @@ pub const Stats = struct {
     instances_written: u32 = 0,
     draw_calls: u32 = 0,
     bytes_uploaded: usize = 0,
+    /// The instances that did not fit in the buffer. A number that grows says
+    /// the buffer was reserved too small ✓ — the same answer the sprite
+    /// batcher gives ✓.
+    overflowed: u32 = 0,
 };
 
 /// A TileMap draw run: consecutive chunks sharing (atlas, layer).
@@ -48,17 +50,21 @@ const Run = struct {
     instance_count: u32 = 0,
     atlas_slot: u8 = 0,
     layer: u16 = 0,
-    tileset_guid: AssetGUID = .{ .value = 0 },
+    tileset_guid: u64 = 0,
 };
 
 /// Layer render state (instance buffer + chunk metadata).
 const LayerRenderState = struct {
     layer_entity: ecs.Entity,
-    tileset_guid: AssetGUID,
+    tileset_guid: u64,
     tile_size: f32,
     atlas_slot: u8,
-    chunk_pool: []TileChunk = &.{},
-    chunk_map: components.ChunkMap = .{},
+    /// The atlas page's grid ✓: the UV of a tile is its index in it ✓.
+    tiles_per_row: u8 = 8,
+    tile_count: u16 = 0,
+    /// The chunks live in the WORLD-LEVEL store ✓ (the ECS layer ✓), not in
+    /// the renderer: the physics and the script layer read the same tiles ✓,
+    /// and a copy in each of them is three copies that drift ✓.
     capacity: usize = 0,
     // Instance buffer for this layer
     instances: []render.SpriteInstance = &.{},
@@ -78,7 +84,7 @@ const LayerRenderState = struct {
 /// TileMapRenderer: collects visible chunks, builds instances, submits draws.
 pub const TileMapRenderer = struct {
     allocator: std.mem.Allocator,
-    layer_states: std.ArrayList(LayerRenderState) = &.{},
+    layer_states: std.ArrayListUnmanaged(LayerRenderState) = .empty,
     stats: Stats = .{},
     // Global instance buffer (all layers combined)
     global_instances: []render.SpriteInstance = &.{},
@@ -105,8 +111,6 @@ pub const TileMapRenderer = struct {
             if (l.order.len > 0) self.allocator.free(l.order);
             if (l.runs.len > 0) self.allocator.free(l.runs);
             if (l.layer_counts.len > 0) self.allocator.free(l.layer_counts);
-            l.chunk_map.deinit(self.allocator);
-            self.allocator.free(l.chunk_pool);
         }
         self.layer_states.deinit(self.allocator);
 
@@ -154,8 +158,8 @@ pub const TileMapRenderer = struct {
     pub fn collect(
         self: *TileMapRenderer,
         world: *World,
-        view: ?components.ViewRect,
-        tilesets: *const assets.AssetRegistry,
+        store: *ecs.tilemap.Store,
+        view: ?render2d.ViewRect,
         atlas_resident: ?*const [4]u64,
     ) void {
         self.stats = .{};
@@ -174,7 +178,7 @@ pub const TileMapRenderer = struct {
             while (i < n) : (i += 1) {
                 const layer = &layers[i];
                 const transform = transforms[i].interpolated(0.0);
-                self.collectLayer(layer, transform, view, tilesets, atlas_resident);
+                self.collectLayer(batch.entityAt(i), layer, transform, store, view, atlas_resident);
             }
         }
 
@@ -185,30 +189,36 @@ pub const TileMapRenderer = struct {
 
     fn collectLayer(
         self: *TileMapRenderer,
+        entity: ecs.Entity,
         layer: *const TileMapLayer,
         transform: Transform,
-        view: ?components.ViewRect,
-        tilesets: *const assets.AssetRegistry,
+        store: *ecs.tilemap.Store,
+        view: ?render2d.ViewRect,
         atlas_resident: ?*const [4]u64,
     ) void {
-        // Find or create layer render state
+        // Find or create layer render state — BY ENTITY ✓.
+        //
+        // It used to be by TILESET, which was a way of saying "two actors
+        // with the same tileset are one layer" — true for the RENDER buffers ✓
+        // and false for the tiles ✓, which live in the store and are per actor
+        // ✓. Two actors sharing a tileset are two layers ✓.
         var state_idx: usize = 0;
         var found = false;
         while (state_idx < self.layer_states.items.len) : (state_idx += 1) {
-            if (self.layer_states.items[state_idx].tileset_guid.value == layer.tileset_guid.value) {
+            if (self.layer_states.items[state_idx].layer_entity.eql(entity)) {
                 found = true; break;
             }
         }
         if (!found) {
-            state_idx = self.createLayerState(layer, tilesets);
+            state_idx = self.createLayerState(entity, layer);
         }
         var lstate = &self.layer_states.items[state_idx];
 
-        // Update tileset if changed
-        if (lstate.tileset_guid.value != layer.tileset_guid.value) {
-            lstate.tileset_guid = layer.tileset_guid;
-            self.reloadTileset(lstate, tilesets);
-        }
+        // The measurements are re-read every frame ✓: a script that changes
+        // the tile size sees it on the next frame ✓, and the frame is cheap
+        // (four numbers ✓).
+        lstate.tileset_guid = layer.tileset_guid;
+        self.reloadTileset(lstate, layer);
 
         // Check atlas residency
         if (atlas_resident) |mask| {
@@ -223,14 +233,14 @@ pub const TileMapRenderer = struct {
         const tile_size = lstate.tile_size;
         const chunk_world_size = tile_size * @as(f32, @floatFromInt(components.chunk_size));
 
-        // Iterate chunks in this layer
-        var iter = lstate.chunk_map.iterator();
-        while (iter.next()) |entry| {
-            const handle = entry.value;
-            if (handle.isNone() or handle.index >= lstate.chunk_pool.len) continue;
-            const chunk = &lstate.chunk_pool[handle.index];
-            if (handle.generation != chunk.generation) continue;
+        // The chunks of this layer, from the store ✓. A layer with no store
+        // entry has no tiles: an actor that carries the component but whose
+        // tiles were never painted draws nothing ✓ — which is the truth ✓.
+        const store_layer = store.findLayer(lstate.layer_entity) orelse return;
 
+        // Iterate chunks in this layer
+        var iter = store.iterChunks(store_layer);
+        while (iter.next()) |chunk| {
             if (!chunk.has_tiles) {
                 self.stats.chunks_culled += 1;
                 continue;
@@ -255,15 +265,13 @@ pub const TileMapRenderer = struct {
         }
     }
 
-    fn createLayerState(self: *TileMapRenderer, layer: *const TileMapLayer, tilesets: *const assets.AssetRegistry) usize {
+    fn createLayerState(self: *TileMapRenderer, entity: ecs.Entity, layer: *const TileMapLayer) usize {
         const idx = self.layer_states.items.len;
         var lstate = LayerRenderState{
-            .layer_entity = ecs.Entity{ .index = 0xFFFF_FFFF, .generation = 0 },
+            .layer_entity = entity,
             .tileset_guid = layer.tileset_guid,
             .tile_size = 32.0,
             .atlas_slot = 0,
-            .chunk_pool = &.{},
-            .chunk_map = .{},
             .capacity = 0,
             .instances = &.{},
             .layers = &.{},
@@ -278,28 +286,34 @@ pub const TileMapRenderer = struct {
             .layers_monotonic = true,
             .max_layer_seen = 0,
         };
-        _ = self.loadTileset(&lstate, tilesets);
+        _ = self.loadTileset(&lstate, layer);
         self.layer_states.appendAssumeCapacity(lstate);
         return idx;
     }
 
-    fn loadTileset(self: *TileMapRenderer, lstate: *LayerRenderState, tilesets: *const assets.AssetRegistry) bool {
-        const entry = tilesets.registry.get(lstate.tileset_guid) orelse return false;
-        const ts_ptr = entry.handle as usize;
-        if (ts_ptr == 0) return false;
-        const tileset: *const TileSet = @ptrCast(@alignCast(ts_ptr));
-        lstate.tile_size = tileset.tile_size;
-        lstate.atlas_slot = tileset.atlas_slot;
-        return true;
+    /// The layer's tile set MEASUREMENTS, which live in the component ✓.
+    ///
+    /// The measurements (the size ✓, the atlas page ✓, the tiles per row ✓)
+    /// are what a layer needs to PLACE its tiles ✓, and they are four
+    /// numbers ✓ that fit in a component ✓. The tile set's DATA (the physics
+    /// shapes ✓, the autotiling rules ✓) is a recipe that belongs in the
+    /// asset ✓, and it is not needed to draw ✓.
+    fn loadTileset(self: *TileMapRenderer, lstate: *LayerRenderState, layer: *const TileMapLayer) bool {
+        _ = self;
+        lstate.tile_size = if (layer.tile_size_override > 0) layer.tile_size_override else layer.tile_size;
+        lstate.atlas_slot = layer.atlas_slot;
+        lstate.tiles_per_row = layer.tiles_per_row;
+        lstate.tile_count = layer.tile_count;
+        return lstate.tile_size > 0;
     }
 
-    fn reloadTileset(self: *TileMapRenderer, lstate: *LayerRenderState, tilesets: *const assets.AssetRegistry) void {
-        _ = self.loadTileset(lstate, tilesets);
+    fn reloadTileset(self: *TileMapRenderer, lstate: *LayerRenderState, layer: *const TileMapLayer) void {
+        _ = self.loadTileset(lstate, layer);
     }
 
     fn writeChunkInstances(
         self: *TileMapRenderer,
-        chunk: *TileChunk,
+        chunk: *const TileChunk,
         layer: *const TileMapLayer,
         transform: Transform,
         lstate: *LayerRenderState,
@@ -311,11 +325,11 @@ pub const TileMapRenderer = struct {
         const chunk_base_x = transform.position.x + @as(f32, @floatFromInt(chunk.key.cx)) * chunk_world_size;
         const chunk_base_y = transform.position.y + @as(f32, @floatFromInt(chunk.key.cy)) * chunk_world_size;
 
-        // Get tileset for UV data
-        const entry = assets.registry.get(lstate.tileset_guid) orelse return;
-        const ts_ptr = entry.handle as usize;
-        if (ts_ptr == 0) return;
-        const tileset: *const TileSet = @ptrCast(@alignCast(ts_ptr));
+        // The UV grid: the tiles per row of the atlas page ✓. It comes from
+        // the layer's MEASUREMENTS ✓ (the component ✓), not from the asset
+        // registry ✓ — the measurements are what a layer needs to place its
+        // tiles ✓, and the tile set's data is not needed to draw ✓.
+        const atlas_w = lstate.tiles_per_row;
 
         var tile_idx: u16 = 0;
         while (tile_idx < components.chunk_area) : (tile_idx += 1) {
@@ -328,13 +342,11 @@ pub const TileMapRenderer = struct {
             if (tile.isEmpty()) continue;
 
             // Calculate UV from atlas (simplified - real impl would use atlas manager)
-            const atlas_w = 16; // tiles per row
-            const tx = tile.atlas_index % atlas_w;
-            const ty = tile.atlas_index / atlas_w;
-            const uv = lstate.getUV(tile.atlas_index, tileset, atlas_w);
+            // The UV of the tile: its cell in the atlas page's grid ✓.
+            const uv = self.getUV(tile.atlas_index, atlas_w);
 
-            const local_x = @as(f32, @floatFromInt(@intCast(tile_idx % components.chunk_size))) * tile_size;
-            const local_y = @as(f32, @floatFromInt(@intCast(tile_idx / components.chunk_size))) * tile_size;
+            const local_x = @as(f32, @floatFromInt(@as(u16, tile_idx % components.chunk_size))) * tile_size;
+            const local_y = @as(f32, @floatFromInt(@as(u16, tile_idx / components.chunk_size))) * tile_size;
             const world_x = chunk_base_x + local_x + half_tile;
             const world_y = chunk_base_y + local_y + half_tile;
 
@@ -348,7 +360,11 @@ pub const TileMapRenderer = struct {
                 .uv = uv,
                 .color = .{ 255, 255, 255, 255 },
                 .slot = lstate.atlas_slot,
-                .layer = layer.layer,
+                // The layer is a BYTE on the GPU ✓ (the sprite path clamps it
+                // the same way ✓), so a layer above 255 is clamped and not
+                // wrapped ✓ — a wrapped layer would draw the tiles in the
+                // wrong place in the painter's order ✓.
+                .layer = @intCast(@min(layer.layer, 255)),
             };
             self.global_layers[self.global_instance_count] = layer.layer;
             self.global_instance_count += 1;
@@ -428,23 +444,34 @@ pub const TileMapRenderer = struct {
         self.stats.draw_calls = @intCast(r.stats().draw_calls);
     }
 
+    /// The instances the last `collect` produced ✓.
+    ///
+    /// They are pushed into the SAME batcher as the sprites ✓, and not
+    /// submitted on their own ✓: the sprite pass CLEARS the target ✓, so a
+    /// second `drawSprites` would erase the scene ✓ — the tiles have to be in
+    /// the same batch as the sprites ✓ to be drawn over them ✓.
+    pub fn instanceSlice(self: *const TileMapRenderer) []const render.SpriteInstance {
+        return self.global_instances[0..self.global_instance_count];
+    }
+
     pub fn drawRuns(self: *const TileMapRenderer) []const Run {
         return self.global_runs[0..self.global_run_count];
     }
 
-    // Helper to get UV from atlas index (placeholder - real impl uses atlas manager)
-    fn getUV(self: *LayerRenderState, atlas_index: u16, tileset: *const TileSet, atlas_w: u16) [4]u16 {
-        const tx = atlas_index % atlas_w;
-        const ty = atlas_index / atlas_w;
+    /// The UV of a tile: its cell in the atlas page's grid ✓.
+    fn getUV(_: *TileMapRenderer, atlas_index: u16, atlas_w: u8) [4]u16 {
+        const cols: u16 = atlas_w;
+        const tx = atlas_index % cols;
+        const ty = atlas_index / cols;
         const tile_w = 1.0 / @as(f32, @floatFromInt(atlas_w));
         const tile_h = 1.0 / @as(f32, @floatFromInt(atlas_w));
-        const u0 = @as(f32, @floatFromInt(tx)) * tile_w;
-        const v0 = @as(f32, @floatFromInt(ty)) * tile_h;
-        const u1 = u0 + tile_w;
-        const v1 = v0 + tile_h;
+        const u_start = @as(f32, @floatFromInt(tx)) * tile_w;
+        const v_start = @as(f32, @floatFromInt(ty)) * tile_h;
+        const u_end = u_start + tile_w;
+        const v_end = v_start + tile_h;
         return .{
-            render.toUnorm16(u0), render.toUnorm16(v0),
-            render.toUnorm16(u1), render.toUnorm16(v1),
+            render.toUnorm16(u_start), render.toUnorm16(v_start),
+            render.toUnorm16(u_end), render.toUnorm16(v_end),
         };
     }
 };

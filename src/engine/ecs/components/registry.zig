@@ -34,9 +34,7 @@ const sound_emitter_mod = @import("sound_emitter.zig");
 const particle_mod = @import("particle.zig");
 const animation_mod = @import("animation.zig");
 const ui_mod = @import("ui.zig");
-// M15 PARKED: the tilemap subsystem is unfinished; re-enable this import with
-// the component_list entry and the exports in components.zig.
-// const tilemap_mod = @import("tilemap.zig");
+const tilemap_mod = @import("tilemap.zig");
 
 pub const Name = name_mod.Name;
 pub const Transform = transform_mod.Transform;
@@ -189,8 +187,8 @@ const component_list = [_]struct { name: []const u8, type: type }{
     .{ .name = "UiButton", .type = UiButton },
     .{ .name = "UiPanel", .type = UiPanel },
     .{ .name = "UiProgressBar", .type = UiProgressBar },
-    // -- M15 PARKED: appended at id 23 once the tilemap subsystem is finished.
-    // .{ .name = "TileMapLayer", .type = tilemap_mod.TileMapLayer },
+    // -- M15: appended, never inserted
+    .{ .name = "TileMapLayer", .type = tilemap_mod.TileMapLayer },
 };
 
 comptime {
@@ -360,15 +358,16 @@ test "the components were APPENDED, not inserted" {
     try testing.expectEqual(@as(ComponentId, 21), componentId(ParticleEmitter2D));
     // M13's animation player: id 22.
     try testing.expectEqual(@as(ComponentId, 22), componentId(AnimationPlayer));
-    // M15 PARKED: the tilemap layer would be id 23; disabled for now.
-    // try testing.expectEqual(@as(ComponentId, 23), componentId(tilemap_mod.TileMapLayer));
     // M14 appended five UI components after animation: ids 23..27.
     try testing.expectEqual(@as(ComponentId, 23), componentId(UiCanvas));
     try testing.expectEqual(@as(ComponentId, 24), componentId(Label));
     try testing.expectEqual(@as(ComponentId, 25), componentId(UiButton));
     try testing.expectEqual(@as(ComponentId, 26), componentId(UiPanel));
     try testing.expectEqual(@as(ComponentId, 27), componentId(UiProgressBar));
-    try testing.expectEqual(@as(usize, 28), entries.len);
+    // M15: the tilemap layer is id 28, APPENDED — the ids before it are
+    // load-bearing (every committed `.zson` file names them by number) ✓.
+    try testing.expectEqual(@as(ComponentId, 28), componentId(tilemap_mod.TileMapLayer));
+    try testing.expectEqual(@as(usize, 29), entries.len);
 }
 
 test "default baseline bytes match a default value" {
