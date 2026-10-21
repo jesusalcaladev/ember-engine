@@ -347,6 +347,13 @@ pub const Context = struct {
     /// has no saves directory (a headless tool, a test).
     saves: ?*save_mod.Manager = null,
 
+    /// The world's tile store, behind the `tilemap.*` bindings. Null when
+    /// there is no store (a headless tool, a test).
+    ///
+    /// The tiles live HERE and not in the component ✓: a grid does not fit
+    /// in a fixed-size record ✓, and a pointer does not fit in a column ✓.
+    tilemap: ?*ecs.tilemap.Store = null,
+
     /// The physics debug overlay, behind the `physics.debug_*` bindings. Null
     /// when there is no overlay (a headless tool, a test).
     physics_debug: ?*physics_mod.debug.PhysicsDebugRenderer = null,

@@ -6221,23 +6221,61 @@ const sound_regs = [_]luaL_Reg{
 // ── M15: TileMap (chunked tile layers) ──────────────────────────────────────
 //
 // The tilemap bindings act on an actor that carries a `TileMapLayer` component.
-// They are per-actor methods like `sprite`/`timer`/`camera`, because a tile layer
-// is a component on an actor. The actual tile grid lives in the asset system.
+//
+// THE TILES LIVE IN THE STORE, not in the component ✓ (a grid does not fit in
+// a fixed-size record ✓, and a pointer does not fit in a column ✓ — the
+// registry forbids both ✓). So every call here reaches the world's tile store
+// ✓, and the component is only the recipe ✓.
+//
+// The bindings that used to be here were written against a component that
+// carried the chunks inline ✓, and they did not compile ✓ — which is why the
+// module was never installed ✓.
 
 const TileMapLayer = components.TileMapLayer;
 const Tile = components.Tile;
-const ChunkKey = components.ChunkKey;
-const ChunkHandle = components.ChunkHandle;
-const AssetGUID = components.AssetGUID;
+
+/// A tile coordinate from Lua, clamped to a range a tile address fits in.
+///
+/// The clamp is not paranoia about the API: a script that computes a
+/// coordinate from a player's position can produce a number outside the
+/// world, and a coordinate that wraps around would paint a tile on the
+/// other side of the level ✗.
+fn tilemapCoord(L: ?*lua_State, idx: c_int) i32 {
+    const raw = lua.toInteger(L, idx);
+    return @intCast(@max(-1_000_000, @min(1_000_000, raw)));
+}
+
+/// An atlas index from Lua ✓ — a whole number ✓, and never negative ✓.
+fn tilemapIndex(L: ?*lua_State, idx: c_int) u16 {
+    const raw = lua.toF32(L, idx);
+    const rounded = @round(raw);
+    if (rounded <= 0) return 0;
+    if (rounded >= 65535) return 65535;
+    return @as(u16, @intFromFloat(rounded));
+}
+
+/// The store's layer of an actor, created if the actor does not have one.
+///
+/// The tile size comes from the COMPONENT ✓ (the layer's measurement ✓), and
+/// a layer that has never been painted gets one ✓ — so a script can paint a
+/// tile on an actor that has the component but no tiles yet ✓.
+fn tilemapLayer(ctx: *Context, e: context_mod.Entity) ?*ecs.tilemap.Store.Layer {
+    const store = ctx.tilemap orelse return null;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return null;
+    const size = if (layer.tile_size_override > 0) layer.tile_size_override else layer.tile_size;
+    return store.layerFor(e, size) catch null;
+}
 
 /// `tilemap.set_tileset(self, tileset_guid)` — which TileSet this layer draws from.
+///
+/// The GUID is the asset's identity as the text the asset registry prints
+/// (`asset_0123456789abcdef`) ✓.
 fn lua_tilemap_set_tileset(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
-    if (ctx.world.get(e, TileMapLayer)) |layer| {
-        const guid_hex = lua.toSlice(L, 2) orelse return 0;
-        layer.tileset_guid = parseAssetGUID(guid_hex);
-    }
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    const guid_hex = lua.toSlice(L, 2) orelse return 0;
+    layer.tileset_guid = parseAssetGUID(guid_hex);
     return 0;
 }
 
@@ -6245,100 +6283,39 @@ fn lua_tilemap_set_tileset(L: ?*lua_State) callconv(.c) c_int {
 fn lua_tilemap_set_tile(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
-    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
-    const assets = ctx.assets orelse return 0;
+    const store = ctx.tilemap orelse return 0;
+    const layer = tilemapLayer(ctx, e) orelse return 0;
 
-    const tile_x = lua.toInteger(L, 2);
-    const tile_y = lua.toInt(L, 3);
-    const atlas_index = @as(u32, @intFromFloat(@max(lua.toF32(L, 4), 0)));
+    const tile_x = tilemapCoord(L, 2);
+    const tile_y = tilemapCoord(L, 3);
+    const atlas_index = tilemapIndex(L, 4);
     const flip_x = lua.getTop(L) >= 5 and lua.toBool(L, 5);
     const flip_y = lua.getTop(L) >= 6 and lua.toBool(L, 6);
 
-    // Find or create chunk
-    const tileset_entry_opt = assets.registry.get(layer.tileset_guid);
-    if (tileset_entry_opt == null) return 0;
-    const tileset_entry = tileset_entry_opt.?;
-    const tileset_ptr = tileset_entry.handle;
-    if (tileset_ptr == 0) return 0;
-    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
-    const tile_size = tileset.tile_size;
-
-    const chunk_key = ChunkKey.fromWorld(
-        @as(f32, @floatFromInt(tile_x)) * tile_size,
-        @as(f32, @floatFromInt(tile_y)) * tile_size,
-        tile_size,
-    );
-
-    var handle = layer.chunk_map.get(chunk_key) orelse {
-        // Would need to allocate a new chunk - for now just return
-        return 0;
-    };
-
-    if (handle.isNone() or handle.index >= layer.chunks.len) return 0;
-    const chunk = &layer.chunks[handle.index];
-    if (handle.generation != chunk.generation) return 0;
-
-    const local = components.ChunkCoord.fromTile(tile_x, tile_y);
-    const idx = local.index();
-    var tile = chunk.tiles[idx];
-    tile.atlas_index = @intCast(atlas_index);
-    tile.flags = 0;
+    var tile = Tile{ .atlas_index = atlas_index };
     if (flip_x) tile.flags |= Tile.FlagFlipX;
     if (flip_y) tile.flags |= Tile.FlagFlipY;
-    chunk.tiles[idx] = tile;
-    chunk.has_tiles = true;
-    chunk.markDirty(idx);
-    layer.physics_dirty = true;
+    store.setTile(layer, tile_x, tile_y, tile) catch return 0;
     return 0;
 }
 
 /// `tilemap.get_tile(self, tile_x, tile_y) -> atlas_index, flip_x, flip_y`
+///
+/// NIL when there is no tile there ✓ — an empty tile is no tile ✓, and a
+/// script that asks "is there a tile here?" should not have to compare the
+/// index with zero ✓.
 fn lua_tilemap_get_tile(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
-    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    const store = ctx.tilemap orelse return 0;
+    const layer = tilemapLayer(ctx, e) orelse return 0;
 
-    const tile_x = lua.toInteger(L, 2);
-    const tile_y = lua.toInt(L, 3);
-
-    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
-    if (tileset_entry_opt == null) return 0;
-    const tileset_entry = tileset_entry_opt.?;
-    const tileset_ptr = tileset_entry.handle;
-    if (tileset_ptr == 0) return 0;
-    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
-    const tile_size = tileset.tile_size;
-
-    const chunk_key = ChunkKey.fromWorld(
-        @as(f32, @floatFromInt(tile_x)) * tile_size,
-        @as(f32, @floatFromInt(tile_y)) * tile_size,
-        tile_size,
-    );
-
-    const handle = layer.chunk_map.get(chunk_key) orelse {
-        lua.pushF32(L, 0);
-        lua.lua_pushboolean(L, 0);
-        lua.lua_pushboolean(L, 0);
-        return 3;
+    const tile_x = tilemapCoord(L, 2);
+    const tile_y = tilemapCoord(L, 3);
+    const tile = store.getTile(layer, tile_x, tile_y) orelse {
+        lua.lua_pushnil(L);
+        return 1;
     };
-
-    if (handle.isNone() or handle.index >= layer.chunks.len) {
-        lua.pushF32(L, 0);
-        lua.lua_pushboolean(L, 0);
-        lua.lua_pushboolean(L, 0);
-        return 3;
-    }
-    const chunk = &layer.chunks[handle.index];
-    if (handle.generation != chunk.generation) {
-        lua.pushF32(L, 0);
-        lua.lua_pushboolean(L, 0);
-        lua.lua_pushboolean(L, 0);
-        return 3;
-    }
-
-    const local = components.ChunkCoord.fromTile(tile_x, tile_y);
-    const idx = local.index();
-    const tile = chunk.tiles[idx];
     lua.pushF32(L, @floatFromInt(tile.atlas_index));
     lua.lua_pushboolean(L, @intFromBool(tile.flipX()));
     lua.lua_pushboolean(L, @intFromBool(tile.flipY()));
@@ -6349,51 +6326,26 @@ fn lua_tilemap_get_tile(L: ?*lua_State) callconv(.c) c_int {
 fn lua_tilemap_fill_rect(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
-    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    const store = ctx.tilemap orelse return 0;
+    const layer = tilemapLayer(ctx, e) orelse return 0;
 
-    const x1 = lua.toInt(L, 2);
-    const y1 = lua.toInt(L, 3);
-    const x2 = lua.toInt(L, 4);
-    const y2 = lua.toInt(L, 5);
-    const atlas_index = @as(u32, @intFromFloat(@max(lua.toF32(L, 6), 0)));
+    const x1 = tilemapCoord(L, 2);
+    const y1 = tilemapCoord(L, 3);
+    const x2 = tilemapCoord(L, 4);
+    const y2 = tilemapCoord(L, 5);
+    const atlas_index = tilemapIndex(L, 6);
 
-    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
-    if (tileset_entry_opt == null) return 0;
-    const tileset_entry = tileset_entry_opt.?;
-    const tileset_ptr = tileset_entry.handle;
-    if (tileset_ptr == 0) return 0;
-    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
-    const tile_size = tileset.tile_size;
+    store.fillRect(layer, x1, y1, x2, y2, .{ .atlas_index = atlas_index }) catch return 0;
+    return 0;
+}
 
-    const min_x = @min(x1, x2);
-    const max_x = @max(x1, x2);
-    const min_y = @min(y1, y2);
-    const max_y = @max(y1, y2);
-
-    var y = min_y;
-    while (y <= max_y) : (y += 1) {
-        var x = min_x;
-        while (x <= max_x) : (x += 1) {
-            const chunk_key = ChunkKey.fromWorld(
-                @as(f32, @floatFromInt(x)) * tile_size,
-                @as(f32, @floatFromInt(y)) * tile_size,
-                tile_size,
-            );
-            const handle = layer.chunk_map.get(chunk_key) orelse continue;
-            if (handle.isNone() or handle.index >= layer.chunks.len) continue;
-            const chunk = &layer.chunks[handle.index];
-            if (handle.generation != chunk.generation) continue;
-            const local = components.ChunkCoord.fromTile(x, y);
-            const idx = local.index();
-            var tile = chunk.tiles[idx];
-            tile.atlas_index = @intCast(atlas_index);
-            tile.flags = 0;
-            chunk.tiles[idx] = tile;
-            chunk.has_tiles = true;
-            chunk.markDirty(idx);
-        }
-    }
-    layer.physics_dirty = true;
+/// `tilemap.clear(self)` — empties the layer.
+fn lua_tilemap_clear(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const store = ctx.tilemap orelse return 0;
+    const layer = tilemapLayer(ctx, e) orelse return 0;
+    store.clearLayer(layer);
     return 0;
 }
 
@@ -6407,13 +6359,37 @@ fn lua_tilemap_set_layer(L: ?*lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// `tilemap.set_tile_size(self, size)` — the tile's size in world units.
+///
+/// It is a MEASUREMENT of the layer ✓, and it is what the tiles are placed
+/// with ✓ — change it and the level moves ✓.
+fn lua_tilemap_set_tile_size(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const size = lua.toF32(L, 2);
+    if (size <= 0) return 0;
+    if (ctx.world.get(e, TileMapLayer)) |layer| layer.tile_size = size;
+    return 0;
+}
+
+/// `tilemap.set_atlas(self, slot, tiles_per_row, tile_count)` — the atlas page
+/// the tiles sample ✓ and its grid ✓.
+fn lua_tilemap_set_atlas(L: ?*lua_State) callconv(.c) c_int {
+    const ctx = ctxOf(L);
+    const e = entityOf(L, 1) orelse return 0;
+    const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    if (lua.getTop(L) >= 2) layer.atlas_slot = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 2), 0))));
+    if (lua.getTop(L) >= 3) layer.tiles_per_row = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 3), 1))));
+    if (lua.getTop(L) >= 4) layer.tile_count = @truncate(@as(u32, @intFromFloat(@max(lua.toF32(L, 4), 0))));
+    return 0;
+}
+
 /// `tilemap.set_physics_enabled(self, enabled)` — whether this layer collides.
 fn lua_tilemap_set_physics_enabled(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
     if (ctx.world.get(e, TileMapLayer)) |layer| {
         layer.physics_enabled = lua.toBool(L, 2);
-        layer.physics_dirty = true;
     }
     return 0;
 }
@@ -6423,46 +6399,38 @@ fn lua_tilemap_get_chunk_bounds(L: ?*lua_State) callconv(.c) c_int {
     const ctx = ctxOf(L);
     const e = entityOf(L, 1) orelse return 0;
     const layer = ctx.world.get(e, TileMapLayer) orelse return 0;
+    const store = ctx.tilemap orelse return 0;
+    const store_layer = store.findLayer(e) orelse return 0;
 
-    const cx = lua.toInt(L, 2);
-    const cy = lua.toInt(L, 3);
-
-    const tileset_entry_opt = ctx.assets.registry.get(layer.tileset_guid);
-    if (tileset_entry_opt == null) return 0;
-    const tileset_entry = tileset_entry_opt.?;
-    const tileset_ptr = tileset_entry.handle;
-    if (tileset_ptr == 0) return 0;
-    const tileset: *const assets_mod.TileSet = @ptrCast(@alignCast(tileset_ptr));
-    const tile_size = tileset.tile_size;
-    const chunk_world_size = tile_size * 16.0;
+    const cx = tilemapCoord(L, 2);
+    const cy = tilemapCoord(L, 3);
+    const chunk_world_size = store_layer.tile_size * 16.0;
 
     const min_x = @as(f32, @floatFromInt(cx)) * chunk_world_size;
     const min_y = @as(f32, @floatFromInt(cy)) * chunk_world_size;
-    const max_x = min_x + chunk_world_size;
-    const max_y = min_y + chunk_world_size;
-
     lua.pushF32(L, min_x);
     lua.pushF32(L, min_y);
-    lua.pushF32(L, max_x);
-    lua.pushF32(L, max_y);
+    lua.pushF32(L, min_x + chunk_world_size);
+    lua.pushF32(L, min_y + chunk_world_size);
+    _ = layer;
     return 4;
 }
 
-fn parseAssetGUID(hex: []const u8) AssetGUID {
-    if (!std.mem.startsWith(u8, hex, "asset_")) return AssetGUID{ .value = 0 };
+/// Parses an asset GUID as the registry prints it: `asset_0123456789abcdef`.
+fn parseAssetGUID(hex: []const u8) u64 {
+    if (!std.mem.startsWith(u8, hex, "asset_")) return 0;
     const hex_part = hex[6..];
-    if (hex_part.len != 16) return AssetGUID{ .value = 0 };
+    if (hex_part.len != 16) return 0;
     var value: u64 = 0;
     for (hex_part) |c| {
         value <<= 4;
-        // Convert hex character to integer value
         const digit = if (c >= '0' and c <= '9') c - '0'
             else if (c >= 'a' and c <= 'f') c - 'a' + 10
             else if (c >= 'A' and c <= 'F') c - 'A' + 10
             else 0;
         value |= @as(u64, digit) & 0xF;
     }
-    return AssetGUID{ .value = value };
+    return value;
 }
 
 const tilemap_regs = [_]luaL_Reg{
@@ -6473,6 +6441,9 @@ const tilemap_regs = [_]luaL_Reg{
     .{ .name = "set_layer", .func = lua_tilemap_set_layer },
     .{ .name = "set_physics_enabled", .func = lua_tilemap_set_physics_enabled },
     .{ .name = "get_chunk_bounds", .func = lua_tilemap_get_chunk_bounds },
+    .{ .name = "clear", .func = lua_tilemap_clear },
+    .{ .name = "set_tile_size", .func = lua_tilemap_set_tile_size },
+    .{ .name = "set_atlas", .func = lua_tilemap_set_atlas },
     .{ .name = null, .func = null },
 };
 
@@ -6634,6 +6605,18 @@ pub const registered_names = [_][]const u8{
     "scene.tint_amount",
     // M9: particles (the CPU pool)
     "particles.burst",
+    // M15: the tilemap. The tiles live in the world's store ✓, so these
+    // calls paint the tiles the renderer draws ✓.
+    "tilemap.set_tileset",
+    "tilemap.set_tile",
+    "tilemap.get_tile",
+    "tilemap.fill_rect",
+    "tilemap.clear",
+    "tilemap.set_layer",
+    "tilemap.set_tile_size",
+    "tilemap.set_atlas",
+    "tilemap.set_physics_enabled",
+    "tilemap.get_chunk_bounds",
     "particles.set_backend",
     "particles.backend",
     "particles.stats",
@@ -6889,7 +6872,7 @@ pub fn registerAll(L: ?*lua_State, ctx: *Context) void {
     // same kind of surface — methods on `self` over a plain-data component.
     installModule(L, ctx, "sound", &sound_regs);
     // M15 PARKED: tilemap module disabled until the subsystem is finished.
-    // installModule(L, ctx, "tilemap", &tilemap_regs);
+    installModule(L, ctx, "tilemap", &tilemap_regs);
 }
 
 /// Creates the global table `name`, registers `regs` into it (each function

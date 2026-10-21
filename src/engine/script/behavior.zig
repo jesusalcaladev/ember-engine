@@ -2920,6 +2920,60 @@ test "the physics debug overlay can be driven from Lua" {
     try std.testing.expectEqual(@as(f32, 0), step);
 }
 
+test "a tile painted from Lua is the tile that is read back" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit();
+
+    // The world's tile store ✓ — the same one the renderer draws ✓.
+    var store = ecs.tilemap.Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.reserve(8, 16);
+    h.b.ctx.tilemap = &store;
+
+    // An actor with a tile layer ✓. The name is how the script finds it ✓:
+    // an actor's handle in Lua is a USERDATA ✓, and there is no number a
+    // script could type that would mean "that entity" ✓.
+    var name = components.Name{};
+    name.set("tilemap_test");
+    const e = try h.world.spawn(.{
+        components.Transform{},
+        name,
+        components.TileMapLayer{ .tile_size = 32 },
+    });
+
+    const L = h.b.vm.state().?;
+    const script =
+        \\local a = actor.find_by_name("tilemap_test")
+        \\if a == nil then return 1 end
+        \\tilemap.set_tile(a, 3, 5, 12)
+        \\local t = tilemap.get_tile(a, 3, 5)
+        \\if t == nil then return 1 end
+        \\if t ~= 12 then return 2 end
+        \\if tilemap.get_tile(a, 3, 6) ~= nil then return 3 end
+        \\tilemap.fill_rect(a, 0, 0, 2, 2, 7)
+        \\if tilemap.get_tile(a, 1, 1) ~= 7 then return 4 end
+        \\tilemap.clear(a)
+        \\if tilemap.get_tile(a, 1, 1) ~= nil then return 5 end
+        \\return 0
+    ;
+    h.b.vm.loadBuffer(script, "tilemap_test") catch return error.TestUnexpectedResult;
+    if (lua.lua_pcall(L, 0, 1, 0) != 0) {
+        std.debug.print("tilemap test: {s}\n", .{lua.toString(L, -1)});
+        return error.TestUnexpectedResult;
+    }
+    const step = lua.toF32(L, -1);
+    lua.pop(L, 1);
+    if (step != 0) std.debug.print("tilemap test stopped at step {d}\n", .{step});
+    try std.testing.expectEqual(@as(f32, 0), step);
+
+    // And the store really holds the tiles ✓ (the script's own reads could
+    // have been a lie ✓).
+    const layer = store.findLayer(e).?;
+    const tile = store.getTile(layer, 0, 0);
+    try std.testing.expectEqual(@as(?components.Tile, null), tile);
+}
+
 test "a coroutine that errors is reported, not fatal" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);

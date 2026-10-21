@@ -3294,6 +3294,167 @@ pub const bindings = [_]Binding{
         ,
     },
     .{
+        .name = "tilemap.set_tileset",
+        .module = "tilemap",
+        .signature = "tilemap.set_tileset(self, tileset_guid) -> nil",
+        .summary = "Which TileSet this layer draws from. The GUID is the asset's identity as the registry prints it (`asset_0123456789abcdef`).",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "tileset_guid", .kind = .string, .doc = "the asset's GUID" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_tileset(self, "asset_0123456789abcdef")
+        ,
+    },
+    .{
+        .name = "tilemap.set_tile",
+        .module = "tilemap",
+        .signature = "tilemap.set_tile(self, tile_x, tile_y, atlas_index, flip_x?, flip_y?) -> nil",
+        .summary = "Sets a single tile. The atlas index 0 is the EMPTY tile — setting it clears the tile.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "tile_x", .kind = .number, .doc = "the tile's column" },
+            .{ .name = "tile_y", .kind = .number, .doc = "the tile's row" },
+            .{ .name = "atlas_index", .kind = .number, .doc = "the tile's index in the atlas page" },
+            .{ .name = "flip_x", .kind = .boolean, .doc = "optional: mirror it horizontally" },
+            .{ .name = "flip_y", .kind = .boolean, .doc = "optional: mirror it vertically" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_tile(self, 3, 5, 12)
+        ,
+    },
+    .{
+        .name = "tilemap.get_tile",
+        .module = "tilemap",
+        .signature = "tilemap.get_tile(self, tile_x, tile_y) -> atlas_index, flip_x, flip_y",
+        .summary = "The tile at a position, or NIL when there is none. An empty tile is no tile: a script that asks \"is there a tile here?\" should not have to compare the index with zero.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "tile_x", .kind = .number, .doc = "the tile's column" },
+            .{ .name = "tile_y", .kind = .number, .doc = "the tile's row" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "the atlas index" },
+            .{ .kind = .boolean, .doc = "flipped horizontally" },
+            .{ .kind = .boolean, .doc = "flipped vertically" },
+        },
+        .example =
+        \\\\local t = tilemap.get_tile(self, 3, 5)
+        \\\\if t then print(t) end
+        ,
+    },
+    .{
+        .name = "tilemap.fill_rect",
+        .module = "tilemap",
+        .signature = "tilemap.fill_rect(self, x1, y1, x2, y2, atlas_index) -> nil",
+        .summary = "Fills a rectangle of tiles, inclusive on both ends. The corners may be given in any order.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "x1", .kind = .number, .doc = "the first column" },
+            .{ .name = "y1", .kind = .number, .doc = "the first row" },
+            .{ .name = "x2", .kind = .number, .doc = "the last column" },
+            .{ .name = "y2", .kind = .number, .doc = "the last row" },
+            .{ .name = "atlas_index", .kind = .number, .doc = "the tile to fill with" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.fill_rect(self, 0, 10, 40, 12, 3)
+        ,
+    },
+    .{
+        .name = "tilemap.clear",
+        .module = "tilemap",
+        .signature = "tilemap.clear(self) -> nil",
+        .summary = "Empties the layer. The chunks stay and their tiles go: the chunks are a pool, and a pool that frees on every clear is a pool that allocates on every clear.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.clear(self)
+        ,
+    },
+    .{
+        .name = "tilemap.set_layer",
+        .module = "tilemap",
+        .signature = "tilemap.set_layer(self, layer) -> nil",
+        .summary = "The render layer — the draw order. Lower draws first.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "layer", .kind = .number, .doc = "the layer" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_layer(self, 1)
+        ,
+    },
+    .{
+        .name = "tilemap.set_tile_size",
+        .module = "tilemap",
+        .signature = "tilemap.set_tile_size(self, size) -> nil",
+        .summary = "The tile's size in world units. It is a MEASUREMENT of the layer, and it is what the tiles are placed with: change it and the level moves.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "size", .kind = .number, .doc = "the size in world units" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_tile_size(self, 16)
+        ,
+    },
+    .{
+        .name = "tilemap.set_atlas",
+        .module = "tilemap",
+        .signature = "tilemap.set_atlas(self, slot, tiles_per_row, tile_count) -> nil",
+        .summary = "The atlas page the tiles sample, and its grid. The UV of a tile is its index in that grid.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "slot", .kind = .number, .doc = "the atlas page" },
+            .{ .name = "tiles_per_row", .kind = .number, .doc = "the tiles in one row of the page" },
+            .{ .name = "tile_count", .kind = .number, .doc = "how many tiles the page has" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_atlas(self, 0, 8, 64)
+        ,
+    },
+    .{
+        .name = "tilemap.set_physics_enabled",
+        .module = "tilemap",
+        .signature = "tilemap.set_physics_enabled(self, enabled) -> nil",
+        .summary = "Whether this layer collides. A layer that collides becomes a floor the actors stand on.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "enabled", .kind = .boolean, .doc = "true or false" },
+        },
+        .returns = &.{},
+        .example =
+        \\\\tilemap.set_physics_enabled(self, true)
+        ,
+    },
+    .{
+        .name = "tilemap.get_chunk_bounds",
+        .module = "tilemap",
+        .signature = "tilemap.get_chunk_bounds(self, cx, cy) -> min_x, min_y, max_x, max_y",
+        .summary = "The world bounds of a chunk. A chunk is 16x16 tiles.",
+        .params = &.{
+            .{ .name = "self", .kind = .actor, .doc = "" },
+            .{ .name = "cx", .kind = .number, .doc = "the chunk's column" },
+            .{ .name = "cy", .kind = .number, .doc = "the chunk's row" },
+        },
+        .returns = &.{
+            .{ .kind = .number, .doc = "the minimum x" },
+            .{ .kind = .number, .doc = "the minimum y" },
+            .{ .kind = .number, .doc = "the maximum x" },
+            .{ .kind = .number, .doc = "the maximum y" },
+        },
+        .example =
+        \\\\local x1, y1, x2, y2 = tilemap.get_chunk_bounds(self, 0, 0)
+        ,
+    },
+    .{
         .name = "tween.to",
         .module = "tween",
         .signature = "tween.to(self, property, value, duration, opts) -> number",

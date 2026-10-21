@@ -1165,6 +1165,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     tile_store.reserve(64, 256) catch |err| {
         log.warn("tile store reserve failed: {s}", .{@errorName(err)});
     };
+    // The script layer paints the same tiles the renderer draws ✓ — one
+    // store, one copy ✓.
+    behaviors.ctx.tilemap = &tile_store;
     var tilemap_renderer = engine.render.tilemap.TileMapRenderer.init(boot_alloc);
     defer tilemap_renderer.deinit();
     tilemap_renderer.reserve(64, 16_384) catch |err| {
