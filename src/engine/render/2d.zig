@@ -840,10 +840,17 @@ test "the rotation reaches the instance, and the corners turn with it" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), inst.rot, 0.0001);
     try testing.expectApproxEqAbs(@as(f32, 10), inst.pos[0], 0.0001);
 
-    // A quarter turn swaps the extents: the corner that was at (+2, -1) is
+    // A QUARTER turn swaps the extents: the corner that was at (+2, -1) is
     // now at (+1, +2). This is the same arithmetic the shader does.
-    const c = @cos(inst.rot);
-    const s = @sin(inst.rot);
+    //
+    // A QUARTER turn and not the instance's own rotation: the instance's
+    // rotation is 0.5 RADIANS, which is not a quarter turn, and the
+    // expectation below ("the corner lands on (1, 2)") is a quarter turn's.
+    // The two used to be the same number, and the test was checking a
+    // quarter turn against half a radian's arithmetic.
+    const quarter: f32 = std.math.pi / 2.0;
+    const c = @cos(quarter);
+    const s = @sin(quarter);
     const corner = [2]f32{ inst.half[0], -inst.half[1] };
     const turned = [2]f32{
         corner[0] * c - corner[1] * s,
