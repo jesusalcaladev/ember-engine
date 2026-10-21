@@ -130,6 +130,10 @@ pub const Store = struct {
         chunk.tiles[idx] = tile;
         chunk.has_tiles = chunk.has_tiles or !tile.isEmpty();
         chunk.markDirty(idx);
+        // The VERSION: a consumer that rebuilds the whole chunk compares it ✓
+        // (the physics ✓) — the dirty bits alone would starve it ✓, because
+        // the renderer clears them ✓.
+        chunk.version +%= 1;
     }
 
     /// The tile at a position, if there is one.

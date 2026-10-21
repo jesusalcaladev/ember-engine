@@ -68,9 +68,8 @@ pub const DebugColors = debug.DebugColors;
 pub const DebugColorSet = debug.DebugColorSet;
 pub const DebugQuad = debug.DebugQuad;
 
-/// M15: TileMap physics system — per-tile collision from TileSet physics data.
-/// M15: TileMap physics system — per-tile collision from TileSet physics data.
-// M15 PARKED: unfinished tilemap physics; re-enable with the rest of M15.
+/// M15: the tilemap's colliders — the tiles a level stands on ✓.
+pub const tilemap = @import("tilemap.zig");
 // pub const tilemap = @import("tilemap.zig");
 // pub const TileMapPhysicsSystem = tilemap.TileMapPhysicsSystem;
 

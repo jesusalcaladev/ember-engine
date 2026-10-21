@@ -173,6 +173,14 @@ pub const TileChunk = struct {
     key: ChunkKey = .{},
     tiles: [chunk_area]Tile = @splat(Tile{}),
     dirty: [4]u64 = @splat(0),
+    /// Bumped every time a tile in the chunk changes ✓.
+    ///
+    /// The dirty BITS say WHICH tile changed ✓ (the renderer wants that ✓);
+    /// the VERSION says WHETHER anything changed ✓, and it is what a consumer
+    /// that rebuilds the whole chunk compares against ✓ — the physics ✓.
+    /// Two consumers cannot share one set of dirty bits ✓: whoever cleared
+    /// them last would starve the other ✓.
+    version: u32 = 0,
     generation: u32 = 0,
     has_tiles: bool = false,
     pub fn markDirty(self: *TileChunk, local_index: u16) void {

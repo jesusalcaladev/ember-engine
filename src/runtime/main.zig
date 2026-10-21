@@ -1175,6 +1175,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     tilemap_renderer.lock();
 
+    // M15: the tilemap's colliders — the tiles a level stands on ✓.
+    var tilemap_physics = physics.tilemap.Tilemap.init(boot_alloc);
+    defer tilemap_physics.deinit();
+
     // M9: the GPU particle backend. The emitters that ask for it keep their
     // particles on the GPU: the CPU packs the recipes and never touches a
     // particle again. The renderer is handed over once, at boot, because the
@@ -1749,6 +1753,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // The solver runs AFTER the gameplay (so the scripts' writes are
             // pushed to it) and BEFORE the root motion (which must be last).
             // It also publishes the contacts the collision bridge hands to Lua.
+            // The tilemap's colliders are brought in line with the tiles
+            // BEFORE the solver runs ✓: a tile painted this tick has to be
+            // solid this tick ✓, not the next one ✓.
+            tilemap_physics.sync(&world, &tile_store, physics_sys.getWorld());
             _ = physics_sys.step(&world, fixed_dt);
             // M13: root motion runs LAST — after the physics step and gameplay —
             // so a solver (or a behavior) that wrote `Transform` this tick does
