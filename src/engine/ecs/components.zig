@@ -118,6 +118,7 @@ pub const ChunkKey = tilemap_mod.ChunkKey;
 pub const Tile = tilemap_mod.Tile;
 pub const TileSet = tilemap_mod.TileSet;
 pub const TileMapLayer = tilemap_mod.TileMapLayer;
+pub const TileMapPath = tilemap_mod.InlinePath;
 pub const TileChunk = tilemap_mod.TileChunk;
 pub const ChunkHandle = tilemap_mod.ChunkHandle;
 pub const ChunkMap = tilemap_mod.ChunkMap;

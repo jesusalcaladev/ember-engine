@@ -585,6 +585,50 @@ fn mountGlobalScripts(
 ///
 /// A failure is logged and skipped, one piece at a time: a scene that does not
 /// load costs the game its scene, not its boot.
+/// Fills the tile store with the maps the scene points at ✓.
+///
+/// The scene's layers say WHICH map they are ✓ (a path ✓); the map's data is
+/// an asset ✓ (a `.tilemap` file ✓ — a line-oriented text file ✓, so a level
+/// is a thing a person can read ✓, diff ✓ and fix ✓).
+fn loadTileMaps(
+    world: *ecs.World,
+    tile_store: *ecs.tilemap.Store,
+    assets_manager: *assets.AssetManager,
+) void {
+    var q = world.query(.{components.Transform, components.TileMapLayer});
+    while (q.nextBatch()) |batch| {
+        const layers = batch.slice(components.TileMapLayer);
+        const n = batch.len();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const layer = &layers[i];
+            const path = layer.data_path.slice();
+            if (path.len == 0) continue;
+            const entity = batch.entityAt(i);
+
+            const handle = assets_manager.getOrLoad(path) catch |err| {
+                log.warn("tilemap '{s}': {s}", .{ path, @errorName(err) });
+                continue;
+            };
+            // The slot index is the handle's id ✓, and the generation is 0 ✓
+            // (the same convention the image path uses ✓ — the manager's
+            // slots are only recycled under the manager's own bookkeeping ✓).
+            const payload = assets_manager.get(assets.AssetHandle{ .id = handle, .generation = 0 }) orelse continue;
+            const map: *const assets.asset_types.TileMapData = @ptrCast(@alignCast(payload));
+
+            const size = if (layer.tile_size_override > 0) layer.tile_size_override else layer.tile_size;
+            const store_layer = tile_store.layerFor(entity, size) catch continue;
+            for (map.tiles.items) |tile| {
+                tile_store.setTile(store_layer, tile.x, tile.y, .{
+                    .atlas_index = tile.atlas_index,
+                    .flags = tile.flags,
+                }) catch {};
+            }
+            log.info("tilemap '{s}': {d} tiles", .{ path, map.tiles.items.len });
+        }
+    }
+}
+
 fn loadScene(
     behaviors: *script.Behaviors,
     world: *ecs.World,
@@ -613,6 +657,7 @@ fn loadScene(
     // colliders are data and nothing simulates: the physics is a separate
     // system and it has to be told what exists.
     physics_sys.syncLoad(world);
+
 
     // 3. The behaviors: every entity that carries a `Script` component.
     var q = world.query(.{components.Script});
@@ -1087,6 +1132,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer nav_grid.deinit();
     behaviors.ctx.nav = &nav_grid;
 
+    // M15: the tile store ✓.
+    //
+    // The tiles live in the STORE (the ECS layer ✓) and not in the component
+    // ✓: a grid does not fit in a fixed-size record ✓, and a pointer does
+    // not fit in a column ✓ (the registry forbids both ✓). The renderer, the
+    // physics and the script layer all read the SAME tiles ✓.
+    //
+    // It is created BEFORE the scene load ✓, because the scene load FILLS it
+    // ✓ (the scene says which map a layer is ✓, and the map's data is an
+    // asset ✓).
+    var tile_store = ecs.tilemap.Store.init(boot_alloc);
+    defer tile_store.deinit();
+    tile_store.reserve(64, 256) catch |err| {
+        log.warn("tile store reserve failed: {s}", .{@errorName(err)});
+    };
+    // The script layer paints the same tiles the renderer draws ✓ — one
+    // store, one copy ✓.
+    behaviors.ctx.tilemap = &tile_store;
+
     // ── The scene, and the behaviors its actors run ────────────────────────
     // AFTER the globals are mounted (a global's `start` may want to know what
     // the scene contains) and BEFORE the first frame, so the world that the
@@ -1154,20 +1218,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     particles.setFixedDt(fixed_dt);
     particles.lock();
 
-    // M15: the tile store and the tilemap renderer.
-    //
-    // The tiles live in the STORE (the ECS layer ✓) and not in the component ✓:
-    // a grid does not fit in a fixed-size record ✓, and a pointer does not
-    // fit in a column ✓ (the registry forbids both ✓). The renderer, the
-    // physics and the script layer all read the SAME tiles ✓.
-    var tile_store = ecs.tilemap.Store.init(boot_alloc);
-    defer tile_store.deinit();
-    tile_store.reserve(64, 256) catch |err| {
-        log.warn("tile store reserve failed: {s}", .{@errorName(err)});
-    };
-    // The script layer paints the same tiles the renderer draws ✓ — one
-    // store, one copy ✓.
-    behaviors.ctx.tilemap = &tile_store;
+    // M15: the tilemap renderer ✓. The STORE is created above ✓ (before the
+    // scene load ✓, which fills it ✓).
     var tilemap_renderer = engine.render.tilemap.TileMapRenderer.init(boot_alloc);
     defer tilemap_renderer.deinit();
     tilemap_renderer.reserve(64, 16_384) catch |err| {
@@ -1393,6 +1445,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     defer if (asset_manager) |*am| am.deinit();
     if (asset_manager) |*am| behaviors.ctx.assets = am;
+
+    // M15: the tile maps' DATA ✓ — the tiles themselves ✓.
+    //
+    // They are not in the scene ✗: a grid does not fit in a component ✗. The
+    // scene says WHICH map a layer is ✓ (a path ✓) and the map's data is an
+    // asset ✓ (a `.tilemap` file ✓ — a line-oriented text file ✓, so a level
+    // is a thing a person can read ✓, diff ✓ and fix ✓).
+    //
+    // It happens HERE ✗ — after the asset manager exists ✗ — and not inside
+    // the scene load ✗, because the scene loads BEFORE the manager ✗ (the
+    // manager's budget is a boot-time decision ✗).
+    if (asset_manager) |*am| loadTileMaps(&world, &tile_store, am);
     // The renderer is a by-value handle (a vtable plus a pointer), so the context
     // holds its address — and `renderer` outlives every frame, including the
     // `defer renderer.deinit()` above, which runs after this whole block.

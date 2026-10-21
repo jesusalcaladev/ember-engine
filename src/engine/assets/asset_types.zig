@@ -15,7 +15,41 @@
 //! (spec §3.15); a second PCM cache in here is how the two drift apart.
 
 /// What a slot holds. A plain enum, not a type pointer.
-pub const AssetKind = enum { image };
+const std = @import("std");
+
+pub const AssetKind = enum { image, tilemap };
+
+/// M15: a tile map's DATA — the tiles themselves.
+///
+/// It is an asset and not a component ✓: a grid does not fit in a fixed-size
+/// record ✓, and a pointer does not fit in a column ✓. The component says
+/// WHICH map this is ✓, and this is what it points at ✓.
+pub const TileMapData = struct {
+    /// The tile set the tiles draw from ✓ (as the registry's hash ✓).
+    tileset_guid: u64 = 0,
+    /// The tiles ✓.
+    tiles: std.ArrayListUnmanaged(Tile) = .empty,
+
+    pub const Tile = struct {
+        x: i32 = 0,
+        y: i32 = 0,
+        atlas_index: u16 = 0,
+        flags: u8 = 0,
+    };
+
+    /// The flip flags ✓ — the same bits the ECS's `Tile` uses ✓.
+    ///
+    /// They are DUPLICATED and not shared ✓: the asset module cannot import
+    /// the ECS module ✓ (a file belongs to ONE module ✓, and the ECS's root
+    /// pulls its components in ✓), so the two copies have to agree by
+    /// CONVENTION ✓ — and this comment is that convention ✓.
+    pub const FlagFlipX: u8 = 0x01;
+    pub const FlagFlipY: u8 = 0x02;
+
+    pub fn deinit(self: *TileMapData, allocator: std.mem.Allocator) void {
+        self.tiles.deinit(allocator);
+    }
+};
 
 /// The longest path a slot can store, including the NUL we never write.
 pub const max_path = 256;

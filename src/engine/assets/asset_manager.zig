@@ -20,6 +20,7 @@ const Image = types.Image;
 const AssetSlot = types.AssetSlot;
 // M15 PARKED: TileSet decode is disabled until the tilemap subsystem is finished.
 // const TileSet = types.TileSet;
+const tilemap_data = @import("tilemap_data.zig");
 const ImageDecode = @import("image.zig");
 
 pub const AssetError = error{
@@ -32,6 +33,8 @@ pub const AssetError = error{
     InvalidImage,
     /// Tileset decoding failed (missing atlas, invalid format).
     InvalidTileset,
+    /// Tile map decoding failed (a bad line, a bad GUID, a bad version).
+    InvalidTilemap,
 };
 
 pub const AssetManager = struct {
@@ -97,7 +100,8 @@ pub const AssetManager = struct {
         const ext = fileExtension(path) orelse return error.UnsupportedFormat;
         const is_image = isImageExtension(ext);
         const is_tileset = isTilesetExtension(ext);
-        if (!is_image and !is_tileset) return error.UnsupportedFormat;
+        const is_tilemap = isTilemapExtension(ext);
+        if (!is_image and !is_tileset and !is_tilemap) return error.UnsupportedFormat;
 
         // 3. Decode first, then make room. Decoding before eviction means a
         //    file that turns out to be corrupt never costs us a resident asset.
@@ -117,6 +121,22 @@ pub const AssetManager = struct {
             kind = .image;
         } else if (is_tileset) {
             return error.InvalidTileset;
+        } else if (is_tilemap) {
+            // The file errors are MAPPED ✓: the manager's error set is the
+            // engine's vocabulary ✓, and "the file is not there" and "the file
+            // is broken" are the two things a caller can do something about ✓.
+            var map = tilemap_data.decode(self.allocator, path) catch |err| switch (err) {
+                error.InvalidTilemap => return error.InvalidTilemap,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.FileNotFound,
+            };
+            errdefer map.deinit(self.allocator);
+            bytes = map.tiles.items.len * @sizeOf(types.TileMapData.Tile);
+            if (bytes > self.budgetBytes) return error.OutOfMemory;
+            const p = try self.allocator.create(types.TileMapData);
+            p.* = map;
+            payload = p;
+            kind = .tilemap;
         }
 
         // 4. Make room: free slots first, then LRU.
@@ -171,6 +191,13 @@ pub const AssetManager = struct {
                         const img: *Image = @ptrCast(@alignCast(p));
                         self.allocator.free(img.pixels);
                         self.allocator.destroy(img);
+                    }
+                },
+                .tilemap => {
+                    if (s.payload) |p| {
+                        const map: *types.TileMapData = @ptrCast(@alignCast(p));
+                        map.deinit(self.allocator);
+                        self.allocator.destroy(map);
                     }
                 },
             }
@@ -236,6 +263,15 @@ fn isImageExtension(ext: []const u8) bool {
     };
     for (image_exts) |e| {
         if (std.mem.eql(u8, e, ext)) return true;
+    }
+    return false;
+}
+
+/// Whether a path names a TILE MAP ✓ (the tiles themselves ✓).
+fn isTilemapExtension(ext: []const u8) bool {
+    const tilemap_exts = [_][]const u8{ "tilemap", "tm" };
+    for (tilemap_exts) |e| {
+        if (std.mem.eql(u8, ext, e)) return true;
     }
     return false;
 }

@@ -124,6 +124,29 @@ pub const TileSet = struct {
     };
 };
 
+/// A path, inline ✓ — the component's own copy ✓.
+///
+/// The components cannot import the assets module ✓ (a file belongs to ONE
+/// module ✓, and the ECS's root pulls its components in ✓), so the path type
+/// is DUPLICATED ✓ and the two copies agree by convention ✓ — and this
+/// comment is that convention ✓.
+pub const InlinePath = struct {
+    bytes: [max_len]u8 = [_]u8{0} ** max_len,
+    len: u8 = 0,
+
+    pub const max_len = 128;
+
+    pub fn set(self: *InlinePath, text: []const u8) void {
+        const n = @min(text.len, max_len);
+        @memcpy(self.bytes[0..n], text[0..n]);
+        self.len = @intCast(n);
+    }
+
+    pub fn slice(self: *const InlinePath) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 /// TileMapLayer — PURE DATA component (spec §7).
 /// NO slices, NO pointers, NO allocators.
 /// All chunk storage lives in TileMapSystem / TileMapRenderSystem.
@@ -161,6 +184,12 @@ pub const TileMapLayer = struct {
     tiles_per_row: u8 = 8,
     /// How many tiles the atlas page has ✓.
     tile_count: u16 = 0,
+    /// The path of the tile map's DATA — the file with the tiles ✓.
+    ///
+    /// A path and not a GUID ✓: the asset registry's identity is a content
+    /// hash ✓, and a level that names its data by hash is a level nobody can
+    /// edit by hand ✓. The path is what a person types ✓.
+    data_path: InlinePath = .{},
     /// Default flip for new tiles.
     default_flip_x: bool = false,
     default_flip_y: bool = false,
